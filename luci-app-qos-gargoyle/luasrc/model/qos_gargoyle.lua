@@ -26,7 +26,6 @@ function cbi_add_dpi_protocols(field)
 end
 
 function get_wan()
-       local net = require "luci.model.network".init()
-       local wan_nets = net:get_wan_networks()
-       return wan_nets and #wan_nets > 0 and wan_nets[1]
+	local net = require "luci.model.network".init()
+	return net:get_wannet()
 end

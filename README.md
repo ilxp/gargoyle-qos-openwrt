@@ -5,5 +5,5 @@
 - 4、在immortalwrt-1806-k5.4上运行最完美，无bug。2102以及2203和官方master分支上运行有个小bug，就是负载没有显示数据，是个瑕疵，但不影响使用。
 
 ### 安装：
-- 方法1、git clone -b openwrt-2102  https://github.com/ilxp/gargoyle-qos-openwrt.git  package/gargoyle-qos-openwrt
-- 方法2、sed -i '$a src-git gargoyle https://github.com/ilxp/gargoyle-qos-openwrt.git;openwrt-2102' feeds.conf.default
+- 方法1、git clone -b openwrt-luci18  https://github.com/ilxp/gargoyle-qos-openwrt.git  package/gargoyle-qos-openwrt
+- 方法2、sed -i '$a src-git gargoyle https://github.com/ilxp/gargoyle-qos-openwrt.git;openwrt-luci18' feeds.conf.default
