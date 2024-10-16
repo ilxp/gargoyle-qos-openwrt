@@ -8,3 +8,4 @@
 
 ### 鸣谢：
 来源 QoS Gargoyle: https://github.com/kuoruan/luci-app-qos-gargoyle  1.3.6。 感谢作者的奉献。
+来源  https://github.com/Ameykyl/openwrt18.06/tree/master/package/my/luci-app-qos-gargoyle 1.3.8-4

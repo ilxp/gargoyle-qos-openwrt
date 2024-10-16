@@ -11,6 +11,9 @@ ra_mark="$ra_mask/$ra_mask"
 death_mask=0x8000
 death_mark="$death_mask"
 
+quota_up_mask="0x7f"
+quota_dn_mask="0x7f00"
+
 wan_if=""
 
 apply_xtables_rule()
@@ -65,6 +68,8 @@ mask_to_cidr()
 
 define_wan_if()
 {
+	no_wan="$(uci -q get network.wan)"
+	if [ -z "$no_wan" ] ; then return ; fi
 	if  [ -z "$wan_if" ] ;  then
 		#Wait for up to 15 seconds for the wan interface to indicate it is up.
 		wait_sec=15
@@ -286,7 +291,7 @@ insert_dmz_rule()
 		done
 		if [ -n "$from" ] ; then
 			network_get_device from_if "$from" || \
-				from_if=$(uci -q get network.$from.ifname)
+				from_if=$(uci -q get network.$from.device)
 		fi
 		# echo "from_if = $from_if"
 		if [ -n "$to_ip" ] && [ -n "$from"  ] && [ -n "$from_if" ] ; then
@@ -551,10 +556,11 @@ initialize_quota_qos()
 		upload_shift=0
 		for rate_kb in $unique_up ; do
 			kbit=$(echo $((rate_kb*8))kbit)
-			mark=$(($cur_band << $upload_shift))
-			tc filter add dev $wan_if parent 1:0 prio $cur_band protocol ip  handle $mark fw flowid 1:$cur_band
+			mark=$(printf "0x%x\n" $(($cur_band << $upload_shift)))
+			tc filter add dev $wan_if parent 1:0 prio $cur_band protocol ip  handle $mark/$quota_up_mask fw flowid 1:$cur_band
+			tc filter add dev $wan_if parent 1:0 prio $(($cur_band+1)) protocol ipv6 handle $mark/$quota_up_mask fw flowid 1:$cur_band
 			tc qdisc  add dev $wan_if parent 1:$cur_band handle $cur_band: tbf rate $kbit burst $kbit limit $kbit
-			cur_band=$(($cur_band+1))
+			cur_band=$(($cur_band+2))
 		done
 
 		#ingress/download
@@ -564,14 +570,16 @@ initialize_quota_qos()
 		download_shift=8
 		for rate_kb in $unique_down ; do
 			kbit=$(echo $((rate_kb*8))kbit)
-			mark=$(($cur_band << $download_shift))
-			tc filter add dev ifb0 parent 1:0 prio $cur_band protocol ip  handle $mark fw flowid 1:$cur_band
+			mark=$(printf "0x%x\n" $(($cur_band << $download_shift)))
+			tc filter add dev ifb0 parent 1:0 prio $cur_band protocol ip  handle $mark/$quota_dn_mask fw flowid 1:$cur_band
+			tc filter add dev ifb0 parent 1:0 prio $(($cur_band+1)) protocol ipv6 handle $mark/$quota_dn_mask fw flowid 1:$cur_band
 			tc qdisc  add dev ifb0 parent 1:$cur_band handle $cur_band: tbf rate $kbit burst $kbit limit $kbit
-			cur_band=$(($cur_band+1))
+			cur_band=$(($cur_band+2))
 		done
 
 		tc qdisc add dev $wan_if handle ffff: ingress
 		tc filter add dev $wan_if parent ffff: protocol ip u32 match u8 0 0 action connmark action mirred egress redirect dev ifb0 flowid ffff:1
+		tc filter add dev $wan_if parent ffff: protocol ipv6 u32 match u8 0 0 action connmark action mirred egress redirect dev ifb0 flowid ffff:1
 
 		#tc -s qdisc show dev $wan_if
 		#tc -s qdisc show dev ifb0
@@ -639,7 +647,7 @@ add_adsl_modem_routes()
 {
 	wan_proto=$(uci -q get network.wan.proto)
 	if [ "$wan_proto" = "pppoe" ] ; then
-		wan_dev=$(uci -q get network.wan.ifname) #not really the interface, but the device
+		wan_dev=$(uci -q get network.wan.device) #not really the interface, but the device
 		iptables -A postrouting_rule -t nat -o $wan_dev -j MASQUERADE
 		iptables -A forwarding_rule -o $wan_dev -j ACCEPT
 		/etc/ppp/ip-up.d/modemaccess.sh firewall $wan_dev
@@ -655,7 +663,7 @@ initialize_firewall()
 	enforce_dhcp_assignments
 	force_router_dns
 	add_adsl_modem_routes
-        isolate_guest_networks
+	isolate_guest_networks
 }
 
 
@@ -692,15 +700,20 @@ isolate_guest_networks()
 				if [ -n "$is_guest" ] ; then
 					echo "$lif with mac $gmac is wireless guest"
 
-					#Allow access to WAN but not other LAN hosts for anyone on guest network
-					ebtables -t filter -A FORWARD -i "$lif" --logical-out br-lan -j DROP
+					#Allow access to WAN and DHCP/DNS servers on LAN, but not other LAN hosts for anyone on guest network
+					ebtables -t filter -I FORWARD -i "$lif" -p IPV4 --ip-protocol udp --ip-destination-port 53 -j ACCEPT
+					ebtables -t filter -I FORWARD -i "$lif" -p IPV4 --ip-protocol udp --ip-destination-port 67 -j ACCEPT
+					ebtables -t filter -A FORWARD -i "$lif" --logical-out br-lan -p IPV4 --ip-destination 192.168.0.0/16 -j DROP
+					ebtables -t filter -A FORWARD -i "$lif" --logical-out br-lan -p IPV4 --ip-destination 172.16.0.0/12 -j DROP
+					ebtables -t filter -A FORWARD -i "$lif" --logical-out br-lan -p IPV4 --ip-destination 10.0.0.0/8 -j DROP
+					ebtables -t filter -A FORWARD -i "$lif" --logical-out br-lan -p IPV6 -j DROP
 
 					#Only allow DHCP/DNS access to router for anyone on guest network
 					ebtables -t filter -A INPUT -i "$lif" -p ARP -j ACCEPT
 					ebtables -t filter -A INPUT -i "$lif" -p IPV4 --ip-protocol udp --ip-destination-port 53 -j ACCEPT
 					ebtables -t filter -A INPUT -i "$lif" -p IPV4 --ip-protocol udp --ip-destination-port 67 -j ACCEPT
 					ebtables -t filter -A INPUT -i "$lif" -p IPV4 --ip-destination $lan_ip -j DROP
-
+					ebtables -t filter -A INPUT -i "$lif" -p IPV6 -j DROP
 				fi
 			done
 		done
