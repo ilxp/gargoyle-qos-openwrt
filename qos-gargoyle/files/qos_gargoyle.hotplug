@@ -2,7 +2,9 @@
 if [ "$INTERFACE" = "wan" ]; then
 	if [ -h /etc/rc.d/S50qos_gargoyle ] ; then
 		if [ "$ACTION" = "ifup" ]; then
-      		/etc/init.d/qos_gargoyle start $DEVICE
+      		# 疑似残留代码,取消
+      		# /etc/init.d/qos_gargoyle start "$DEVICE"
+			/etc/init.d/qos_gargoyle start
 		fi
 	fi
 

@@ -1,5 +1,6 @@
 #
 # Copyright (C) 2017 Xingwang Liao <kuoruan@gmail.com>
+# Modded by Erick GUO <erickguo999@gmail.com>
 #
 # This is free software, licensed under the Apache License, Version 2.0 .
 #

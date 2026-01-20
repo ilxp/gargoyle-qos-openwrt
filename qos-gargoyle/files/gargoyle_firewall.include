@@ -1,0 +1,4 @@
+#!/bin/sh
+# gargoyle_firewall_addition for firewall3
+. /etc/init.d/qos_gargoyle
+start

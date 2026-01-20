@@ -40,8 +40,8 @@ msgstr "分类规则"
 msgid "Collecting data..."
 msgstr "正在收集数据..."
 
-msgid "Connection Bytes Reach"
-msgstr "连接流量达到"
+msgid "Connection Bytes Reach (eg. 800:900 or 80: or :90)."
+msgstr "连接流量达到 (例如: 800:900 或者 80: 或者 :90)"
 
 msgid "DPI Protocol"
 msgstr "DPI 协议"
@@ -101,6 +101,9 @@ msgstr "石像鬼 QoS"
 msgid "Global Settings"
 msgstr "全局设置"
 
+msgid "ICMP Extension"
+msgstr "ICMP 拓展选项"
+
 msgid ""
 "Indicates to the active congestion controller that you wish to minimize "
 "round trip times (RTT) when this class is active. Use this setting for "
@@ -113,6 +116,12 @@ msgstr ""
 "在 VoIP 或在线游戏这类需要低延时（Ping 值）的应用上。减小往返延时（RTT）会带"
 "来WAN有效吞吐量的额外花销，所以当这些服务类型启用时你的 WAN 吞吐量将下降（通"
 "常在20%左右）"
+
+msgid "IP family"
+msgstr "地址族限制"
+
+msgid "IPV6 and IPV4"
+msgstr "IPV6 和 IPV4"
 
 msgid "Load"
 msgstr "负载"
@@ -157,8 +166,8 @@ msgstr ""
 "数据包的目标 IP，可以在后面加子网掩码（/[mask]，请看 iptables 的 -d 参数说"
 "明）"
 
-msgid "Packet's destination port, can be a range (eg. 80-90)."
-msgstr "数据包的目标端口，可以是一个范围（例如：80-90）"
+msgid "Packet's destination port, support multi ports (eg. 80:90,443,6000)."
+msgstr "数据包的目标端口，可以是多个范围（例如：80:90,443,6000）"
 
 msgid "Packet's maximum size (in bytes)."
 msgstr "数据包的最大大小（单位：bytes）"
@@ -172,8 +181,8 @@ msgid ""
 msgstr ""
 "数据包的源 IP，可以在后面加子网掩码（/[mask]，请看 iptables 的 -s 参数说明）"
 
-msgid "Packet's source port, can be a range (eg. 80-90)."
-msgstr "数据包的源端口，可以是一个范围（例如：80-90）"
+msgid "Packet's source port, support multi ports (eg. 80:90,443,6000)."
+msgstr "数据包的源端口，可以是多个范围（例如：80:90,443,6000）"
 
 msgid ""
 "Packets are tested against the rules in the order specified -- rules toward "

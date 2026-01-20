@@ -34,7 +34,7 @@ msgstr ""
 msgid "Collecting data..."
 msgstr ""
 
-msgid "Connection Bytes Reach"
+msgid "Connection Bytes Reach (eg. 800:900 or 80: or :90)."
 msgstr ""
 
 msgid "DPI Protocol"
@@ -93,6 +93,9 @@ msgstr ""
 msgid "Global Settings"
 msgstr ""
 
+msgid "ICMP Extension"
+msgstr ""
+
 msgid ""
 "Indicates to the active congestion controller that you wish to minimize "
 "round trip times (RTT) when this class is active. Use this setting for "
@@ -100,6 +103,12 @@ msgid ""
 "times). Minimizing RTT comes at the expense of efficient WAN throughput so "
 "while these class are active your WAN throughput will decline (usually "
 "around 20%)."
+msgstr ""
+
+msgid "IP family"
+msgstr ""
+
+msgid "IPV6 and IPV4"
 msgstr ""
 
 msgid "Load"
@@ -143,7 +152,7 @@ msgid ""
 "in iptables man page)."
 msgstr ""
 
-msgid "Packet's destination port, can be a range (eg. 80-90)."
+msgid "Packet's destination port, support multi ports (eg. 80:90,443,6000)."
 msgstr ""
 
 msgid "Packet's maximum size (in bytes)."
@@ -157,7 +166,7 @@ msgid ""
 "iptables man page)."
 msgstr ""
 
-msgid "Packet's source port, can be a range (eg. 80-90)."
+msgid "Packet's source port, support multi ports (eg. 80:90,443,6000)."
 msgstr ""
 
 msgid ""

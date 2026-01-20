@@ -9,19 +9,51 @@ START=50
 EXTRA_COMMANDS=show
 EXTRA_HELP="	show	Show current Qos configuration (if active)"
 
+. /lib/functions.sh
+. /lib/functions/network.sh
+
 include /lib/network
-include /usr/lib/gargoyle_firewall_util
+# include /usr/lib/gargoyle_firewall_util (不要啦)
 
 config_file_name="qos_gargoyle"
 upload_mask="0x007F"
 download_mask="0x7F00"
-qos_mark_file="/etc/qos_class_marks"
+# 这里应该要改成/etc/qos_gargoyle/qos_class_marks
+# qos_mark_file="/etc/qos_class_marks"
+qos_mark_file="/etc/qos_gargoyle/qos_class_marks"
 
-bwmonscript="/usr/lib/bwmon-gargoyle/bwmon-gargoyle.d/020-qos.bwmon"
+# 带宽监控脚本(可以删, 我们没有这个)
+# bwmonscript="/usr/lib/bwmon-gargoyle/bwmon-gargoyle.d/020-qos.bwmon"
 
 #created while qos is being initialized so hotplug and init script don't
 #both try to initialize qos at the same time
-lock_file="/var/run/qos_updating"
+lock_file="/var/run/qos_gargoyle_updating"
+
+# 应用防火墙规则
+apply_xtables_rule()
+{
+	rule="$1"
+	family="${2:-ip}"
+
+	if [ "$family" = "ip" ] || [ "$family" = "inet" ] ; then
+		iptables ${rule}
+	fi
+	if [ "$family" = "ip6" ] || [ "$family" = "inet" ] ; then
+		ip6tables ${rule}
+	fi
+}
+
+# 地址族判断
+ip_family()
+{
+	ip="$1"
+	# 不用旧的ip4匹配方法
+	# ip4=$(echo "$ip" | grep -E "^\d+\.\d+\.\d+\.\d+$")
+	ip4=$(echo "$ip" | grep -E "^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$")
+	[ -n "$ip4" ] && echo "ipv4"
+	ip6=$(echo "$ip" | grep -E "^([0-9a-fA-F]{0,4}:){1,7}[0-9a-fA-F]{0,4}$")
+	[ -n "$ip6" ] && echo "ipv6"
+}
 
 load_all_config_options()
 {
@@ -117,7 +149,12 @@ load_and_sort_all_config_sections()
 	echo "$all_config_sections" | awk ' {for(i=1; i <= NF; i++){ print $i }}' | sort -n -t ":" | awk 'BEGIN {FS=":"}; {print $2}'
 }
 
-
+# 为qos类别进行掩码标记
+# 输入是一个长字符串, 算是一个清单
+# 格式为classname:classid(外加两个空格)
+# 以单个为例, 经过处理后输出classname后对应的classid
+# 举例: class = dclass_1 ,list = "dclass_1:0x200  "
+# 结果: 0x200
 get_classname_mark()
 {
 	local class="$1"
@@ -125,6 +162,10 @@ get_classname_mark()
 	echo "$class_mark_list" | awk -v class="$class" '{ for (i = 1; i <= NF; i++){  if($i~class":"){ gsub(class":",""); print $i } }}'
 }
 
+# 应用所有规则配置
+# 删除layer7层
+# case中的各项解释
+# destination(目标地址),dstport(目标端口),source(源地址),srcport(源端口)
 apply_all_rules()
 {
 	local rule_type="$1"
@@ -137,14 +178,21 @@ apply_all_rules()
 	local fam
 
 	# add filter rules
+	# 筛选拥有test_order的规则
 	rule_list=$(load_and_sort_all_config_sections "$config_file_name" "$rule_type" "test_order")
 	for rule in $rule_list ; do
 		class=""
 		proto=""
 		min_pkt_size=""
 		max_pkt_size=""
+		# 规则字符串
 		match_str=""
+		# 这个是用来给没有定义端口协议但是定义了端口号用的
 		need_proto=""
+		# 把地址族放上面,默认inet(留空)
+		fam=""
+		# 新东西, icmp拓展
+		icmp_type=""
 
 		load_all_config_options "$config_file_name" "$rule"
 
@@ -152,47 +200,79 @@ apply_all_rules()
 
 			option_value=$(eval echo \$$option)
 			case "$option" in
+				family)
+					fam=$option_value
+				;;
+				proto)
+					# 协议
+					if [ -n "$option_value" ] ; then
+						proto="$option_value"
+					fi
+				;;
+				icmpext)
+					# icmp拓展选项
+					icmp_type="$option_value"
+				;;
 				source)
+					# 源地址
 					if [ "$3" = "qos_egress" ] ; then
 						if [ "$option_value" = "$local_ip" ] || [ "$option_value" = "$wan_ip" ]; then
 							option_value="$wan_ip"
 						fi
 					fi
+					# 还是用回源代码
 					match_str="$match_str -s $option_value"
 				;;
 				destination)
+					# 目标地址
 					if [ "$3" = "qos_ingress" ] ; then
 						if [ "$option_value" = "$local_ip" ] || [ "$option_value" = "$wan_ip" ]; then
 							option_value="$wan_ip"
 						fi
 					fi
+					# 还是用回源代码
 					match_str="$match_str -d $option_value"
 				;;
 				srcport)
-					if [ -n $(echo $option_value | grep "-") ] ; then option_value="$(echo "$option_value" | sed -e 's,-,:,g')" ; fi
-					match_str="$match_str --sport $option_value"
+					# 源协议端口
+					# 旧的代码,用新的代码代替(端口参数去除破折号)
+					# 输入的端口数字不需要额外处理破折号了
+					# if [ -n $(echo $option_value | grep "-") ] ; then option_value="$(echo "$option_value" | sed -e 's,-,:,g')" ; fi
+					# match_str="$match_str --sport $option_value"
+					# 直接让它们处理多个端口了
+					match_str="$match_str -m multiport --sports $option_value"
 					need_proto="1"
 				;;
 				dstport)
-					if [ -n $(echo $option_value | grep "-") ] ; then option_value="$(echo "$option_value" | sed -e 's,-,:,g')" ; fi
-					match_str="$match_str --dport $option_value"
+					# 目标协议端口
+					# 旧的代码,用新的代码代替(端口参数去除破折号)
+					# 输入的端口数字不需要额外处理破折号了
+					# if [ -n $(echo $option_value | grep "-") ] ; then option_value="$(echo "$option_value" | sed -e 's,-,:,g')" ; fi
+					# match_str="$match_str --dport $option_value"
+					# 直接让它们处理多个端口了
+					match_str="$match_str -m multiport --dports $option_value"
 					need_proto="1"
-
-				;;
-				layer7)
-					layer7_connmark=$(cat /etc/l7marker.marks 2>/dev/null | grep "$option_value" | awk '{ print $2 }')
-					layer7_mask=$(cat /etc/l7marker.marks 2>/dev/null | grep "$option_value" | awk '{ print $3 }')
-					if [ -n "$layer7_connmark" ] ; then
-						match_str="$match_str -m connmark --mark $layer7_connmark/$layer7_mask "
-					else
-						match_str="$match_str -m layer7 --l7proto $option_value"
-					fi
 				;;
 				connbytes_kb)
-					match_str="$match_str -m connbytes --connbytes $(($option_value*1024)): --connbytes-dir both --connbytes-mode bytes"
-				;;
-				family)
-					fam=$option_value
+					# 数据连接达到多少
+					# 旧的代码,用新的代码代替(从代码看应该是用ct byte的了GE)
+					# match_str="$match_str -m connbytes --connbytes $(($option_value*1024)): --connbytes-dir both --connbytes-mode bytes"
+					if [ -n "$(echo "$option_value" | grep ":")" ] ; then
+						local str_a=$(echo "$option_value" | awk -F ":" "{print \$1}")
+						if [ -n "$str_a" ] ; then
+							str_a=$((str_a*1024))
+						else
+							str_a=""
+						fi
+						local str_b=":"
+						local str_c=$(echo "$option_value" | awk -F ":" "{print \$2}")
+						if [ -n "$str_c" ] ; then
+							str_c=$((str_c*1024))
+						else
+							str_c=""
+						fi
+						match_str="$match_str -m connbytes --connbytes $str_a$str_b$str_c --connbytes-dir both --connbytes-mode bytes"
+					fi
 				;;
 			esac
 		done
@@ -204,7 +284,7 @@ apply_all_rules()
 			match_str="$match_str -m length --length $min_pkt_size:$max_pkt_size"
 		fi
 
-		[ -z "$fam" ] && fam="ipv4"
+		[ -z "$fam" ] && fam="inet"
 
 		if [ -n "$class" ] ; then
 			if [ -n "$proto" ] || [ -n "$match_str" ] ; then
@@ -212,8 +292,9 @@ apply_all_rules()
 
 				#We need to specify both udp and tcp if the user indicated a port
 				#and he did not indicate a protocol.
+				# 如果用户没有设置指定协议, 那就默认使用tcp和udp端口添加进防火墙
 				if [ -z "$proto" ] && [ -n "$need_proto" ] ; then
-
+					# 省略了nft重新拼接的步骤
 					$echo_on
 					apply_xtables_rule "-t $table -I $chain -p tcp $match_str -j MARK --set-mark $next_mark" "$fam"
 					apply_xtables_rule "-t $table -I $chain -p udp $match_str -j MARK --set-mark $next_mark" "$fam"
@@ -224,7 +305,18 @@ apply_all_rules()
  					#Otherwise just specify what the user requested (or nothing)
 
 					if [ -n "$proto" ] ; then
-						tmp_proto="-p $proto"
+						# 添加新判断, 如果协议是icmp,那就用icmp那套
+						tmp_proto=""
+						if [ "$proto" = "icmp" ] ; then
+							# 判断地址族, 分开来弄, inet反而会很麻烦
+							if [ -n "$icmp_type" ] && [ "$fam" = "ip" ] ; then
+								tmp_proto="-p icmp --icmp-type $icmp_type"
+							elif [ -n "$icmp_type" ] && [ "$fam" = "ip6" ] ; then
+								tmp_proto="-p icmpv6 --icmpv6-type $icmp_type"
+							fi
+						else
+							tmp_proto="-p $proto"
+						fi
 					else
 						tmp_proto=""
 					fi
@@ -249,25 +341,25 @@ update_markfile()
 	rm -rf "$tmp_qos_mark_file"
 
 	#re-populate per the QoS setup.
-	if [ $total_upload_bandwidth -ge 0 ] ; then
+	if [ "$total_upload_bandwidth" -ge 0 ] ; then
 
 		upload_class_list=$(load_all_config_sections "$config_file_name" "upload_class")
 
 		next_class_index=2
 		for uclass_name in $upload_class_list ; do
 			printf "upload $uclass_name %d $upload_mask\n" $next_class_index >> "$tmp_qos_mark_file"
- 			next_class_index=$(($next_class_index+1))
+ 			next_class_index=$((next_class_index+1))
 		done
 	fi
 
-	if [ $total_download_bandwidth -ge 0 ] ; then
+	if [ "$total_download_bandwidth" -ge 0 ] ; then
 
 		download_class_list=$(load_all_config_sections "$config_file_name" "download_class")
 
 		next_class_index=2
 		for dclass_name in $download_class_list ; do
-			printf "download $dclass_name %d $download_mask\n" $(($next_class_index << 8)) >> "$tmp_qos_mark_file"
- 			next_class_index=$(($next_class_index+1))
+			printf "download $dclass_name %d $download_mask\n" $((next_class_index << 8)) >> "$tmp_qos_mark_file"
+ 			next_class_index=$((next_class_index+1))
 		done
 	fi
 
@@ -292,19 +384,24 @@ update_markfile()
 initialize_qos()
 {
 	#initialize layer7_marker if necessary
-	create_l7marker_chain
+	#删除layer7依赖
+	#create_l7marker_chain
 
 	# Now, load/insert necessary kernel modules
 	# The following packages are required for the modules:
-	rmmod  ifb >&- 2>&-
+	# 卸载->加载 ifb 模块
+	# rmmod  ifb >&- 2>&-
 	# Allow IFB to fail to load 3 times (15 seconds) before we bail out gracefully
-	insmod ifb >&- 2>&-
+	#insmod ifb >&- 2>&-
+	# 默认自动加载了,不用再重新卸载加载了
 	ip link add $qos_ifb type ifb 2>/dev/null
 	cnt=0
 	while [ "$(ls -d /proc/sys/net/ipv4/conf/ifb* 2>&- | wc -l)" -eq "0" ]
 		do
 			logger -t "qos_gargoyle" "insmod ifb failed. Waiting and trying again..."
-			cnt=`expr $cnt + 1`
+			## 过时代码
+			## cnt=$(expr "$cnt" + 1)
+			cnt=$((cnt + 1))
 			if [ $cnt -ge 3 ] ; then
 				logger -t "qos_gargoyle" "Could not insmod ifb, too many retries. Stopping."
 				rm -rf "$lock_file"
@@ -319,11 +416,11 @@ initialize_qos()
 	ip link set dev $qos_ifb mtu 1500
 
 	# Make sure the other kernel modules we need are loaded
-	insmod cls_fw >&- 2>&-
-	insmod cls_flow >&- 2>&-
-	insmod sch_hfsc >&- 2>&-
-	insmod sch_sfq >&- 2>&-
-	insmod act_connmark >&- 2>&-
+	# insmod cls_fw >&- 2>&-
+	# insmod cls_flow >&- 2>&-
+	# insmod sch_hfsc >&- 2>&-
+	# insmod sch_sfq >&- 2>&-
+	# insmod act_connmark >&- 2>&-
 
 	#Deciding how to set sfq_depth is not straight forward. Too high and we burn up RAM
 	#needlessly on low memory routers. Too low and our maximum bandwidth gets limited.
@@ -377,7 +474,7 @@ initialize_qos()
 
 	$echo_off
 
-	if [ $total_upload_bandwidth -ge 0 ] ; then
+	if [ "$total_upload_bandwidth" -ge 0 ] ; then
 		#load upload classes
 		upload_class_list=$(load_all_config_sections "$config_file_name" "upload_class")
 		for uclass_name in $upload_class_list ; do
@@ -395,7 +492,7 @@ initialize_qos()
 				max_bandwidth="-1"
 			fi
 			classdef="$percent_bandwidth $max_bandwidth $min_bandwidth"
-			eval $uclass_name=\"\$classdef\"  #"#comment quote here so formatting in editor isn't FUBAR
+			eval "$uclass_name"=\"\$classdef\"  #"#comment quote here so formatting in editor isn't FUBAR
 		done
 
 		# Attach egress queuing discipline to QoS interface, now with temperary default
@@ -419,7 +516,7 @@ initialize_qos()
 		class_mark_list=""
 		upload_shift=0
 		next_class_index=2
-		next_classid=$(printf "0x%X" $(($next_class_index << $upload_shift)) )
+		next_classid=$(printf "0x%X" $((next_class_index << upload_shift)) )
 		def_upload_idx=$next_class_index
 		def_upload_class=$next_classid
 
@@ -430,23 +527,23 @@ initialize_qos()
 			uclass_def=$(eval echo "\$$uclass_name")
 
 			#Bandwidth at capacity for this class
-			m2=$((  10 * $(echo $uclass_def | awk ' {print $1}' ) ))
+			m2=$((  10 * $(echo "$uclass_def" | awk ' {print $1}' ) ))
 
 			#is there a minimum bandwidth specified in kbps?
-			min_bandwidth=$( echo $uclass_def | awk ' {print $3}' )
+			min_bandwidth=$( echo "$uclass_def" | awk ' {print $3}' )
 			if [ "$min_bandwidth" -gt 0 ] ; then
-				ll_str=" rt m1 $((2*$min_bandwidth))kbit d 2ms m2 ${min_bandwidth}kbit"
+				ll_str=" rt m1 $((2*min_bandwidth))kbit d 2ms m2 ${min_bandwidth}kbit"
 			else
 				ll_str=""
 			fi
 
 			#is there an upper limit specified in kbps?
-			max_bandwidth=$( echo $uclass_def | awk ' {print $2}' )
+			max_bandwidth=$( echo "$uclass_def" | awk ' {print $2}' )
 			if [ "$max_bandwidth" -ge 0 ] ; then
 				ul_str=" ul m2 ${max_bandwidth}kbit"
 			else
 				#Calculate from the class link share.
-				max_bandwidth=$(($m2*$total_upload_bandwidth/1000000))
+				max_bandwidth=$((m2*total_upload_bandwidth/1000000))
 				ul_str=""
 			fi
 
@@ -459,7 +556,7 @@ initialize_qos()
 			#tbw is the Delay x Bandwidth product in bytes. We do not actually know the packet
 			#delay so we make an estimate of 150ms here and hope for the best. max_bandwidth is in kbps
 			#we multiply 100ms by 1000 below so the units work out.
-			tbw=$(($max_bandwidth*100/8));
+			tbw=$((max_bandwidth*100/8));
 			if [ "$tbw" -lt 6000 ] ; then
 				tbw=6000
 			fi
@@ -472,7 +569,7 @@ initialize_qos()
 			#Add the leaf class
 			tc class add dev $qos_interface parent 1:1 classid 1:$next_class_index hfsc ls m2 ${m2}Mbit $ll_str $ul_str
 			#Add the qdisc to the leaf class, assuming average packet at 250 bytes.
-			tc qdisc add dev $qos_interface parent 1:$next_class_index handle $next_class_index:1 sfq headdrop limit $(($tbw/250)) $sfq_depth divisor 256
+			tc qdisc add dev $qos_interface parent 1:$next_class_index handle $next_class_index:1 sfq headdrop limit $((tbw/250)) $sfq_depth divisor 256
 
 			#
 			#Folks interested in experimenting with CoDEL can comment out the preceeding line and uncomment hte next line.
@@ -499,8 +596,8 @@ initialize_qos()
 				def_upload_class=$next_classid
 			fi
 
-			next_class_index=$(($next_class_index+1))
-			next_classid=$(printf "0x%X" $(($next_class_index << $upload_shift)) )
+			next_class_index=$((next_class_index+1))
+			next_classid=$(printf "0x%X" $((next_class_index << upload_shift)) )
 		done
 
 		$echo_on
@@ -509,8 +606,9 @@ initialize_qos()
 		tc qdisc change dev $qos_interface $overhead root handle 1:0 hfsc default $def_upload_idx
 
 		# Set up egress chain
-		apply_xtables_rule "-t mangle -N qos_egress" "any"
-		apply_xtables_rule "-t mangle -A POSTROUTING -o $qos_interface -j qos_egress" "any"
+		# 创建上传链
+		apply_xtables_rule "-t mangle -N qos_egress" "inet"
+		apply_xtables_rule "-t mangle -A POSTROUTING -o $qos_interface -j qos_egress" "inet"
 
 		#Next the user entered rules.
 		$echo_off
@@ -518,24 +616,24 @@ initialize_qos()
 		$echo_on
 
 		#set default class mark first in case we don't match anything
-		apply_xtables_rule "-t mangle -I qos_egress -j MARK --set-mark $def_upload_class" "any"
+		apply_xtables_rule "-t mangle -I qos_egress -j MARK --set-mark $def_upload_class" "inet"
 
 		#if we already set a mark in quota chain, we need to save that mark to the connmark, then return so it doesn't get over-written
-		apply_xtables_rule "-t mangle -I qos_egress -m mark ! --mark 0x0/$upload_mask -j RETURN" "any"
-		apply_xtables_rule "-t mangle -I qos_egress -m mark ! --mark 0x0/$upload_mask -j CONNMARK --save-mark --mask $upload_mask" "any"
+		apply_xtables_rule "-t mangle -I qos_egress -m mark ! --mark 0x0/$upload_mask -j RETURN" "inet"
+		apply_xtables_rule "-t mangle -I qos_egress -m mark ! --mark 0x0/$upload_mask -j CONNMARK --save-mark --mask $upload_mask" "inet"
 
 		# save current mark to connmark at end of chain
-		apply_xtables_rule "-t mangle -A qos_egress -j CONNMARK --save-mark --mask $upload_mask" "any"
+		apply_xtables_rule "-t mangle -A qos_egress -j CONNMARK --save-mark --mask $upload_mask" "inet"
 	fi
 
 
 
 	#Only if both upload and download QoS are enabled can we enable Gargoyle active QoS monitor
-	if [ $total_download_bandwidth -eq 0 ] || [ $total_upload_bandwidth -eq 0 ] ; then
-		qos_monenabled = "false" ;
+	if [ "$total_download_bandwidth" -eq 0 ] || [ "$total_upload_bandwidth" -eq 0 ] ; then
+		qos_monenabled="false" ;
 	fi
 
-	if [ $total_download_bandwidth -ge 0 ] ; then
+	if [ "$total_download_bandwidth" -ge 0 ] ; then
 		# Set up the Intermediate Functional block (IFB0) for ingress
 		ip link set $qos_ifb up
 
@@ -566,14 +664,14 @@ initialize_qos()
 			fi
             
 			classdef="$percent_bandwidth $max_bandwidth $min_bandwidth $minRTT"
-			eval $dclass_name=\"\$classdef\"  #"#comment quote here so formatting in editor isn't FUBAR
+			eval "$dclass_name"=\"\$classdef\"  #"#comment quote here so formatting in editor isn't FUBAR
 		done
 
 
 		class_mark_list=""
 		download_shift=8
 		next_class_index=2
-		next_classid=$(printf "0x%X" $(($next_class_index << $download_shift)) )
+		next_classid=$(printf "0x%X" $((next_class_index << download_shift)) )
 		def_download_idx=$next_class_index
 		def_download_class=$next_classid
 		#leave room for 2 high priority ping classes
@@ -585,7 +683,7 @@ initialize_qos()
 			dclass_def=$(eval echo "\$$dclass_name")
 
 			#bandwidth for this class
-			m2=$(( 10 * $(echo $dclass_def | awk ' {print $1}' ) ))
+			m2=$(( 10 * $(echo "$dclass_def" | awk ' {print $1}' ) ))
 
 			#The Gargoyle ACC switches from optimum WAN utilization mode to minimum RTT mode
 			#when it detects a class has become active that includes a two part service curve.
@@ -598,7 +696,7 @@ initialize_qos()
 			#speed.
 
 			#is there an upper limit specified?
-			max_bandwidth=$( echo $dclass_def | awk ' {print $2}' )
+			max_bandwidth=$( echo "$dclass_def" | awk ' {print $2}' )
 			ul_str=""
 			if [ "$max_bandwidth" -ge 0 ] ; then
 				ul_str=" ul m2 ${max_bandwidth}kbit"
@@ -607,36 +705,36 @@ initialize_qos()
 			fi
 
 			#How about a link share in percent?
-			minRTT=$( echo $dclass_def | awk ' {print $4}' )
+			minRTT=$( echo "$dclass_def" | awk ' {print $4}' )
 			if [ "$minRTT" = "Yes" ] ; then
-				d1=$((15000/$max_bandwidth+1))
-				ll_str=" ls m1 $((2*$m2))Mbit d ${d1}ms m2 ${m2}Mbit"
+				d1=$((15000/max_bandwidth+1))
+				ll_str=" ls m1 $((2*m2))Mbit d ${d1}ms m2 ${m2}Mbit"
 			else
 				ll_str=" ls m2 ${m2}Mbit"
 			fi
 
 			#is there a minimum bandwidth specified?
-			min_bandwidth=$( echo $dclass_def | awk ' {print $3}' )
+			min_bandwidth=$( echo "$dclass_def" | awk ' {print $3}' )
 			rt_str=""
 			if [ "$min_bandwidth" -gt 0 ] ; then
 				if [ "$minRTT" = "Yes" ] ; then
-					d2=$((15000/$max_bandwidth+1))
-					rt_str=" rt m1 $(($max_bandwidth))kbit d ${d2}ms m2 ${min_bandwidth}kbit"
+					d2=$((15000/max_bandwidth+1))
+					rt_str=" rt m1 ${max_bandwidth}kbit d ${d2}ms m2 ${min_bandwidth}kbit"
 				else
 					rt_str=" rt m2 ${min_bandwidth}kbit"
 				fi
 			fi
 
-			tbw=$(($max_bandwidth*100/8));
+			tbw=$((max_bandwidth*100/8));
 			if [ "$tbw" -lt 10000 ] ; then
 				tbw=10000
 			fi
 
 			tc class add dev $qos_ifb parent 1:1 classid 1:$next_class_index hfsc $rt_str $ll_str $ul_str
 			#Assume average download packet size is 250 bytes.
-			tc qdisc add dev $qos_ifb parent 1:$next_class_index handle $next_class_index:1 sfq headdrop limit $(($tbw/250)) $sfq_depth divisor 256  
+			tc qdisc add dev $qos_ifb parent 1:$next_class_index handle $next_class_index:1 sfq headdrop limit $((tbw/250)) $sfq_depth divisor 256  
 			tc filter add dev $qos_ifb parent 1:0 prio $next_class_prio protocol ip handle $next_classid/$download_mask fw flowid 1:$next_class_index
-			tc filter add dev $qos_ifb parent 1:0 prio $(($next_class_prio+1)) protocol ipv6 handle $next_classid/$download_mask fw flowid 1:$next_class_index
+			tc filter add dev $qos_ifb parent 1:0 prio $((next_class_prio+1)) protocol ipv6 handle $next_classid/$download_mask fw flowid 1:$next_class_index
 			tc filter add dev $qos_ifb parent $next_class_index: handle 1 flow divisor 256 map key dst and 0xff
 			$echo_off
 
@@ -645,9 +743,9 @@ initialize_qos()
 				def_download_class=$next_classid
 			fi
 
-			next_class_index=$(($next_class_index+1))
-			next_classid=$(printf "0x%X" $(($next_class_index << $download_shift)) )
-			next_class_prio=$(($next_class_prio+2))
+			next_class_index=$((next_class_index+1))
+			next_classid=$(printf "0x%X" $((next_class_index << download_shift)) )
+			next_class_prio=$((next_class_prio+2))
 		done
 
 		$echo_on
@@ -656,13 +754,14 @@ initialize_qos()
 		tc qdisc change dev $qos_ifb $overhead root handle 1:0 hfsc default $def_download_idx
 
 		# Create ingress chain
-		apply_xtables_rule "-t mangle -N qos_ingress" "any"
+		# 创建下载链
+		apply_xtables_rule "-t mangle -N qos_ingress" "inet"
 
 		# Mark ingress in FORWARD and INPUT chains to make sure any DNAT (virt. server) is taken into account
-		apply_xtables_rule "-t mangle -A FORWARD -i $qos_interface -j qos_ingress" "any"
-		apply_xtables_rule "-t mangle -A INPUT -i $qos_interface -j qos_ingress" "any"
+		apply_xtables_rule "-t mangle -A FORWARD -i $qos_interface -j qos_ingress" "inet"
+		apply_xtables_rule "-t mangle -A INPUT -i $qos_interface -j qos_ingress" "inet"
 		# Clear MARKs before we get to Quotas/QoS. They have been restored by act_connmark
-		apply_xtables_rule "-t mangle -I PREROUTING -i $qos_interface -j MARK --set-mark 0" "any"
+		apply_xtables_rule "-t mangle -I PREROUTING -i $qos_interface -j MARK --set-mark 0" "inet"
 
 		#Now the rest of the user entered rules.
 		$echo_off
@@ -670,11 +769,11 @@ initialize_qos()
 		$echo_on
 
 		#set default class mark first in case we don't match anything
-		apply_xtables_rule "-t mangle -I qos_ingress -j MARK --set-mark $def_download_class" "any"
+		apply_xtables_rule "-t mangle -I qos_ingress -j MARK --set-mark $def_download_class" "inet"
 
 		#If we already set a mark in quota chain, we need to save that mark to the connmark, then return so it doesn't get over-written
-		apply_xtables_rule "-t mangle -I qos_ingress -m mark ! --mark 0x0/$download_mask -j RETURN" "any"
-		apply_xtables_rule "-t mangle -I qos_ingress -m mark ! --mark 0x0/$download_mask -j CONNMARK --save-mark --mask $download_mask" "any"
+		apply_xtables_rule "-t mangle -I qos_ingress -m mark ! --mark 0x0/$download_mask -j RETURN" "inet"
+		apply_xtables_rule "-t mangle -I qos_ingress -m mark ! --mark 0x0/$download_mask -j CONNMARK --save-mark --mask $download_mask" "inet"
 
 		# Make sure all packets get sent through IFB
 		tc qdisc add dev $qos_interface handle ffff: ingress
@@ -682,7 +781,7 @@ initialize_qos()
 		tc filter add dev $qos_interface parent ffff: protocol ipv6 u32 match u8 0 0 action connmark action mirred egress redirect dev $qos_ifb flowid ffff:1
 
 		#save current mark to connmark at end of chain
-		apply_xtables_rule "-t mangle -A qos_ingress -j CONNMARK --save-mark --mask $download_mask" "any"
+		apply_xtables_rule "-t mangle -A qos_ingress -j CONNMARK --save-mark --mask $download_mask" "inet"
 
 		$echo_off
 	fi
@@ -695,7 +794,7 @@ initialize_qos()
 		if [ -z "$ptarget_ip" ] ; then
 			old_ifs="$IFS"
 			IFS=$(printf "\n\r")
-			targets=$(traceroute -n -I -w 1 -q 2 -m6 8.8.8.8 | grep -o '[0-9]\{1,3\}\.[0-9]\{1,3\}\.[0-9]\{1,3\}\.[0-9]\{1,3\}.*ms' | grep -v '8.8.8.8' | sed 's/ms//g')
+			targets=$(traceroute -n -I -w 1 -q 2 -m6 223.6.6.6 | grep -o '[0-9]\{1,3\}\.[0-9]\{1,3\}\.[0-9]\{1,3\}\.[0-9]\{1,3\}.*ms' | grep -v '223.6.6.6' | sed 's/ms//g')
 			ptarget_ip=""
 			for t in $targets ; do
 				if [ -z "$ptarget_ip" ] ; then
@@ -717,17 +816,24 @@ initialize_qos()
 			
 			#in case ping target is still not defined use default gateway
 			if [ -z "$ptarget_ip" ] ; then
-				ptarget_ip=$(gargoyle_header_footer -i gargoyle | sed -n 's/.*currentWanGateway.*"\(.*\)".*/\1/p')
+				# 这是别的C文件,对其他固件不适用
+				# ptarget_ip=$(gargoyle_header_footer -i gargoyle | sed -n 's/.*currentWanGateway.*"\(.*\)".*/\1/p')
+				# 使用ip route查看默认网关
+				ptarget_ip=$(ip route show | grep "default" | awk '{print $3}')
+				# 如果还是空, 那就试试ipv6
+				if [ -z "$ptarget_ip" ] ; then
+					ptarget_ip=$(ip -6 route show | grep "default" | awk '{print $3}')
+				fi
 			fi
 		fi
 
 		
 		#Ping responses from the ping target never go to ingress QoS (so their MARK isn't overwritten).
-		if [ "$(ip_family $ptarget_ip)" == "ipv4" ] ; then
-			apply_xtables_rule "-t mangle -I qos_ingress -p icmp --icmp-type 0 -s $ptarget_ip -j RETURN" "ipv4"
+		if [ "$(ip_family "$ptarget_ip")" = "ipv4" ] ; then
+			apply_xtables_rule "-t mangle -I qos_ingress -p icmp --icmp-type 0 -s $ptarget_ip -j RETURN" "ip"
 		fi
-		if [ "$(ip_family $ptarget_ip)" == "ipv6" ] ; then
-			apply_xtables_rule "-t mangle -I qos_ingress -p icmpv6 --icmpv6-type 129 -s $ptarget_ip -j RETURN" "ipv6"
+		if [ "$(ip_family "$ptarget_ip")" = "ipv6" ] ; then
+			apply_xtables_rule "-t mangle -I qos_ingress -p icmpv6 --icmpv6-type 129 -s $ptarget_ip -j RETURN" "ip6"
 		fi
 		#Make a class to handle the replied ping requests from the ptarget.
 		tc class add dev $qos_ifb parent 1:1 classid 1:127 hfsc rt umax 106 dmax 10ms rate 4kbit
@@ -743,11 +849,11 @@ initialize_qos()
 		tc filter add dev $qos_interface parent 1:0 prio 2 protocol ipv6 handle 127 fw flowid 1:127
 
 		#Mark all ping requests from the router to the ptarget to the above special class overriding any other mark.
-		if [ "$(ip_family $wan_ip)" == "ipv4" ] && [ "$(ip_family $ptarget_ip)" == "ipv4" ] ; then
-			apply_xtables_rule "-t mangle -I qos_egress -p icmp --icmp-type 8 -s $wan_ip -d $ptarget_ip -j MARK --set-mark 127" "ipv4"
+		if [ "$(ip_family "$wan_ip")" = "ipv4" ] && [ "$(ip_family "$ptarget_ip")" = "ipv4" ] ; then
+			apply_xtables_rule "-t mangle -I qos_egress -p icmp --icmp-type 8 -s $wan_ip -d $ptarget_ip -j MARK --set-mark 127" "ip"
 		fi
-		if [ "$(ip_family $wan_ip6)" == "ipv6" ] && [ "$(ip_family $ptarget_ip)" == "ipv6" ] ; then
-			apply_xtables_rule "-t mangle -I qos_egress -p icmpv6 --icmpv6-type 128 -s $wan_ip6 -d $ptarget_ip -j MARK --set-mark 127" "ipv6"
+		if [ "$(ip_family "$wan_ip6")" = "ipv6" ] && [ "$(ip_family "$ptarget_ip")" = "ipv6" ] ; then
+			apply_xtables_rule "-t mangle -I qos_egress -p icmpv6 --icmpv6-type 128 -s $wan_ip6 -d $ptarget_ip -j MARK --set-mark 127" "ip6"
 		fi
 
 		#Start the monitor
@@ -760,7 +866,7 @@ initialize_qos()
 		else
 			#In auto mode we calculate transmission delay based on our bandwidth and then ask qosmon
 			#to add this value to its measured ping entitlement to form the final ping limit.
-			pinglimit=$((1500*10*2/3/$total_download_bandwidth+1500*10/$total_upload_bandwidth+2))
+			pinglimit=$((1500*10*2/3/total_download_bandwidth+1500*10/total_upload_bandwidth+2))
 			qosmon -a -b 800 $ptarget_ip $total_download_bandwidth $pinglimit
 		fi
 
@@ -778,7 +884,7 @@ define_interface()
 	wait_sec=15
 	while ! network_is_up wan && [ $wait_sec -gt 0 ] ; do
 		sleep 1
-		wait_sec=$(($wait_sec - 1))
+		wait_sec=$((wait_sec - 1))
 	done
 
 	#The wan interface name will depend on if pppoe is used or not.  If pppoe is used then
@@ -786,7 +892,7 @@ define_interface()
 	#use the device named by network.wan.device
 
 	network_get_device qos_interface wan
-	if [ -z $qos_interface ] ; then
+	if [ -z "$qos_interface" ] ; then
 		network_get_physdev qos_interface wan
 	fi
 
@@ -821,7 +927,9 @@ stop()
 	#Kill the qos monitor in case it is running
 	killall qosmon 2>/dev/null
 
-	[ -e $bwmonscript ] && $bwmonscript "stop"
+	# 停止带宽监控
+	# 我们这是没有带宽监控的
+	# [ -e $bwmonscript ] && $bwmonscript "stop"
 
 	$echo_on
 	#Delete the qdiscs we hung on the devices
@@ -836,7 +944,7 @@ stop()
 	if [ -z "$qos_interface" ] ; then
 		define_interface
 	fi
-	apply_xtables_rule "-t mangle -D PREROUTING -i $qos_interface -j MARK --set-mark 0" "any"
+	apply_xtables_rule "-t mangle -D PREROUTING -i $qos_interface -j MARK --set-mark 0" "inet"
 
 	$echo_off
 }
@@ -860,7 +968,9 @@ start()
 	while ps | grep '[//]rcS S boot' >/dev/null
 		do
 			sleep 4
-			cnt=`expr $cnt + 1`
+			## 过时代码
+			## cnt=$(expr "$cnt" + 1)
+			cnt=$((cnt + 1))
 			if [ $cnt -ge 15 ] ; then
 				break;
 			fi
@@ -869,11 +979,13 @@ start()
 	touch "$lock_file"
 
 	#load qos_interface from global variables
+	# 加载qos首页配置
 	define_interface
 	if [ -n "$qos_interface" ] ; then
 		load_all_config_options "$config_file_name" "global"
 		initialize_qos
-		[ -e $bwmonscript ] && $bwmonscript "start"
+		# 删除带宽监控
+		# [ -e $bwmonscript ] && $bwmonscript "start"
 	fi
 
 	rm -rf "$lock_file"
@@ -883,7 +995,9 @@ restart()
 {
 	echo_on="set -x"
 	echo_off="set +x"
-	start "$1"
+	# 疑似残留代码,使用新方式
+	# start "$1"
+	start
 }
 
 show()

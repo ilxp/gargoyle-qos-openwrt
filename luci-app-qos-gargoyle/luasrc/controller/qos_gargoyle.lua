@@ -78,6 +78,7 @@ function action_troubleshooting_data()
 	http.write_json(data)
 end
 
+-- 猜测, 显示负载
 function action_load_data(type)
 	local device
 	if type == "download" then

@@ -12,10 +12,12 @@ PKG_BUILD_DIR := $(BUILD_DIR)/$(PKG_NAME)
 include $(INCLUDE_DIR)/package.mk
 include $(INCLUDE_DIR)/kernel.mk
 
+# 测试能不能跑了
 define Package/qos-gargoyle
 	SECTION:=net
 	CATEGORY:=Network
 	TITLE:=A set of QoS scripts designed for use with Gargoyle Web Interface
+	#DEPENDS:=+tc +ip +kmod-ifb +kmod-sched +kmod-sched-connmark +kmod-sched-prio +gargoyle-firewall-util
 	DEPENDS:=+tc +ip +kmod-ifb +kmod-sched +kmod-sched-connmark +kmod-sched-prio +iptables-mod-filter +iptables-mod-ipopt  +gargoyle-firewall-util
 	MAINTAINER:=Eric Bishop <eric@gargoyle-router.com>
 endef
@@ -45,14 +47,23 @@ define Build/Compile
 
 endef
 
+# 重启防火墙时, 添加qos规则
+define Package/gargoyle-firewall-util/postinst
+	included=$$(cat $${IPKG_INSTROOT}/etc/config/firewall | grep 'gargoyle_firewall.include'  )
+	if [ -z "$$included" ] ; then printf "config include 'qos_gargoyle'\n\toption type script\n\toption path /usr/share/qos_gargoyle/gargoyle_firewall.include\n\toption family any\n\toption reload 1\n\n" >> $${IPKG_INSTROOT}/etc/config/firewall ; fi
+endef
+
 define Package/qos-gargoyle/install
 	$(INSTALL_DIR) $(1)/etc/init.d
 	$(INSTALL_DIR) $(1)/etc/hotplug.d/iface
 	$(INSTALL_DIR) $(1)/etc/config
+	$(INSTALL_DIR) $(1)/etc/qos_gargoyle/
+	$(INSTALL_DIR) $(1)/usr/share/qos_gargoyle/
 	
-	$(INSTALL_BIN) ./files/qos_gargoyle.init $(1)/etc/init.d/qos_gargoyle
-	$(INSTALL_BIN) ./files/qos_gargoyle.hotplug $(1)/etc/hotplug.d/iface/23-qos_gargoyle
-	$(INSTALL_DATA) ./files/qos_gargoyle.conf $(1)/etc/config/qos_gargoyle
+	$(INSTALL_BIN) $(CURDIR)/files/qos_gargoyle.init $(1)/etc/init.d/qos_gargoyle
+	$(INSTALL_BIN) $(CURDIR)/files/qos_gargoyle.hotplug $(1)/etc/hotplug.d/iface/23-qos_gargoyle
+	$(INSTALL_CONF) $(CURDIR)/files/qos_gargoyle.conf $(1)/etc/config/qos_gargoyle
+	$(INSTALL_BIN) $(CURDIR)/files/gargoyle_firewall.include $(1)/usr/share/qos_gargoyle/gargoyle_firewall.include
 
 	$(INSTALL_DIR) $(1)/usr/sbin
 	$(INSTALL_BIN) $(PKG_BUILD_DIR)/qosmon $(1)/usr/sbin/qosmon

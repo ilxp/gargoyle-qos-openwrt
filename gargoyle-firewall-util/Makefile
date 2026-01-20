@@ -15,7 +15,7 @@ define Package/gargoyle-firewall-util
 	SECTION:=net
 	CATEGORY:=Network
 	TITLE:=A couple of shell script routines for firewall initialization
-	DEPENDS:=+iptables-zz-legacy +ip6tables-zz-legacy +ebtables-legacy +kmod-ebtables-ipv4 +kmod-ebtables-ipv6 +libericstools +uci +libiptbwctl +iptables-mod-filter +iptables-mod-ipopt +iptables-mod-conntrack-extra +iptables-mod-nat-extra +iptables-mod-extra +iptables-mod-iprange +kmod-tun +kmod-nf-nathelper +kmod-nf-nathelper-extra +ipset +kmod-ipt-ipset
+	DEPENDS:=+iptables +ip6tables +libericstools +iptables-mod-filter +iptables-mod-ipopt +iptables-mod-conntrack-extra +iptables-mod-nat-extra +iptables-mod-extra +iptables-mod-iprange +iptables-mod-ipopt +kmod-tun +kmod-nf-nathelper +kmod-nf-nathelper-extra +ipset +kmod-ipt-ipset
 	MAINTAINER:=Eric Bishop <eric@gargoyle-router.com>
 endef
 
@@ -43,30 +43,22 @@ endef
 
 
 
-define Package/gargoyle-firewall-util/postinst
-	included=$$(cat $${IPKG_INSTROOT}/etc/config/firewall | grep 'gargoyle_additions.firewall'  )
-	if [ -z "$$included" ] ; then printf "config include\n\toption type script\n\toption path /usr/lib/gargoyle_firewall_util/gargoyle_additions.firewall\n\toption family any\n\toption reload 1\n\n" >> $${IPKG_INSTROOT}/etc/config/firewall ; fi
-endef
+# define Package/gargoyle-firewall-util/postinst
+# 	included=$$(cat $${IPKG_INSTROOT}/etc/config/firewall | grep 'gargoyle_firewall_additions.include'  )
+# 	if [ -z "$$included" ] ; then printf "config include\n\toption type script\n\toption path /usr/lib/gargoyle_firewall_util/gargoyle_firewall_additions.include\n\toption family any\n\toption reload 1\n\n" >> $${IPKG_INSTROOT}/etc/config/firewall ; fi
+# endef
 
+# 初始化安装路径
+# 不需要的多余东西
+# $(INSTALL_DIR) $(1)/etc/ppp/ip-up.d/
+# $(INSTALL_BIN) $(CURDIR)/files/modemaccess.pppoe $(1)/etc/ppp/ip-up.d/modemaccess.sh
+# $(INSTALL_DIR) $(1)/etc/init.d/
+# $(INSTALL_BIN) $(CURDIR)/files/set_kernel_timezone.init $(1)/etc/init.d/set_kernel_timezone
 define Package/gargoyle-firewall-util/install
-	$(INSTALL_DIR) $(1)/usr/lib/gargoyle_firewall_util/
-	$(INSTALL_DIR) $(1)/etc/hotplug.d/iface/
 	$(INSTALL_DIR) $(1)/usr/bin/
-	$(INSTALL_DIR) $(1)/etc/init.d/
-	$(INSTALL_DIR) $(1)/etc/ppp/ip-up.d/
 	
-	$(INSTALL_BIN) $(PKG_BUILD_DIR)/make_iptables_rules $(1)/usr/bin/make_iptables_rules
 	$(INSTALL_BIN) $(PKG_BUILD_DIR)/delete_chain_from_table $(1)/usr/bin/delete_chain_from_table
-	$(INSTALL_BIN) $(PKG_BUILD_DIR)/backup_quotas $(1)/usr/bin/backup_quotas
-	$(INSTALL_BIN) $(PKG_BUILD_DIR)/restore_quotas $(1)/usr/bin/restore_quotas
-	$(INSTALL_BIN) $(PKG_BUILD_DIR)/print_quotas $(1)/usr/bin/print_quotas
 	
-	$(INSTALL_BIN) ./files/cache_dhcpv4_leases.sh $(1)/usr/lib/gargoyle_firewall_util/cache_dhcpv4_leases.sh
-	$(INSTALL_BIN) ./files/gargoyle_firewall_util.sh $(1)/usr/lib/gargoyle_firewall_util/gargoyle_firewall_util.sh
-	$(INSTALL_BIN) ./files/gargoyle_additions.firewall $(1)/usr/lib/gargoyle_firewall_util/gargoyle_additions.firewall 
-	$(INSTALL_BIN) ./files/gargoyle_firewall.hotplug $(1)/etc/hotplug.d/iface/21-gargoyle_firewall
-	$(INSTALL_BIN) ./files/set_kernel_timezone.init $(1)/etc/init.d/set_kernel_timezone
-	$(INSTALL_BIN) ./files/modemaccess.pppoe $(1)/etc/ppp/ip-up.d/modemaccess.sh 
 endef
 
 

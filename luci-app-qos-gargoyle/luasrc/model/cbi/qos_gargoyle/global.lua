@@ -5,6 +5,7 @@ local sys = require "luci.sys"
 local uci = require "luci.model.uci".cursor()
 local net = require "luci.model.network".init()
 local qos = require "luci.model.qos_gargoyle"
+local http = require "luci.http"
 
 local m, s, o
 local upload_classes = {}
