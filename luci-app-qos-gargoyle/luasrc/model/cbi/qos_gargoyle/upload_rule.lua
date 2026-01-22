@@ -61,45 +61,41 @@ end
 -- 算了, 不搞那么复杂了,那种按判断添加值的我不会弄
 o = s:option(Value, "icmpext", translate("ICMP Extension"))
 o.datatype = "string"
-o.default = "0"
+o.default = "echo-reply"
 -- o.rmempty = false
-o:value("0", "echo reply")
-o:value("3", "destination unreachable")
-o:value("4", "source quench")
-o:value("5", "redirect")
-o:value("8", "echo request")
-o:value("11", "time exceeded")
-o:value("12", "parameter problem")
-o:value("13", "timestamp request")
-o:value("14", "timestamp reply")
-o:value("15", "info request")
-o:value("16", "info reply")
-o:value("17", "address mask request")
-o:value("18", "address mask reply")
-o:value("9", "router advertisement")
-o:value("10", "router solicitation")
--- 添加v6
-o:value("128", "v6 echo request")
-o:value("129", "v6 echo reply")
-o:value("1", "v6 destination unreachable")
-o:value("2", "v6 packet too big")
-o:value("130", "v6 mld listener query")
-o:value("131", "v6 mld listener report")
-o:value("132", "v6 mld listener reduction")
-o:value("133", "v6 nd router solicit")
-o:value("134", "v6 nd router advert")
-o:value("135", "v6 nd neighbor solicit")
-o:value("136", "v6 nd neighbor advert")
-o:value("4", "v6 parameter problem")
-o:value("143", "v6 mld2 listener report")
+o:value("echo-reply", "echo reply")
+o:value("destination-unreachable", "destination unreachable")
+o:value("source-quench", "source quench")
+o:value("redirect", "redirect")
+o:value("echo-request", "echo request")
+o:value("time-exceeded", "time exceeded")
+o:value("parameter-problem", "parameter problem")
+o:value("timestamp-request", "timestamp request")
+o:value("timestamp-reply", "timestamp reply")
+o:value("info-request", "info request")
+o:value("info-reply", "info reply")
+o:value("address-mask-request", "address mask request")
+o:value("address-mask-reply", "address mask reply")
+o:value("router-advertisement", "router advertisement")
+o:value("router-solicitation", "router solicitation")
+o:value("packet-too-big", "packet too big")
+o:value("mld-listener-query", "mld listener query")
+o:value("mld-listener-report", "mld listener report")
+o:value("mld-listener-reduction", "mld listener reduction")
+o:value("nd-router-solicit", "nd router solicit")
+o:value("nd-router-advert", "nd router advert")
+o:value("nd-neighbor-solicit", "nd neighbor solicit")
+o:value("nd-neighbor-advert", "nd neighbor advert")
+o:value("parameter-problem", "parameter problem")
+o:value("mld2-listener-report", "mld2 listener report")
 o:depends("proto", "icmp")
 
 -- 这是ipv6 icmp选项
--- o:value("echo-request", "echo request")
--- o:value("echo-reply", "echo reply")
 -- o:value("destination-unreachable", "destination unreachable")
 -- o:value("packet-too-big", "packet too big")
 -- o:value("time-exceeded", "time exceeded")
+-- o:value("echo-request", "echo request")
+-- o:value("echo-reply", "echo reply")
 -- o:value("mld-listener-query", "mld listener query")
 -- o:value("mld-listener-report", "mld listener report")
 -- o:value("mld-listener-reduction", "mld listener reduction")
@@ -115,10 +111,10 @@ o = s:option(Value, "source", translate("Source IP(s)"),
 	.. "man page)."))
 o:value("", translate("All"))
 wa.cbi_add_knownips(o)
-o.datatype = "ipmask"
+o.datatype = "ipaddr"
 
 o = s:option(Value, "srcport", translate("Source Port(s)"),
-	translate("Packet's source port, support multi ports (eg. 80:90,443,6000)."))
+	translate("Packet's source port, support multi ports (eg. 80-90, 443, 6000)."))
 o:value("", translate("All"))
 -- 使用字符串
 -- o.datatype = "or(port, portrange)"
@@ -129,10 +125,10 @@ o = s:option(Value, "destination", translate("Destination IP(s)"),
 	.. "iptables man page)."))
 o:value("", translate("All"))
 wa.cbi_add_knownips(o)
-o.datatype = "ipmask"
+o.datatype = "ipaddr"
 
 o = s:option(Value, "dstport", translate("Destination Port(s)"),
-	translate("Packet's destination port, support multi ports (eg. 80:90,443,6000)."))
+	translate("Packet's destination port, can be a range (eg. 80-90, 443, 6000)."))
 o:value("", translate("All"))
 -- 使用字符串
 -- o.datatype = "or(port, portrange)"
@@ -146,10 +142,15 @@ o = s:option(Value, "max_pkt_size", translate("Maximum Packet Length"),
 	translate("Packet's maximum size (in bytes)."))
 o.datatype = "range(1, 1500)"
 
-o = s:option(Value, "connbytes_kb", translate("Connection Bytes Reach (eg. 800:900 or 80: or :90)."),
+o = s:option(Value, "connbytes_kb", translate("Connection Bytes Reach"),
 	translate("The total size of data transmitted since the establishment of the link (in kBytes)."))
 -- 改成string
 -- o.datatype = "range(0, 4194303)"
+o.datatype = "string"
+
+--  特征码匹配
+o = s:option(Value, "match_feature_code", translate("Packet Feature Code Match"),
+	translate("Match feature code in a packet"))
 o.datatype = "string"
 
 -- ndpi

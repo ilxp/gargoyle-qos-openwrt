@@ -34,7 +34,7 @@ msgstr ""
 msgid "Collecting data..."
 msgstr ""
 
-msgid "Connection Bytes Reach (eg. 800:900 or 80: or :90)."
+msgid "Connection Bytes Reach"
 msgstr ""
 
 msgid "DPI Protocol"

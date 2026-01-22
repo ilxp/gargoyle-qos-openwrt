@@ -1,6 +1,7 @@
 -- Copyright 2017 Xingwang Liao <kuoruan@gmail.com>
 -- Licensed to the public under the Apache License 2.0.
 -- Modded by ErickG <erickguo999@gmail.com>
+-- 写的什么垃圾东西, 一坨屎
 
 local wa   = require "luci.tools.webadmin"
 local uci  = require "luci.model.uci".cursor()
@@ -364,30 +365,30 @@ od2.cfgvalue = function(...)
 end
 
 -- 连接流量
-od3 = rule_s:option(DummyValue, "connbytes_kb", translate("Connection Bytes Reach (eg. 800:900 or 80: or :90)."))
+od3 = rule_s:option(DummyValue, "connbytes_kb", translate("Connection Bytes Reach"))
 od3.cfgvalue = function(...)
 	-- local v = tonumber(Value.cfgvalue(...))
 	local str_v = tostring(Value.cfgvalue(...))
-	local num1, num2
+	local str_symbol, num1, num2
 	if str_v then
 		-- 检查字符串, 先检查-, 再检查大于小于号
-		if string.find(str_v, ":") then
-			num1, num2 = str_v:match("^(%d+)%:(%d+)$")
-			if num1 then
+		if string.find(str_v, "-") then
+			num1, num2 = str_v:match("^(%d+)%-(%d+)$")
+			if num1 and num2 then
 				if tonumber(num1) > 0 then
 					num1 = wa.byte_format(tonumber(num1) * 1024)
 				end
-			else
-				num1 = ""
-			end
-			if num2 then
-				if tonumber(num2) > 0 then
-			 		num2 = wa.byte_format(tonumber(num2) * 1024)
+				if tonumber(num2) >0 then
+					num2 = wa.byte_format(tonumber(num2) * 1024)
 				end
-			else
-				num2 = ""
+				return num1 .. " - " .. num2
 			end
-			return num1 .. " :" .. num2
+		else
+			str_symbol, num1 = str_v:match("([<=>]+)(%d+)")
+			if str_symbol and num1 then
+				num1 = wa.byte_format(tonumber(num1) * 1024)
+				return str_symbol .. num1
+			end
 		end
 	end
 
@@ -398,12 +399,12 @@ od3.cfgvalue = function(...)
 end
 
 -- ndpi
- if qos.has_ndpi() then
- 	o = rule_s:option(DummyValue, "ndpi", translate("DPI Protocol"))
- 	o.cfgvalue = function(...)
- 		local v = Value.cfgvalue(...)
- 		return v and v:upper() or translate("All")
- 	end
- end
+if qos.has_ndpi() then
+	o = rule_s:option(DummyValue, "ndpi", translate("DPI Protocol"))
+	o.cfgvalue = function(...)
+		local v = Value.cfgvalue(...)
+		return v and v:upper() or translate("All")
+	end
+end
 
 return m

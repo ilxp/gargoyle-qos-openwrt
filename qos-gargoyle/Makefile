@@ -13,12 +13,13 @@ include $(INCLUDE_DIR)/package.mk
 include $(INCLUDE_DIR)/kernel.mk
 
 # 测试能不能跑了
+# 使用nftables作为依赖
 define Package/qos-gargoyle
 	SECTION:=net
 	CATEGORY:=Network
 	TITLE:=A set of QoS scripts designed for use with Gargoyle Web Interface
-	#DEPENDS:=+tc +ip +kmod-ifb +kmod-sched +kmod-sched-connmark +kmod-sched-prio +gargoyle-firewall-util
-	DEPENDS:=+tc +ip +kmod-ifb +kmod-sched +kmod-sched-connmark +kmod-sched-prio +iptables-mod-filter +iptables-mod-ipopt  +gargoyle-firewall-util
+	DEPENDS:=+tc-full +ip +kmod-ifb +kmod-sched +kmod-sched-connmark +kmod-sched-prio +nftables \
+							+kmod-nf-conntrack +kmod-nf-conntrack6 +kmod-nf-nat +kmod-nf-nat6 +kmod-nf-nathelper +kmod-nf-nathelper-extra
 	MAINTAINER:=Eric Bishop <eric@gargoyle-router.com>
 endef
 
@@ -67,7 +68,6 @@ define Package/qos-gargoyle/install
 
 	$(INSTALL_DIR) $(1)/usr/sbin
 	$(INSTALL_BIN) $(PKG_BUILD_DIR)/qosmon $(1)/usr/sbin/qosmon
-
 endef
 
 define Package/qos-gargoyle/prerm
