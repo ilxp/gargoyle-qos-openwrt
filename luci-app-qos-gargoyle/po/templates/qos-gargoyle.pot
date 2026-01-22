@@ -84,6 +84,9 @@ msgstr ""
 msgid "Enable QoS"
 msgstr ""
 
+msgid "Ethernet"
+msgstr ""
+
 msgid "Error collecting troubleshooting information"
 msgstr ""
 
@@ -111,10 +114,19 @@ msgstr ""
 msgid "IPV6 and IPV4"
 msgstr ""
 
+msgid "Linklayer Type"
+msgstr ""
+
+msgid "Linklayer Overhead"
+msgstr ""
+
 msgid "Load"
 msgstr ""
 
 msgid "Loading"
+msgstr ""
+
+msgid "Match feature code in a packet"
 msgstr ""
 
 msgid "Manual Ping Limit"
@@ -135,6 +147,9 @@ msgstr ""
 msgid "Minimum Packet Length"
 msgstr ""
 
+msgid "Network Interface"
+msgstr ""
+
 msgid "No"
 msgstr ""
 
@@ -147,12 +162,15 @@ msgstr ""
 msgid "Not set"
 msgstr ""
 
+msgid "Packet Feature Code Match"
+msgstr ""
+
 msgid ""
 "Packet's destination ip, can optionally have /[mask] after it (see -d option "
 "in iptables man page)."
 msgstr ""
 
-msgid "Packet's destination port, support multi ports (eg. 80:90,443,6000)."
+msgid "Packet's destination port, can be a range (eg. 80-90, 443, 6000)."
 msgstr ""
 
 msgid "Packet's maximum size (in bytes)."
@@ -166,7 +184,7 @@ msgid ""
 "iptables man page)."
 msgstr ""
 
-msgid "Packet's source port, support multi ports (eg. 80:90,443,6000)."
+msgid "Packet's source port, support multi ports (eg. 80-90, 443, 6000)."
 msgstr ""
 
 msgid ""
@@ -199,6 +217,12 @@ msgid ""
 "default settings."
 msgstr ""
 
+msgid "Select the network interface"
+msgstr ""
+
+msgid "Select linkelayer type"
+msgstr ""
+
 msgid "Service Class"
 msgstr ""
 
@@ -206,6 +230,9 @@ msgid "Service Class Name"
 msgstr ""
 
 msgid "Service Classes"
+msgstr ""
+
+msgid "Set linklayer overhead"
 msgstr ""
 
 msgid ""

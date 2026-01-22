@@ -61,6 +61,9 @@ msgstr "禁用 QoS"
 msgid "Download Settings"
 msgstr "下载设置"
 
+msgid "Ethernet"
+msgstr "以太网"
+
 msgid ""
 "Each service class is specified by four parameters: percent bandwidth at "
 "capacity, realtime bandwidth and maximum bandwidth and the minimimze round "
@@ -123,11 +126,26 @@ msgstr "地址族限制"
 msgid "IPV6 and IPV4"
 msgstr "IPV6 和 IPV4"
 
+msgid "Linklayer Type"
+msgstr "链路类型"
+
+msgid "Linklayer Overhead"
+msgstr "链路开销"
+
 msgid "Load"
 msgstr "负载"
 
 msgid "Loading"
 msgstr "正在加载"
+
+msgid "Match feature code in a packet"
+msgstr ""
+"数据包特征码匹配, 格式 为@th,位置,长度 0x特征码"
+"@ll 链路层, @nh 网络层, @th 传输层, @ih 数据包内容"
+"位置: 特征码相对层级所在位置(在第几个字节减去一), 乘以8"
+"长度: 特征码长度(字节数乘以8)"
+"例如: 特征码为112233, 所在位置为第9个字节"
+"则: @th,64,24 0x112233"
 
 msgid "Manual Ping Limit"
 msgstr "手动 Ping 限制"
@@ -146,6 +164,9 @@ msgstr "最小带宽"
 
 msgid "Minimum Packet Length"
 msgstr "最小数据包长度"
+
+msgid "Network Interface"
+msgstr "外部网络接口"
 
 msgid "No"
 msgstr "否"
@@ -166,8 +187,11 @@ msgstr ""
 "数据包的目标 IP，可以在后面加子网掩码（/[mask]，请看 iptables 的 -d 参数说"
 "明）"
 
-msgid "Packet's destination port, support multi ports (eg. 80:90,443,6000)."
-msgstr "数据包的目标端口，可以是多个范围（例如：80:90,443,6000）"
+msgid "Packet Feature Code Match"
+msgstr "数据包特征码匹配"
+
+msgid "Packet's destination port, can be a range (eg. 80-90, 443, 6000)."
+msgstr "数据包的目标端口，可以是一个范围（例如：80-90, 443, 6000）"
 
 msgid "Packet's maximum size (in bytes)."
 msgstr "数据包的最大大小（单位：bytes）"
@@ -181,8 +205,8 @@ msgid ""
 msgstr ""
 "数据包的源 IP，可以在后面加子网掩码（/[mask]，请看 iptables 的 -s 参数说明）"
 
-msgid "Packet's source port, support multi ports (eg. 80:90,443,6000)."
-msgstr "数据包的源端口，可以是多个范围（例如：80:90,443,6000）"
+msgid "Packet's source port, support multi ports (eg. 80-90, 443, 6000)."
+msgstr "数据包的源端口，可以设置多个端口（例如：80-90, 443, 6000）"
 
 msgid ""
 "Packets are tested against the rules in the order specified -- rules toward "
@@ -220,6 +244,12 @@ msgstr ""
 "尝试不同的 Ping 限制，你可以在这里输入一个时间值。输入高的时间值将导致更高的 "
 "Ping 限制，低的时间值会有更低的限制。留空则将由 ACC 自动控制。"
 
+msgid "Select linkelayer type"
+msgstr "选择链路类型"
+
+msgid "Select the network interface"
+msgstr "选择外网接口"
+
 msgid "Service Class"
 msgstr "服务类型"
 
@@ -228,6 +258,9 @@ msgstr "服务类型名称"
 
 msgid "Service Classes"
 msgstr "服务类型"
+
+msgid "Set linklayer overhead"
+msgstr "设置链路开销"
 
 msgid ""
 "Should be set to around 98% of your available upload bandwidth. Entering a "

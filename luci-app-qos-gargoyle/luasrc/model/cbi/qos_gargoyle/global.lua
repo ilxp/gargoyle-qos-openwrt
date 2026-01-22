@@ -6,6 +6,7 @@ local uci = require "luci.model.uci".cursor()
 local net = require "luci.model.network".init()
 local qos = require "luci.model.qos_gargoyle"
 local http = require "luci.http"
+local apply = http.formvalue("cbi.apply")
 
 local m, s, o
 local upload_classes = {}
@@ -14,6 +15,17 @@ local qos_gargoyle = "qos_gargoyle"
 
 local function qos_enabled()
 	return sys.init.enabled(qos_gargoyle)
+end
+
+if apply then
+	-- 只有在qos启动之后才能应用这段代码
+	local qos_enable = sys.init.enabled(qos_gargoyle)
+	if qos_enable then
+		sys.init.stop(qos_gargoyle)
+		sys.init.disable(qos_gargoyle)
+		sys.init.enable(qos_gargoyle)
+		sys.init.start(qos_gargoyle)
+	end
 end
 
 uci:foreach(qos_gargoyle, "upload_class", function(s)
@@ -57,6 +69,29 @@ o.write = function(...)
 		sys.init.start(qos_gargoyle)
 	end
 end
+
+-- 网络接口设置
+o = s:option(Value, "wan_interface", translate("Network Interface"), translate("Select the network interface"))
+local interfaces = sys.exec("ls -l /sys/class/net/ | grep virtual 2>/dev/null |awk '{print $9}' 2>/dev/null")
+for interface in string.gmatch(interfaces, "%S+") do
+   o:value(interface)
+end
+local wan = qos.get_wan()
+if wan then o.default = wan:ifname() end
+-- o.default = "auto"
+o.rmempty = false
+
+-- 链路类型
+o = s:option(ListValue, "linklayer", translate("Linklayer Type"), translate("Select linkelayer type"))
+o:value("ethernet", translate("Ethernet"))
+o:value("atm", "ATM")
+o:value("adsl", "ADSL")
+o.default = "atm"
+
+-- 链路开销
+o = s:option(Value, "overhead", translate("Linklayer Overhead"), translate("Set linklayer overhead"))
+o.datatype = "uinteger"
+o.default="32"
 
 s = m:section(NamedSection, "upload", "upload", translate("Upload Settings"))
 s.anonymous = true

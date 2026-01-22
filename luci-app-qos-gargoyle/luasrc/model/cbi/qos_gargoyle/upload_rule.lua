@@ -154,9 +154,9 @@ o.datatype = "string"
 
 -- ndpi
 if qos.has_ndpi() then
-o = s:option(ListValue, "ndpi", translate("DPI Protocol"))
-o:value("", translate("All"))
-qos.cbi_add_dpi_protocols(o)
+	o = s:option(ListValue, "ndpi", translate("DPI Protocol"))
+	o:value("", translate("All"))
+	qos.cbi_add_dpi_protocols(o)
 end
 
 return m

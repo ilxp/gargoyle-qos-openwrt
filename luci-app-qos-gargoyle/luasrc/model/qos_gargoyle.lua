@@ -2,6 +2,7 @@
 -- Licensed to the public under the Apache License 2.0.
 
 module("luci.model.qos_gargoyle", package.seeall)
+local sys = require "luci.sys"
 
 function has_ndpi()
 	return luci.sys.call("lsmod | cut -d ' ' -f1 | grep -q 'xt_ndpi'") == 0

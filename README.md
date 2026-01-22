@@ -7,6 +7,4 @@
 ### 安装：
 - 方法1、git clone -b ipt https://github.com/ilxp/gargoyle-qos-openwrt.git  package/gargoyle-qos-openwrt
 - 方法2、sed -i '$a src-git gargoyle https://github.com/ilxp/gargoyle-qos-openwrt.git;ipt' feeds.conf.default
-- iptables补丁：将path/iptables目录下的608-add-gargoyle-netfilter-match-modules.patch放入package/network/utils/iptables/patches目录
-- 内核补丁：将path/iptables目录下608-add-kernel-gargoyle-netfilter-match-modules.patch放入target/linux/generic/pending-xx.xx目录
 - 依赖ndpi layer7 是故意去掉的，你可以装 ndpi，然后luci 上就有选项了https://github.com/fuqiang03/ndpi-netfilter
