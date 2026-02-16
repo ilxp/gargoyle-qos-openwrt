@@ -1,4 +1,4 @@
-#!/bin/sh /etc/rc.common
+#!/bin/bash /etc/rc.common
 #
 # Copyright Eric Bishop, 2008
 # This is free software licensed under the terms of the GNU GPL v2.0
@@ -13,7 +13,6 @@ EXTRA_HELP="	show	Show current Qos configuration (if active)"
 
 . /lib/functions.sh
 . /lib/functions/network.sh
-
 include /lib/network
 
 # qos配置文件
@@ -56,7 +55,7 @@ load_all_config_options()
 	# and $2 is the name of the section
 	config_cb()
 	{
-		if [ ".${2}" = ".${section_id}" ]; then
+		if [ ."$2" = ."$section_id" ]; then
 			option_cb()
 			{
 				ALL_OPTION_VARIABLES="$ALL_OPTION_VARIABLES $1"
@@ -66,11 +65,11 @@ load_all_config_options()
 		fi
 	}
 
-	config_load "${config_name}"
+	config_load "$config_name"
 
 	for var in $ALL_OPTION_VARIABLES
 	do
-		config_get "${var}" "${section_id}" "${var}"
+		config_get "$var" "$section_id" "$var"
 	done
 }
 
@@ -95,7 +94,7 @@ load_all_config_sections()
 		fi
 	}
 
-	config_load "${config_name}"
+	config_load "$config_name"
 	echo "$all_config_sections"
 }
 
@@ -131,7 +130,7 @@ load_and_sort_all_config_sections()
 		fi
 	}
 
-	config_load "${config_name}"
+	config_load "$config_name"
 
 	echo "$all_config_sections" | awk ' {for(i=1; i <= NF; i++){ print $i }}' | sort -n -t ":" | awk 'BEGIN {FS=":"}; {print $2}'
 }
@@ -344,16 +343,14 @@ apply_all_rules()
 						match_str="$section_feature_code $match_str"
 					fi
 
-					eval "$echo_on"
+					$echo_on
 					# 取消旧代码
 					# apply_xtables_rule "-t gargoyle-qos-priority -I $chain -p tcp $match_str -j MARK --set-mark $next_mark" "$fam"
 					# apply_xtables_rule "-t gargoyle-qos-priority -I $chain -p udp $match_str -j MARK --set-mark $next_mark" "$fam"
 					# 设置新代码,地址族已经在前面处理过了
-					[ -n "$tcp_sport" ] && nft add rule inet gargoyle-qos-priority "$chain" $tcp_sport $match_str meta mark set "$next_mark"
-					[ -n "$tcp_dport" ] && nft add rule inet gargoyle-qos-priority "$chain" $tcp_dport $match_str meta mark set "$next_mark"
-					[ -n "$udp_sport" ] && nft add rule inet gargoyle-qos-priority "$chain" $udp_sport $match_str meta mark set "$next_mark"
-					[ -n "$udp_dport" ] && nft add rule inet gargoyle-qos-priority "$chain" $udp_dport $match_str meta mark set "$next_mark"
-					eval "$echo_off"
+					nft add rule inet gargoyle-qos-priority "$chain" "$tcp_sport" "$tcp_dport" "$match_str" meta mark set "$next_mark"
+					nft add rule inet gargoyle-qos-priority "$chain" "$udp_sport" "$udp_dport" "$match_str" meta mark set "$next_mark"
+					$echo_off
 
 				else
 
@@ -393,12 +390,12 @@ apply_all_rules()
 						fi
 					fi
 
-					eval "$echo_on"
+					$echo_on
 					# 取消旧代码
 					# apply_xtables_rule "-t gargoyle-qos-priority -I $chain $tmp_proto $match_str -j MARK --set-mark $next_mark" "$fam"
 					# 设置新代码
-					nft add rule inet gargoyle-qos-priority "$chain" $tmp_proto_str $match_str meta mark set "$next_mark"
-					eval "$echo_off"
+					nft add rule inet gargoyle-qos-priority "$chain" "$tmp_proto_str" "$match_str" meta mark set "$next_mark"
+					$echo_off
 				fi
 
 			fi
@@ -422,7 +419,7 @@ update_markfile()
 
 		next_class_index=2
 		for uclass_name in $upload_class_list ; do
-			printf "upload %s %d %s\n" "$uclass_name" $next_class_index "$upload_mask" >> "$tmp_qos_mark_file"
+			printf "upload $uclass_name %d $upload_mask\n" $next_class_index >> "$tmp_qos_mark_file"
  			next_class_index=$((next_class_index+1))
 		done
 	fi
@@ -433,7 +430,7 @@ update_markfile()
 
 		next_class_index=2
 		for dclass_name in $download_class_list ; do
-			printf "download %s %d %s\n" "$dclass_name" $((next_class_index << 8)) "$download_mask" >> "$tmp_qos_mark_file"
+			printf "download $dclass_name %d $download_mask\n" $((next_class_index << 8)) >> "$tmp_qos_mark_file"
  			next_class_index=$((next_class_index+1))
 		done
 	fi
@@ -454,40 +451,11 @@ update_markfile()
 	fi
 }
 
-# 自动适应内存大小的SFQ队列深度设置
-configure_sfq_depth() {
-    # 更健壮的内存获取方式
-    local total_mem_kb=$(awk '/^MemTotal:/ {print $2}' /proc/meminfo 2>/dev/null)
-    
-    # 默认值（高内存配置）
-    local sfq_depth=""
-    
-    if [ -n "$total_mem_kb" ] && [ "$total_mem_kb" -gt 0 ]; then
-        # 精确内存阈值计算（单位：KB）
-        # 小内存设备 (<16MB)   -> depth 32 (≈11Mbps上限)
-        # 中等内存设备 (16-64MB) -> depth 64 (≈22Mbps上限)
-        # 大内存设备 (>64MB)    -> depth 127 (≈350Mbps上限)
-        
-        if [ "$total_mem_kb" -lt 16384 ]; then       # < 16MB
-            sfq_depth="depth 32"
-        elif [ "$total_mem_kb" -lt 65536 ]; then     # 16-64MB
-            sfq_depth="depth 64"
-        else                                         # > 64MB
-            sfq_depth="depth 127"
-        fi
-        
-        # 记录调试信息
-        logger -t qos_gargoyle "Memory detected: ${total_mem_kb}KB, SFQ depth set to: ${sfq_depth:-default(127)}"
-    else
-        logger -t qos_gargoyle "Unable to detect memory, using default SFQ settings"
-    fi
-    
-    echo "$sfq_depth"
-}
 
 # 初始化qos
 initialize_qos()
 {
+
 	ip link add dev $qos_ifb type ifb 2>/dev/null
 	cnt=0
 	# 查看ifb接口是否正确创建
@@ -516,13 +484,17 @@ initialize_qos()
 	#When depth is limited to 32 maximum bandwidth through any class will be around 11Mbps.
 	#Otherwise it will be around 350Mbps.
 	# 查看总内存使用量
-   # 自动配置SFQ队列深度
-    sfq_depth=$(configure_sfq_depth)
+	total_mem="$(sed -e '/^MemTotal: /!d; s#MemTotal: *##; s# kB##g' /proc/meminfo)"
+	if [ "$total_mem" -lt 16000 ] ; then
+		sfq_depth="depth 32";
+	else
+		sfq_depth="";
+	fi
 
-	eval "$echo_off"
+	$echo_off
 	#load upload variables
 	load_all_config_options "$config_file_name" "upload"
-	eval "$echo_on"
+	$echo_on
 	if [ -n "$total_bandwidth" ] ; then
 		total_upload_bandwidth="$total_bandwidth"
 	else
@@ -533,9 +505,9 @@ initialize_qos()
 	#load download variables
 	total_bandwidth=""
 	default_class=""
-	eval "$echo_off"
+	$echo_off
 	load_all_config_options "$config_file_name" "download"
-	eval "$echo_on"
+	$echo_on
 	if [ -n "$total_bandwidth" ] ; then
 		total_download_bandwidth="$total_bandwidth"
 	else
@@ -562,7 +534,7 @@ initialize_qos()
 		overhead=""
 	fi
 
-	eval "$echo_off"
+	$echo_off
 
 	if [ "$total_upload_bandwidth" -ge 0 ] ; then
 		#load upload classes
@@ -589,7 +561,7 @@ initialize_qos()
 		done
 
 		# Attach egress queuing discipline to QoS interface, now with temperary default
-		eval "$echo_on"
+		$echo_on
 		tc qdisc add dev $qos_interface root handle 1:0 hfsc default 1
 
 		# For the root qdisc, only ul and ls are relevant since rt only applies to leaf qdiscs
@@ -604,7 +576,7 @@ initialize_qos()
 		#
 		# Again, for ls only the ratios matter, the absolute values do not.
 		tc class add dev $qos_interface parent 1:0 classid 1:1 hfsc ls rate 1000Mbit ul rate ${total_upload_bandwidth}kbit
-		eval "$echo_off"
+		$echo_off
 
 		class_mark_list=""
 		upload_shift=0
@@ -617,7 +589,7 @@ initialize_qos()
 		for uclass_name in $upload_class_list ; do
 			class_mark_list="$class_mark_list$uclass_name:$next_classid "
 
-			eval "$echo_on"
+			$echo_on
 			uclass_def=$(eval echo "\$$uclass_name")
 
 			#Bandwidth at capacity for this class
@@ -644,8 +616,8 @@ initialize_qos()
 			# For leaf nodes in HFSC we calculate the latency as the time spent waiting to earn enough credit (credit_t) to
 			#get selected to send plus the time to transmit (tts). The maximum latency can be calculated as shown
 			#below assuming an MTU of 1500bytes and 8.2bits/byte including overhead.
-			#credit_t = $((1500 * 82/$max_bandwidth/10));
-			#tts = $((1500 * 82/$total_upload_bandwidth/10));
+			#credit_t = $((1500*82/$max_bandwidth/10));
+			#tts = $((1500*82/$total_upload_bandwidth/10));
 
 			#tbw is the Delay x Bandwidth product in bytes. We do not actually know the packet
 			#delay so we make an estimate of 150ms here and hope for the best. max_bandwidth is in kbps
@@ -685,7 +657,7 @@ initialize_qos()
 			# tc filter add dev $qos_interface parent 1:0 protocol ipv6 u32 match mark $next_classid $upload_mask flowid 1:$next_class_index
 			#Add a filter to the leaf class to define flows as being the source IP address.
 			tc filter add dev $qos_interface parent ${next_class_index}: handle 1 flow divisor 256 map key nfct-src and 0xff
-			eval "$echo_off"
+			$echo_off
 
 			if [ "$upload_default_class" = "$uclass_name" ] ; then
 				def_upload_idx=$next_class_index
@@ -696,7 +668,7 @@ initialize_qos()
 			next_classid=$(printf "0x%X" $((next_class_index << upload_shift)))
 		done
 
-		eval "$echo_on"
+		$echo_on
 
 		#Go back and touch up the root qdisc to have the proper default class
 		tc qdisc change dev $qos_interface $overhead root handle 1:0 hfsc default $def_upload_idx
@@ -708,21 +680,21 @@ initialize_qos()
 		# 先创建常规链
 		nft add chain inet gargoyle-qos-priority filter_qos_egress
 		# 然后再创建基本链
-		nft add chain inet gargoyle-qos-priority filter_postrouting '{ type filter hook postrouting priority 120; }'
+		nft add chain inet gargoyle-qos-priority filter_postrouting \{ type filter hook postrouting priority 120\; \}
 		# 基本链再跳转给常规链
-		nft add rule inet gargoyle-qos-priority filter_postrouting oifname "$qos_interface" counter jump filter_qos_egress
+		nft add rule inet gargoyle-qos-priority filter_postrouting oifname \"$qos_interface\" counter jump filter_qos_egress
 
 		#Next the user entered rules.
 		#上传规则应用与添加
 		# 不需要指定的表咧
-		eval "$echo_off"
+		$echo_off
 		apply_all_rules "upload_rule" "$class_mark_list" "filter_qos_egress"
-		eval "$echo_on"
+		$echo_on
 
 		# set default class mark first in case we don't match anything
 		# 将所有流量设置成默认类别
 		# apply_xtables_rule "-t mangle -I filter_qos_egress -j MARK --set-mark $def_upload_class" "inet"
-		nft insert rule inet gargoyle-qos-priority filter_qos_egress meta mark set $def_upload_class counter
+		nft insert rule inet gargoyle-qos-priority filter_qos_egress mark set $def_upload_class counter
 
 		#if we already set a mark in quota chain, we need to save that mark to the connmark, then return so it doesn't get over-written
 		# 若流量已经过石像鬼处理, 则直接跳过
@@ -753,7 +725,7 @@ initialize_qos()
 		tc class add dev $qos_ifb parent 1:0 classid 1:1 hfsc ls rate 1000Mbit ul m2 ${total_download_bandwidth}kbit
 
 		#load download classes
-		eval "$echo_off"
+		$echo_off
 		# 文件名为qos_gargoyle
 		download_class_list=$(load_all_config_sections "$config_file_name" "download_class")
 		for dclass_name in $download_class_list ; do
@@ -789,7 +761,7 @@ initialize_qos()
 		next_class_prio=3
 
 		for dclass_name in $download_class_list ; do
-			eval "$echo_on"
+			$echo_on
 			# 判断是用来拼接的
 			class_mark_list="$class_mark_list$dclass_name:$next_classid  "
 			dclass_def=$(eval echo "\$$dclass_name")
@@ -841,14 +813,14 @@ initialize_qos()
 			if [ "$tbw" -lt 10000 ] ; then
 				tbw=10000
 			fi
-      
+
 			tc class add dev $qos_ifb parent 1:1 classid 1:$next_class_index hfsc $rt_str $ll_str $ul_str
 			#Assume average download packet size is 250 bytes.
 			tc qdisc add dev $qos_ifb parent 1:$next_class_index handle ${next_class_index}:1 sfq headdrop limit $((tbw/250)) $sfq_depth divisor 256
 			tc filter add dev $qos_ifb parent 1:0 prio $next_class_prio protocol ip handle ${next_classid}/$download_mask fw flowid 1:$next_class_index
 			tc filter add dev $qos_ifb parent 1:0 prio $((next_class_prio+1)) protocol ipv6 handle ${next_classid}/$download_mask fw flowid 1:$next_class_index
 			tc filter add dev $qos_ifb parent ${next_class_index}: handle 1 flow divisor 256 map key dst and 0xff
-			eval "$echo_off"
+			$echo_off
 
 			if [ "$download_default_class" = "$dclass_name" ] ; then
 				def_download_idx=$next_class_index
@@ -860,7 +832,7 @@ initialize_qos()
 			next_class_prio=$((next_class_prio+2))
 		done
 
-		eval "$echo_on"
+		$echo_on
 
 		#Go back and touch up the root qdisc to have the proper default class
 		tc qdisc change dev $qos_ifb $overhead root handle 1:0 hfsc default $def_download_idx
@@ -871,27 +843,27 @@ initialize_qos()
 		# 先创建常规链
 		nft add chain inet gargoyle-qos-priority filter_qos_ingress
 		# 再创建基本链(下载有两条, 一条转发(FORWARD),另一条输入(INPUT))
-		nft add chain inet gargoyle-qos-priority filter_input '{ type filter hook input priority 0; }'
-		nft add chain inet gargoyle-qos-priority filter_forward '{ type filter hook forward priority 0; }'
+		nft add chain inet gargoyle-qos-priority filter_input \{ type filter hook input priority 0\; \}
+		nft add chain inet gargoyle-qos-priority filter_forward \{ type filter hook forward priority 0\; \}
 		# 创建一条基本链用来清理标记(优先级高一点)
-		nft add chain inet gargoyle-qos-priority filter_prerouting '{ type filter hook prerouting priority -150; }'
+		nft add chain inet gargoyle-qos-priority filter_prerouting \{ type filter hook prerouting priority -150\; \}
 
 		# Mark ingress in FORWARD and INPUT chains to make sure any DNAT (virt. server) is taken into account
 		# 确保输入和转发处理交给filter_qos_ingress(若为虚拟接口则添加虚拟接口)
 		# apply_xtables_rule "-t mangle -A FORWARD -i $qos_interface -j filter_qos_ingress" "inet"
 		# apply_xtables_rule "-t mangle -A INPUT -i $qos_interface -j filter_qos_ingress" "inet"
-		nft add rule inet gargoyle-qos-priority filter_input iifname "$qos_interface" counter jump filter_qos_ingress
-		nft add rule inet gargoyle-qos-priority filter_forward iifname "$qos_interface" counter jump filter_qos_ingress
+		nft add rule inet gargoyle-qos-priority filter_input iifname \"$qos_interface\" counter jump filter_qos_ingress
+		nft add rule inet gargoyle-qos-priority filter_forward iifname \"$qos_interface\" counter jump filter_qos_ingress
 		# Clear MARKs before we get to Quotas/QoS. They have been restored by act_connmark
 		# apply_xtables_rule "-t mangle -I PREROUTING -i $qos_interface -j MARK --set-mark 0" "inet"
 		# 清除mark标记(清除之后不需要跳转)
-		nft insert rule inet gargoyle-qos-priority filter_prerouting iifname "$qos_interface" meta mark set 0x0 counter
+		nft insert rule inet gargoyle-qos-priority filter_prerouting iifname \"$qos_interface\" meta mark set 0x0 counter
 
 		#Now the rest of the user entered rules.
 		#当链创建好之后添加对应的规则,删除残留代码$download_mask
-		eval "$echo_off"
+		$echo_off
 		apply_all_rules "download_rule" "$class_mark_list" "filter_qos_ingress"
-		eval "$echo_on"
+		$echo_on
 
 		#set default class mark first in case we don't match anything
 		# 将所有流量设置成默认类别
@@ -916,14 +888,14 @@ initialize_qos()
 		# apply_xtables_rule "-t mangle -A filter_qos_ingress -j CONNMARK --save-mark --mask $download_mask" "inet"
 		nft add rule inet gargoyle-qos-priority filter_qos_ingress ct mark set mark and $download_mask counter
 
-		eval "$echo_off"
+		$echo_off
 	fi
 
 	#Enable Gargoyle active QoS monitor
 	#启动主动拥塞控制
 	if [ "$total_upload_bandwidth" -ge 0 ] && [ $total_download_bandwidth -ge 0 ] && [ "$qos_monenabled" = "true" ] ; then
 		# 不过这个主动拥塞控制目前只能控制ipv4, 不会弄ipv6
-		eval "$echo_on"
+		$echo_on
 
 		#if the user specified a ping target then use that otherwise use the gateway.
 		# 如果用户指定了 ping 目标，则使用该目标，否则使用网关
@@ -1017,24 +989,24 @@ initialize_qos()
 
 			# 默认使用ipv4那个网关进行ping
 			if [ -n "$ptarget_ip" ] ; then
-				qosmon -a -b 800 $ptarget_ip $total_download_bandwidth $pinglimit &
+				qosmon -a -b 800 $ptarget_ip $total_download_bandwidth $pinglimit
 			elif [ -n "$ptarget_ip6" ] ; then
-				qosmon -a -b 800 $ptarget_ip6 $total_download_bandwidth $pinglimit &
+				qosmon -a -b 800 $ptarget_ip6 $total_download_bandwidth $pinglimit
 			fi
 		else
 			#In auto mode we calculate transmission delay based on our bandwidth and then ask qosmon
 			#to add this value to its measured ping entitlement to form the final ping limit.
-			pinglimit=$((1500 * 10 * 2/3/total_download_bandwidth+1500 * 10/total_upload_bandwidth+2))
+			pinglimit=$((1500*10*2/3/total_download_bandwidth+1500*10/total_upload_bandwidth+2))
 
 			# 默认使用ipv4那个网关进行ping
 			if [ -n "$ptarget_ip" ] ; then
-				qosmon -a -b 800 $ptarget_ip $total_download_bandwidth $pinglimit &
+				qosmon -a -b 800 $ptarget_ip $total_download_bandwidth $pinglimit
 			elif [ -n "$ptarget_ip6" ] ; then
-				qosmon -a -b 800 $ptarget_ip6 $total_download_bandwidth $pinglimit &
+				qosmon -a -b 800 $ptarget_ip6 $total_download_bandwidth $pinglimit
 			fi
 		fi
 
-		eval "$echo_off"
+		$echo_off
 	fi
 
 	update_markfile
@@ -1043,7 +1015,7 @@ initialize_qos()
 # 接口获取(wan,lan)
 define_interface()
 {
-	eval "$echo_on"
+	$echo_on
 	#Wait for up to 15 seconds for the wan interface to indicate it is up.
 	# 15秒内查看外网接口是否正确启用
 	wait_sec=15
@@ -1076,7 +1048,7 @@ define_interface()
 
 	#Set up the ingress IFB name for good measure
 	qos_ifb="ifb-gargoyle"
-	eval "$echo_off"
+	$echo_off
 }
 
 # 清空防火墙表内数据和删除表
@@ -1108,7 +1080,7 @@ stop()
 	killall qosmon 2>/dev/null
 
 	#开启代码跟踪
-	eval "$echo_on"
+	$echo_on
 	#Delete the qdiscs we hung on the devices
 	#删除对应的qdiscs规则
 	for iface in $(tc qdisc show | grep hfsc | awk '{print $5}'); do
@@ -1126,14 +1098,14 @@ stop()
 	fi
 
 	# 删除ifb设备
-	ip link delete dev $qos_ifb 2>/dev/null
+	ip link delete dev $qos_ifb
 
 	# 清空表并删除表
 	if [ -n "$(nft list table inet gargoyle-qos-priority 2>/dev/null)" ] ; then
 		flush_delete_table
 	fi
 
-	eval "$echo_off"
+	$echo_off
 }
 
 
@@ -1193,226 +1165,30 @@ restart()
 }
 
 # 显示已添加好的qos配置
-# 显示QoS状态（最终修复版）
 show()
 {
-    # 增强诊断信息
-    echo "===== QoS状态报告 ====="
-    echo "时间: $(date)"
-    echo "系统运行时间: $(uptime | sed 's/.*up //; s/,.*//')"
-    
-    # 确保接口已定义
-    if [ -z "$qos_interface" ]; then
-        define_interface
-    fi
-    
-    # 如果仍然为空，尝试从TC输出推断接口
-    if [ -z "$qos_interface" ]; then
-        qos_interface=$(tc qdisc show 2>/dev/null | grep -E "hfsc.*root" | awk '{print $5}' | head -1)
-        [ -z "$qos_interface" ] && qos_interface="未知"
-    fi
-    
-    # 获取IP地址（如果为空）
-    if [ -z "$wan_ip" ] || [ -z "$wan_ip6" ]; then
-        network_find_wan real_wan
-        network_get_ipaddr wan_ip $real_wan 2>/dev/null
-        network_find_wan6 real_wan6
-        network_get_ipaddr6 wan_ip6 $real_wan6 2>/dev/null
-        network_get_ipaddr local_ip lan 2>/dev/null
-        network_get_ipaddr6 local_ip6 lan 2>/dev/null
-    fi
-    
-    echo "WAN接口: ${qos_interface:-未知}"
-    echo "WAN IPv4: ${wan_ip:-未检测到}"
-    echo "WAN IPv6: ${wan_ip6:-未检测到}"
-    echo "LAN IPv4: ${local_ip:-未检测到}"
-    echo "LAN IPv6: ${local_ip6:-未检测到}"
-    echo "IFB设备: ${qos_ifb:-未创建}"
-    
-    # 检查QoS是否实际运行
-    if ! tc qdisc show dev "${qos_interface}" 2>/dev/null | grep -q hfsc; then
-        echo "警告: QoS未在接口 ${qos_interface} 上激活"
-        return 1
-    fi
-    
-    # 显示出口配置
-    echo -e "\n======== 出口QoS ($qos_interface) ========"
-    echo "NFT规则:"
-    nft list chain inet gargoyle-qos-priority filter_qos_egress 2>/dev/null || echo "无NFT规则"
-    
-    echo -e "\nTC统计:"
-    tc -s qdisc show dev "$qos_interface"
-    tc -s class show dev "$qos_interface"
-    tc -s filter show dev "$qos_interface"
-    
-    # 显示入口配置
-    echo -e "\n======== 入口QoS ($qos_ifb) ========"
-    echo "NFT规则:"
-    nft list chain inet gargoyle-qos-priority filter_qos_ingress 2>/dev/null || echo "无NFT规则"
-    
-    echo -e "\nTC统计:"
-    tc -s qdisc show dev "$qos_ifb" 2>/dev/null || echo "无TC统计"
-    tc -s class show dev "$qos_ifb" 2>/dev/null || echo "无类统计"
-    tc -s filter show dev "$qos_ifb" 2>/dev/null || echo "无过滤器统计"
-    
-    # 修复连接标记显示
-    echo -e "\n======== 活动连接标记 (IPv4) ========"
-    if [ -n "$wan_ip" ]; then
-        echo "WAN IP: $wan_ip"
-        conntrack -L -d "$wan_ip" 2>/dev/null | grep -E "mark=[0-9]+" | head -n 10 | while read -r line; do
-            echo "  $line"
-        done
-    else
-        echo "WAN IPv4不可用"
-    fi
-    
-    echo -e "\n======== 活动连接标记 (IPv6) ========"
-    if [ -n "$wan_ip6" ]; then
-        echo "WAN IPv6: $wan_ip6"
-        conntrack -L -d "$wan_ip6" 2>/dev/null | grep -E "mark=[0-9]+" | head -n 10 | while read -r line; do
-            echo "  $line"
-        done
-    else
-        echo "WAN IPv6不可用"
-    fi
-    
-    # 修复分类标记显示
-    echo -e "\n======== QoS分类标记 ========"
-    if [ -f "$qos_mark_file" ]; then
-        while IFS= read -r line; do
-            type=$(echo "$line" | awk '{print $1}')
-            class=$(echo "$line" | awk '{print $2}')
-            id=$(echo "$line" | awk '{print $3}')
-            mask=$(echo "$line" | awk '{print $4}')
-            
-            # 转换ID为十六进制
-            hex_id=$(printf "0x%X" "$id")
-            printf "%s %s %s %s\n" "$type" "$class" "$hex_id" "$mask"
-        done < "$qos_mark_file"
-    else
-        echo "标记文件未找到: $qos_mark_file"
-    fi
-    
-    # === 修复内存显示问题 ===
-    echo -e "\n===== 系统资源 ====="
-    
-    # 方法1: 使用/proc/meminfo直接读取（推荐）
-    if [ -f /proc/meminfo ]; then
-        mem_total_kb=$(grep "MemTotal:" /proc/meminfo | awk '{print $2}')
-        mem_free_kb=$(grep "MemFree:" /proc/meminfo | awk '{print $2}')
-        mem_available_kb=$(grep "MemAvailable:" /proc/meminfo | awk '{print $2}')
-        mem_buffers_kb=$(grep "Buffers:" /proc/meminfo | awk '{print $2}')
-        mem_cached_kb=$(grep "Cached:" /proc/meminfo | awk '{print $2}')
-        
-        # 计算已用内存
-        if [ -n "$mem_available_kb" ]; then
-            mem_used_kb=$((mem_total_kb - mem_available_kb))
-        else
-            mem_used_kb=$((mem_total_kb - mem_free_kb - mem_buffers_kb - mem_cached_kb))
-        fi
-        
-        # 转换为MB
-        mem_total_mb=$((mem_total_kb / 1024))
-        mem_used_mb=$((mem_used_kb / 1024))
-        
-        echo "内存: ${mem_used_mb}MB 已用/${mem_total_mb}MB 总计"
-    else
-        # 方法2: 使用free命令作为备选
-        free_output=$(free 2>/dev/null)
-        if [ $? -eq 0 ]; then
-            mem_used=$(echo "$free_output" | awk '/Mem:/ {print $3}')
-            mem_total=$(echo "$free_output" | awk '/Mem:/ {print $2}')
-            if [ -n "$mem_used" ] && [ -n "$mem_total" ] && [ "$mem_total" -gt 0 ] 2>/dev/null; then
-                echo "内存: ${mem_used}KB 已用/${mem_total}KB 总计"
-            else
-                # 方法3: 使用free -h并解析人类可读格式
-                free_h_output=$(free -h 2>/dev/null)
-                mem_line=$(echo "$free_h_output" | grep "Mem:")
-                if [ -n "$mem_line" ]; then
-                    used_part=$(echo "$mem_line" | awk '{print $3}')
-                    total_part=$(echo "$mem_line" | awk '{print $2}')
-                    echo "内存: ${used_part} 已用/${total_part} 总计"
-                else
-                    echo "内存: 无法获取"
-                fi
-            fi
-        else
-            echo "内存: 无法获取"
-        fi
-    fi
-    
-    # 显示交换分区信息
-    if [ -f /proc/meminfo ]; then
-        swap_total_kb=$(grep "SwapTotal:" /proc/meminfo | awk '{print $2}')
-        swap_free_kb=$(grep "SwapFree:" /proc/meminfo | awk '{print $2}')
-        if [ "$swap_total_kb" -gt 0 ] 2>/dev/null; then
-            swap_used_kb=$((swap_total_kb - swap_free_kb))
-            swap_total_mb=$((swap_total_kb / 1024))
-            swap_used_mb=$((swap_used_kb / 1024))
-            echo "交换: ${swap_used_mb}MB 已用/${swap_total_mb}MB 总计"
-        else
-            echo "交换: 未启用"
-        fi
-    else
-        # 使用free命令获取交换信息
-        swap_line=$(free | grep "Swap:")
-        if [ -n "$swap_line" ]; then
-            swap_used=$(echo "$swap_line" | awk '{print $3}')
-            swap_total=$(echo "$swap_line" | awk '{print $2}')
-            if [ "$swap_total" -gt 0 ] 2>/dev/null; then
-                echo "交换: ${swap_used}KB 已用/${swap_total}KB 总计"
-            else
-                echo "交换: 未启用"
-            fi
-        else
-            echo "交换: 未启用"
-        fi
-    fi
-    
-    # CPU负载
-    cpu_load=$(uptime | awk -F'load average:' '{print $2}' | sed 's/^[ \t]*//')
-    echo "CPU负载: ${cpu_load}"
-    
-    # 修复连接跟踪条目计数
-    echo -n "连接跟踪条目: "
-    if [ -f /proc/sys/net/netfilter/nf_conntrack_count ]; then
-        cat /proc/sys/net/netfilter/nf_conntrack_count
-    elif command -v conntrack >/dev/null 2>&1; then
-        conntrack -C 2>/dev/null || echo "未知"
-    else
-        echo "未知"
-    fi
-    
-    # === 修复QoS状态检测 ===
-    echo -e "\n===== QoS状态摘要 ====="
-    
-    # 检测出口QoS状态
-    if tc qdisc show dev "${qos_interface}" 2>/dev/null | grep -q hfsc; then
-        echo "出口队列: $(tc qdisc show dev $qos_interface 2>/dev/null | grep -E "qdisc [a-z]+ [0-9]+:" | head -1 | awk '{print $2, $3}')"
-        echo "出口标记规则: $(nft list chain inet gargoyle-qos-priority filter_qos_egress 2>/dev/null | grep -q "meta mark set" && echo "已配置" || echo "未配置")"
-    else
-        echo "出口队列: 未配置"
-        echo "出口标记规则: 未配置"
-    fi
-    
-    # 检测入口QoS状态
-    if [ -n "$qos_ifb" ] && ip link show "$qos_ifb" >/dev/null 2>&1 && 
-       tc qdisc show dev "$qos_ifb" 2>/dev/null | grep -q hfsc; then
-        echo "入口队列: $(tc qdisc show dev $qos_ifb 2>/dev/null | grep -E "qdisc [a-z]+ [0-9]+:" | head -1 | awk '{print $2, $3}')"
-        echo "入口标记规则: $(nft list chain inet gargoyle-qos-priority filter_qos_ingress 2>/dev/null | grep -q "meta mark set" && echo "已配置" || echo "未配置")"
-    else
-        echo "入口队列: 未配置"
-        echo "入口标记规则: 未配置"
-    fi
-    
-    # 实时QoS状态检测
-    if tc qdisc show dev "${qos_interface}" 2>/dev/null | grep -q hfsc || 
-       ( [ -n "$qos_ifb" ] && ip link show "$qos_ifb" >/dev/null 2>&1 && 
-         tc qdisc show dev "$qos_ifb" 2>/dev/null | grep -q hfsc ); then
-        echo "QoS状态: 运行中"
-    else
-        echo "QoS状态: 已停止"
-    fi
+	#load qos_interface from global variables
+	define_interface
+
+	echo "Egress configuration on $qos_interface"
+	# iptables-nft -t mangle -vnL qos_egress 2>/dev/null
+	# ip6tables-nft -t mangle -vnL qos_egress 2>/dev/null
+	# 取消旧版iptables显示,使用新版nft显示
+	nft list chain inet gargoyle-qos-priority filter_qos_egress 2>/dev/null
+	tc -s qdisc show dev $qos_interface
+	tc -s class show dev $qos_interface
+	tc -s filter show dev $qos_interface
+
+	echo "Ingress configuration in ifb0"
+	# iptables-nft -t mangle -vnL qos_ingress 2>/dev/null
+	# ip6tables-nft -t mangle -vnL qos_ingress 2>/dev/null
+	# 取消旧版iptables显示,使用新版nft显示
+	nft list chain inet gargoyle-qos-priority filter_qos_ingress 2>/dev/null
+
+	tc -s qdisc show dev $qos_ifb
+	tc -s class show dev $qos_ifb
+	tc -s filter show dev $qos_ifb
+	tc -s filter show dev $qos_ifb parent 2:
 }
 
 boot()
@@ -1420,3 +1196,4 @@ boot()
 	#Do nothing during init.  Start is called by hotplug.
 	return
 }
+

@@ -1,0 +1,937 @@
+#!/bin/bash /etc/rc.common
+#
+# Copyright Eric Bishop, 2008
+# This is free software licensed under the terms of the GNU GPL v2.0
+#
+
+# 启动优先级（数值越小越早执行）
+START=50
+
+# 额外命令定义
+EXTRA_COMMANDS=show
+EXTRA_HELP="	show	显示当前QoS配置（如果激活）"
+
+# 包含网络配置工具和防火墙工具库
+. /lib/functions.sh
+. /lib/functions/network.sh
+include /lib/network
+#include /usr/lib/gargoyle_firewall_util
+
+# 配置文件名
+config_file_name="qos_gargoyle"
+# 上传流量标记掩码（低7位）
+upload_mask="0x007F"
+# 上传掩码取反（用于清除标记）
+upload_mask_inv="0xFFFFFF80"
+# 下载流量标记掩码（高7位）
+download_mask="0x7F00"
+# 下载掩码取反
+download_mask_inv="0xFFFF80FF"
+# QoS分类标记存储文件
+qos_mark_file="/etc/qos_class_marks"
+
+# 带宽监控脚本路径
+bwmonscript="/usr/lib/bwmon-gargoyle/bwmon-gargoyle.d/020-qos.bwmon"
+
+# 初始化锁文件（防止并发初始化）
+lock_file="/var/run/qos_updating"
+
+# 加载指定配置节的所有选项到变量
+load_all_config_options()
+{
+	local config_name="$1"   # 配置文件名
+	local section_id="$2"    # 配置节ID
+
+	ALL_OPTION_VARIABLES=""  # 存储选项名的变量
+
+	# 配置回调函数 - 动态捕获选项名
+	config_cb()
+	{
+		# 当找到目标配置节时
+		if [ ."$2" = ."$section_id" ]; then
+			# 定义选项回调 - 捕获选项名
+			option_cb()
+			{
+				ALL_OPTION_VARIABLES="$ALL_OPTION_VARIABLES $1"
+			}
+		else
+			# 其他节忽略选项
+			option_cb() { return 0; }
+		fi
+	}
+
+	# 加载配置文件
+	config_load "$config_name"
+
+	# 将选项值赋给同名变量
+	for var in $ALL_OPTION_VARIABLES
+	do
+		config_get "$var" "$section_id" "$var"
+	done
+}
+
+# 加载所有指定类型的配置节
+load_all_config_sections()
+{
+	local config_name="$1"   # 配置文件名
+	local section_type="$2"  # 配置节类型
+
+	all_config_sections=""  # 存储节ID的变量
+	section_order=""        # 节顺序（未使用）
+
+	# 配置回调函数
+	config_cb()
+	{
+		# 确保有有效输入
+		if [ -n "$2" ] || [ -n "$1" ] ; then
+			if [ -n "$section_type" ] ; then
+				# 匹配指定类型
+				if [ "$1" = "$section_type" ] ; then
+					all_config_sections="$all_config_sections $2"
+				fi
+			else
+				# 加载所有节
+				all_config_sections="$all_config_sections $2"
+			fi
+		fi
+	}
+
+	# 加载配置文件
+	config_load "$config_name"
+	# 返回节列表
+	echo "$all_config_sections"
+}
+
+# 加载并按指定变量排序的配置节
+load_and_sort_all_config_sections()
+{
+	local config_name="$1"     # 配置文件名
+	local section_type="$2"    # 配置节类型
+	local sort_variable="$3"   # 排序依据变量
+
+	all_config_sections=""  # 存储节ID的变量
+
+	# 选项回调 - 捕获排序变量
+	defined_option_cb()
+	{
+		if [ "$1" = "$sort_variable" ]; then
+			# 存储节ID和排序值
+			all_config_sections=" $2:$all_config_sections"
+		fi
+	}
+
+	# 配置回调函数
+	config_cb()
+	{
+		if [ -n "$2" ] || [ -n "$1" ] ; then
+			if [ -n "$section_type" ] ; then
+				# 匹配指定类型
+				if [ "$1" = "$section_type" ] ; then
+					# 添加节ID
+					all_config_sections="$2 $all_config_sections"
+					# 定义选项回调
+					option_cb() { defined_option_cb $1 $2 ; }
+				else
+					# 其他节忽略选项
+					option_cb() { return 0; }
+				fi
+			else
+				# 加载所有节
+				all_config_sections="$2 $all_config_sections"
+				option_cb(){ defined_option_cb $1 $2 ; }
+			fi
+		fi
+	}
+
+	# 加载配置文件
+	config_load "$config_name"
+
+	# 处理排序：分割字段 -> 数字排序 -> 提取节ID
+	echo "$all_config_sections" | awk ' {for(i=1; i <= NF; i++){ print $i }}' | sort -n -t ":" | awk 'BEGIN {FS=":"}; {print $2}'
+}
+
+# 获取分类名称对应的标记值
+get_classname_mark()
+{
+	local class="$1"             # 分类名称
+	local class_mark_list="$2"   # 分类标记列表
+
+	# 使用awk查找匹配的分类
+	echo "$class_mark_list" | awk -v class="$class" '{
+		for (i = 1; i <= NF; i++){  
+			if($i~class":"){ 
+				gsub(class":",""); 
+				print $i 
+			}
+		}
+	}'
+}
+
+# 应用所有QoS规则
+apply_all_rules()
+{
+	local rule_type="$1"          # 规则类型（upload_rule/download_rule）
+	local class_mark_list="$2"    # 分类标记列表
+	local chain="$3"              # nftables链名
+	local table="$4"              # nftables表名
+
+	local need_proto             # 是否需要协议字段
+	local tmp_proto              # 临时协议变量
+	local fam                    # 协议族（ipv4/ipv6）
+
+	# 加载并排序规则
+	rule_list=$(load_and_sort_all_config_sections "$config_file_name" "$rule_type" "test_order")
+	
+	# 处理每条规则
+	for rule in $rule_list ; do
+		class=""            # 目标分类
+		proto=""            # 协议类型
+		min_pkt_size=""     # 最小包大小
+		max_pkt_size=""     # 最大包大小
+		match_str=""        # 匹配字符串
+		need_proto=""       # 需要协议标志
+
+		# 加载规则配置
+		load_all_config_options "$config_file_name" "$rule"
+
+		# 确定协议族（默认ipv4）
+		fam=$(eval echo $family)
+		[ -z "$fam" ] && fam="ipv4"
+		
+		# 处理每个选项
+		for option in $ALL_OPTION_VARIABLES ; do
+			option_value=$(eval echo \$$option)
+			case "$option" in
+				source)  # 源地址
+					# 出口方向特殊处理WAN IP
+					if [ "$3" = "qos_egress" ] ; then
+						if [ "$option_value" = "$local_ip" ] || [ "$option_value" = "$wan_ip" ]; then
+							option_value="$wan_ip"
+						fi
+					fi
+					# 根据协议族添加匹配
+					if [ "$fam" = "ipv4" ] ; then
+						match_str="$match_str ip saddr $option_value"
+					else
+						match_str="$match_str ip6 saddr $option_value"
+					fi
+				;;
+				destination)  # 目的地址
+					# 入口方向特殊处理WAN IP
+					if [ "$3" = "qos_ingress" ] ; then
+						if [ "$option_value" = "$local_ip" ] || [ "$option_value" = "$wan_ip" ]; then
+							option_value="$wan_ip"
+						fi
+					fi
+					# 根据协议族添加匹配
+					if [ "$fam" = "ipv4" ] ; then
+						match_str="$match_str ip daddr $option_value"
+					else
+						match_str="$match_str ip6 daddr $option_value"
+					fi
+				;;
+				srcport)  # 源端口
+					# 转换端口范围格式
+					if [ -n "$(echo $option_value | grep ":")" ] ; then 
+						option_value="$(echo "$option_value" | sed -e 's,:,-,g')" 
+					fi
+					# 添加端口匹配（使用占位符）
+					match_str="$match_str PPROTOO sport $option_value"
+					need_proto="1"  # 标记需要协议
+				;;
+				dstport)  # 目的端口
+					# 转换端口范围格式
+					if [ -n "$(echo $option_value | grep ":")" ] ; then 
+						option_value="$(echo "$option_value" | sed -e 's,:,-,g')" 
+					fi
+					# 添加端口匹配（使用占位符）
+					match_str="$match_str PPROTOO dport $option_value"
+					need_proto="1"  # 标记需要协议
+				;;
+				layer7)  # L7层协议
+					# 从预定义文件获取标记
+					layer7_connmark=$(cat /etc/l7marker.marks 2>/dev/null | grep "$option_value" | awk '{ print $2 }')
+					layer7_mask=$(cat /etc/l7marker.marks 2>/dev/null | grep "$option_value" | awk '{ print $3 }')
+					if [ -n "$layer7_connmark" ] ; then
+						# 使用连接标记匹配
+						match_str="$match_str ct mark \& $layer7_mask = $layer7_connmark"
+					else
+						# 回退到nftables层7匹配（可能不支持）
+						match_str="$match_str layer7 l7proto $option_value"
+					fi
+				;;
+				connbytes_kb)  # 连接字节数
+					# 转换为字节阈值
+					match_str="$match_str ct bytes > $(($option_value*1024))"
+				;;
+			esac
+		done
+
+		# 处理包大小限制
+		if [ -n "$min_pkt_size" ] || [ -n "$max_pkt_size" ] ; then
+			[ -z "$min_pkt_size" ] && min_pkt_size=0
+			[ -z "$max_pkt_size" ] && max_pkt_size=1500
+			match_str="$match_str meta length $min_pkt_size-$max_pkt_size"
+		fi
+
+		# 如果有目标分类且匹配条件
+		if [ -n "$class" ] ; then
+			if [ -n "$proto" ] || [ -n "$match_str" ] ; then
+				# 获取分类标记
+				next_mark=$(get_classname_mark "$class" "$class_mark_list" )
+
+				# 处理协议缺失时的双协议插入
+				if [ -z "$proto" ] && [ -n "$need_proto" ] ; then
+					$echo_on
+					# TCP规则
+					tcpstr="$(echo $match_str | sed 's/PPROTOO/tcp/g')"
+					nft insert rule $table $chain $tcpstr meta mark set $next_mark
+					# UDP规则
+					udpstr="$(echo $match_str | sed 's/PPROTOO/udp/g')"
+					nft insert rule $table $chain $udpstr meta mark set $next_mark
+					$echo_off
+
+				else
+					# 处理显式协议或不需要协议的情况
+					tmp_proto=""
+					[ -n "$proto" ] && tmp_proto="meta l4proto $proto"
+					
+					# 替换占位符为实际协议
+					[ -n "$need_proto" ] && match_str="$(echo $match_str | sed "s/PPROTOO/$proto/")"
+
+					$echo_on
+					# 添加规则
+					nft insert rule $table $chain $tmp_proto $match_str meta mark set $next_mark
+					$echo_off
+				fi
+			fi
+		fi
+	done
+}
+
+# 更新分类标记文件
+update_markfile()
+{
+	# 创建临时文件
+	tmp_qos_mark_file="/tmp/qos_marks.tmp.tmp"
+	rm -rf "$tmp_qos_mark_file"
+
+	# 重新生成标记文件内容
+	if [ $total_upload_bandwidth -ge 0 ] ; then
+		# 处理上传分类
+		upload_class_list=$(load_all_config_sections "$config_file_name" "upload_class")
+		next_class_index=2
+		for uclass_name in $upload_class_list ; do
+			printf "upload $uclass_name %d $upload_mask\n" $next_class_index >> "$tmp_qos_mark_file"
+			next_class_index=$(($next_class_index+1))
+		done
+	fi
+
+	if [ $total_download_bandwidth -ge 0 ] ; then
+		# 处理下载分类
+		download_class_list=$(load_all_config_sections "$config_file_name" "download_class")
+		next_class_index=2
+		for dclass_name in $download_class_list ; do
+			printf "download $dclass_name %d $download_mask\n" $(($next_class_index << 8)) >> "$tmp_qos_mark_file"
+			next_class_index=$(($next_class_index+1))
+		done
+	fi
+
+	# 检查文件是否变化
+	mark_files_match="0"
+	if [ -e "$qos_mark_file" ] ; then
+		new_md5=$(md5sum "$tmp_qos_mark_file" | awk '{ print $1 ; } ')
+		old_md5=$(md5sum "$qos_mark_file" | awk '{ print $1 ; } ')
+		[ "$new_md5" = "$old_md5" ] && mark_files_match="1"
+	fi
+
+	# 更新文件（仅当内容变化）
+	if [ "$mark_files_match" = "0" ] ; then
+		mv "$tmp_qos_mark_file" "$qos_mark_file"
+	else
+		rm -rf "$tmp_qos_mark_file"
+	fi
+}
+
+# 初始化QoS系统
+initialize_qos()
+{
+	# 初始化L7标记链
+	create_l7marker_chain
+
+	# 加载必要内核模块
+	rmmod ifb >&- 2>&-  # 先移除旧模块
+	insmod ifb >&- 2>&-  # 加载IFB模块
+	# 创建IFB设备
+	ip link add $qos_ifb type ifb 2>/dev/null
+	
+	# 等待IFB设备就绪（最多3次重试）
+	cnt=0
+	while [ "$(ls -d /proc/sys/net/ipv4/conf/ifb* 2>&- | wc -l)" -eq "0" ]; do
+		logger -t "qos_gargoyle" "insmod ifb failed. Waiting and trying again..."
+		cnt=$((cnt + 1))
+		if [ $cnt -ge 3 ] ; then
+			logger -t "qos_gargoyle" "Could not insmod ifb, too many retries. Stopping."
+			rm -rf "$lock_file"
+			stop
+			exit
+		fi
+		sleep 5
+		insmod ifb >&- 2>&-
+		ip link add $qos_ifb type ifb 2>/dev/null
+	done
+
+	# 配置IFB设备
+	ip link set dev $qos_ifb mtu 1500
+
+	# 加载其他必要模块
+	insmod cls_fw >&- 2>&-       # 防火墙分类器
+	insmod cls_flow >&- 2>&-     # 流分类器
+	insmod sch_hfsc >&- 2>&-     # HFSC调度器
+	insmod sch_sfq >&- 2>&-      # SFQ调度器
+	insmod act_connmark >&- 2>&-  # 连接标记动作
+
+	# 根据内存大小设置SFQ队列深度
+	total_mem="$(sed -e '/^MemTotal: /!d; s#MemTotal: *##; s# kB##g' /proc/meminfo)"
+	if [ "$total_mem" -lt 16000 ] ; then
+		sfq_depth="depth 32"  # 低内存设备
+	else
+		sfq_depth=""          # 默认设置
+	fi
+
+	# 关闭命令回显
+	$echo_off
+	
+	# 加载上传配置
+	load_all_config_options "$config_file_name" "upload"
+	$echo_on
+	# 设置上传带宽（默认-1表示禁用）
+	[ -n "$total_bandwidth" ] && total_upload_bandwidth="$total_bandwidth" || total_upload_bandwidth=-1
+	upload_default_class="$default_class"
+
+	# 加载下载配置
+	total_bandwidth=""
+	default_class=""
+	$echo_off
+	load_all_config_options "$config_file_name" "download"
+	$echo_on
+	# 设置下载带宽（默认-1表示禁用）
+	[ -n "$total_bandwidth" ] && total_download_bandwidth="$total_bandwidth" || total_download_bandwidth=-1
+	download_default_class="$default_class"
+
+	# 设置链路层适配参数（ATM开销）
+	overhead="stab linklayer atm overhead 32 mtu 2048 "
+	# 高速连接不使用开销补偿
+	wan_proto=$(uci get network.wan.proto 2>/dev/null)
+	if [ "$wan_proto" != "pppoe" ] && [ "$total_upload_bandwidth" -ge 1100 ] && [ "$total_download_bandwidth" -ge 3100 ] ; then
+		overhead=""
+	fi
+
+	$echo_off
+
+	# ===== 上传方向QoS配置 =====
+	if [ $total_upload_bandwidth -ge 0 ] ; then
+		# 加载上传分类
+		upload_class_list=$(load_all_config_sections "$config_file_name" "upload_class")
+		for uclass_name in $upload_class_list ; do
+			# 初始化分类参数
+			percent_bandwidth=""
+			min_bandwidth=""
+			max_bandwidth=""
+			load_all_config_options "$config_file_name" "$uclass_name"
+			# 设置默认值
+			[ -z "$percent_bandwidth" ] && percent_bandwidth="0"
+			[ -z "$min_bandwidth" ] && min_bandwidth="-1"
+			[ -z "$max_bandwidth" ] && max_bandwidth="-1"
+			# 存储分类定义
+			classdef="$percent_bandwidth $max_bandwidth $min_bandwidth"
+			eval $uclass_name=\"\$classdef\"
+		done
+
+		# 添加根队列规则
+		$echo_on
+		tc qdisc add dev $qos_interface root handle 1:0 hfsc default 1
+		# 添加根分类（1000Mbps参考带宽）
+		tc class add dev $qos_interface parent 1:0 classid 1:1 hfsc ls rate 1000Mbit ul rate ${total_upload_bandwidth}kbit
+		$echo_off
+
+		# 初始化分类标记
+		class_mark_list=""
+		upload_shift=0
+		next_class_index=2
+		next_classid=$(printf "0x%X" $((next_class_index << upload_shift)))
+		def_upload_idx=$next_class_index
+		def_upload_class=$next_classid
+
+		# 处理每个上传分类
+		for uclass_name in $upload_class_list ; do
+			# 添加分类标记
+			class_mark_list="$class_mark_list$uclass_name:$next_classid "
+			$echo_on
+			
+			# 获取分类定义
+			uclass_def=$(eval echo "\$$uclass_name")
+			# 计算带宽份额（百分比*10）
+			m2=$((10 * $(echo $uclass_def | awk ' {print $1}' )))
+			# 获取最小带宽
+			min_bandwidth=$(echo $uclass_def | awk ' {print $3}' )
+			# 构建实时服务曲线
+			if [ "$min_bandwidth" -gt 0 ] ; then
+				ll_str=" rt m1 $((2*$min_bandwidth))kbit d 2ms m2 ${min_bandwidth}kbit"
+			else
+				ll_str=""
+			fi
+			# 获取最大带宽
+			max_bandwidth=$(echo $uclass_def | awk ' {print $2}' )
+			# 构建带宽限制
+			if [ "$max_bandwidth" -ge 0 ] ; then
+				ul_str=" ul m2 ${max_bandwidth}kbit"
+			else
+				# 自动计算最大带宽
+				max_bandwidth=$((m2*total_upload_bandwidth/1000000))
+				ul_str=""
+			fi
+
+			# 计算队列长度（基于带宽延迟积）
+			tbw=$((max_bandwidth*100/8))
+			[ "$tbw" -lt 6000 ] && tbw=6000  # 设置最小值
+
+			# 添加叶分类
+			tc class add dev $qos_interface parent 1:1 classid 1:$next_class_index hfsc ls m2 ${m2}Mbit $ll_str $ul_str
+			# 添加SFQ队列
+			tc qdisc add dev $qos_interface parent 1:$next_class_index handle $next_class_index:1 sfq headdrop limit $((tbw/250)) $sfq_depth divisor 256
+			# 添加分类过滤器
+			tc filter add dev $qos_interface parent 1:0 protocol ip handle $next_classid/$upload_mask fw flowid 1:$next_class_index
+			tc filter add dev $qos_interface parent 1:0 protocol ipv6 handle $next_classid/$upload_mask fw flowid 1:$next_class_index
+			# 添加流分类器（按源IP）
+			tc filter add dev $qos_interface parent $next_class_index: handle 1 flow divisor 256 map key nfct-src and 0xff
+			$echo_off
+
+			# 检查是否为默认分类
+			if [ "$upload_default_class" = "$uclass_name" ] ; then
+				def_upload_idx=$next_class_index
+				def_upload_class=$next_classid
+			fi
+
+			# 准备下一个分类
+			next_class_index=$((next_class_index+1))
+			next_classid=$(printf "0x%X" $((next_class_index << upload_shift)))
+		done
+
+		$echo_on
+		# 更新根队列的默认分类
+		tc qdisc change dev $qos_interface $overhead root handle 1:0 hfsc default $def_upload_idx
+
+		# 创建出口链
+		nft add chain inet fw4 mangle_qos_egress
+		nft add rule inet fw4 mangle_postrouting oifname "$qos_interface" jump mangle_qos_egress
+
+		# 应用用户规则
+		$echo_off
+		apply_all_rules "upload_rule" "$class_mark_list" "mangle_qos_egress" "inet fw4"
+		$echo_on
+
+		# 设置默认标记
+		nft insert rule inet fw4 mangle_qos_egress meta mark set "$def_upload_class"
+		# 保存现有标记到连接标记
+		nft insert rule inet fw4 mangle_qos_egress meta mark \& $upload_mask != 0x0 return
+		nft insert rule inet fw4 mangle_qos_egress meta mark \& $upload_mask != 0x0 ct mark set ct mark \& $upload_mask_inv \| mark \& $upload_mask
+		# 最终保存标记
+		nft add rule inet fw4 mangle_qos_egress ct mark set ct mark \& $upload_mask_inv \| mark \& $upload_mask
+	fi
+
+	# 检查QoS监控是否启用
+	qos_monenabled="true"
+	if [ $total_download_bandwidth -eq 0 ] || [ $total_upload_bandwidth -eq 0 ] ; then
+		qos_monenabled="false"
+	fi
+
+	# ===== 下载方向QoS配置 =====
+	if [ $total_download_bandwidth -ge 0 ] ; then
+		# 启动IFB设备
+		ip link set $qos_ifb up
+
+		# 添加根队列规则
+		tc qdisc add dev $qos_ifb root handle 1:0 hfsc default 1
+		# 添加根分类
+		tc class add dev $qos_ifb parent 1:0 classid 1:1 hfsc ls rate 1000Mbit ul m2 ${total_download_bandwidth}kbit
+
+		# 加载下载分类
+		$echo_off
+		download_class_list=$(load_all_config_sections "$config_file_name" "download_class")
+		for dclass_name in $download_class_list ; do
+			# 初始化分类参数
+			percent_bandwidth=""
+			min_bandwidth=""
+			max_bandwidth=""
+			minRTT=""
+			load_all_config_options "$config_file_name" "$dclass_name"
+			# 设置默认值
+			[ -z "$percent_bandwidth" ] && percent_bandwidth="0"
+			[ -z "$min_bandwidth" ] && min_bandwidth="-1"
+			[ -z "$max_bandwidth" ] && max_bandwidth="-1"
+			# 存储分类定义
+			classdef="$percent_bandwidth $max_bandwidth $min_bandwidth $minRTT"
+			eval $dclass_name=\"\$classdef\"
+		done
+
+		# 初始化分类标记
+		class_mark_list=""
+		download_shift=8
+		next_class_index=2
+		next_classid=$(printf "0x%X" $((next_class_index << download_shift)))
+		def_download_idx=$next_class_index
+		def_download_class=$next_classid
+		next_class_prio=3  # 过滤器优先级
+
+		# 处理每个下载分类
+		for dclass_name in $download_class_list ; do
+			$echo_on
+			# 添加分类标记
+			class_mark_list="$class_mark_list$dclass_name:$next_classid  "
+			# 获取分类定义
+			dclass_def=$(eval echo "\$$dclass_name")
+			# 计算带宽份额
+			m2=$((10 * $(echo $dclass_def | awk ' {print $1}' )))
+
+			# 获取最大带宽
+			max_bandwidth=$(echo $dclass_def | awk ' {print $2}' )
+			ul_str=""
+			if [ "$max_bandwidth" -ge 0 ] ; then
+				ul_str=" ul m2 ${max_bandwidth}kbit"
+			else
+				max_bandwidth="$total_download_bandwidth"
+			fi
+
+			# 处理最小RTT设置
+			minRTT=$(echo $dclass_def | awk ' {print $4}' )
+			if [ "$minRTT" = "Yes" ] ; then
+				# 计算延迟参数
+				d1=$((15000/max_bandwidth+1))
+				ll_str=" ls m1 $((2*m2))Mbit d ${d1}ms m2 ${m2}Mbit"
+			else
+				ll_str=" ls m2 ${m2}Mbit"
+			fi
+
+			# 处理最小带宽
+			min_bandwidth=$(echo $dclass_def | awk ' {print $3}' )
+			rt_str=""
+			if [ "$min_bandwidth" -gt 0 ] ; then
+				if [ "$minRTT" = "Yes" ] ; then
+					d2=$((15000/max_bandwidth+1))
+					rt_str=" rt m1 $((max_bandwidth))kbit d ${d2}ms m2 ${min_bandwidth}kbit"
+				else
+					rt_str=" rt m2 ${min_bandwidth}kbit"
+				fi
+			fi
+
+			# 计算队列长度
+			tbw=$((max_bandwidth*100/8))
+			[ "$tbw" -lt 10000 ] && tbw=10000  # 设置最小值
+
+			# 添加叶分类
+			tc class add dev $qos_ifb parent 1:1 classid 1:$next_class_index hfsc $rt_str $ll_str $ul_str
+			# 添加SFQ队列
+			tc qdisc add dev $qos_ifb parent 1:$next_class_index handle $next_class_index:1 sfq headdrop limit $((tbw/250)) $sfq_depth divisor 256
+			# 添加分类过滤器
+			tc filter add dev $qos_ifb parent 1:0 prio $next_class_prio protocol ip handle $next_classid/$download_mask fw flowid 1:$next_class_index
+			tc filter add dev $qos_ifb parent 1:0 prio $((next_class_prio+1)) protocol ipv6 handle $next_classid/$download_mask fw flowid 1:$next_class_index
+			# 添加流分类器（按目的IP）
+			tc filter add dev $qos_ifb parent $next_class_index: handle 1 flow divisor 256 map key dst and 0xff
+			$echo_off
+
+			# 检查是否为默认分类
+			if [ "$download_default_class" = "$dclass_name" ] ; then
+				def_download_idx=$next_class_index
+				def_download_class=$next_classid
+			fi
+
+			# 准备下一个分类
+			next_class_index=$((next_class_index+1))
+			next_classid=$(printf "0x%X" $((next_class_index << download_shift)))
+			next_class_prio=$((next_class_prio+2))
+		done
+
+		$echo_on
+		# 更新根队列的默认分类
+		tc qdisc change dev $qos_ifb $overhead root handle 1:0 hfsc default $def_download_idx
+
+		# 创建入口链
+		nft add chain inet fw4 mangle_qos_ingress
+		# 在转发和输入链中添加跳转
+		nft add rule inet fw4 mangle_forward iifname $qos_interface jump mangle_qos_ingress
+		nft add rule inet fw4 mangle_input iifname $qos_interface jump mangle_qos_ingress
+		# 创建预路由链（清除标记）
+		nft add chain inet fw4 mangle_quotaqos_prerouting
+		nft add rule inet fw4 mangle_quotaqos_prerouting meta mark set 0x0
+		nft insert rule inet fw4 mangle_prerouting iifname $qos_interface jump mangle_quotaqos_prerouting
+
+		# 应用用户规则
+		$echo_off
+		apply_all_rules "download_rule" "$class_mark_list" "mangle_qos_ingress" "inet fw4"
+		$echo_on
+
+		# 设置默认标记
+		nft insert rule inet fw4 mangle_qos_ingress meta mark set "$def_download_class"
+		# 保存现有标记到连接标记
+		nft insert rule inet fw4 mangle_qos_ingress meta mark \& $download_mask != 0x0 return
+		nft insert rule inet fw4 mangle_qos_ingress meta mark \& $download_mask != 0x0 ct mark set ct mark \& $download_mask_inv \| mark \& $download_mask
+		# 最终保存标记
+		nft add rule inet fw4 mangle_qos_ingress ct mark set ct mark \& $download_mask_inv \| mark \& $download_mask
+
+		# 重定向入口流量到IFB
+		tc qdisc add dev $qos_interface handle ffff: ingress
+		tc filter add dev $qos_interface parent ffff: protocol ip u32 match u8 0 0 action connmark action mirred egress redirect dev $qos_ifb flowid ffff:1
+		tc filter add dev $qos_interface parent ffff: protocol ipv6 u32 match u8 0 0 action connmark action mirred egress redirect dev $qos_ifb flowid ffff:1
+
+		$echo_off
+	fi
+
+	# ===== 启用QoS监控 =====
+	if [ $total_upload_bandwidth -ge 0 ] && [ $total_download_bandwidth -ge 0 ] && [ "$qos_monenabled" = "true" ] ; then
+		$echo_on
+
+		# 确定ping目标
+		if [ -z "$ptarget_ip" ] ; then
+			# 自动选择目标（非本地网关）
+			old_ifs="$IFS"
+			IFS=$(printf "\n\r")
+			targets=$(traceroute -n -I -w 1 -q 2 -m6 8.8.8.8 | grep -o '[0-9]\{1,3\}\.[0-9]\{1,3\}\.[0-9]\{1,3\}\.[0-9]\{1,3\}.*ms' | grep -v '8.8.8.8' | sed 's/ms//g')
+			ptarget_ip=""
+			for t in $targets ; do
+				[ -n "$ptarget_ip" ] && break
+				target=$(echo "$t" | awk '{ print $1 ; }')
+				# 检查是否为本地地址
+				target_is_local=$(echo "$target" | grep -E '^(192\.168|10\.|172\.1[6789]\.|172\.2[0-9]\.|172\.3[01]\.|0\.0\.0\.0|127\.|255\.)') 
+				# 计算延迟（向上取整）
+				time=$(echo "$t" | awk ' { print $3 ; }' | sed 's/\..*$//g')
+				time=$((time + 1))
+				# 选择非本地或高延迟目标
+				if [ -z "$target_is_local" ] || [ "$time" -gt 5 ] ; then
+					ptarget_ip="$target"
+				fi
+			done
+			IFS="$old_ifs"
+			# 回退到默认网关
+			[ -z "$ptarget_ip" ] && ptarget_ip=$(gargoyle_header_footer -i gargoyle | sed -n 's/.*currentWanGateway.*"\(.*\)".*/\1/p')
+		fi
+
+		# 保护ping响应不被重新标记
+		if [ "$(ip_family $ptarget_ip)" == "ipv4" ] ; then
+			nft insert rule inet fw4 mangle_qos_ingress icmp type echo-reply ip saddr $ptarget_ip return
+		fi
+		if [ "$(ip_family $ptarget_ip)" == "ipv6" ] ; then
+			nft insert rule inet fw4 mangle_qos_ingress icmpv6 type echo-reply ip6 saddr $ptarget_ip return
+		fi
+		
+		# 创建特殊分类处理ping流量
+		# 下载方向（IFB）
+		tc class add dev $qos_ifb parent 1:1 classid 1:127 hfsc rt umax 106 dmax 10ms rate 4kbit
+		tc qdisc add dev $qos_ifb parent 1:127 pfifo
+		tc filter add dev $qos_ifb parent 1:0 prio 1 protocol ip handle 127 fw flowid 1:127
+		tc filter add dev $qos_ifb parent 1:0 prio 2 protocol ipv6 handle 127 fw flowid 1:127
+		# 上传方向
+		tc class add dev $qos_interface parent 1:1 classid 1:127 hfsc rt umax 106 dmax 10ms rate 4kbit
+		tc qdisc add dev $qos_interface parent 1:127 pfifo
+		tc filter add dev $qos_interface parent 1:0 prio 1 protocol ip handle 127 fw flowid 1:127
+		tc filter add dev $qos_interface parent 1:0 prio 2 protocol ipv6 handle 127 fw flowid 1:127
+
+		# 标记路由器发出的ping请求
+		if [ "$(ip_family $wan_ip)" == "ipv4" ] && [ "$(ip_family $ptarget_ip)" == "ipv4" ] ; then
+			nft insert rule inet fw4 mangle_qos_egress icmp type echo-request ip saddr $wan_ip ip daddr $ptarget_ip meta mark set 127
+		fi
+		if [ "$(ip_family $wan_ip6)" == "ipv6" ] && [ "$(ip_family $ptarget_ip)" == "ipv6" ] ; then
+			nft insert rule inet fw4 mangle_qos_egress icmpv6 type echo-request ip6 saddr $wan_ip6 ip6 daddr $ptarget_ip meta mark set 127
+		fi
+
+		# 准备qosmon参数
+		qmonextra=""
+		if [ -n "$qmoncurrenttarget" ] ; then
+			if [ "$ptarget_ip" = "$qmoncurrenttarget" ] ; then
+				qmonextra="-s"  # 跳过初始测量
+				[ -n "$qmoncurrentping" ] && qmonextra="$qmonextra -t $qmoncurrentping"
+				[ -n "$qmoncurrentfll" ] && qmonextra="$qmonextra -l $qmoncurrentfll"
+			fi
+		fi
+
+		# 启动QoS监控
+		if [ -n "$pinglimit" ] ; then
+			# 手动模式
+			qosmon -a -b $qmonextra 800 $ptarget_ip $total_download_bandwidth $pinglimit
+		else
+			# 自动模式（计算ping限制）
+			pinglimit=$((1500 * 10 * 2/3/total_download_bandwidth+1500 * 10/total_upload_bandwidth+2))
+			qosmon -a -b $qmonextra 800 $ptarget_ip $total_download_bandwidth $pinglimit
+		fi
+
+		$echo_off
+	fi
+
+	# 更新标记文件
+	update_markfile
+}
+
+# 确定网络接口
+define_interface()
+{
+	$echo_on
+	# 等待WAN接口就绪（最多15秒）
+	wait_sec=15
+	while ! network_is_up wan && [ $wait_sec -gt 0 ] ; do
+		sleep 1
+		wait_sec=$((wait_sec - 1))
+	done
+
+	# 获取WAN接口名
+	network_get_device qos_interface wan
+	[ -z $qos_interface ] && network_get_physdev qos_interface wan
+
+	# 获取IP地址
+	network_get_ipaddr wan_ip wan
+	network_get_ipaddr local_ip lan
+	# 获取IPv6地址
+	network_find_wan6 iface6 && network_get_ipaddr6 wan_ip6 "$iface6"
+	network_get_ipaddr6 local_ip6 lan
+	[ -n "$local_ip6" ] && wan_ip6="$local_ip6"  # 回退到局域网IPv6
+
+	# 获取VPN接口
+	vpn_interface=$(uci -q get firewall.vpn_zone.device)
+
+	# 设置IFB设备名
+	qos_ifb="ifb0"
+	$echo_off
+}
+
+# 获取当前qosmon状态
+get_current_qosmon_state()
+{
+	# 从进程列表中提取ping目标
+	qmoncurrenttarget="$(ps | grep [q]osmon | awk '
+	{
+		for (i = 1; i <= NF; i++) {
+			# 匹配IPv4地址
+			if ($i ~ /^([0-9]{1,3}\.){3}[0-9]{1,3}$/) {
+				split($i, octets, ".");
+				valid = 1;
+				for (j in octets) if (octets[j] > 255) valid = 0;
+				if (valid) { print $i; exit }
+			}
+			# 匹配IPv6地址
+			else if ($i ~ /^([0-9a-fA-F]{0,4}:){2,7}[0-9a-fA-F]{0,4}$/) {
+				print $i;
+				exit;
+			}
+		}
+	}')"
+
+	# 从状态文件获取ping参数
+	qmoncurrentping="$(cat /tmp/qosmon.status 2>/dev/null | grep "Filtered/Max recent RTT:" | sed 's/.*: \(.*\)\/.* (ms)/\1/')"
+	qmoncurrentfll="$(cat /tmp/qosmon.status 2>/dev/null | grep "Fair Link limit:" | cut -d" " -f 4)"
+}
+
+# 停止QoS
+stop()
+{
+	# 检查是否正在初始化
+	if [ -e "$lock_file" ] ; then
+		while [ -e "$lock_file" ] ; do sleep 1; done
+		exit
+	fi
+
+	# 停止监控进程
+	killall qosmon 2>/dev/null
+	[ -e $bwmonscript ] && $bwmonscript "stop"
+
+	$echo_on
+	# 删除所有QoS相关的队列规则
+	for iface in $(tc qdisc show | grep hfsc | awk '{print $5}'); do
+		tc qdisc del dev "$iface" root 2>/dev/null
+		tc qdisc del dev "$iface" ingress 2>/dev/null
+	done
+
+	# 删除nftables链
+	delete_chain_from_table inet fw4 mangle_qos_egress
+	delete_chain_from_table inet fw4 mangle_qos_ingress
+	delete_chain_from_table inet fw4 mangle_quotaqos_prerouting
+	$echo_off
+}
+
+# 启动QoS
+start()
+{
+	# 处理热插拔参数
+	[ -n "$2" ] && get_current_qosmon_state
+	
+	# 检查配置是否存在
+	test_total_up=$(uci get qos_gargoyle.upload.total_bandwidth 2>/dev/null)
+	test_total_down=$(uci get qos_gargoyle.download.total_bandwidth 2>/dev/null)
+	if [ -z "$test_total_up" ] && [ -z "$test_total_down" ] ;then
+		disable
+		exit 0
+	fi
+
+	# 等待系统启动完成（最多60秒）
+	cnt=0
+	while ps | grep '[//]rcS S boot' >/dev/null; do
+		sleep 4
+		cnt=$((cnt + 1))
+		[ $cnt -ge 15 ] && break
+	done
+	
+	# 重启QoS
+	stop
+	touch "$lock_file"  # 设置锁文件
+
+	# 初始化接口
+	define_interface
+	if [ -n "$qos_interface" ] ; then
+		# 加载全局配置
+		load_all_config_options "$config_file_name" "global"
+		# 初始化QoS
+		initialize_qos
+		# 启动带宽监控
+		[ -e $bwmonscript ] && $bwmonscript "start"
+	fi
+
+	# 清理锁文件
+	rm -rf "$lock_file"
+}
+
+# 重启QoS
+restart()
+{
+	# 设置命令回显
+	echo_on="set -x"
+	echo_off="set +x"
+	start "$1"
+}
+
+# 显示QoS状态
+show()
+{
+	# 加载全局配置
+	load_all_config_options "$config_file_name" "global"
+	# 确定接口
+	define_interface
+
+	# 显示出口配置
+	echo "Egress configuration on $qos_interface"
+	nft list chain inet fw4 mangle_qos_egress 2>/dev/null
+	tc -s qdisc show dev $qos_interface
+	tc -s class show dev $qos_interface
+	tc -s filter show dev $qos_interface
+
+	# 显示入口配置
+	echo "Ingress configuration in ifb0"
+	nft list chain inet fw4 mangle_qos_ingress 2>/dev/null
+	tc -s qdisc show dev $qos_ifb
+	tc -s class show dev $qos_ifb
+	tc -s filter show dev $qos_ifb
+	tc -s filter show dev $qos_ifb parent 2:
+}
+
+# 启动阶段（空操作）
+boot()
+{
+	return
+}
