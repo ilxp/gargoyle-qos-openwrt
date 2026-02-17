@@ -454,37 +454,6 @@ update_markfile()
 	fi
 }
 
-# 自动适应内存大小的SFQ队列深度设置
-configure_sfq_depth() {
-    # 更健壮的内存获取方式
-    local total_mem_kb=$(awk '/^MemTotal:/ {print $2}' /proc/meminfo 2>/dev/null)
-    
-    # 默认值（高内存配置）
-    local sfq_depth=""
-    
-    if [ -n "$total_mem_kb" ] && [ "$total_mem_kb" -gt 0 ]; then
-        # 精确内存阈值计算（单位：KB）
-        # 小内存设备 (<16MB)   -> depth 32 (≈11Mbps上限)
-        # 中等内存设备 (16-64MB) -> depth 64 (≈22Mbps上限)
-        # 大内存设备 (>64MB)    -> depth 127 (≈350Mbps上限)
-        
-        if [ "$total_mem_kb" -lt 16384 ]; then       # < 16MB
-            sfq_depth="depth 32"
-        elif [ "$total_mem_kb" -lt 65536 ]; then     # 16-64MB
-            sfq_depth="depth 64"
-        else                                         # > 64MB
-            sfq_depth="depth 127"
-        fi
-        
-        # 记录调试信息
-        logger -t qos_gargoyle "Memory detected: ${total_mem_kb}KB, SFQ depth set to: ${sfq_depth:-default(127)}"
-    else
-        logger -t qos_gargoyle "Unable to detect memory, using default SFQ settings"
-    fi
-    
-    echo "$sfq_depth"
-}
-
 # 初始化qos
 initialize_qos()
 {
@@ -516,8 +485,12 @@ initialize_qos()
 	#When depth is limited to 32 maximum bandwidth through any class will be around 11Mbps.
 	#Otherwise it will be around 350Mbps.
 	# 查看总内存使用量
-   # 自动配置SFQ队列深度
-    sfq_depth=$(configure_sfq_depth)
+	total_mem="$(sed -e '/^MemTotal: /!d; s#MemTotal: *##; s# kB##g' /proc/meminfo)"
+	if [ "$total_mem" -lt 16000 ] ; then
+		sfq_depth="depth 32";
+	else
+		sfq_depth="";
+	fi
 
 	eval "$echo_off"
 	#load upload variables
