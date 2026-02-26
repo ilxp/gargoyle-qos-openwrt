@@ -1,97 +1,169 @@
-<%#
- Copyright 2017 Xingwang Liao <kuoruan@gmail.com>
- Licensed to the public under the Apache License 2.0.
--%>
-
 <%
-	local dsp = require "luci.dispatcher"
-	local request = dsp.context.path
-	local leaf = request[#request]
--%>
+-- Copyright 2017 Xingwang Liao <kuoruan@gmail.com>
+-- Licensed to the public under the Apache License 2.0.
+
+local dsp = require "luci.dispatcher"
+local request = dsp.context.path
+local leaf = request[#request]
+%>
 
 <style title="text/css">
 /* container for entire page. fixes bootstrap theme's ridiculously small page width */
 .container {
-	max-width: none;
-	margin: 0 30px;
-	width: auto;
+    max-width: none;
+    margin: 0 30px;
+    width: auto;
 }
 /* column for configuration section name */
 table th {
-	padding: 5px 0;
-	text-align: center;
-	vertical-align: middle;
+    padding: 5px 0;
+    text-align: center;
+    vertical-align: middle;
 }
 /* cells showing the configuration values */
 table td {
-	padding: 5px 0;
-	text-align: center;
-	vertical-align: middle;
+    padding: 5px 0;
+    text-align: center;
+    vertical-align: middle;
 }
 /* sort buttons column */
 table.cbi-section-table td.cbi-section-table-cell {
-	text-align: center;
+    text-align: center;
 }
 </style>
 
 <%+cbi/map%>
 
 <script type="text/javascript">//<![CDATA[
-	function bpsToKbpsString(bps) {
-		var kbps = '*';
-		var bpsn = parseInt(bps) / 1000;
-		if (isNaN(bpsn)) {
-			kbps = '*';
-		} else if (bpsn < 1) {
-			kbps = bpsn.toFixed(1) + '';
-		} else {
-			kbps = bpsn.toFixed(0) + '';
-		}
-		return kbps;
-	}
-	(function(doc){
-		var tbs = doc.getElementsByClassName('ld-<%=leaf%>');
-		var lastTime = 0;
-		var dataTable = [];
-		var updateInProgress = false;
-
-		XHR.poll(3, '<%=dsp.build_url("admin", "qos", "qos_gargoyle", "load_data", leaf)%>',
-			null, function(res) {
-				if (res.readyState == 4 && tbs) {
-					var timestamp = new Date().getTime();
-					var timeDiff = timestamp - lastTime;
-					lastTime = timestamp;
-
-					if (updateInProgress) return;
-
-					updateInProgress = true;
-					var lines = res.responseText.match(/hfsc\s1:[0-9]{1,2}\s.+leaf.+\n.+Sent\s[0-9]+/g);
-
-					if (lines) {
-						for (var i = 0, len = lines.length; i < len; i++) {
-							var line = lines[i];
-							var idx = parseInt(line.match(/hfsc\s1:([0-9]+)/)[1]) - 2;
-							var lastBytes;
-							if (idx < tbs.length) {
-								lastBytes = dataTable[idx];
-								var newBytes = line.match(/Sent\s([0-9]+)/)[1];
-								dataTable[idx] = newBytes;
-								var bps = NaN;
-								if (lastBytes) {
-									var diffBytes = parseInt(newBytes) - parseInt(lastBytes);
-									if (diffBytes <= 0) {
-										bps = 0;
-									} else {
-										bps = diffBytes * 8000 / timeDiff;
-									}
-								}
-								tbs[idx].innerText = bpsToKbpsString(bps);
-							}
-						}
-					}
-					updateInProgress = false;
-				}
-			}
-		);
-	}(document));
+(function() {
+    if (typeof window.qosLoadInitialized !== 'undefined') return;
+    window.qosLoadInitialized = true;
+    
+    var leaf = '<%=leaf%>';
+    console.log('QoS负载显示初始化，方向:', leaf);
+    
+    // 查找负载显示单元格
+    function findLoadCells() {
+        var cells = [];
+        var tables = document.querySelectorAll('table.cbi-section-table, table.table');
+        
+        tables.forEach(function(table) {
+            // 查找包含"负载"的表头
+            var headers = table.querySelectorAll('th');
+            var loadCol = -1;
+            
+            for (var i = 0; i < headers.length; i++) {
+                if (headers[i].textContent.includes('负载')) {
+                    loadCol = i;
+                    break;
+                }
+            }
+            
+            if (loadCol >= 0) {
+                var rows = table.querySelectorAll('tbody tr');
+                for (var i = 0; i < rows.length; i++) {
+                    var tds = rows[i].querySelectorAll('td');
+                    if (tds.length > loadCol) {
+                        cells.push({
+                            element: tds[loadCol],
+                            rowIndex: i
+                        });
+                    }
+                }
+            }
+        });
+        
+        console.log('找到负载单元格:', cells.length, '个');
+        return cells;
+    }
+    
+    // 解析TC数据
+    function parseTCData(text) {
+        var data = {};
+        if (!text || text.trim().length === 0) return data;
+        
+        var lines = text.split('\n');
+        var currentClass = null;
+        
+        lines.forEach(function(line) {
+            var classMatch = line.match(/class\s+hfsc\s+1:(\d+)/);
+            if (classMatch) {
+                currentClass = classMatch[1];
+            }
+            
+            if (currentClass && line.includes('Sent')) {
+                var sentMatch = line.match(/Sent\s+(\d+)/);
+                if (sentMatch) {
+                    data[currentClass] = parseInt(sentMatch[1]);
+                    currentClass = null;
+                }
+            }
+        });
+        
+        return data;
+    }
+    
+    // 主逻辑
+    var loadCells = findLoadCells();
+    if (loadCells.length === 0) {
+        console.warn('未找到负载显示单元格');
+        return;
+    }
+    
+    var lastBytes = {};
+    var lastTime = Date.now();
+    
+    // 初始化显示
+    loadCells.forEach(function(cell) {
+        cell.element.textContent = '0';
+    });
+    
+    // 更新函数
+    function updateLoadDisplay() {
+        var url = '<%=dsp.build_url("admin", "qos", "qos_gargoyle", "load_data", leaf)%>';
+        
+        fetch(url)
+            .then(function(response) { 
+                if (!response.ok) throw new Error('HTTP ' + response.status);
+                return response.text(); 
+            })
+            .then(function(data) {
+                var now = Date.now();
+                var timeDiff = now - lastTime;
+                if (timeDiff <= 0) timeDiff = 3000;
+                
+                var tcData = parseTCData(data);
+                
+                loadCells.forEach(function(cell, idx) {
+                    var classId = (idx + 2).toString(); // 从1:2开始
+                    if (tcData[classId] !== undefined) {
+                        var newBytes = tcData[classId];
+                        var oldBytes = lastBytes[classId] || 0;
+                        var kbps = 0;
+                        
+                        if (oldBytes > 0 && timeDiff > 0 && newBytes >= oldBytes) {
+                            var bytesDiff = newBytes - oldBytes;
+                            var bps = (bytesDiff * 8) * (1000 / timeDiff);
+                            kbps = Math.round(bps / 1000);
+                        }
+                        
+                        lastBytes[classId] = newBytes;
+                        cell.element.textContent = kbps.toString();
+                    } else {
+                        cell.element.textContent = '0';
+                    }
+                });
+                
+                lastTime = now;
+                setTimeout(updateLoadDisplay, 3000);
+            })
+            .catch(function(error) {
+                console.error('更新负载数据失败:', error);
+                setTimeout(updateLoadDisplay, 5000);
+            });
+    }
+    
+    // 延迟启动更新
+    setTimeout(updateLoadDisplay, 1000);
+})();
 //]]></script>
