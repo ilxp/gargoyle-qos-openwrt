@@ -1,0 +1,358 @@
+<%
+-- Copyright 2017 Xingwang Liao <kuoruan@gmail.com>
+-- Licensed to the public under the Apache License 2.0.
+
+local dsp = require "luci.dispatcher"
+local request = dsp.context.path
+local leaf = request[#request]
+%>
+
+<style title="text/css">
+/* container for entire page. fixes bootstrap theme's ridiculously small page width */
+.container {
+    max-width: none;
+    margin: 0 30px;
+    width: auto;
+}
+/* column for configuration section name */
+table th {
+    padding: 5px 0;
+    text-align: center;
+    vertical-align: middle;
+}
+/* cells showing the configuration values */
+table td {
+    padding: 5px 0;
+    text-align: center;
+    vertical-align: middle;
+}
+/* sort buttons column */
+table.cbi-section-table td.cbi-section-table-cell {
+    text-align: center;
+}
+</style>
+
+<%+cbi/map%>
+
+<script type="text/javascript">//<![CDATA[
+// QoS负载显示增强版
+(function() {
+    if (typeof window.qosLoadEnhanced !== 'undefined') return;
+    window.qosLoadEnhanced = true;
+    
+    var leaf = '<%=leaf%>';
+    console.log('QoS增强显示初始化，方向:', leaf);
+    
+    // 配置参数
+    var config = {
+        enableColor: true,      // 启用颜色标识
+        enableUnit: 'auto',     // 单位显示: 'auto', 'fixed', 'none'
+        enableTooltip: true,    // 启用工具提示
+        maxBandwidth: 100000,   // 最大带宽(kbps)，用于百分比计算
+        refreshInterval: 3000,  // 刷新间隔(ms)
+        historySize: 10         // 历史记录数量
+    };
+    
+    // 查找负载显示单元格
+    function findLoadCells() {
+        var cells = [];
+        var tables = document.querySelectorAll('table.cbi-section-table, table.table');
+        
+        tables.forEach(function(table) {
+            var headers = table.querySelectorAll('th');
+            var loadCol = -1;
+            
+            for (var i = 0; i < headers.length; i++) {
+                if (headers[i].textContent.includes('负载')) {
+                    loadCol = i;
+                    break;
+                }
+            }
+            
+            if (loadCol >= 0) {
+                var rows = table.querySelectorAll('tbody tr');
+                for (var i = 0; i < rows.length; i++) {
+                    var tds = rows[i].querySelectorAll('td');
+                    if (tds.length > loadCol) {
+                        var cell = tds[loadCol];
+                        cells.push({
+                            element: cell,
+                            rowIndex: i,
+                            history: [],
+                            maxValue: 0
+                        });
+                        
+                        // 添加工具提示容器
+                        if (config.enableTooltip) {
+                            cell.title = '点击查看详情';
+                            cell.style.cursor = 'help';
+                            cell.onclick = function() {
+                                showCellDetails(this);
+                            };
+                        }
+                    }
+                }
+            }
+        });
+        
+        console.log('找到负载单元格:', cells.length, '个');
+        return cells;
+    }
+    
+    // 格式化速度显示
+    function formatSpeed(kbps) {
+        switch(config.enableUnit) {
+            case 'auto':
+                if (kbps >= 1000) {
+                    return (kbps / 1000).toFixed(1) + ' Mbps';
+                } else {
+                    return kbps + ' kbps';
+                }
+            case 'fixed':
+                return kbps + ' kbps';
+            default:
+                return kbps.toString();
+        }
+    }
+    
+    // 获取颜色标识
+    function getSpeedColor(kbps) {
+        if (!config.enableColor) return '';
+        
+        var percentage = (kbps / config.maxBandwidth) * 100;
+        
+        if (percentage < 20) return '#4CAF50';      // 绿色 - 低负载
+        if (percentage < 50) return '#8BC34A';      // 浅绿
+        if (percentage < 70) return '#FFC107';      // 黄色 - 中等
+        if (percentage < 90) return '#FF9800';      // 橙色 - 较高
+        return '#F44336';                          // 红色 - 高负载
+    }
+    
+    // 解析TC数据
+    function parseTCData(text) {
+        var data = {};
+        if (!text || text.trim().length === 0) return data;
+        
+        var lines = text.split('\n');
+        var currentClass = null;
+        
+        lines.forEach(function(line) {
+            var classMatch = line.match(/class\s+hfsc\s+1:(\d+)/);
+            if (classMatch) currentClass = classMatch[1];
+            
+            if (currentClass && line.includes('Sent')) {
+                var sentMatch = line.match(/Sent\s+(\d+)/);
+                if (sentMatch) {
+                    data[currentClass] = parseInt(sentMatch[1]);
+                    currentClass = null;
+                }
+            }
+        });
+        
+        return data;
+    }
+    
+    // 显示单元格详情
+    function showCellDetails(cellElement) {
+        var index = Array.from(cellElement.parentElement.parentElement.children)
+                        .indexOf(cellElement.parentElement);
+        var cellInfo = loadCells[index];
+        
+        if (!cellInfo) return;
+        
+        var details = [
+            '实时负载: ' + formatSpeed(cellInfo.currentValue || 0),
+            '历史峰值: ' + formatSpeed(cellInfo.maxValue),
+            '服务类型: 类 ' + (index + 2)
+        ];
+        
+        if (cellInfo.history.length > 1) {
+            var avg = cellInfo.history.reduce((a, b) => a + b, 0) / cellInfo.history.length;
+            details.push('平均负载: ' + formatSpeed(avg));
+            
+            var trend = cellInfo.history[cellInfo.history.length - 1] - 
+                       cellInfo.history[Math.max(0, cellInfo.history.length - 2)];
+            details.push('变化趋势: ' + (trend >= 0 ? '↑' : '↓') + formatSpeed(Math.abs(trend)));
+        }
+        
+        alert('负载详情:\n' + details.join('\n'));
+    }
+    
+    // 主逻辑
+    var loadCells = findLoadCells();
+    if (loadCells.length === 0) {
+        console.warn('未找到负载显示单元格');
+        return;
+    }
+    
+    var lastBytes = {};
+    var lastTime = Date.now();
+    
+    // 初始化显示
+    loadCells.forEach(function(cell) {
+        cell.element.textContent = '0 kbps';
+        if (config.enableColor) {
+            cell.element.style.color = getSpeedColor(0);
+        }
+    });
+    
+    // 更新显示
+    function updateLoadDisplay() {
+        var url = '<%=dsp.build_url("admin", "qos", "qos_gargoyle", "load_data", leaf)%>';
+        
+        fetch(url)
+            .then(function(response) { 
+                if (!response.ok) throw new Error('HTTP ' + response.status);
+                return response.text(); 
+            })
+            .then(function(data) {
+                var now = Date.now();
+                var timeDiff = now - lastTime;
+                if (timeDiff <= 0) timeDiff = config.refreshInterval;
+                
+                var tcData = parseTCData(data);
+                
+                loadCells.forEach(function(cell, idx) {
+                    var classId = (idx + 2).toString();
+                    var kbps = 0;
+                    
+                    if (tcData[classId] !== undefined) {
+                        var newBytes = tcData[classId];
+                        var oldBytes = lastBytes[classId] || 0;
+                        
+                        if (oldBytes > 0 && timeDiff > 0 && newBytes >= oldBytes) {
+                            var bytesDiff = newBytes - oldBytes;
+                            var bps = (bytesDiff * 8) * (1000 / timeDiff);
+                            kbps = Math.round(bps / 1000);
+                        }
+                        
+                        lastBytes[classId] = newBytes;
+                        cell.currentValue = kbps;
+                        
+                        // 更新历史记录
+                        cell.history.push(kbps);
+                        if (cell.history.length > config.historySize) {
+                            cell.history.shift();
+                        }
+                        
+                        // 更新峰值
+                        if (kbps > cell.maxValue) {
+                            cell.maxValue = kbps;
+                        }
+                    }
+                    
+                    // 更新显示
+                    cell.element.innerHTML = formatSpeed(kbps);
+                    if (config.enableColor) {
+                        cell.element.style.color = getSpeedColor(kbps);
+                        cell.element.style.fontWeight = kbps > config.maxBandwidth * 0.8 ? 'bold' : 'normal';
+                    }
+                    
+                    // 更新工具提示
+                    if (config.enableTooltip) {
+                        var percentage = ((kbps / config.maxBandwidth) * 100).toFixed(1);
+                        cell.element.title = '当前: ' + formatSpeed(kbps) + 
+                                           '\n占比: ' + percentage + '%' +
+                                           '\n峰值: ' + formatSpeed(cell.maxValue) +
+                                           '\n点击查看详情';
+                    }
+                });
+                
+                lastTime = now;
+                setTimeout(updateLoadDisplay, config.refreshInterval);
+            })
+            .catch(function(error) {
+                console.error('更新负载数据失败:', error);
+                // 错误时显示灰色
+                loadCells.forEach(function(cell) {
+                    cell.element.style.color = '#9E9E9E';
+                    cell.element.title = '数据获取失败，正在重试...';
+                });
+                setTimeout(updateLoadDisplay, 5000);
+            });
+    }
+    
+    // 添加配置面板（可选）
+    function addConfigPanel() {
+        var container = document.querySelector('.container');
+        if (!container) return;
+        
+        var configHtml = `
+            <div style="margin: 10px 0; padding: 10px; background: #f5f5f5; border-radius: 4px;">
+                <small>QoS显示设置: 
+                    <label><input type="checkbox" id="qosColorToggle" checked> 颜色标识</label>
+                    <label><input type="checkbox" id="qosTooltipToggle" checked> 工具提示</label>
+                    单位: 
+                    <select id="qosUnitSelect">
+                        <option value="auto">自动</option>
+                        <option value="fixed">固定(kbps)</option>
+                        <option value="none">无单位</option>
+                    </select>
+                </small>
+            </div>
+        `;
+        
+        container.insertAdjacentHTML('afterbegin', configHtml);
+        
+        // 事件监听
+        document.getElementById('qosColorToggle').onchange = function() {
+            config.enableColor = this.checked;
+        };
+        
+        document.getElementById('qosTooltipToggle').onchange = function() {
+            config.enableTooltip = this.checked;
+        };
+        
+        document.getElementById('qosUnitSelect').onchange = function() {
+            config.enableUnit = this.value;
+        };
+    }
+    
+    // 延迟启动
+    setTimeout(function() {
+        updateLoadDisplay();
+        // addConfigPanel(); // 如需配置面板可取消注释
+    }, 1000);
+    
+    console.log('QoS增强显示已启动');
+})();
+//]]></script>
+
+<style>
+/* QoS负载显示增强样式 */
+.qos-load-cell {
+    transition: all 0.3s ease;
+    padding: 4px 8px;
+    border-radius: 3px;
+    min-width: 80px;
+    display: inline-block;
+}
+
+.qos-load-low { background-color: #E8F5E9; }
+.qos-load-medium { background-color: #FFF3E0; }
+.qos-load-high { background-color: #FFEBEE; }
+
+.qos-trend-up { color: #F44336; }
+.qos-trend-down { color: #4CAF50; }
+.qos-trend-stable { color: #9E9E9E; }
+
+.qos-tooltip {
+    position: relative;
+    cursor: help;
+}
+
+.qos-tooltip:hover::after {
+    content: attr(data-tooltip);
+    position: absolute;
+    bottom: 100%;
+    left: 50%;
+    transform: translateX(-50%);
+    background: #333;
+    color: white;
+    padding: 6px 10px;
+    border-radius: 4px;
+    font-size: 12px;
+    white-space: nowrap;
+    z-index: 1000;
+}
+</style>
