@@ -2,7 +2,7 @@ CC = gcc
 CFLAGS = -Wall -O2 -D_GNU_SOURCE
 LDFLAGS = -lpthread
 
-TARGET = qos_dba
+TARGET = qosdba
 OBJS = config_parser.o tc_monitor.o dba_core.o qos_dba.o main.o
 
 all: $(TARGET)
@@ -20,12 +20,12 @@ install: $(TARGET)
 	install -d /usr/sbin
 	install -m 755 $(TARGET) /usr/sbin/
 	install -d /etc/init.d
-	install -m 755 qos_dba.init /etc/init.d/qos_dba
+	install -m 755 qosdba.init /etc/init.d/qosdba
 	update-rc.d qos_dba defaults
 
 uninstall:
 	rm -f /usr/sbin/$(TARGET)
-	rm -f /etc/init.d/qos_dba
-	update-rc.d qos_dba remove
+	rm -f /etc/init.d/qosdba
+	update-rc.d qosdba remove
 
 .PHONY: all clean install uninstall

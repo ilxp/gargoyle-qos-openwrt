@@ -5,7 +5,7 @@ START=99
 STOP=10
 
 USE_PROCD=1
-PROG=/usr/local/bin/qos_dba
+PROG=/usr/sbin/qosdba
 
 start_service() {
     procd_open_instance
@@ -17,5 +17,5 @@ start_service() {
 }
 
 stop_service() {
-    killall qos_dba 2>/dev/null
+    killall qosdba 2>/dev/null
 }
