@@ -1,34 +1,31 @@
-BINDIR = /usr/sbin
-#TCDIR:=$(BUILD_DIR)/iproute2-tc*/ip*
-TCDIR:=$(shell if [ -e "${BUILD_DIR}/iproute2-tcfull" ] ; then echo "${BUILD_DIR}/iproute2-tcfull"/ip* ; else echo "${BUILD_DIR}/iproute2-tctiny"/ip* ; fi ; )
-#The ncurses library only needed if we remove the ONLYBG switch
-#below.  Mostly for debug
-#LDLIBS += -lncurses
+CC = gcc
+CFLAGS = -Wall -O2 -D_GNU_SOURCE
+LDFLAGS = -lpthread
 
-LDLIBS += -lm
+TARGET = qos_dba
+OBJS = config_parser.o tc_monitor.o dba_core.o qos_dba.o main.o
 
+all: $(TARGET)
 
-TCOBJS := $(TCDIR)/tc/tc_util.o
-TCOBJS += $(TCDIR)/tc/tc_core.o
-TCOBJS += $(TCDIR)/tc/q_hfsc.o
-TCOBJS += $(TCDIR)/lib/libnetlink.a
-TCOBJS += $(TCDIR)/lib/libutil.a
-LDFLAGS += -Wl,-export-dynamic 
+$(TARGET): $(OBJS)
+	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
 
-all: qosmon
-
-qosmon: qosmon.o
-	$(CC) $(LDFLAGS) $^ $(TCOBJS) -o $@ $(LDLIBS)
-
-qosmon.o: qosmon.c
-	$(CC) -D ONLYBG $(CFLAGS) -I $(TCDIR)/include -I $(TCDIR)/tc -c $^ -o $@
-
-install: all uninstall
-	-mkdir -p $(BINDIR)
-	cp qosmon  $(BINDIR)
-
-uninstall:
-	rm -f $(BINDIR)/qosmon
+%.o: %.c qos_dba.h
+	$(CC) $(CFLAGS) -c -o $@ $<
 
 clean:
-	rm -rf *.o *~ .*sw* qosmon
+	rm -f $(TARGET) $(OBJS)
+
+install: $(TARGET)
+	install -d /usr/local/bin
+	install -m 755 $(TARGET) /usr/local/bin/
+	install -d /etc/init.d
+	install -m 755 qos_dba.init /etc/init.d/qos_dba
+	update-rc.d qos_dba defaults
+
+uninstall:
+	rm -f /usr/local/bin/$(TARGET)
+	rm -f /etc/init.d/qos_dba
+	update-rc.d qos_dba remove
+
+.PHONY: all clean install uninstall
