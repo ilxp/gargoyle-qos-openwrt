@@ -74,7 +74,7 @@ define Package/qos-gargoyle/install
 	$(INSTALL_BIN) $(CURDIR)/files/gargoyle_firewall.include $(1)/usr/share/qos_gargoyle/gargoyle_firewall.include
 
 	$(INSTALL_DIR) $(1)/usr/sbin
-	$(INSTALL_BIN) $(PKG_BUILD_DIR)/qosmon $(1)/usr/sbin/qosmon
+	$(INSTALL_BIN) $(PKG_BUILD_DIR)/qos_dba $(1)/usr/sbin/qos_dba
 endef
 
 define Package/qos-gargoyle/prerm

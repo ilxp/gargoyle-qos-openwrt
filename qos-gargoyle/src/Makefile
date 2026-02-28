@@ -17,14 +17,14 @@ clean:
 	rm -f $(TARGET) $(OBJS)
 
 install: $(TARGET)
-	install -d /usr/local/bin
-	install -m 755 $(TARGET) /usr/local/bin/
+	install -d /usr/sbin
+	install -m 755 $(TARGET) /usr/sbin/
 	install -d /etc/init.d
 	install -m 755 qos_dba.init /etc/init.d/qos_dba
 	update-rc.d qos_dba defaults
 
 uninstall:
-	rm -f /usr/local/bin/$(TARGET)
+	rm -f /usr/sbin/$(TARGET)
 	rm -f /etc/init.d/qos_dba
 	update-rc.d qos_dba remove
 
