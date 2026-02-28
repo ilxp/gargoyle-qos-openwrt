@@ -1,6 +1,7 @@
+# Makefile for QoS DBA Daemon
 CC = gcc
 CFLAGS = -Wall -O2 -D_GNU_SOURCE
-LDFLAGS = -lpthread -lm
+LDFLAGS = -lpthread -lm -luci  # 添加了-luci
 
 TARGET = qosdba
 OBJS = config_parser.o dba_core.o qos_dba.o main.o tc_monitor.o
