@@ -1,113 +1,31 @@
 #include "qos_dba.h"
 #include <signal.h>
+#include <sys/wait.h>
+#include <uci.h>
 
+// 全局变量定义
+qos_dba_system_t g_qos_system = {0};
 static pthread_t g_monitor_thread = 0;
 static int g_is_running = 0;
 
-// 打印系统状态
-void qos_dba_print_status(void) {
-    pthread_mutex_lock(&g_qos_system.mutex);
+// 辅助函数：解析带宽字符串
+static int parse_bandwidth_string(const char *str) {
+    if (!str) return 0;
     
-    dba_config_t *config = &g_qos_system.config;
+    char *endptr;
+    long value = strtol(str, &endptr, 10);
     
-    printf("\n=================== QoS DBA 状态 ===================\n");
-    printf("接口: %s, 总带宽: %d kbps (%.1f Mbps)\n", 
-           g_qos_system.wan_interface,
-           g_qos_system.total_bandwidth_kbps,
-           g_qos_system.total_bandwidth_kbps / 1000.0);
-    printf("DBA状态: %s, 检查间隔: %d秒\n",
-           config->enabled ? "启用" : "禁用",
-           config->interval);
+    if (endptr == str) return 0;
     
-    printf("\n上传分类:\n");
-    printf("%-12s %-8s %-8s %-8s %-8s %-8s %-8s %-12s %-8s\n", 
-           "分类", "配置%", "最小", "最大", "当前", "使用", "使用率", "状态", "借用");
-    printf("--------------------------------------------------------------------------------\n");
-    
-    for (int i = 0; i < g_qos_system.upload_class_count; i++) {
-        qos_class_t *cls = &g_qos_system.upload_classes[i];
-        
-        char status[16];
-        if (cls->high_usage_seconds > 0) {
-            snprintf(status, sizeof(status), "高负荷(%ds)", cls->high_usage_seconds);
-        } else if (cls->low_usage_seconds > 0) {
-            snprintf(status, sizeof(status), "低负荷(%ds)", cls->low_usage_seconds);
-        } else {
-            snprintf(status, sizeof(status), "正常(%ds)", cls->normal_usage_seconds);
-        }
-        
-        char borrowed[16];
-        if (cls->borrowed_kbps > 0) {
-            snprintf(borrowed, sizeof(borrowed), "+%d", cls->borrowed_kbps);
-        } else if (cls->borrowed_kbps < 0) {
-            snprintf(borrowed, sizeof(borrowed), "%d", cls->borrowed_kbps);
-        } else {
-            snprintf(borrowed, sizeof(borrowed), "0");
-        }
-        
-        printf("%-12s %-8d %-8d %-8d %-8d %-8d %-7.1f%% %-12s %-8s\n",
-               cls->name,
-               cls->config_percent,
-               cls->config_min_kbps,
-               cls->config_max_kbps,
-               cls->current_kbps,
-               cls->used_kbps,
-               cls->usage_rate * 100,
-               status,
-               borrowed);
+    if (*endptr == 'k' || *endptr == 'K') {
+        return (int)value;
+    } else if (*endptr == 'm' || *endptr == 'M') {
+        return (int)(value * 1000);
+    } else if (*endptr == 'g' || *endptr == 'G') {
+        return (int)(value * 1000000);
+    } else {
+        return (int)value;
     }
-    
-    printf("\n下载分类:\n");
-    printf("%-12s %-8s %-8s %-8s %-8s %-8s %-8s %-12s %-8s\n", 
-           "分类", "配置%", "最小", "最大", "当前", "使用", "使用率", "状态", "借用");
-    printf("--------------------------------------------------------------------------------\n");
-    
-    for (int i = 0; i < g_qos_system.download_class_count; i++) {
-        qos_class_t *cls = &g_qos_system.download_classes[i];
-        
-        char status[16];
-        if (cls->high_usage_seconds > 0) {
-            snprintf(status, sizeof(status), "高负荷(%ds)", cls->high_usage_seconds);
-        } else if (cls->low_usage_seconds > 0) {
-            snprintf(status, sizeof(status), "低负荷(%ds)", cls->low_usage_seconds);
-        } else {
-            snprintf(status, sizeof(status), "正常(%ds)", cls->normal_usage_seconds);
-        }
-        
-        char borrowed[16];
-        if (cls->borrowed_kbps > 0) {
-            snprintf(borrowed, sizeof(borrowed), "+%d", cls->borrowed_kbps);
-        } else if (cls->borrowed_kbps < 0) {
-            snprintf(borrowed, sizeof(borrowed), "%d", cls->borrowed_kbps);
-        } else {
-            snprintf(borrowed, sizeof(borrowed), "0");
-        }
-        
-        printf("%-12s %-8d %-8d %-8d %-8d %-8d %-7.1f%% %-12s %-8s\n",
-               cls->name,
-               cls->config_percent,
-               cls->config_min_kbps,
-               cls->config_max_kbps,
-               cls->current_kbps,
-               cls->used_kbps,
-               cls->usage_rate * 100,
-               status,
-               borrowed);
-    }
-    
-    printf("\n调整参数:\n");
-    printf("  高使用阈值=%d%%, 持续时间=%ds\n", config->high_usage_threshold, config->high_usage_duration);
-    printf("  低使用阈值=%d%%, 持续时间=%ds\n", config->low_usage_threshold, config->low_usage_duration);
-    printf("  借用比例=%.1f, 最小借用=%dkbps\n", config->borrow_ratio, config->min_borrow_kbps);
-    printf("  冷却时间=%ds, 自动归还=%s\n", config->cooldown_time, config->auto_return_enable ? "是" : "否");
-    
-    if (config->auto_return_enable) {
-        printf("  归还阈值=%d%%, 归还速度=%.1f\n", config->return_threshold, config->return_speed);
-    }
-    
-    printf("====================================================\n");
-    
-    pthread_mutex_unlock(&g_qos_system.mutex);
 }
 
 // 检测WAN接口
@@ -120,6 +38,7 @@ static int detect_wan_interface(void) {
     if (execute_command(cmd, output, sizeof(output)) == 0 && strlen(output) > 1) {
         output[strlen(output)-1] = '\0';  // 去掉换行符
         strncpy(g_qos_system.wan_interface, output, MAX_IFACE_LEN-1);
+        g_qos_system.wan_interface[MAX_IFACE_LEN-1] = '\0';
         DEBUG_LOG("检测到WAN接口: %s", g_qos_system.wan_interface);
         return 0;
     }
@@ -128,8 +47,9 @@ static int detect_wan_interface(void) {
     const char *common_ifaces[] = {"eth0", "eth1", "ppp0", "wan", "br-wan", NULL};
     for (int i = 0; common_ifaces[i] != NULL; i++) {
         snprintf(cmd, sizeof(cmd), "ip link show %s 2>/dev/null | grep -q 'state UP'", common_ifaces[i]);
-        if (system(cmd) == 0) {
+        if (execute_command(cmd, NULL, 0) == 0) {
             strncpy(g_qos_system.wan_interface, common_ifaces[i], MAX_IFACE_LEN-1);
+            g_qos_system.wan_interface[MAX_IFACE_LEN-1] = '\0';
             DEBUG_LOG("使用接口: %s", g_qos_system.wan_interface);
             return 0;
         }
@@ -143,17 +63,6 @@ static int detect_wan_interface(void) {
 static int detect_total_bandwidth(void) {
     char cmd[256];
     char output[256] = {0};
-    
-    // 尝试从speedtest获取
-    snprintf(cmd, sizeof(cmd), "cat /tmp/speedtest_result 2>/dev/null | grep 'Download:' | awk '{print $2}'");
-    if (execute_command(cmd, output, sizeof(output)) == 0 && strlen(output) > 0) {
-        float mbps = atof(output);
-        if (mbps > 0) {
-            g_qos_system.total_bandwidth_kbps = (int)(mbps * 1000);
-            DEBUG_LOG("从speedtest获取带宽: %.1f Mbps", mbps);
-            return 0;
-        }
-    }
     
     // 尝试从配置读取
     FILE *fp = fopen("/etc/config/qos_gargoyle", "r");
@@ -174,7 +83,9 @@ static int detect_total_bandwidth(void) {
                         
                         g_qos_system.total_bandwidth_kbps = parse_bandwidth_string(value_str);
                         if (g_qos_system.total_bandwidth_kbps > 0) {
-                            DEBUG_LOG("从配置获取带宽: %d kbps", g_qos_system.total_bandwidth_kbps);
+                            DEBUG_LOG("从配置获取带宽: %d kbps (%.1f Mbps)", 
+                                     g_qos_system.total_bandwidth_kbps,
+                                     g_qos_system.total_bandwidth_kbps / 1000.0);
                             fclose(fp);
                             return 0;
                         }
@@ -191,6 +102,112 @@ static int detect_total_bandwidth(void) {
     return 0;
 }
 
+// 打印系统状态
+void qos_dba_print_status(void) {
+    dba_config_t *config = &g_qos_system.config;
+    
+    printf("\n=================== QoS DBA 状态 ===================\n");
+    printf("接口: %s, 总带宽: %d kbps (%.1f Mbps)\n", 
+           g_qos_system.wan_interface,
+           g_qos_system.total_bandwidth_kbps,
+           g_qos_system.total_bandwidth_kbps / 1000.0);
+    printf("DBA状态: %s, 检查间隔: %d秒\n",
+           config->enabled ? "启用" : "禁用",
+           config->interval);
+    
+    if (g_qos_system.upload_class_count > 0) {
+        printf("\n上传分类:\n");
+        printf("%-12s %-8s %-8s %-8s %-8s %-8s %-8s %-12s %-8s\n", 
+               "分类", "配置%", "最小", "最大", "当前", "使用", "使用率", "状态", "借用");
+        printf("--------------------------------------------------------------------------------\n");
+        
+        for (int i = 0; i < g_qos_system.upload_class_count; i++) {
+            qos_class_t *cls = &g_qos_system.upload_classes[i];
+            
+            char status[32];
+            if (cls->high_usage_seconds > 0) {
+                snprintf(status, sizeof(status), "高负荷(%ds)", cls->high_usage_seconds);
+            } else if (cls->low_usage_seconds > 0) {
+                snprintf(status, sizeof(status), "低负荷(%ds)", cls->low_usage_seconds);
+            } else {
+                snprintf(status, sizeof(status), "正常(%ds)", cls->normal_usage_seconds);
+            }
+            
+            char borrowed[16];
+            if (cls->borrowed_kbps > 0) {
+                snprintf(borrowed, sizeof(borrowed), "+%d", cls->borrowed_kbps);
+            } else if (cls->borrowed_kbps < 0) {
+                snprintf(borrowed, sizeof(borrowed), "%d", cls->borrowed_kbps);
+            } else {
+                snprintf(borrowed, sizeof(borrowed), "0");
+            }
+            
+            printf("%-12s %-8d %-8d %-8d %-8d %-8d %-7.1f%% %-12s %-8s\n",
+                   cls->name,
+                   cls->config_percent,
+                   cls->config_min_kbps,
+                   cls->config_max_kbps,
+                   cls->current_kbps,
+                   cls->used_kbps,
+                   cls->usage_rate * 100,
+                   status,
+                   borrowed);
+        }
+    }
+    
+    if (g_qos_system.download_class_count > 0) {
+        printf("\n下载分类:\n");
+        printf("%-12s %-8s %-8s %-8s %-8s %-8s %-8s %-12s %-8s\n", 
+               "分类", "配置%", "最小", "最大", "当前", "使用", "使用率", "状态", "借用");
+        printf("--------------------------------------------------------------------------------\n");
+        
+        for (int i = 0; i < g_qos_system.download_class_count; i++) {
+            qos_class_t *cls = &g_qos_system.download_classes[i];
+            
+            char status[32];
+            if (cls->high_usage_seconds > 0) {
+                snprintf(status, sizeof(status), "高负荷(%ds)", cls->high_usage_seconds);
+            } else if (cls->low_usage_seconds > 0) {
+                snprintf(status, sizeof(status), "低负荷(%ds)", cls->low_usage_seconds);
+            } else {
+                snprintf(status, sizeof(status), "正常(%ds)", cls->normal_usage_seconds);
+            }
+            
+            char borrowed[16];
+            if (cls->borrowed_kbps > 0) {
+                snprintf(borrowed, sizeof(borrowed), "+%d", cls->borrowed_kbps);
+            } else if (cls->borrowed_kbps < 0) {
+                snprintf(borrowed, sizeof(borrowed), "%d", cls->borrowed_kbps);
+            } else {
+                snprintf(borrowed, sizeof(borrowed), "0");
+            }
+            
+            printf("%-12s %-8d %-8d %-8d %-8d %-8d %-7.1f%% %-12s %-8s\n",
+                   cls->name,
+                   cls->config_percent,
+                   cls->config_min_kbps,
+                   cls->config_max_kbps,
+                   cls->current_kbps,
+                   cls->used_kbps,
+                   cls->usage_rate * 100,
+                   status,
+                   borrowed);
+        }
+    }
+    
+    printf("\n调整参数:\n");
+    printf("  高使用阈值=%d%%, 持续时间=%ds\n", config->high_usage_threshold, config->high_usage_duration);
+    printf("  低使用阈值=%d%%, 持续时间=%ds\n", config->low_usage_threshold, config->low_usage_duration);
+    printf("  借用比例=%.1f, 最小借用=%dkbps\n", config->borrow_ratio, config->min_borrow_kbps);
+    printf("  冷却时间=%ds, 自动归还=%s\n", config->cooldown_time, config->auto_return_enable ? "是" : "否");
+    
+    if (config->auto_return_enable) {
+        printf("  归还阈值=%d%%, 归还速度=%.1f\n", config->return_threshold, config->return_speed);
+    }
+    
+    printf("====================================================\n");
+}
+
 // 主监控线程
 static void *monitor_thread(void *arg) {
     DEBUG_LOG("QoS DBA监控线程启动");
@@ -201,6 +218,8 @@ static void *monitor_thread(void *arg) {
             sleep(1);
             continue;
         }
+        
+        pthread_mutex_lock(&g_qos_system.mutex);
         
         // 1. 监控分类状态
         monitor_all_classes();
@@ -218,6 +237,8 @@ static void *monitor_thread(void *arg) {
             qos_dba_print_status();
         }
         
+        pthread_mutex_unlock(&g_qos_system.mutex);
+        
         // 5. 休眠
         sleep(g_qos_system.config.interval);
     }
@@ -229,7 +250,7 @@ static void *monitor_thread(void *arg) {
 // 初始化系统
 int qos_dba_init(const char *config_path) {
     if (!config_path) {
-        config_path = "/etc/config/qos_gargoyle";
+        config_path = DEFAULT_CONFIG_PATH;
     }
     
     // 初始化互斥锁
@@ -357,24 +378,24 @@ int qos_dba_reload_config(void) {
     g_qos_system.download_class_count = 0;
     
     // 重新加载配置
-    int ret = qos_dba_init("/etc/config/qos_gargoyle");
+    int ret = qos_dba_init(DEFAULT_CONFIG_PATH);
     
-    if (ret == 0) {
+    if (ret == 0 && upload_current_bw && download_current_bw) {
         // 恢复带宽设置
-        for (int i = 0; i < g_qos_system.upload_class_count && i < MAX_CLASSES; i++) {
+        for (int i = 0; i < g_qos_system.upload_class_count; i++) {
             if (i < g_qos_system.upload_class_count) {
                 adjust_tc_class_bandwidth(g_qos_system.wan_interface,
-                                        g_qos_system.upload_classes[i].classid,
-                                        upload_current_bw[i]);
+                                         g_qos_system.upload_classes[i].classid,
+                                         upload_current_bw[i]);
                 g_qos_system.upload_classes[i].current_kbps = upload_current_bw[i];
             }
         }
         
-        for (int i = 0; i < g_qos_system.download_class_count && i < MAX_CLASSES; i++) {
+        for (int i = 0; i < g_qos_system.download_class_count; i++) {
             if (i < g_qos_system.download_class_count) {
                 adjust_tc_class_bandwidth(g_qos_system.wan_interface,
-                                        g_qos_system.download_classes[i].classid,
-                                        download_current_bw[i]);
+                                         g_qos_system.download_classes[i].classid,
+                                         download_current_bw[i]);
                 g_qos_system.download_classes[i].current_kbps = download_current_bw[i];
             }
         }

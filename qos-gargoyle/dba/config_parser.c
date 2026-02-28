@@ -1,354 +1,254 @@
 #include "qos_dba.h"
-#include <ctype.h>
+#include <uci.h>
+#include <string.h>
+#include <stdlib.h>
 
-qos_system_t g_qos_system = {0};
-
-// 去除字符串首尾空白字符
-char *trim_whitespace(char *str) {
-    if (!str) return NULL;
-    
-    char *end;
-    
-    // 去除前导空白
-    while (isspace((unsigned char)*str)) str++;
-    
-    if (*str == 0) return str;
-    
-    // 去除尾部空白
-    end = str + strlen(str) - 1;
-    while (end > str && isspace((unsigned char)*end)) end--;
-    
-    end[1] = '\0';
-    
-    return str;
-}
-
-// 判断字符串是否为数字
-int is_numeric_string(const char *str) {
-    if (!str || *str == '\0') return 0;
-    
-    while (*str) {
-        if (!isdigit((unsigned char)*str)) return 0;
-        str++;
-    }
-    return 1;
-}
-
-// 解析带宽字符串
-int parse_bandwidth_string(const char *str) {
-    if (!str) return 0;
-    
-    char *endptr;
-    long value = strtol(str, &endptr, 10);
-    
-    if (endptr == str) {
-        // 尝试解析科学计数法
-        if (strstr(str, "kbps") || strstr(str, "kbit")) {
-            sscanf(str, "%ld", &value);
-            return value;  // 已经是kbps
-        }
-        return 0;
-    }
-    
-    if (strstr(endptr, "mbit") || strstr(endptr, "Mbit") || 
-        strstr(endptr, "mbps") || strstr(endptr, "Mbps")) {
-        return value * 1000;  // Mbps转kbps
-    } else if (strstr(endptr, "gbit") || strstr(endptr, "Gbit") || 
-               strstr(endptr, "gbps") || strstr(endptr, "Gbps")) {
-        return value * 1000000;  // Gbps转kbps
-    } else if (strstr(endptr, "kbit") || strstr(endptr, "Kbit") || 
-               strstr(endptr, "kbps") || strstr(endptr, "Kbps")) {
-        return value;  // 已经是kbps
-    } else {
-        // 默认为kbps
-        return value;
-    }
-}
-
-// 从字符串读取整数配置
-static int get_int_option(const char *line, int default_val) {
-    char *start = strstr(line, "'");
-    if (!start) return default_val;
-    
-    start++;  // 跳过单引号
-    char *end = strchr(start, '\'');
-    if (!end) return default_val;
-    
-    char value_str[32] = {0};
-    int len = end - start;
-    if (len >= sizeof(value_str)) len = sizeof(value_str) - 1;
-    strncpy(value_str, start, len);
-    value_str[len] = '\0';
-    
-    return atoi(value_str);
-}
-
-// 从字符串读取浮点数配置
-static float get_float_option(const char *line, float default_val) {
-    char *start = strstr(line, "'");
-    if (!start) return default_val;
-    
-    start++;  // 跳过单引号
-    char *end = strchr(start, '\'');
-    if (!end) return default_val;
-    
-    char value_str[32] = {0};
-    int len = end - start;
-    if (len >= sizeof(value_str)) len = sizeof(value_str) - 1;
-    strncpy(value_str, start, len);
-    value_str[len] = '\0';
-    
-    return atof(value_str);
-}
-
-// 从qos_gargoyle配置文件读取DBA参数
-static int load_dba_config(const char *config_path) {
-    FILE *fp = fopen(config_path, "r");
-    if (!fp) {
-        DEBUG_LOG("无法打开配置文件: %s", config_path);
+// 从UCI配置加载DBA设置
+int load_dba_config(const char *config_path) {
+    struct uci_context *ctx = uci_alloc_context();
+    if (!ctx) {
+        DEBUG_LOG("无法创建UCI上下文");
         return -1;
     }
     
-    dba_config_t *config = &g_qos_system.config;
+    struct uci_package *pkg = NULL;
+    int ret = 0;
     
-    // 设置默认值
-    config->enabled = 0;
-    config->interval = 1;
-    config->min_change_kbps = 64;
-    config->high_usage_threshold = 90;
-    config->high_usage_duration = 5;
-    config->low_usage_threshold = 50;
-    config->low_usage_duration = 5;
-    config->borrow_ratio = 0.2f;
-    config->min_borrow_kbps = 64;
-    config->cooldown_time = 5;
-    config->auto_return_enable = 1;
-    config->return_threshold = 60;
-    config->return_speed = 0.1f;
-    
-    char line[512];
-    int in_dba_section = 0;
-    
-    while (fgets(line, sizeof(line), fp)) {
-        char *trimmed = trim_whitespace(line);
-        
-        // 跳过空行和注释
-        if (trimmed[0] == '\0' || trimmed[0] == '#') {
-            continue;
-        }
-        
-        // 检测DBA配置节
-        if (strstr(trimmed, "config dba 'dba") || strstr(trimmed, "config dba 'dba'")) {
-            in_dba_section = 1;
-            continue;
-        }
-        
-        if (in_dba_section) {
-            // 检测配置节结束
-            if (strstr(trimmed, "config ") && !strstr(trimmed, "option")) {
-                in_dba_section = 0;
-                continue;
-            }
-            
-            // 解析选项
-            if (strstr(trimmed, "option enabled")) {
-                config->enabled = get_int_option(trimmed, 0);
-            } else if (strstr(trimmed, "option interval")) {
-                config->interval = get_int_option(trimmed, 1);
-            } else if (strstr(trimmed, "option min_change_kbps")) {
-                config->min_change_kbps = get_int_option(trimmed, 64);
-            } else if (strstr(trimmed, "option high_usage_threshold")) {
-                config->high_usage_threshold = get_int_option(trimmed, 90);
-            } else if (strstr(trimmed, "option high_usage_duration")) {
-                config->high_usage_duration = get_int_option(trimmed, 5);
-            } else if (strstr(trimmed, "option low_usage_threshold")) {
-                config->low_usage_threshold = get_int_option(trimmed, 50);
-            } else if (strstr(trimmed, "option low_usage_duration")) {
-                config->low_usage_duration = get_int_option(trimmed, 5);
-            } else if (strstr(trimmed, "option borrow_ratio")) {
-                config->borrow_ratio = get_float_option(trimmed, 0.2f);
-            } else if (strstr(trimmed, "option min_borrow_kbps")) {
-                config->min_borrow_kbps = get_int_option(trimmed, 64);
-            } else if (strstr(trimmed, "option cooldown_time")) {
-                config->cooldown_time = get_int_option(trimmed, 5);
-            } else if (strstr(trimmed, "option auto_return_enable")) {
-                config->auto_return_enable = get_int_option(trimmed, 1);
-            } else if (strstr(trimmed, "option return_threshold")) {
-                config->return_threshold = get_int_option(trimmed, 60);
-            } else if (strstr(trimmed, "option return_speed")) {
-                config->return_speed = get_float_option(trimmed, 0.1f);
-            }
-        }
+    // 打开配置文件
+    if (uci_load(ctx, "qos_gargoyle", &pkg) != 0) {
+        DEBUG_LOG("无法加载UCI配置");
+        uci_free_context(ctx);
+        return -1;
     }
     
-    fclose(fp);
+    // 查找DBA配置节
+    struct uci_section *dba_section = uci_lookup_section(ctx, pkg, "dba");
+    if (!dba_section) {
+        DEBUG_LOG("未找到DBA配置节，使用默认值");
+        // 使用默认值
+        g_qos_system.config.enabled = 1;
+        g_qos_system.config.interval = 5;
+        g_qos_system.config.high_usage_threshold = 85;
+        g_qos_system.config.high_usage_duration = 5;
+        g_qos_system.config.low_usage_threshold = 30;
+        g_qos_system.config.low_usage_duration = 10;
+        g_qos_system.config.borrow_ratio = 0.5;
+        g_qos_system.config.min_borrow_kbps = 64;
+        g_qos_system.config.min_change_kbps = 32;
+        g_qos_system.config.cooldown_time = 10;
+        g_qos_system.config.auto_return_enable = 1;
+        g_qos_system.config.return_threshold = 50;
+        g_qos_system.config.return_speed = 0.1;
+        
+        uci_unload(ctx, pkg);
+        uci_free_context(ctx);
+        return 0;
+    }
     
-    DEBUG_LOG("DBA配置加载成功: enabled=%d, interval=%d", 
-              config->enabled, config->interval);
+    // 读取配置值
+    const char *enabled = uci_lookup_option_string(ctx, dba_section, "enabled");
+    const char *interval = uci_lookup_option_string(ctx, dba_section, "interval");
+    const char *high_usage_threshold = uci_lookup_option_string(ctx, dba_section, "high_usage_threshold");
+    const char *high_usage_duration = uci_lookup_option_string(ctx, dba_section, "high_usage_duration");
+    const char *low_usage_threshold = uci_lookup_option_string(ctx, dba_section, "low_usage_threshold");
+    const char *low_usage_duration = uci_lookup_option_string(ctx, dba_section, "low_usage_duration");
+    const char *borrow_ratio = uci_lookup_option_string(ctx, dba_section, "borrow_ratio");
+    const char *min_borrow_kbps = uci_lookup_option_string(ctx, dba_section, "min_borrow_kbps");
+    const char *min_change_kbps = uci_lookup_option_string(ctx, dba_section, "min_change_kbps");
+    const char *cooldown_time = uci_lookup_option_string(ctx, dba_section, "cooldown_time");
+    const char *auto_return_enable = uci_lookup_option_string(ctx, dba_section, "auto_return_enable");
+    const char *return_threshold = uci_lookup_option_string(ctx, dba_section, "return_threshold");
+    const char *return_speed = uci_lookup_option_string(ctx, dba_section, "return_speed");
+    
+    // 设置配置值，如果没有则使用默认值
+    g_qos_system.config.enabled = enabled ? atoi(enabled) : 1;
+    g_qos_system.config.interval = interval ? atoi(interval) : 5;
+    g_qos_system.config.high_usage_threshold = high_usage_threshold ? atoi(high_usage_threshold) : 85;
+    g_qos_system.config.high_usage_duration = high_usage_duration ? atoi(high_usage_duration) : 5;
+    g_qos_system.config.low_usage_threshold = low_usage_threshold ? atoi(low_usage_threshold) : 30;
+    g_qos_system.config.low_usage_duration = low_usage_duration ? atoi(low_usage_duration) : 10;
+    g_qos_system.config.borrow_ratio = borrow_ratio ? atof(borrow_ratio) : 0.5;
+    g_qos_system.config.min_borrow_kbps = min_borrow_kbps ? atoi(min_borrow_kbps) : 64;
+    g_qos_system.config.min_change_kbps = min_change_kbps ? atoi(min_change_kbps) : 32;
+    g_qos_system.config.cooldown_time = cooldown_time ? atoi(cooldown_time) : 10;
+    g_qos_system.config.auto_return_enable = auto_return_enable ? atoi(auto_return_enable) : 1;
+    g_qos_system.config.return_threshold = return_threshold ? atoi(return_threshold) : 50;
+    g_qos_system.config.return_speed = return_speed ? atof(return_speed) : 0.1;
+    
+    DEBUG_LOG("加载DBA配置成功");
+    DEBUG_LOG("  启用: %d", g_qos_system.config.enabled);
+    DEBUG_LOG("  检查间隔: %d秒", g_qos_system.config.interval);
+    DEBUG_LOG("  高使用阈值: %d%%", g_qos_system.config.high_usage_threshold);
+    DEBUG_LOG("  高使用持续时间: %d秒", g_qos_system.config.high_usage_duration);
+    DEBUG_LOG("  低使用阈值: %d%%", g_qos_system.config.low_usage_threshold);
+    DEBUG_LOG("  低使用持续时间: %d秒", g_qos_system.config.low_usage_duration);
+    DEBUG_LOG("  借用比例: %.1f", g_qos_system.config.borrow_ratio);
+    DEBUG_LOG("  最小借用: %d kbps", g_qos_system.config.min_borrow_kbps);
+    DEBUG_LOG("  最小调整: %d kbps", g_qos_system.config.min_change_kbps);
+    DEBUG_LOG("  冷却时间: %d秒", g_qos_system.config.cooldown_time);
+    DEBUG_LOG("  自动归还: %d", g_qos_system.config.auto_return_enable);
+    DEBUG_LOG("  归还阈值: %d%%", g_qos_system.config.return_threshold);
+    DEBUG_LOG("  归还速度: %.1f", g_qos_system.config.return_speed);
+    
+    uci_unload(ctx, pkg);
+    uci_free_context(ctx);
     return 0;
 }
 
-// 从qos_gargoyle配置文件读取分类定义
-static int load_qos_classes(const char *config_path) {
-    FILE *fp = fopen(config_path, "r");
-    if (!fp) {
-        DEBUG_LOG("无法打开配置文件: %s", config_path);
+// 从UCI配置加载QoS分类
+int load_qos_classes(const char *config_path) {
+    struct uci_context *ctx = uci_alloc_context();
+    if (!ctx) {
+        DEBUG_LOG("无法创建UCI上下文");
+        return -1;
+    }
+    
+    struct uci_package *pkg = NULL;
+    int ret = 0;
+    
+    // 打开配置文件
+    if (uci_load(ctx, "qos_gargoyle", &pkg) != 0) {
+        DEBUG_LOG("无法加载UCI配置");
+        uci_free_context(ctx);
+        return -1;
+    }
+    
+    // 先计算分类数量
+    int upload_count = 0;
+    int download_count = 0;
+    
+    struct uci_element *e;
+    uci_foreach_element(&pkg->sections, e) {
+        struct uci_section *s = uci_to_section(e);
+        if (strstr(s->type, "upload_class")) {
+            upload_count++;
+        } else if (strstr(s->type, "download_class")) {
+            download_count++;
+        }
+    }
+    
+    if (upload_count == 0 && download_count == 0) {
+        DEBUG_LOG("未找到QoS分类配置");
+        uci_unload(ctx, pkg);
+        uci_free_context(ctx);
         return -1;
     }
     
     // 分配内存
-    g_qos_system.upload_classes = calloc(MAX_CLASSES, sizeof(qos_class_t));
-    g_qos_system.download_classes = calloc(MAX_CLASSES, sizeof(qos_class_t));
-    
-    if (!g_qos_system.upload_classes || !g_qos_system.download_classes) {
-        DEBUG_LOG("内存分配失败");
-        fclose(fp);
-        return -1;
+    if (upload_count > 0) {
+        g_qos_system.upload_classes = malloc(upload_count * sizeof(qos_class_t));
+        if (!g_qos_system.upload_classes) {
+            DEBUG_LOG("分配上传分类内存失败");
+            uci_unload(ctx, pkg);
+            uci_free_context(ctx);
+            return -1;
+        }
+        memset(g_qos_system.upload_classes, 0, upload_count * sizeof(qos_class_t));
     }
     
-    char line[512];
-    qos_class_t temp_class = {0};
-    int in_upload_class = 0;
-    int in_download_class = 0;
+    if (download_count > 0) {
+        g_qos_system.download_classes = malloc(download_count * sizeof(qos_class_t));
+        if (!g_qos_system.download_classes) {
+            DEBUG_LOG("分配下载分类内存失败");
+            free(g_qos_system.upload_classes);
+            g_qos_system.upload_classes = NULL;
+            uci_unload(ctx, pkg);
+            uci_free_context(ctx);
+            return -1;
+        }
+        memset(g_qos_system.download_classes, 0, download_count * sizeof(qos_class_t));
+    }
     
-    while (fgets(line, sizeof(line), fp)) {
-        char *trimmed = trim_whitespace(line);
+    // 填充分类信息
+    int upload_idx = 0;
+    int download_idx = 0;
+    
+    uci_foreach_element(&pkg->sections, e) {
+        struct uci_section *s = uci_to_section(e);
+        qos_class_t *cls = NULL;
         
-        // 跳过空行和注释
-        if (trimmed[0] == '\0' || trimmed[0] == '#') {
+        if (strstr(s->type, "upload_class")) {
+            if (upload_idx >= upload_count) continue;
+            cls = &g_qos_system.upload_classes[upload_idx];
+            upload_idx++;
+        } else if (strstr(s->type, "download_class")) {
+            if (download_idx >= download_count) continue;
+            cls = &g_qos_system.download_classes[download_idx];
+            download_idx++;
+        } else {
             continue;
         }
         
-        // 检测上传分类
-        if (strstr(trimmed, "config upload_class")) {
-            if (in_upload_class || in_download_class) {
-                // 保存上一个分类
-                if (in_upload_class) {
-                    if (g_qos_system.upload_class_count < MAX_CLASSES) {
-                        g_qos_system.upload_classes[g_qos_system.upload_class_count++] = temp_class;
-                    }
-                } else if (in_download_class) {
-                    if (g_qos_system.download_class_count < MAX_CLASSES) {
-                        g_qos_system.download_classes[g_qos_system.download_class_count++] = temp_class;
-                    }
-                }
-            }
-            
-            memset(&temp_class, 0, sizeof(temp_class));
-            in_upload_class = 1;
-            in_download_class = 0;
-            temp_class.direction = 0;  // 上传
-            continue;
+        // 获取分类名称
+        const char *name = uci_lookup_option_string(ctx, s, "name");
+        if (name) {
+            strncpy(cls->name, name, MAX_NAME_LEN-1);
+            cls->name[MAX_NAME_LEN-1] = '\0';
+        } else {
+            strncpy(cls->name, s->e.name, MAX_NAME_LEN-1);
+            cls->name[MAX_NAME_LEN-1] = '\0';
         }
         
-        // 检测下载分类
-        if (strstr(trimmed, "config download_class")) {
-            if (in_upload_class || in_download_class) {
-                // 保存上一个分类
-                if (in_upload_class) {
-                    if (g_qos_system.upload_class_count < MAX_CLASSES) {
-                        g_qos_system.upload_classes[g_qos_system.upload_class_count++] = temp_class;
-                    }
-                } else if (in_download_class) {
-                    if (g_qos_system.download_class_count < MAX_CLASSES) {
-                        g_qos_system.download_classes[g_qos_system.download_class_count++] = temp_class;
-                    }
-                }
+        // 获取classid
+        const char *classid = uci_lookup_option_string(ctx, s, "classid");
+        if (classid) {
+            strncpy(cls->classid, classid, MAX_CLASSID_LEN-1);
+            cls->classid[MAX_CLASSID_LEN-1] = '\0';
+        } else {
+            // 从section名称生成
+            if (strstr(s->type, "upload_class")) {
+                snprintf(cls->classid, MAX_CLASSID_LEN, "1:1%02d", upload_idx);
+            } else {
+                snprintf(cls->classid, MAX_CLASSID_LEN, "1:2%02d", download_idx);
             }
-            
-            memset(&temp_class, 0, sizeof(temp_class));
-            in_upload_class = 0;
-            in_download_class = 1;
-            temp_class.direction = 1;  // 下载
-            continue;
         }
         
-        // 解析分类选项
-        if (in_upload_class || in_download_class) {
-            if (strstr(trimmed, "option name")) {
-                char *start = strstr(trimmed, "'");
-                if (start) {
-                    start++;
-                    char *end = strchr(start, '\'');
-                    if (end) {
-                        int len = end - start;
-                        if (len >= MAX_NAME_LEN) len = MAX_NAME_LEN - 1;
-                        strncpy(temp_class.name, start, len);
-                        temp_class.name[len] = '\0';
-                        
-                        // 设置优先级
-                        if (strcmp(temp_class.name, "realtime") == 0) {
-                            temp_class.priority = 0;
-                        } else if (strcmp(temp_class.name, "normal") == 0) {
-                            temp_class.priority = 1;
-                        } else if (strcmp(temp_class.name, "bulk") == 0) {
-                            temp_class.priority = 2;
-                        }
-                    }
-                }
-            } else if (strstr(trimmed, "option percent_bandwidth")) {
-                temp_class.config_percent = get_int_option(trimmed, 0);
-            } else if (strstr(trimmed, "option min_bandwidth")) {
-                char *start = strstr(trimmed, "'");
-                if (start) {
-                    start++;
-                    char *end = strchr(start, '\'');
-                    if (end) {
-                        char value_str[32] = {0};
-                        int len = end - start;
-                        if (len >= sizeof(value_str)) len = sizeof(value_str) - 1;
-                        strncpy(value_str, start, len);
-                        value_str[len] = '\0';
-                        temp_class.config_min_kbps = parse_bandwidth_string(value_str);
-                    }
-                }
-            } else if (strstr(trimmed, "option max_bandwidth")) {
-                char *start = strstr(trimmed, "'");
-                if (start) {
-                    start++;
-                    char *end = strchr(start, '\'');
-                    if (end) {
-                        char value_str[32] = {0};
-                        int len = end - start;
-                        if (len >= sizeof(value_str)) len = sizeof(value_str) - 1;
-                        strncpy(value_str, start, len);
-                        value_str[len] = '\0';
-                        temp_class.config_max_kbps = parse_bandwidth_string(value_str);
-                    }
-                }
-            } else if (strstr(trimmed, "option minRTT")) {
-                // 优先级已根据名称设置
-            }
+        // 获取百分比
+        const char *percent = uci_lookup_option_string(ctx, s, "percent");
+        cls->config_percent = percent ? atoi(percent) : 10;
+        
+        // 计算带宽
+        int bandwidth_kbps = 0;
+        if (strstr(s->type, "upload_class")) {
+            bandwidth_kbps = (g_qos_system.total_bandwidth_kbps * cls->config_percent) / 100;
+        } else {
+            bandwidth_kbps = (g_qos_system.total_bandwidth_kbps * cls->config_percent) / 100;
         }
+        
+        // 设置最小/最大/当前带宽
+        cls->config_min_kbps = (int)(bandwidth_kbps * 0.1);  // 最小为配置的10%
+        cls->config_max_kbps = (int)(bandwidth_kbps * 2.0);  // 最大为配置的200%
+        cls->current_kbps = bandwidth_kbps;
+        
+        // 获取优先级
+        const char *priority = uci_lookup_option_string(ctx, s, "priority");
+        cls->priority = priority ? atoi(priority) : upload_idx;  // 默认为索引
+        
+        // 初始化其他字段
+        cls->used_kbps = 0;
+        cls->usage_rate = 0.0f;
+        cls->avg_usage_rate = 0.0f;
+        cls->high_usage_seconds = 0;
+        cls->low_usage_seconds = 0;
+        cls->normal_usage_seconds = 0;
+        cls->peak_usage_kbps = 0;
+        cls->borrowed_kbps = 0;
+        cls->adjust_count = 0;
+        cls->last_adjust_time = 0;
+        
+        DEBUG_LOG("加载分类: %s (classid: %s, 类型: %s, 带宽: %dkbps, 优先级: %d)",
+                  cls->name, cls->classid, 
+                  strstr(s->type, "upload_class") ? "上传" : "下载",
+                  bandwidth_kbps, cls->priority);
     }
     
-    // 保存最后一个分类
-    if (in_upload_class && g_qos_system.upload_class_count < MAX_CLASSES) {
-        g_qos_system.upload_classes[g_qos_system.upload_class_count++] = temp_class;
-    } else if (in_download_class && g_qos_system.download_class_count < MAX_CLASSES) {
-        g_qos_system.download_classes[g_qos_system.download_class_count++] = temp_class;
-    }
+    g_qos_system.upload_class_count = upload_idx;
+    g_qos_system.download_class_count = download_idx;
     
-    fclose(fp);
-    
-    // 生成classid
-    for (int i = 0; i < g_qos_system.upload_class_count; i++) {
-        snprintf(g_qos_system.upload_classes[i].classid, MAX_CLASSID_LEN, 
-                 "1:%d0", i+1);  // 上传: 1:10, 1:20, 1:30
-        g_qos_system.upload_classes[i].current_kbps = 
-            g_qos_system.total_bandwidth_kbps * 
-            g_qos_system.upload_classes[i].config_percent / 100;
-    }
-    
-    for (int i = 0; i < g_qos_system.download_class_count; i++) {
-        snprintf(g_qos_system.download_classes[i].classid, MAX_CLASSID_LEN, 
-                 "2:%d0", i+1);  // 下载: 2:10, 2:20, 2:30
-        g_qos_system.download_classes[i].current_kbps = 
-            g_qos_system.total_bandwidth_kbps * 
-            g_qos_system.download_classes[i].config_percent / 100;
-    }
-    
-    DEBUG_LOG("加载分类: 上传%d个, 下载%d个", 
+    DEBUG_LOG("加载完成: 上传分类 %d 个, 下载分类 %d 个", 
               g_qos_system.upload_class_count, g_qos_system.download_class_count);
+    
+    uci_unload(ctx, pkg);
+    uci_free_context(ctx);
     return 0;
 }
