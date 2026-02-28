@@ -8,6 +8,9 @@ qos_dba_system_t g_qos_system = {0};
 static pthread_t g_monitor_thread = 0;
 static int g_is_running = 0;
 
+// borrow_bandwidth_for_class函数是static函数，只在qos_dba.c内部使用
+static int borrow_bandwidth_for_class(qos_class_t *dst_class, int needed_kbps, int is_upload);
+
 // 辅助函数：解析带宽字符串
 static int parse_bandwidth_string(const char *str) {
     if (!str) return 0;
@@ -231,10 +234,17 @@ static void *monitor_thread(void *arg) {
         // 3. 自动归还
         int returned = auto_return_borrowed_bandwidth();
         
-        // 4. 打印状态
-        if (g_qos_system.verbose || upload_adjustments > 0 || 
-            download_adjustments > 0 || returned > 0) {
-            qos_dba_print_status();
+        // 4. 更新状态文件
+        if (upload_adjustments > 0 || download_adjustments > 0 || returned > 0) {
+            write_dba_status();
+        } else {
+            // 即使没有调整，也每分钟更新一次状态文件
+            static time_t last_status_update = 0;
+            time_t now = time(NULL);
+            if (now - last_status_update >= 60) {
+                write_dba_status();
+                last_status_update = now;
+            }
         }
         
         pthread_mutex_unlock(&g_qos_system.mutex);
@@ -299,6 +309,271 @@ int qos_dba_init(const char *config_path) {
     
     return 0;
 }
+
+// 调整上传分类带宽
+int adjust_upload_classes(void) {
+    int adjustments = 0;
+    
+    DEBUG_LOG("开始调整上传分类...");
+    
+    // 1. 找出高负载分类（需要更多带宽）
+    for (int i = 0; i < g_qos_system.upload_class_count; i++) {
+        qos_class_t *class = &g_qos_system.upload_classes[i];
+        
+        if (!class->enabled) {
+            continue;
+        }
+        
+        // 检查是否需要调整
+        if (class->high_usage_seconds >= g_qos_system.config.high_usage_duration) {
+            // 高负载分类，需要更多带宽
+            DEBUG_LOG("上传分类 %s 高负载: 使用率=%.1f%%, 持续%d秒", 
+                     class->name, class->usage_rate * 100, class->high_usage_seconds);
+            
+            // 计算需要的额外带宽
+            int needed_kbps = 0;
+            if (class->current_kbps < class->config_max_kbps) {
+                // 计算目标带宽：使用率降到85%所需的带宽
+                int target_kbps = (int)(class->used_kbps * 100.0 / g_qos_system.config.high_usage_threshold);
+                target_kbps = MIN(target_kbps, class->config_max_kbps);
+                
+                needed_kbps = target_kbps - class->current_kbps;
+                
+                if (needed_kbps > 0) {
+                    // 从低优先级低使用率分类借用带宽
+                    int borrowed = borrow_bandwidth_for_class(class, needed_kbps, 1); // 1表示上传方向
+                    if (borrowed > 0) {
+                        // 调整TC分类带宽
+                        int new_kbps = class->current_kbps + borrowed;
+                        if (adjust_tc_class_bandwidth(g_qos_system.wan_interface, 
+                                                       class->classid, new_kbps) == 0) {
+                            class->current_kbps = new_kbps;
+                            class->borrowed_kbps += borrowed;
+                            class->high_usage_seconds = 0; // 重置计时器
+                            adjustments++;
+                            
+                            DEBUG_LOG("为上传分类 %s 增加 %d kbps 带宽 (当前: %d kbps)", 
+                                     class->name, borrowed, new_kbps);
+                        }
+                    }
+                }
+            }
+        } else if (class->low_usage_seconds >= g_qos_system.config.low_usage_duration) {
+            // 低负载分类，但只有借出逻辑在borrow_bandwidth_for_class中处理
+        }
+    }
+    
+	if (adjustments > 0) {
+        DEBUG_LOG("上传分类调整完成，共调整 %d 个分类", adjustments);
+        
+        // 在这里调用write_dba_status
+        write_dba_status();  // 添加这行
+    }
+	
+    return adjustments;
+}
+
+// 调整下载分类带宽
+int adjust_download_classes(void) {
+    int adjustments = 0;
+    
+    DEBUG_LOG("开始调整下载分类...");
+    
+    for (int i = 0; i < g_qos_system.download_class_count; i++) {
+        qos_class_t *class = &g_qos_system.download_classes[i];
+        
+        if (!class->enabled) {
+            continue;
+        }
+        
+        // 检查是否需要调整
+        if (class->high_usage_seconds >= g_qos_system.config.high_usage_duration) {
+            // 高负载分类，需要更多带宽
+            DEBUG_LOG("下载分类 %s 高负载: 使用率=%.1f%%, 持续%d秒", 
+                     class->name, class->usage_rate * 100, class->high_usage_seconds);
+            
+            // 计算需要的额外带宽
+            int needed_kbps = 0;
+            if (class->current_kbps < class->config_max_kbps) {
+                // 计算目标带宽：使用率降到85%所需的带宽
+                int target_kbps = (int)(class->used_kbps * 100.0 / g_qos_system.config.high_usage_threshold);
+                target_kbps = MIN(target_kbps, class->config_max_kbps);
+                
+                needed_kbps = target_kbps - class->current_kbps;
+                
+                if (needed_kbps > 0) {
+                    // 从低优先级低使用率分类借用带宽
+                    int borrowed = borrow_bandwidth_for_class(class, needed_kbps, 0); // 0表示下载方向
+                    if (borrowed > 0) {
+                        // 调整TC分类带宽
+                        int new_kbps = class->current_kbps + borrowed;
+                        if (adjust_tc_class_bandwidth("imq0", class->classid, new_kbps) == 0) {
+                            class->current_kbps = new_kbps;
+                            class->borrowed_kbps += borrowed;
+                            class->high_usage_seconds = 0; // 重置计时器
+                            adjustments++;
+                            
+                            DEBUG_LOG("为下载分类 %s 增加 %d kbps 带宽 (当前: %d kbps)", 
+                                     class->name, borrowed, new_kbps);
+                        }
+                    }
+                }
+            }
+        }
+    }
+	
+	if (adjustments > 0) {
+        DEBUG_LOG("下载分类调整完成，共调整 %d 个分类", adjustments);
+        
+        // 在这里调用write_dba_status
+        write_dba_status();  // 添加这行
+    }
+    
+    return adjustments;
+}
+
+// 自动归还借用的带宽
+int auto_return_borrowed_bandwidth(void) {
+    int total_returned = 0;
+    
+    if (!g_qos_system.config.auto_return_enable) {
+        return 0;
+    }
+    
+    DEBUG_LOG("检查自动归还...");
+    
+    // 检查上传分类
+    for (int i = 0; i < g_qos_system.upload_class_count; i++) {
+        qos_class_t *class = &g_qos_system.upload_classes[i];
+        
+        if (class->borrowed_kbps > 0) {
+            // 有借用带宽的分类
+            if (class->low_usage_seconds >= g_qos_system.config.low_usage_duration) {
+                // 持续低使用，归还部分带宽
+                int return_kbps = (int)(class->borrowed_kbps * g_qos_system.config.return_speed);
+                return_kbps = MAX(return_kbps, g_qos_system.config.min_change_kbps);
+                
+                if (return_kbps > 0 && class->current_kbps - return_kbps >= class->config_min_kbps) {
+                    int new_kbps = class->current_kbps - return_kbps;
+                    if (adjust_tc_class_bandwidth(g_qos_system.wan_interface, 
+                                                   class->classid, new_kbps) == 0) {
+                        class->current_kbps = new_kbps;
+                        class->borrowed_kbps -= return_kbps;
+                        
+                        // 找到对应的借出分类并更新
+                        for (int j = 0; j < g_qos_system.upload_class_count; j++) {
+                            qos_class_t *src_class = &g_qos_system.upload_classes[j];
+                            if (src_class->lent_kbps > 0 && src_class->lent_to == i) {
+                                src_class->lent_kbps -= return_kbps;
+                                break;
+                            }
+                        }
+                        
+                        total_returned += return_kbps;
+                        DEBUG_LOG("上传分类 %s 归还 %d kbps 带宽", class->name, return_kbps);
+                    }
+                }
+            }
+        }
+    }
+    
+    // 检查下载分类
+    for (int i = 0; i < g_qos_system.download_class_count; i++) {
+        qos_class_t *class = &g_qos_system.download_classes[i];
+        
+        if (class->borrowed_kbps > 0) {
+            if (class->low_usage_seconds >= g_qos_system.config.low_usage_duration) {
+                int return_kbps = (int)(class->borrowed_kbps * g_qos_system.config.return_speed);
+                return_kbps = MAX(return_kbps, g_qos_system.config.min_change_kbps);
+                
+                if (return_kbps > 0 && class->current_kbps - return_kbps >= class->config_min_kbps) {
+                    int new_kbps = class->current_kbps - return_kbps;
+                    if (adjust_tc_class_bandwidth("imq0", class->classid, new_kbps) == 0) {
+                        class->current_kbps = new_kbps;
+                        class->borrowed_kbps -= return_kbps;
+                        
+                        for (int j = 0; j < g_qos_system.download_class_count; j++) {
+                            qos_class_t *src_class = &g_qos_system.download_classes[j];
+                            if (src_class->lent_kbps > 0 && src_class->lent_to == i) {
+                                src_class->lent_kbps -= return_kbps;
+                                break;
+                            }
+                        }
+                        
+                        total_returned += return_kbps;
+                        DEBUG_LOG("下载分类 %s 归还 %d kbps 带宽", class->name, return_kbps);
+                    }
+                }
+            }
+        }
+    }
+	
+	if (total_returned > 0) {
+        DEBUG_LOG("自动归还完成，共归还 %d kbps 带宽", total_returned);
+        
+        // 在这里调用write_dba_status
+        write_dba_status();  // 添加这行
+    }
+    
+    return total_returned;
+}
+
+// 为分类借用带宽
+static int borrow_bandwidth_for_class(qos_class_t *dst_class, int needed_kbps, int is_upload) {
+    int borrowed = 0;
+    qos_class_t *src_classes = is_upload ? g_qos_system.upload_classes : g_qos_system.download_classes;
+    int class_count = is_upload ? g_qos_system.upload_class_count : g_qos_system.download_class_count;
+    
+    // 从低优先级分类借用
+    for (int i = 0; i < class_count; i++) {
+        if (borrowed >= needed_kbps) {
+            break;
+        }
+        
+        qos_class_t *src_class = &src_classes[i];
+        
+        // 检查是否可以作为借出者：
+        // 1. 优先级低于目标分类
+        // 2. 当前低使用
+        // 3. 有可用带宽
+        if (src_class != dst_class && 
+            src_class->priority > dst_class->priority &&
+            src_class->low_usage_seconds >= g_qos_system.config.low_usage_duration &&
+            src_class->current_kbps > src_class->config_min_kbps) {
+            
+            // 计算可借出的带宽
+            int available_kbps = src_class->current_kbps - src_class->config_min_kbps;
+            int lend_kbps = (int)(available_kbps * g_qos_system.config.borrow_ratio);
+            lend_kbps = MAX(lend_kbps, g_qos_system.config.min_borrow_kbps);
+            
+            if (lend_kbps > 0) {
+                int actual_lend = MIN(lend_kbps, needed_kbps - borrowed);
+                
+                // 确保不会借到低于最小带宽
+                if (src_class->current_kbps - actual_lend >= src_class->config_min_kbps) {
+                    // 更新源分类
+                    int new_src_kbps = src_class->current_kbps - actual_lend;
+                    const char *iface = is_upload ? g_qos_system.wan_interface : "imq0";
+                    
+                    if (adjust_tc_class_bandwidth(iface, src_class->classid, new_src_kbps) == 0) {
+                        src_class->current_kbps = new_src_kbps;
+                        src_class->lent_kbps += actual_lend;
+                        src_class->lent_to = dst_class - src_classes; // 存储目标分类索引
+                        
+                        borrowed += actual_lend;
+                        
+                        DEBUG_LOG("从分类 %s 借出 %d kbps 给 %s", 
+                                 src_class->name, actual_lend, dst_class->name);
+                    }
+                }
+            }
+        }
+    }
+    
+    return borrowed;
+}
+
+
 
 // 启动DBA
 int qos_dba_start(void) {
@@ -414,3 +689,62 @@ int qos_dba_set_verbose(int verbose) {
     g_qos_system.verbose = verbose ? 1 : 0;
     return 0;
 }
+
+// 写入DBA状态到JSON文件
+void write_dba_status(void) {
+    const char *status_file = "/tmp/qosdba.status";
+    
+    FILE *fp = fopen(status_file, "w");
+    if (!fp) {
+        DEBUG_LOG("无法写入状态文件: %s", status_file);
+        return;
+    }
+    
+    // 写入JSON格式的状态信息
+    fprintf(fp, "{\n");
+    fprintf(fp, "  \"timestamp\": %ld,\n", (long)time(NULL));
+    fprintf(fp, "  \"enabled\": %s,\n", g_qos_system.config.enabled ? "true" : "false");
+    
+    // 写入上传分类状态
+    fprintf(fp, "  \"upload_classes\": {\n");
+    for (int i = 0; i < g_qos_system.upload_class_count; i++) {
+        qos_class_t *cls = &g_qos_system.upload_classes[i];
+        fprintf(fp, "    \"%s\": {\n", cls->name);
+        fprintf(fp, "      \"current\": %d,\n", cls->current_kbps);
+        fprintf(fp, "      \"used\": %d,\n", cls->used_kbps);
+        fprintf(fp, "      \"usage_rate\": %.2f,\n", cls->usage_rate);
+        fprintf(fp, "      \"borrowed\": %d\n", cls->borrowed_kbps);
+        
+        if (i < g_qos_system.upload_class_count - 1) {
+            fprintf(fp, "    },\n");
+        } else {
+            fprintf(fp, "    }\n");
+        }
+    }
+    fprintf(fp, "  },\n");
+    
+    // 写入下载分类状态
+    fprintf(fp, "  \"download_classes\": {\n");
+    for (int i = 0; i < g_qos_system.download_class_count; i++) {
+        qos_class_t *cls = &g_qos_system.download_classes[i];
+        fprintf(fp, "    \"%s\": {\n", cls->name);
+        fprintf(fp, "      \"current\": %d,\n", cls->current_kbps);
+        fprintf(fp, "      \"used\": %d,\n", cls->used_kbps);
+        fprintf(fp, "      \"usage_rate\": %.2f,\n", cls->usage_rate);
+        fprintf(fp, "      \"borrowed\": %d\n", cls->borrowed_kbps);
+        
+        if (i < g_qos_system.download_class_count - 1) {
+            fprintf(fp, "    },\n");
+        } else {
+            fprintf(fp, "    }\n");
+        }
+    }
+    fprintf(fp, "  }\n");
+    fprintf(fp, "}\n");
+    
+    fclose(fp);
+    chmod(status_file, 0644);
+    
+    DEBUG_LOG("状态已写入: %s", status_file);
+}
+

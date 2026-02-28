@@ -92,6 +92,10 @@ int qos_dba_stop(void);
 int qos_dba_reload_config(void);
 int qos_dba_set_verbose(int verbose);
 void qos_dba_print_status(void);
+void write_dba_status(void);
+int adjust_upload_classes(void);
+int adjust_download_classes(void);
+int auto_return_borrowed_bandwidth(void);
 
 // 配置文件解析函数
 int load_dba_config(const char *config_path);
