@@ -362,161 +362,469 @@ int validate_qos_classes(qos_class_t *classes, int class_count, int total_bandwi
 }
 
 // 保存QoS配置到UCI
-int save_qos_config_to_uci(qos_dba_system_t *qos_system) {
+int save_qos_config_to_uci(qos_dba_system_t *qos_system)
+{
+    int i, ret = 0;
+    char value[32];
+    char section_name[32];
+    
     if (!qos_system) {
+        ERROR_LOG("无效的参数");
         return -1;
     }
     
+    // 加载UCI配置
     struct uci_context *ctx = uci_alloc_context();
     if (!ctx) {
-        DEBUG_LOG("无法创建UCI上下文");
+        ERROR_LOG("无法分配UCI上下文");
         return -1;
     }
     
     struct uci_package *pkg = NULL;
+    struct uci_ptr ptr;
     
-    // 打开配置文件
-    if (uci_load(ctx, "qos_gargoyle", &pkg) != 0) {
-        DEBUG_LOG("无法加载UCI配置");
+    // 加载现有配置
+    if (uci_load(ctx, "qos_gargoyle", &pkg) != UCI_OK) {
+        ERROR_LOG("无法加载qos_gargoyle配置");
         uci_free_context(ctx);
         return -1;
     }
     
-    int ret = 0;
+    // 保存DBA全局配置
+    char option_name[64];
     
-    // 保存DBA配置
-    struct uci_section *dba_section = uci_lookup_section(ctx, pkg, "dba");
-    if (!dba_section) {
-        // 创建新的DBA节
-        dba_section = uci_add_section(ctx, pkg, "dba");
-        if (!dba_section) {
-            DEBUG_LOG("无法创建DBA配置节");
-            uci_unload(ctx, pkg);
-            uci_free_context(ctx);
-            return -1;
+    // 设置enabled选项
+    snprintf(value, sizeof(value), "%d", qos_system->enabled);
+    snprintf(option_name, sizeof(option_name), "qos_gargoyle.@dba[0].enabled");
+    memset(&ptr, 0, sizeof(ptr));
+    ptr.package = "qos_gargoyle";
+    ptr.section = "dba";
+    ptr.option = "enabled";
+    ptr.value = value;
+    
+    if (uci_lookup_ptr(ctx, &ptr, option_name, true) != UCI_OK) {
+        // 如果选项不存在，创建它
+        ptr.value = value;
+        if (uci_add_list(ctx, &ptr) != UCI_OK) {
+            ERROR_LOG("无法创建enabled选项");
         }
+    } else {
+        // 更新现有选项
+        uci_set(ctx, &ptr);
     }
     
-    // 设置DBA配置值
-    char value[32];
+    // 设置interval选项
+    snprintf(value, sizeof(value), "%d", qos_system->interval);
+    snprintf(option_name, sizeof(option_name), "qos_gargoyle.@dba[0].interval");
+    memset(&ptr, 0, sizeof(ptr));
+    ptr.package = "qos_gargoyle";
+    ptr.section = "dba";
+    ptr.option = "interval";
+    ptr.value = value;
     
-    snprintf(value, sizeof(value), "%d", qos_system->config.enabled);
-    uci_set(ctx, &pkg, "dba", "enabled", value);
+    if (uci_lookup_ptr(ctx, &ptr, option_name, true) != UCI_OK) {
+        ptr.value = value;
+        if (uci_add_list(ctx, &ptr) != UCI_OK) {
+            ERROR_LOG("无法创建interval选项");
+        }
+    } else {
+        uci_set(ctx, &ptr);
+    }
     
-    snprintf(value, sizeof(value), "%d", qos_system->config.interval);
-    uci_set(ctx, &pkg, "dba", "interval", value);
+    // 设置high_usage_threshold选项
+    snprintf(value, sizeof(value), "%d", qos_system->high_usage_threshold);
+    snprintf(option_name, sizeof(option_name), "qos_gargoyle.@dba[0].high_usage_threshold");
+    memset(&ptr, 0, sizeof(ptr));
+    ptr.package = "qos_gargoyle";
+    ptr.section = "dba";
+    ptr.option = "high_usage_threshold";
+    ptr.value = value;
     
-    snprintf(value, sizeof(value), "%d", qos_system->config.high_usage_threshold);
-    uci_set(ctx, &pkg, "dba", "high_usage_threshold", value);
+    if (uci_lookup_ptr(ctx, &ptr, option_name, true) != UCI_OK) {
+        ptr.value = value;
+        if (uci_add_list(ctx, &ptr) != UCI_OK) {
+            ERROR_LOG("无法创建high_usage_threshold选项");
+        }
+    } else {
+        uci_set(ctx, &ptr);
+    }
     
-    snprintf(value, sizeof(value), "%d", qos_system->config.high_usage_duration);
-    uci_set(ctx, &pkg, "dba", "high_usage_duration", value);
+    // 设置high_usage_duration选项
+    snprintf(value, sizeof(value), "%d", qos_system->high_usage_duration);
+    snprintf(option_name, sizeof(option_name), "qos_gargoyle.@dba[0].high_usage_duration");
+    memset(&ptr, 0, sizeof(ptr));
+    ptr.package = "qos_gargoyle";
+    ptr.section = "dba";
+    ptr.option = "high_usage_duration";
+    ptr.value = value;
     
-    snprintf(value, sizeof(value), "%d", qos_system->config.low_usage_threshold);
-    uci_set(ctx, &pkg, "dba", "low_usage_threshold", value);
+    if (uci_lookup_ptr(ctx, &ptr, option_name, true) != UCI_OK) {
+        ptr.value = value;
+        if (uci_add_list(ctx, &ptr) != UCI_OK) {
+            ERROR_LOG("无法创建high_usage_duration选项");
+        }
+    } else {
+        uci_set(ctx, &ptr);
+    }
     
-    snprintf(value, sizeof(value), "%d", qos_system->config.low_usage_duration);
-    uci_set(ctx, &pkg, "dba", "low_usage_duration", value);
+    // 设置low_usage_threshold选项
+    snprintf(value, sizeof(value), "%d", qos_system->low_usage_threshold);
+    snprintf(option_name, sizeof(option_name), "qos_gargoyle.@dba[0].low_usage_threshold");
+    memset(&ptr, 0, sizeof(ptr));
+    ptr.package = "qos_gargoyle";
+    ptr.section = "dba";
+    ptr.option = "low_usage_threshold";
+    ptr.value = value;
     
-    snprintf(value, sizeof(value), "%.2f", qos_system->config.borrow_ratio);
-    uci_set(ctx, &pkg, "dba", "borrow_ratio", value);
+    if (uci_lookup_ptr(ctx, &ptr, option_name, true) != UCI_OK) {
+        ptr.value = value;
+        if (uci_add_list(ctx, &ptr) != UCI_OK) {
+            ERROR_LOG("无法创建low_usage_threshold选项");
+        }
+    } else {
+        uci_set(ctx, &ptr);
+    }
     
-    snprintf(value, sizeof(value), "%d", qos_system->config.min_borrow_kbps);
-    uci_set(ctx, &pkg, "dba", "min_borrow_kbps", value);
+    // 设置low_usage_duration选项
+    snprintf(value, sizeof(value), "%d", qos_system->low_usage_duration);
+    snprintf(option_name, sizeof(option_name), "qos_gargoyle.@dba[0].low_usage_duration");
+    memset(&ptr, 0, sizeof(ptr));
+    ptr.package = "qos_gargoyle";
+    ptr.section = "dba";
+    ptr.option = "low_usage_duration";
+    ptr.value = value;
     
-    snprintf(value, sizeof(value), "%d", qos_system->config.min_change_kbps);
-    uci_set(ctx, &pkg, "dba", "min_change_kbps", value);
+    if (uci_lookup_ptr(ctx, &ptr, option_name, true) != UCI_OK) {
+        ptr.value = value;
+        if (uci_add_list(ctx, &ptr) != UCI_OK) {
+            ERROR_LOG("无法创建low_usage_duration选项");
+        }
+    } else {
+        uci_set(ctx, &ptr);
+    }
     
-    snprintf(value, sizeof(value), "%d", qos_system->config.cooldown_time);
-    uci_set(ctx, &pkg, "dba", "cooldown_time", value);
+    // 设置borrow_ratio选项
+    snprintf(value, sizeof(value), "%.2f", qos_system->borrow_ratio);
+    snprintf(option_name, sizeof(option_name), "qos_gargoyle.@dba[0].borrow_ratio");
+    memset(&ptr, 0, sizeof(ptr));
+    ptr.package = "qos_gargoyle";
+    ptr.section = "dba";
+    ptr.option = "borrow_ratio";
+    ptr.value = value;
     
-    snprintf(value, sizeof(value), "%d", qos_system->config.auto_return_enable);
-    uci_set(ctx, &pkg, "dba", "auto_return_enable", value);
+    if (uci_lookup_ptr(ctx, &ptr, option_name, true) != UCI_OK) {
+        ptr.value = value;
+        if (uci_add_list(ctx, &ptr) != UCI_OK) {
+            ERROR_LOG("无法创建borrow_ratio选项");
+        }
+    } else {
+        uci_set(ctx, &ptr);
+    }
     
-    snprintf(value, sizeof(value), "%d", qos_system->config.return_threshold);
-    uci_set(ctx, &pkg, "dba", "return_threshold", value);
+    // 设置min_borrow_kbps选项
+    snprintf(value, sizeof(value), "%d", qos_system->min_borrow_kbps);
+    snprintf(option_name, sizeof(option_name), "qos_gargoyle.@dba[0].min_borrow_kbps");
+    memset(&ptr, 0, sizeof(ptr));
+    ptr.package = "qos_gargoyle";
+    ptr.section = "dba";
+    ptr.option = "min_borrow_kbps";
+    ptr.value = value;
     
-    snprintf(value, sizeof(value), "%.2f", qos_system->config.return_speed);
-    uci_set(ctx, &pkg, "dba", "return_speed", value);
+    if (uci_lookup_ptr(ctx, &ptr, option_name, true) != UCI_OK) {
+        ptr.value = value;
+        if (uci_add_list(ctx, &ptr) != UCI_OK) {
+            ERROR_LOG("无法创建min_borrow_kbps选项");
+        }
+    } else {
+        uci_set(ctx, &ptr);
+    }
     
-    // 保存分类配置
-    for (int i = 0; i < qos_system->upload_class_count; i++) {
+    // 设置min_change_kbps选项
+    snprintf(value, sizeof(value), "%d", qos_system->min_change_kbps);
+    snprintf(option_name, sizeof(option_name), "qos_gargoyle.@dba[0].min_change_kbps");
+    memset(&ptr, 0, sizeof(ptr));
+    ptr.package = "qos_gargoyle";
+    ptr.section = "dba";
+    ptr.option = "min_change_kbps";
+    ptr.value = value;
+    
+    if (uci_lookup_ptr(ctx, &ptr, option_name, true) != UCI_OK) {
+        ptr.value = value;
+        if (uci_add_list(ctx, &ptr) != UCI_OK) {
+            ERROR_LOG("无法创建min_change_kbps选项");
+        }
+    } else {
+        uci_set(ctx, &ptr);
+    }
+    
+    // 设置cooldown_time选项
+    snprintf(value, sizeof(value), "%d", qos_system->cooldown_time);
+    snprintf(option_name, sizeof(option_name), "qos_gargoyle.@dba[0].cooldown_time");
+    memset(&ptr, 0, sizeof(ptr));
+    ptr.package = "qos_gargoyle";
+    ptr.section = "dba";
+    ptr.option = "cooldown_time";
+    ptr.value = value;
+    
+    if (uci_lookup_ptr(ctx, &ptr, option_name, true) != UCI_OK) {
+        ptr.value = value;
+        if (uci_add_list(ctx, &ptr) != UCI_OK) {
+            ERROR_LOG("无法创建cooldown_time选项");
+        }
+    } else {
+        uci_set(ctx, &ptr);
+    }
+    
+    // 设置auto_return_enable选项
+    snprintf(value, sizeof(value), "%d", qos_system->auto_return_enable);
+    snprintf(option_name, sizeof(option_name), "qos_gargoyle.@dba[0].auto_return_enable");
+    memset(&ptr, 0, sizeof(ptr));
+    ptr.package = "qos_gargoyle";
+    ptr.section = "dba";
+    ptr.option = "auto_return_enable";
+    ptr.value = value;
+    
+    if (uci_lookup_ptr(ctx, &ptr, option_name, true) != UCI_OK) {
+        ptr.value = value;
+        if (uci_add_list(ctx, &ptr) != UCI_OK) {
+            ERROR_LOG("无法创建auto_return_enable选项");
+        }
+    } else {
+        uci_set(ctx, &ptr);
+    }
+    
+    // 设置return_threshold选项
+    snprintf(value, sizeof(value), "%d", qos_system->return_threshold);
+    snprintf(option_name, sizeof(option_name), "qos_gargoyle.@dba[0].return_threshold");
+    memset(&ptr, 0, sizeof(ptr));
+    ptr.package = "qos_gargoyle";
+    ptr.section = "dba";
+    ptr.option = "return_threshold";
+    ptr.value = value;
+    
+    if (uci_lookup_ptr(ctx, &ptr, option_name, true) != UCI_OK) {
+        ptr.value = value;
+        if (uci_add_list(ctx, &ptr) != UCI_OK) {
+            ERROR_LOG("无法创建return_threshold选项");
+        }
+    } else {
+        uci_set(ctx, &ptr);
+    }
+    
+    // 设置return_speed选项
+    snprintf(value, sizeof(value), "%.2f", qos_system->return_speed);
+    snprintf(option_name, sizeof(option_name), "qos_gargoyle.@dba[0].return_speed");
+    memset(&ptr, 0, sizeof(ptr));
+    ptr.package = "qos_gargoyle";
+    ptr.section = "dba";
+    ptr.option = "return_speed";
+    ptr.value = value;
+    
+    if (uci_lookup_ptr(ctx, &ptr, option_name, true) != UCI_OK) {
+        ptr.value = value;
+        if (uci_add_list(ctx, &ptr) != UCI_OK) {
+            ERROR_LOG("无法创建return_speed选项");
+        }
+    } else {
+        uci_set(ctx, &ptr);
+    }
+    
+    // 保存上传分类配置
+    for (i = 0; i < qos_system->upload_class_count; i++) {
         qos_class_t *cls = &qos_system->upload_classes[i];
-        char section_name[32];
-        snprintf(section_name, sizeof(section_name), "upload_class_%d", i);
         
-        // 查找或创建分类节
-        struct uci_section *class_section = uci_lookup_section(ctx, pkg, section_name);
-        if (!class_section) {
-            class_section = uci_add_section(ctx, pkg, "upload_class");
-            if (!class_section) {
-                DEBUG_LOG("无法创建上传分类节: %s", section_name);
+        // 创建分类section名称
+        snprintf(section_name, sizeof(section_name), "qos_gargoyle.@upload_class[%d]", i);
+        
+        // 先查找是否已存在
+        memset(&ptr, 0, sizeof(ptr));
+        if (uci_lookup_ptr(ctx, &ptr, section_name, true) != UCI_OK) {
+            // 如果不存在，创建新的section
+            struct uci_section *new_section = NULL;
+            if (uci_add_section(ctx, pkg, "upload_class", &new_section) != UCI_OK) {
+                ERROR_LOG("无法添加上传分类section: %s", cls->name);
                 continue;
             }
         }
         
-        // 设置分类参数
-        uci_set(ctx, &pkg, section_name, "name", cls->name);
-        uci_set(ctx, &pkg, section_name, "classid", cls->classid);
+        // 设置name选项
+        memset(&ptr, 0, sizeof(ptr));
+        ptr.package = "qos_gargoyle";
+        ptr.section = "upload_class";
+        ptr.option = "name";
+        ptr.value = cls->name;
         
+        if (uci_set(ctx, &ptr) != UCI_OK) {
+            ERROR_LOG("无法设置上传分类name: %s", cls->name);
+        }
+        
+        // 设置classid选项
+        memset(&ptr, 0, sizeof(ptr));
+        ptr.package = "qos_gargoyle";
+        ptr.section = "upload_class";
+        ptr.option = "classid";
+        ptr.value = cls->classid;
+        
+        if (uci_set(ctx, &ptr) != UCI_OK) {
+            ERROR_LOG("无法设置上传分类classid: %s", cls->classid);
+        }
+        
+        // 设置priority选项
         snprintf(value, sizeof(value), "%d", cls->priority);
-        uci_set(ctx, &pkg, section_name, "priority", value);
+        memset(&ptr, 0, sizeof(ptr));
+        ptr.package = "qos_gargoyle";
+        ptr.section = "upload_class";
+        ptr.option = "priority";
+        ptr.value = value;
         
-        snprintf(value, sizeof(value), "%d", cls->config_min_kbps);
-        uci_set(ctx, &pkg, section_name, "min_kbps", value);
+        if (uci_set(ctx, &ptr) != UCI_OK) {
+            ERROR_LOG("无法设置上传分类priority: %s", cls->name);
+        }
         
-        snprintf(value, sizeof(value), "%d", cls->config_max_kbps);
-        uci_set(ctx, &pkg, section_name, "max_kbps", value);
+        // 设置min_kbps选项
+        snprintf(value, sizeof(value), "%d", cls->min_kbps);
+        memset(&ptr, 0, sizeof(ptr));
+        ptr.package = "qos_gargoyle";
+        ptr.section = "upload_class";
+        ptr.option = "min_kbps";
+        ptr.value = value;
         
-        // 计算百分比
-        int percent = (cls->current_kbps * 100) / qos_system->total_bandwidth_kbps;
-        snprintf(value, sizeof(value), "%d", percent);
-        uci_set(ctx, &pkg, section_name, "percent_bandwidth", value);
+        if (uci_set(ctx, &ptr) != UCI_OK) {
+            ERROR_LOG("无法设置上传分类min_kbps: %s", cls->name);
+        }
+        
+        // 设置max_kbps选项
+        snprintf(value, sizeof(value), "%d", cls->max_kbps);
+        memset(&ptr, 0, sizeof(ptr));
+        ptr.package = "qos_gargoyle";
+        ptr.section = "upload_class";
+        ptr.option = "max_kbps";
+        ptr.value = value;
+        
+        if (uci_set(ctx, &ptr) != UCI_OK) {
+            ERROR_LOG("无法设置上传分类max_kbps: %s", cls->name);
+        }
+        
+        // 设置percent_bandwidth选项
+        snprintf(value, sizeof(value), "%.2f", cls->percent_bandwidth);
+        memset(&ptr, 0, sizeof(ptr));
+        ptr.package = "qos_gargoyle";
+        ptr.section = "upload_class";
+        ptr.option = "percent_bandwidth";
+        ptr.value = value;
+        
+        if (uci_set(ctx, &ptr) != UCI_OK) {
+            ERROR_LOG("无法设置上传分类percent_bandwidth: %s", cls->name);
+        }
     }
     
-    for (int i = 0; i < qos_system->download_class_count; i++) {
+    // 保存下载分类配置
+    for (i = 0; i < qos_system->download_class_count; i++) {
         qos_class_t *cls = &qos_system->download_classes[i];
-        char section_name[32];
-        snprintf(section_name, sizeof(section_name), "download_class_%d", i);
         
-        // 查找或创建分类节
-        struct uci_section *class_section = uci_lookup_section(ctx, pkg, section_name);
-        if (!class_section) {
-            class_section = uci_add_section(ctx, pkg, "download_class");
-            if (!class_section) {
-                DEBUG_LOG("无法创建下载分类节: %s", section_name);
+        // 创建分类section名称
+        snprintf(section_name, sizeof(section_name), "qos_gargoyle.@download_class[%d]", i);
+        
+        // 先查找是否已存在
+        memset(&ptr, 0, sizeof(ptr));
+        if (uci_lookup_ptr(ctx, &ptr, section_name, true) != UCI_OK) {
+            // 如果不存在，创建新的section
+            struct uci_section *new_section = NULL;
+            if (uci_add_section(ctx, pkg, "download_class", &new_section) != UCI_OK) {
+                ERROR_LOG("无法添加下载分类section: %s", cls->name);
                 continue;
             }
         }
         
-        // 设置分类参数
-        uci_set(ctx, &pkg, section_name, "name", cls->name);
-        uci_set(ctx, &pkg, section_name, "classid", cls->classid);
+        // 设置name选项
+        memset(&ptr, 0, sizeof(ptr));
+        ptr.package = "qos_gargoyle";
+        ptr.section = "download_class";
+        ptr.option = "name";
+        ptr.value = cls->name;
         
+        if (uci_set(ctx, &ptr) != UCI_OK) {
+            ERROR_LOG("无法设置下载分类name: %s", cls->name);
+        }
+        
+        // 设置classid选项
+        memset(&ptr, 0, sizeof(ptr));
+        ptr.package = "qos_gargoyle";
+        ptr.section = "download_class";
+        ptr.option = "classid";
+        ptr.value = cls->classid;
+        
+        if (uci_set(ctx, &ptr) != UCI_OK) {
+            ERROR_LOG("无法设置下载分类classid: %s", cls->classid);
+        }
+        
+        // 设置priority选项
         snprintf(value, sizeof(value), "%d", cls->priority);
-        uci_set(ctx, &pkg, section_name, "priority", value);
+        memset(&ptr, 0, sizeof(ptr));
+        ptr.package = "qos_gargoyle";
+        ptr.section = "download_class";
+        ptr.option = "priority";
+        ptr.value = value;
         
-        snprintf(value, sizeof(value), "%d", cls->config_min_kbps);
-        uci_set(ctx, &pkg, section_name, "min_kbps", value);
+        if (uci_set(ctx, &ptr) != UCI_OK) {
+            ERROR_LOG("无法设置下载分类priority: %s", cls->name);
+        }
         
-        snprintf(value, sizeof(value), "%d", cls->config_max_kbps);
-        uci_set(ctx, &pkg, section_name, "max_kbps", value);
+        // 设置min_kbps选项
+        snprintf(value, sizeof(value), "%d", cls->min_kbps);
+        memset(&ptr, 0, sizeof(ptr));
+        ptr.package = "qos_gargoyle";
+        ptr.section = "download_class";
+        ptr.option = "min_kbps";
+        ptr.value = value;
         
-        // 计算百分比
-        int percent = (cls->current_kbps * 100) / qos_system->total_bandwidth_kbps;
-        snprintf(value, sizeof(value), "%d", percent);
-        uci_set(ctx, &pkg, section_name, "percent_bandwidth", value);
+        if (uci_set(ctx, &ptr) != UCI_OK) {
+            ERROR_LOG("无法设置下载分类min_kbps: %s", cls->name);
+        }
+        
+        // 设置max_kbps选项
+        snprintf(value, sizeof(value), "%d", cls->max_kbps);
+        memset(&ptr, 0, sizeof(ptr));
+        ptr.package = "qos_gargoyle";
+        ptr.section = "download_class";
+        ptr.option = "max_kbps";
+        ptr.value = value;
+        
+        if (uci_set(ctx, &ptr) != UCI_OK) {
+            ERROR_LOG("无法设置下载分类max_kbps: %s", cls->name);
+        }
+        
+        // 设置percent_bandwidth选项
+        snprintf(value, sizeof(value), "%.2f", cls->percent_bandwidth);
+        memset(&ptr, 0, sizeof(ptr));
+        ptr.package = "qos_gargoyle";
+        ptr.section = "download_class";
+        ptr.option = "percent_bandwidth";
+        ptr.value = value;
+        
+        if (uci_set(ctx, &ptr) != UCI_OK) {
+            ERROR_LOG("无法设置下载分类percent_bandwidth: %s", cls->name);
+        }
     }
     
     // 提交更改
-    if (uci_commit(ctx, &pkg, false) != 0) {
-        DEBUG_LOG("保存配置失败");
+    if (uci_save(ctx, pkg) != UCI_OK) {
+        ERROR_LOG("无法保存配置");
         ret = -1;
-    } else {
-        DEBUG_LOG("配置已保存到UCI");
     }
     
+    if (uci_commit(ctx, &pkg, false) != UCI_OK) {
+        ERROR_LOG("无法提交配置更改");
+        ret = -1;
+    }
+    
+    // 清理
     uci_unload(ctx, pkg);
     uci_free_context(ctx);
+    
+    if (ret == 0) {
+        INFO_LOG("配置保存成功");
+    }
+    
     return ret;
 }
