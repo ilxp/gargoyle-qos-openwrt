@@ -2,6 +2,7 @@
 #include <signal.h>
 #include <sys/wait.h>
 #include <uci.h>
+#include <dirent.h>
 
 // 全局变量定义
 qos_dba_system_t g_qos_system = {0};
@@ -29,6 +30,42 @@ static int parse_bandwidth_string(const char *str) {
     } else {
         return (int)value;
     }
+}
+
+// 执行shell命令
+static int execute_command(const char *cmd, char *output, int output_len) {
+    FILE *fp = popen(cmd, "r");
+    if (!fp) {
+        return -1;
+    }
+    
+    if (output && output_len > 0) {
+        output[0] = '\0';
+        if (fgets(output, output_len, fp) != NULL) {
+            // 去掉换行符
+            size_t len = strlen(output);
+            if (len > 0 && output[len-1] == '\n') {
+                output[len-1] = '\0';
+            }
+        }
+    }
+    
+    int ret = pclose(fp);
+    return WEXITSTATUS(ret);
+}
+
+// 调整TC分类带宽
+static int adjust_tc_class_bandwidth(const char *iface, const char *classid, int kbps) {
+    if (!iface || !classid || kbps <= 0) {
+        return -1;
+    }
+    
+    char cmd[256];
+    snprintf(cmd, sizeof(cmd), "tc class change dev %s parent 1:1 classid 1:%s htb rate %dkbit ceil %dkbit", 
+             iface, classid, kbps, kbps);
+    
+    DEBUG_LOG("执行TC命令: %s", cmd);
+    return execute_command(cmd, NULL, 0);
 }
 
 // 检测WAN接口
@@ -102,6 +139,262 @@ static int detect_total_bandwidth(void) {
     // 默认100M
     g_qos_system.total_bandwidth_kbps = 100 * 1000;
     DEBUG_LOG("使用默认带宽: 100 Mbps");
+    return 0;
+}
+
+// 加载DBA配置
+static int load_dba_config(const char *config_path) {
+    struct uci_context *ctx = uci_alloc_context();
+    if (!ctx) {
+        DEBUG_LOG("无法创建UCI上下文");
+        return -1;
+    }
+    
+    struct uci_package *pkg = NULL;
+    if (uci_load(ctx, "qos_gargoyle", &pkg) != 0) {
+        DEBUG_LOG("无法加载配置: %s", config_path);
+        uci_free_context(ctx);
+        return -1;
+    }
+    
+    // 获取DBA配置
+    struct uci_section *dba_section = uci_lookup_section(ctx, pkg, "dba");
+    if (dba_section) {
+        dba_config_t *config = &g_qos_system.config;
+        
+        const char *enabled = uci_lookup_option_string(ctx, dba_section, "enabled");
+        config->enabled = (enabled && atoi(enabled) > 0) ? 1 : 0;
+        
+        const char *interval = uci_lookup_option_string(ctx, dba_section, "interval");
+        config->interval = interval ? atoi(interval) : 5;
+        
+        const char *high_usage_threshold = uci_lookup_option_string(ctx, dba_section, "high_usage_threshold");
+        config->high_usage_threshold = high_usage_threshold ? atoi(high_usage_threshold) : 85;
+        
+        const char *high_usage_duration = uci_lookup_option_string(ctx, dba_section, "high_usage_duration");
+        config->high_usage_duration = high_usage_duration ? atoi(high_usage_duration) : 5;
+        
+        const char *low_usage_threshold = uci_lookup_option_string(ctx, dba_section, "low_usage_threshold");
+        config->low_usage_threshold = low_usage_threshold ? atoi(low_usage_threshold) : 30;
+        
+        const char *low_usage_duration = uci_lookup_option_string(ctx, dba_section, "low_usage_duration");
+        config->low_usage_duration = low_usage_duration ? atoi(low_usage_duration) : 10;
+        
+        const char *borrow_ratio = uci_lookup_option_string(ctx, dba_section, "borrow_ratio");
+        config->borrow_ratio = borrow_ratio ? atof(borrow_ratio) : 0.5f;
+        
+        const char *min_borrow_kbps = uci_lookup_option_string(ctx, dba_section, "min_borrow_kbps");
+        config->min_borrow_kbps = min_borrow_kbps ? atoi(min_borrow_kbps) : 64;
+        
+        const char *min_change_kbps = uci_lookup_option_string(ctx, dba_section, "min_change_kbps");
+        config->min_change_kbps = min_change_kbps ? atoi(min_change_kbps) : 32;
+        
+        const char *cooldown_time = uci_lookup_option_string(ctx, dba_section, "cooldown_time");
+        config->cooldown_time = cooldown_time ? atoi(cooldown_time) : 10;
+        
+        const char *auto_return_enable = uci_lookup_option_string(ctx, dba_section, "auto_return_enable");
+        config->auto_return_enable = (auto_return_enable && atoi(auto_return_enable) > 0) ? 1 : 0;
+        
+        const char *return_threshold = uci_lookup_option_string(ctx, dba_section, "return_threshold");
+        config->return_threshold = return_threshold ? atoi(return_threshold) : 60;
+        
+        const char *return_speed = uci_lookup_option_string(ctx, dba_section, "return_speed");
+        config->return_speed = return_speed ? atof(return_speed) : 0.1f;
+    } else {
+        DEBUG_LOG("DBA配置节不存在，使用默认值");
+    }
+    
+    uci_unload(ctx, pkg);
+    uci_free_context(ctx);
+    
+    return 0;
+}
+
+// 加载QoS分类
+static int load_qos_classes(const char *config_path) {
+    struct uci_context *ctx = uci_alloc_context();
+    if (!ctx) {
+        DEBUG_LOG("无法创建UCI上下文");
+        return -1;
+    }
+    
+    struct uci_package *pkg = NULL;
+    if (uci_load(ctx, "qos_gargoyle", &pkg) != 0) {
+        DEBUG_LOG("无法加载配置: %s", config_path);
+        uci_free_context(ctx);
+        return -1;
+    }
+    
+    // 先统计上传下载分类数量
+    int upload_count = 0;
+    int download_count = 0;
+    
+    struct uci_element *e;
+    uci_foreach_element(&pkg->sections, e) {
+        struct uci_section *s = uci_to_section(e);
+        if (strstr(s->type, "upload") || strstr(s->type, "download")) {
+            if (strncmp(s->type, "upload", 6) == 0) {
+                upload_count++;
+            } else if (strncmp(s->type, "download", 8) == 0) {
+                download_count++;
+            }
+        }
+    }
+    
+    // 分配内存
+    if (upload_count > 0) {
+        g_qos_system.upload_classes = calloc(upload_count, sizeof(qos_class_t));
+        g_qos_system.upload_class_count = upload_count;
+    }
+    
+    if (download_count > 0) {
+        g_qos_system.download_classes = calloc(download_count, sizeof(qos_class_t));
+        g_qos_system.download_class_count = download_count;
+    }
+    
+    // 重新遍历填充数据
+    int upload_idx = 0;
+    int download_idx = 0;
+    
+    uci_foreach_element(&pkg->sections, e) {
+        struct uci_section *s = uci_to_section(e);
+        qos_class_t *class_ptr = NULL;
+        int is_upload = 0;
+        
+        if (strncmp(s->type, "upload", 6) == 0) {
+            if (upload_idx >= upload_count) continue;
+            class_ptr = &g_qos_system.upload_classes[upload_idx];
+            is_upload = 1;
+        } else if (strncmp(s->type, "download", 8) == 0) {
+            if (download_idx >= download_count) continue;
+            class_ptr = &g_qos_system.download_classes[download_idx];
+            is_upload = 0;
+        } else {
+            continue;
+        }
+        
+        // 获取分类名称
+        const char *name = uci_lookup_option_string(ctx, s, "name");
+        if (name) {
+            strncpy(class_ptr->name, name, sizeof(class_ptr->name)-1);
+        } else {
+            snprintf(class_ptr->name, sizeof(class_ptr->name), "%s%d", 
+                    is_upload ? "upload" : "download", 
+                    is_upload ? upload_idx+1 : download_idx+1);
+        }
+        
+        // 获取带宽百分比
+        const char *percent = uci_lookup_option_string(ctx, s, "percent_bandwidth");
+        if (percent) {
+            class_ptr->config_percent = atoi(percent);
+        } else {
+            class_ptr->config_percent = 0;
+        }
+        
+        // 计算带宽
+        if (is_upload) {
+            class_ptr->config_max_kbps = g_qos_system.total_bandwidth_kbps * class_ptr->config_percent / 100;
+        } else {
+            class_ptr->config_max_kbps = g_qos_system.total_bandwidth_kbps * class_ptr->config_percent / 100;
+        }
+        
+        class_ptr->config_min_kbps = class_ptr->config_max_kbps * 10 / 100; // 最小带宽是最大带宽的10%
+        class_ptr->current_kbps = class_ptr->config_max_kbps;
+        class_ptr->enabled = 1;
+        class_ptr->borrowed_from = -1;
+        class_ptr->lent_to = -1;
+        
+        // 生成TC classid
+        int class_num = is_upload ? upload_idx+1 : download_idx+1;
+        if (is_upload) {
+            snprintf(class_ptr->classid, sizeof(class_ptr->classid), "%d", class_num+10);
+        } else {
+            snprintf(class_ptr->classid, sizeof(class_ptr->classid), "%d", class_num+20);
+        }
+        
+        if (is_upload) {
+            upload_idx++;
+        } else {
+            download_idx++;
+        }
+    }
+    
+    uci_unload(ctx, pkg);
+    uci_free_context(ctx);
+    
+    DEBUG_LOG("加载了 %d 个上传分类和 %d 个下载分类", 
+              g_qos_system.upload_class_count, g_qos_system.download_class_count);
+    
+    return 0;
+}
+
+// 监控分类状态
+static int monitor_all_classes(void) {
+    char cmd[256];
+    char output[1024];
+    
+    // 监控上传分类
+    for (int i = 0; i < g_qos_system.upload_class_count; i++) {
+        qos_class_t *class = &g_qos_system.upload_classes[i];
+        if (!class->enabled) continue;
+        
+        // 获取当前使用率
+        // 这里需要实现获取TC分类的流量统计
+        // 暂时使用模拟数据
+        class->used_kbps = 0;  // 需要实际获取
+        if (class->current_kbps > 0) {
+            class->usage_rate = (float)class->used_kbps / class->current_kbps;
+        } else {
+            class->usage_rate = 0.0f;
+        }
+        
+        // 更新使用状态计时器
+        if (class->usage_rate * 100 >= g_qos_system.config.high_usage_threshold) {
+            class->high_usage_seconds++;
+            class->low_usage_seconds = 0;
+            class->normal_usage_seconds = 0;
+        } else if (class->usage_rate * 100 <= g_qos_system.config.low_usage_threshold) {
+            class->low_usage_seconds++;
+            class->high_usage_seconds = 0;
+            class->normal_usage_seconds = 0;
+        } else {
+            class->normal_usage_seconds++;
+            class->high_usage_seconds = 0;
+            class->low_usage_seconds = 0;
+        }
+    }
+    
+    // 监控下载分类
+    for (int i = 0; i < g_qos_system.download_class_count; i++) {
+        qos_class_t *class = &g_qos_system.download_classes[i];
+        if (!class->enabled) continue;
+        
+        // 获取当前使用率
+        // 这里需要实现获取TC分类的流量统计
+        // 暂时使用模拟数据
+        class->used_kbps = 0;  // 需要实际获取
+        if (class->current_kbps > 0) {
+            class->usage_rate = (float)class->used_kbps / class->current_kbps;
+        } else {
+            class->usage_rate = 0.0f;
+        }
+        
+        // 更新使用状态计时器
+        if (class->usage_rate * 100 >= g_qos_system.config.high_usage_threshold) {
+            class->high_usage_seconds++;
+            class->low_usage_seconds = 0;
+            class->normal_usage_seconds = 0;
+        } else if (class->usage_rate * 100 <= g_qos_system.config.low_usage_threshold) {
+            class->low_usage_seconds++;
+            class->high_usage_seconds = 0;
+            class->normal_usage_seconds = 0;
+        } else {
+            class->normal_usage_seconds++;
+            class->high_usage_seconds = 0;
+            class->low_usage_seconds = 0;
+        }
+    }
+    
     return 0;
 }
 
@@ -276,23 +569,27 @@ int qos_dba_init(const char *config_path) {
     // 检测WAN接口
     if (detect_wan_interface() != 0) {
         DEBUG_LOG("初始化失败: 无法检测WAN接口");
+        pthread_mutex_destroy(&g_qos_system.mutex);
         return -1;
     }
     
     // 获取总带宽
     if (detect_total_bandwidth() != 0) {
         DEBUG_LOG("初始化失败: 无法获取总带宽");
+        pthread_mutex_destroy(&g_qos_system.mutex);
         return -1;
     }
     
     // 加载配置
     if (load_dba_config(config_path) != 0) {
         DEBUG_LOG("加载DBA配置失败");
+        pthread_mutex_destroy(&g_qos_system.mutex);
         return -1;
     }
     
     if (load_qos_classes(config_path) != 0) {
         DEBUG_LOG("加载QoS分类失败");
+        pthread_mutex_destroy(&g_qos_system.mutex);
         return -1;
     }
     
@@ -363,13 +660,10 @@ int adjust_upload_classes(void) {
         }
     }
     
-	if (adjustments > 0) {
+    if (adjustments > 0) {
         DEBUG_LOG("上传分类调整完成，共调整 %d 个分类", adjustments);
-        
-        // 在这里调用write_dba_status
-        write_dba_status();  // 添加这行
     }
-	
+    
     return adjustments;
 }
 
@@ -421,12 +715,9 @@ int adjust_download_classes(void) {
             }
         }
     }
-	
-	if (adjustments > 0) {
+    
+    if (adjustments > 0) {
         DEBUG_LOG("下载分类调整完成，共调整 %d 个分类", adjustments);
-        
-        // 在这里调用write_dba_status
-        write_dba_status();  // 添加这行
     }
     
     return adjustments;
@@ -507,12 +798,9 @@ int auto_return_borrowed_bandwidth(void) {
             }
         }
     }
-	
-	if (total_returned > 0) {
+    
+    if (total_returned > 0) {
         DEBUG_LOG("自动归还完成，共归还 %d kbps 带宽", total_returned);
-        
-        // 在这里调用write_dba_status
-        write_dba_status();  // 添加这行
     }
     
     return total_returned;
@@ -573,7 +861,63 @@ static int borrow_bandwidth_for_class(qos_class_t *dst_class, int needed_kbps, i
     return borrowed;
 }
 
-
+// 写入DBA状态到JSON文件
+void write_dba_status(void) {
+    const char *status_file = "/tmp/qosdba.status";
+    
+    FILE *fp = fopen(status_file, "w");
+    if (!fp) {
+        DEBUG_LOG("无法写入状态文件: %s", status_file);
+        return;
+    }
+    
+    // 写入JSON格式的状态信息
+    fprintf(fp, "{\n");
+    fprintf(fp, "  \"timestamp\": %ld,\n", (long)time(NULL));
+    fprintf(fp, "  \"enabled\": %s,\n", g_qos_system.config.enabled ? "true" : "false");
+    
+    // 写入上传分类状态
+    fprintf(fp, "  \"upload_classes\": {\n");
+    for (int i = 0; i < g_qos_system.upload_class_count; i++) {
+        qos_class_t *cls = &g_qos_system.upload_classes[i];
+        fprintf(fp, "    \"%s\": {\n", cls->name);
+        fprintf(fp, "      \"current\": %d,\n", cls->current_kbps);
+        fprintf(fp, "      \"used\": %d,\n", cls->used_kbps);
+        fprintf(fp, "      \"usage_rate\": %.2f,\n", cls->usage_rate);
+        fprintf(fp, "      \"borrowed\": %d\n", cls->borrowed_kbps);
+        
+        if (i < g_qos_system.upload_class_count - 1) {
+            fprintf(fp, "    },\n");
+        } else {
+            fprintf(fp, "    }\n");
+        }
+    }
+    fprintf(fp, "  },\n");
+    
+    // 写入下载分类状态
+    fprintf(fp, "  \"download_classes\": {\n");
+    for (int i = 0; i < g_qos_system.download_class_count; i++) {
+        qos_class_t *cls = &g_qos_system.download_classes[i];
+        fprintf(fp, "    \"%s\": {\n", cls->name);
+        fprintf(fp, "      \"current\": %d,\n", cls->current_kbps);
+        fprintf(fp, "      \"used\": %d,\n", cls->used_kbps);
+        fprintf(fp, "      \"usage_rate\": %.2f,\n", cls->usage_rate);
+        fprintf(fp, "      \"borrowed\": %d\n", cls->borrowed_kbps);
+        
+        if (i < g_qos_system.download_class_count - 1) {
+            fprintf(fp, "    },\n");
+        } else {
+            fprintf(fp, "    }\n");
+        }
+    }
+    fprintf(fp, "  }\n");
+    fprintf(fp, "}\n");
+    
+    fclose(fp);
+    chmod(status_file, 0644);
+    
+    DEBUG_LOG("状态已写入: %s", status_file);
+}
 
 // 启动DBA
 int qos_dba_start(void) {
@@ -689,62 +1033,3 @@ int qos_dba_set_verbose(int verbose) {
     g_qos_system.verbose = verbose ? 1 : 0;
     return 0;
 }
-
-// 写入DBA状态到JSON文件
-void write_dba_status(void) {
-    const char *status_file = "/tmp/qosdba.status";
-    
-    FILE *fp = fopen(status_file, "w");
-    if (!fp) {
-        DEBUG_LOG("无法写入状态文件: %s", status_file);
-        return;
-    }
-    
-    // 写入JSON格式的状态信息
-    fprintf(fp, "{\n");
-    fprintf(fp, "  \"timestamp\": %ld,\n", (long)time(NULL));
-    fprintf(fp, "  \"enabled\": %s,\n", g_qos_system.config.enabled ? "true" : "false");
-    
-    // 写入上传分类状态
-    fprintf(fp, "  \"upload_classes\": {\n");
-    for (int i = 0; i < g_qos_system.upload_class_count; i++) {
-        qos_class_t *cls = &g_qos_system.upload_classes[i];
-        fprintf(fp, "    \"%s\": {\n", cls->name);
-        fprintf(fp, "      \"current\": %d,\n", cls->current_kbps);
-        fprintf(fp, "      \"used\": %d,\n", cls->used_kbps);
-        fprintf(fp, "      \"usage_rate\": %.2f,\n", cls->usage_rate);
-        fprintf(fp, "      \"borrowed\": %d\n", cls->borrowed_kbps);
-        
-        if (i < g_qos_system.upload_class_count - 1) {
-            fprintf(fp, "    },\n");
-        } else {
-            fprintf(fp, "    }\n");
-        }
-    }
-    fprintf(fp, "  },\n");
-    
-    // 写入下载分类状态
-    fprintf(fp, "  \"download_classes\": {\n");
-    for (int i = 0; i < g_qos_system.download_class_count; i++) {
-        qos_class_t *cls = &g_qos_system.download_classes[i];
-        fprintf(fp, "    \"%s\": {\n", cls->name);
-        fprintf(fp, "      \"current\": %d,\n", cls->current_kbps);
-        fprintf(fp, "      \"used\": %d,\n", cls->used_kbps);
-        fprintf(fp, "      \"usage_rate\": %.2f,\n", cls->usage_rate);
-        fprintf(fp, "      \"borrowed\": %d\n", cls->borrowed_kbps);
-        
-        if (i < g_qos_system.download_class_count - 1) {
-            fprintf(fp, "    },\n");
-        } else {
-            fprintf(fp, "    }\n");
-        }
-    }
-    fprintf(fp, "  }\n");
-    fprintf(fp, "}\n");
-    
-    fclose(fp);
-    chmod(status_file, 0644);
-    
-    DEBUG_LOG("状态已写入: %s", status_file);
-}
-
