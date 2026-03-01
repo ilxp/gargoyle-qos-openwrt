@@ -49,10 +49,10 @@ msgstr "DPI 协议"
 msgid "Default Service Class"
 msgstr "默认服务类型"
 
-msgid "Destination IP(s)"
+msgid "Dest IP"
 msgstr "目标 IP"
 
-msgid "Destination Port(s)"
+msgid "Dest Port"
 msgstr "目标端口"
 
 msgid "Disable QoS"
@@ -110,17 +110,25 @@ msgid "Active Congestion Control"
 msgstr "主动拥塞控制"
 
 msgid ""
-"Each service class is specified by four parameters: percent bandwidth at "
-"capacity, realtime bandwidth and maximum bandwidth and the minimimze round "
+"Each download service class is specified by five main parameters: priority, percent "
+"bandwidth at capacity, minimum bandwidth and maximum bandwidth and the minimimze round "
 "trip time flag."
-msgstr ""
-"每个下载服务类型由四个参数指定：带宽占用百分比、最小保证带宽、最大带宽和最小"
+msgstr "每个下载服务类型由五个主要参数指定：优先级、带宽占用百分比、最小带宽和最大带宽。"
 "往返延时标志。"
 
 msgid ""
-"Each upload service class is specified by three parameters: percent "
+"Each upload service class is specified by four main parameters: priority, percent "
 "bandwidth at capacity, minimum bandwidth and maximum bandwidth."
-msgstr "每个上传服务类型由三个参数指定：带宽占用百分比、最小带宽和最大带宽。"
+msgstr "每个上传服务类型由四个主要参数指定：优先级、带宽占用百分比、最小带宽和最大带宽。"
+
+msgid "Priority"
+msgstr "优先级"
+
+msgid "Description"
+msgstr "猫叔"
+
+msgid "Load"
+msgstr "负载"
 
 msgid "Edit Download Classification Rule"
 msgstr "编辑下载分类规则"
@@ -177,9 +185,6 @@ msgstr "链路类型"
 msgid "Linklayer Overhead"
 msgstr "链路开销"
 
-msgid "Load"
-msgstr "负载"
-
 msgid "Loading"
 msgstr "正在加载"
 
@@ -195,20 +200,26 @@ msgstr ""
 msgid "Manual Ping Limit"
 msgstr "手动 Ping 限制"
 
-msgid "Maximum Bandwidth"
-msgstr "最大带宽"
+msgid "Max (kbps)"
+msgstr "最大带宽(kbps)"
 
-msgid "Maximum Packet Length"
-msgstr "最大数据包长度"
+msgid "Max Packet"
+msgstr "最大数据包"
 
 msgid "Minimize RTT"
 msgstr "最小往返延时"
 
-msgid "Minimum Bandwidth"
-msgstr "最小带宽"
+msgid "Min (kbps)"
+msgstr "最小带宽(kbps)"
 
-msgid "Minimum Packet Length"
-msgstr "最小数据包长度"
+msgid "Min Packet"
+msgstr "最小数据包"
+
+msgid "Optional description for this service class."
+msgstr "分类描述"
+
+msgid "Optional description for this rule."
+msgstr "规则描述"
 
 msgid "Network Interface"
 msgstr "外部网络接口"
@@ -262,7 +273,7 @@ msgstr ""
 "数据包将按规则中指定的顺序进行匹配 —— 靠上的规则优先进行匹配。一旦数据包匹配"
 "一条规则那它将被归类，并且其余的规则将被忽略。使用上下箭头可调整规则的顺序。"
 
-msgid "Percent Bandwidth At Capacity"
+msgid "Percent"
 msgstr "带宽占用百分比"
 
 msgid "QoS Switch"
@@ -318,10 +329,10 @@ msgstr ""
 "测速程序以确定可用的上传带宽。带宽以 kbps 为单位，留空以禁用上传 QoS。"
 "（1KByte/s=8Kbps）"
 
-msgid "Source IP(s)"
+msgid "Source IP"
 msgstr "源 IP"
 
-msgid "Source Port(s)"
+msgid "Source Port"
 msgstr "源端口"
 
 msgid "Specifie how packets that do not match any rule should be classified."
@@ -397,7 +408,7 @@ msgstr "下载总带宽"
 msgid "Total Upload Bandwidth"
 msgstr "上传总带宽"
 
-msgid "Transport Protocol"
+msgid "Protocol"
 msgstr "协议"
 
 msgid "Troubleshooting"

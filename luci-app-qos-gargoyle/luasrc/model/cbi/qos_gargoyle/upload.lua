@@ -113,8 +113,8 @@ end
 
 -- 1. 服务分类部分
 s = m:section(TypedSection, "upload_class", translate("Service Classes"),
-    translate("Each upload service class is specified by three parameters: percent bandwidth at "
-    .. "capacity, minimum bandwidth and maximum bandwidth."))
+    translate("Each upload service class is specified by four main parameters: priority, percent "
+    .. "bandwidth at capacity, minimum bandwidth and maximum bandwidth."))
 s.anonymous = true
 s.template = "cbi/tblsection"
 s.addremove = true
@@ -174,12 +174,12 @@ o.cfgvalue = function(self, section)
     return translate("Unlimited")
 end
 
--- 负载显示
 o = s:option(DummyValue, "description", translate("Description"))
 o.cfgvalue = function(self, section)
     return Value.cfgvalue(self, section) or "-"
 end
 
+-- 负载显示
 o = s:option(DummyValue, "_ld", "%s (kbps)" % translate("Load"))
 o.rawhtml = true
 o.value   = "0 kbps"
@@ -258,14 +258,36 @@ o.cfgvalue = function(self, section)
     return v and wa.byte_format(v) or "-"
 end
 
-o = r:option(DummyValue, "connbytes_kb", translate("Conn Bytes"))
-o.cfgvalue = function(self, section)
-    local v = Value.cfgvalue(self, section)
+o = r:option(DummyValue, "connbytes_kb", translate("Connection Bytes Reach"))
+o.cfgvalue = function(...)
+	local str_v = tostring(Value.cfgvalue(...))
+	local str_symbol, num1, num2
+	if str_v then
+		-- 检查字符串, 先检查-, 再检查大于小于号
+		if string.find(str_v, "-") then
+			num1, num2 = str_v:match("^(%d+)%-(%d+)$")
+			if num1 and num2 then
+				if tonumber(num1) > 0 then
+					num1 = wa.byte_format(tonumber(num1) * 1024)
+				end
+				if tonumber(num2) >0 then
+					num2 = wa.byte_format(tonumber(num2) * 1024)
+				end
+				return num1 .. " - " .. num2
+			end
+		else
+			str_symbol, num1 = str_v:match("([<=>]+)(%d+)")
+			if str_symbol and num1 then
+				num1 = wa.byte_format(tonumber(num1) * 1024)
+				return str_symbol .. num1
+			end
+		end
+	end
     return v or "-"
 end
 
 if qos.has_ndpi() then
-    o = r:option(DummyValue, "ndpi", translate("DPI"))
+    o = r:option(DummyValue, "ndpi", translate("DPI Protocol"))
     o.cfgvalue = function(self, section)
         local v = Value.cfgvalue(self, section)
         return v and v:upper() or translate("All")

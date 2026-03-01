@@ -43,10 +43,10 @@ msgstr ""
 msgid "Default Service Class"
 msgstr ""
 
-msgid "Destination IP(s)"
+msgid "Dest IP"
 msgstr ""
 
-msgid "Destination Port(s)"
+msgid "Dest Port"
 msgstr ""
 
 msgid "Disable QoS"
@@ -101,14 +101,17 @@ msgid "Active Congestion Control"
 msgstr ""
 
 msgid ""
-"Each service class is specified by four parameters: percent bandwidth at "
-"capacity, realtime bandwidth and maximum bandwidth and the minimimze round "
-"trip time flag."
+"Each upload service class is specified by four main parameters: priority, percent "
+"bandwidth at capacity, minimum bandwidth and maximum bandwidth."
 msgstr ""
 
-msgid ""
-"Each upload service class is specified by three parameters: percent "
-"bandwidth at capacity, minimum bandwidth and maximum bandwidth."
+msgid "Priority"
+msgstr ""
+
+msgid "Description"
+msgstr ""
+
+msgid "Load"
 msgstr ""
 
 msgid "Edit Download Classification Rule"
@@ -165,9 +168,6 @@ msgstr ""
 msgid "Linklayer Overhead"
 msgstr ""
 
-msgid "Load"
-msgstr ""
-
 msgid "Loading"
 msgstr ""
 
@@ -177,19 +177,25 @@ msgstr ""
 msgid "Manual Ping Limit"
 msgstr ""
 
-msgid "Maximum Bandwidth"
+msgid "Max (kbps)"
 msgstr ""
 
-msgid "Maximum Packet Length"
+msgid "Max Packet"
+msgstr ""
+
+msgid "Optional description for this service class."
+msgstr ""
+
+msgid "Optional description for this rule."
 msgstr ""
 
 msgid "Minimize RTT"
 msgstr ""
 
-msgid "Minimum Bandwidth"
+msgid "Min (kbps)"
 msgstr ""
 
-msgid "Minimum Packet Length"
+msgid "Min Packet"
 msgstr ""
 
 msgid "Network Interface"
@@ -239,7 +245,7 @@ msgid ""
 "using the arrow controls."
 msgstr ""
 
-msgid "Percent Bandwidth At Capacity"
+msgid "Percent"
 msgstr ""
 
 msgid "QoS Switch"
@@ -349,7 +355,7 @@ msgstr ""
 msgid "Total Upload Bandwidth"
 msgstr ""
 
-msgid "Transport Protocol"
+msgid "Protocol"
 msgstr ""
 
 msgid "Troubleshooting"
