@@ -43,7 +43,7 @@ local function create_class()
     local new_id = max_id + 1
     local new_sname = "uclass_" .. new_id
     
-    -- 创建新分类
+    -- 创建新分类但不提交
     uci:section(qos_config, "upload_class", new_sname, {
         name = "Class " .. new_id,
         priority = new_id,
@@ -54,7 +54,7 @@ local function create_class()
     })
     
     uci:save(qos_config)
-    uci:commit(qos_config)
+    -- 注意：移除了 uci:commit(qos_config)，只在用户保存时才提交
     
     return new_sname
 end
@@ -80,7 +80,15 @@ local function create_rule()
     
     local new_id = max_id + 1
     local new_sname = "upload_rule_" .. new_id
-    local new_order = new_id * 100
+    
+    -- 修复2: 从*5开始而不是*100
+    local new_order
+    if rule_count == 0 then
+        new_order = 5
+    else
+        -- 计算新的排序值，确保是5的倍数
+        new_order = math.floor((max_id + 1) * 5)
+    end
     
     -- 获取第一个可用的分类
     local first_class = nil
@@ -90,7 +98,7 @@ local function create_rule()
         end
     end)
     
-    -- 创建新规则
+    -- 创建新规则但不提交
     uci:section(qos_config, "upload_rule", new_sname, {
         test_order = new_order,
         family = "inet",
@@ -98,7 +106,7 @@ local function create_rule()
     })
     
     uci:save(qos_config)
-    uci:commit(qos_config)
+    -- 注意：移除了 uci:commit(qos_config)，只在用户保存时才提交
     
     return new_sname
 end
@@ -166,6 +174,7 @@ o.cfgvalue = function(self, section)
     return translate("Unlimited")
 end
 
+-- 负载显示
 o = s:option(DummyValue, "description", translate("Description"))
 o.cfgvalue = function(self, section)
     return Value.cfgvalue(self, section) or "-"
@@ -281,17 +290,34 @@ function m.on_before_commit(self)
         m.uci:set(qos_config, class, "priority", i)
     end
     
-    -- 自动排序规则
+    -- 自动排序规则，从5开始
     local rules = {}
     m.uci:foreach(qos_config, "upload_rule", function(s)
         table.insert(rules, s[".name"])
     end)
     
+    -- 按当前顺序排序
     for i, rule in ipairs(rules) do
-        m.uci:set(qos_config, rule, "test_order", i * 100)
+        -- 修复3: 从*5开始排序
+        m.uci:set(qos_config, rule, "test_order", i * 5)
     end
     
     return true
+end
+
+-- 修复4: 添加页面渲染前的处理
+function m.on_before_render(self)
+    -- 确保页面加载时保存临时数据
+    m.uci:save(qos_config)
+    return true
+end
+
+-- 修复5: 添加取消处理
+function m.on_cancel(self)
+    -- 当用户取消时，回滚未保存的更改
+    m.uci:revert(qos_config)
+    http.redirect(dsp.build_url("admin/qos/qos_gargoyle"))
+    return false
 end
 
 return m

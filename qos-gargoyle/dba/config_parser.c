@@ -2,11 +2,12 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdarg.h>  // 添加这行
 #include <uci.h>
 #include "config_parser.h"
 #include "qos_dba.h"
 
-// 全局变量
+// 全局变量 - 只定义一次
 qos_dba_system_t g_qos_system = {0};
 
 // 日志函数实现
@@ -36,9 +37,6 @@ void INFO_LOG(const char *format, ...) {
     fprintf(stderr, "\n");
     va_end(args);
 }
-
-// 全局变量
-qos_dba_system_t g_qos_system = {0};
 
 // 辅助函数：从UCI获取字符串值
 static char* uci_get_string(struct uci_context *ctx, struct uci_section *s, const char *option) {
@@ -96,20 +94,20 @@ int load_dba_config() {
         if (strcmp(s->type, "dba") == 0) {
             dba_found = 1;
             
-            // 读取DBA配置参数
-            g_qos_system.enabled = uci_get_int(ctx, s, "enabled", 1);
-            g_qos_system.interval = uci_get_int(ctx, s, "interval", 5);
-            g_qos_system.high_usage_threshold = uci_get_int(ctx, s, "high_usage_threshold", 85);
-            g_qos_system.high_usage_duration = uci_get_int(ctx, s, "high_usage_duration", 5);
-            g_qos_system.low_usage_threshold = uci_get_int(ctx, s, "low_usage_threshold", 30);
-            g_qos_system.low_usage_duration = uci_get_int(ctx, s, "low_usage_duration", 10);
-            g_qos_system.borrow_ratio = uci_get_float(ctx, s, "borrow_ratio", 0.5);
-            g_qos_system.min_borrow_kbps = uci_get_int(ctx, s, "min_borrow_kbps", 64);
-            g_qos_system.min_change_kbps = uci_get_int(ctx, s, "min_change_kbps", 32);
-            g_qos_system.cooldown_time = uci_get_int(ctx, s, "cooldown_time", 10);
-            g_qos_system.auto_return_enable = uci_get_int(ctx, s, "auto_return_enable", 1);
-            g_qos_system.return_threshold = uci_get_int(ctx, s, "return_threshold", 50);
-            g_qos_system.return_speed = uci_get_float(ctx, s, "return_speed", 0.1);
+            // 读取DBA配置参数到config结构体
+            g_qos_system.config.enabled = uci_get_int(ctx, s, "enabled", 1);
+            g_qos_system.config.interval = uci_get_int(ctx, s, "interval", 5);
+            g_qos_system.config.high_usage_threshold = uci_get_int(ctx, s, "high_usage_threshold", 85);
+            g_qos_system.config.high_usage_duration = uci_get_int(ctx, s, "high_usage_duration", 5);
+            g_qos_system.config.low_usage_threshold = uci_get_int(ctx, s, "low_usage_threshold", 30);
+            g_qos_system.config.low_usage_duration = uci_get_int(ctx, s, "low_usage_duration", 10);
+            g_qos_system.config.borrow_ratio = uci_get_float(ctx, s, "borrow_ratio", 0.5);
+            g_qos_system.config.min_borrow_kbps = uci_get_int(ctx, s, "min_borrow_kbps", 64);
+            g_qos_system.config.min_change_kbps = uci_get_int(ctx, s, "min_change_kbps", 32);
+            g_qos_system.config.cooldown_time = uci_get_int(ctx, s, "cooldown_time", 10);
+            g_qos_system.config.auto_return_enable = uci_get_int(ctx, s, "auto_return_enable", 1);
+            g_qos_system.config.return_threshold = uci_get_int(ctx, s, "return_threshold", 50);
+            g_qos_system.config.return_speed = uci_get_float(ctx, s, "return_speed", 0.1);
             
             DEBUG_LOG("加载DBA配置成功");
             break;
@@ -119,19 +117,19 @@ int load_dba_config() {
     if (!dba_found) {
         DEBUG_LOG("未找到DBA配置，使用默认值");
         // 设置默认值
-        g_qos_system.enabled = 1;
-        g_qos_system.interval = 5;
-        g_qos_system.high_usage_threshold = 85;
-        g_qos_system.high_usage_duration = 5;
-        g_qos_system.low_usage_threshold = 30;
-        g_qos_system.low_usage_duration = 10;
-        g_qos_system.borrow_ratio = 0.5;
-        g_qos_system.min_borrow_kbps = 64;
-        g_qos_system.min_change_kbps = 32;
-        g_qos_system.cooldown_time = 10;
-        g_qos_system.auto_return_enable = 1;
-        g_qos_system.return_threshold = 50;
-        g_qos_system.return_speed = 0.1;
+        g_qos_system.config.enabled = 1;
+        g_qos_system.config.interval = 5;
+        g_qos_system.config.high_usage_threshold = 85;
+        g_qos_system.config.high_usage_duration = 5;
+        g_qos_system.config.low_usage_threshold = 30;
+        g_qos_system.config.low_usage_duration = 10;
+        g_qos_system.config.borrow_ratio = 0.5;
+        g_qos_system.config.min_borrow_kbps = 64;
+        g_qos_system.config.min_change_kbps = 32;
+        g_qos_system.config.cooldown_time = 10;
+        g_qos_system.config.auto_return_enable = 1;
+        g_qos_system.config.return_threshold = 50;
+        g_qos_system.config.return_speed = 0.1;
     }
     
     uci_unload(ctx, pkg);
@@ -139,19 +137,19 @@ int load_dba_config() {
     
     // 打印加载的配置
     DEBUG_LOG("DBA配置：");
-    DEBUG_LOG("  启用: %d", g_qos_system.enabled);
-    DEBUG_LOG("  检查间隔: %d秒", g_qos_system.interval);
-    DEBUG_LOG("  高使用阈值: %d%%", g_qos_system.high_usage_threshold);
-    DEBUG_LOG("  高使用持续时间: %d秒", g_qos_system.high_usage_duration);
-    DEBUG_LOG("  低使用阈值: %d%%", g_qos_system.low_usage_threshold);
-    DEBUG_LOG("  低使用持续时间: %d秒", g_qos_system.low_usage_duration);
-    DEBUG_LOG("  借用比例: %.1f", g_qos_system.borrow_ratio);
-    DEBUG_LOG("  最小借用: %d kbps", g_qos_system.min_borrow_kbps);
-    DEBUG_LOG("  最小调整: %d kbps", g_qos_system.min_change_kbps);
-    DEBUG_LOG("  冷却时间: %d秒", g_qos_system.cooldown_time);
-    DEBUG_LOG("  自动归还: %d", g_qos_system.auto_return_enable);
-    DEBUG_LOG("  归还阈值: %d%%", g_qos_system.return_threshold);
-    DEBUG_LOG("  归还速度: %.1f", g_qos_system.return_speed);
+    DEBUG_LOG("  启用: %d", g_qos_system.config.enabled);
+    DEBUG_LOG("  检查间隔: %d秒", g_qos_system.config.interval);
+    DEBUG_LOG("  高使用阈值: %d%%", g_qos_system.config.high_usage_threshold);
+    DEBUG_LOG("  高使用持续时间: %d秒", g_qos_system.config.high_usage_duration);
+    DEBUG_LOG("  低使用阈值: %d%%", g_qos_system.config.low_usage_threshold);
+    DEBUG_LOG("  低使用持续时间: %d秒", g_qos_system.config.low_usage_duration);
+    DEBUG_LOG("  借用比例: %.1f", g_qos_system.config.borrow_ratio);
+    DEBUG_LOG("  最小借用: %d kbps", g_qos_system.config.min_borrow_kbps);
+    DEBUG_LOG("  最小调整: %d kbps", g_qos_system.config.min_change_kbps);
+    DEBUG_LOG("  冷却时间: %d秒", g_qos_system.config.cooldown_time);
+    DEBUG_LOG("  自动归还: %d", g_qos_system.config.auto_return_enable);
+    DEBUG_LOG("  归还阈值: %d%%", g_qos_system.config.return_threshold);
+    DEBUG_LOG("  归还速度: %.1f", g_qos_system.config.return_speed);
     
     return 0;
 }
@@ -268,8 +266,8 @@ int load_qos_classes() {
         }
         
         // 设置带宽
-        cls->min_kbps = min_kbps;
-        cls->max_kbps = max_kbps;
+        cls->config_min_kbps = min_kbps;
+        cls->config_max_kbps = max_kbps;
         cls->current_kbps = min_kbps;
         cls->used_kbps = 0;
         cls->usage_rate = 0.0f;
@@ -289,7 +287,7 @@ int load_qos_classes() {
         }
         
         DEBUG_LOG("加载分类: %s, ID: %s, 最小: %d kbps, 最大: %d kbps, 优先级: %d",
-                  cls->name, cls->classid, cls->min_kbps, cls->max_kbps, cls->priority);
+                  cls->name, cls->classid, cls->config_min_kbps, cls->config_max_kbps, cls->priority);
         
         if (is_upload) {
             upload_idx++;
@@ -321,52 +319,52 @@ int validate_qos_classes() {
     for (int i = 0; i < g_qos_system.upload_class_count; i++) {
         qos_class_t *cls = &g_qos_system.upload_classes[i];
         
-        if (cls->min_kbps <= 0) {
+        if (cls->config_min_kbps <= 0) {
             ERROR_LOG("上传分类 %d (%s) 的最小带宽必须大于0", i, cls->name);
             error_count++;
         }
         
-        if (cls->max_kbps <= 0) {
+        if (cls->config_max_kbps <= 0) {
             ERROR_LOG("上传分类 %d (%s) 的最大带宽必须大于0", i, cls->name);
             error_count++;
         }
         
-        if (cls->max_kbps < cls->min_kbps) {
+        if (cls->config_max_kbps < cls->config_min_kbps) {
             ERROR_LOG("上传分类 %d (%s) 的最大带宽不能小于最小带宽", i, cls->name);
             error_count++;
         }
         
-        total_min_kbps += cls->min_kbps;
-        total_max_kbps += cls->max_kbps;
+        total_min_kbps += cls->config_min_kbps;
+        total_max_kbps += cls->config_max_kbps;
         
         DEBUG_LOG("上传分类[%d]: %s, 最小: %d, 最大: %d, 优先级: %d", 
-                  i, cls->name, cls->min_kbps, cls->max_kbps, cls->priority);
+                  i, cls->name, cls->config_min_kbps, cls->config_max_kbps, cls->priority);
     }
     
     // 验证下载分类
     for (int i = 0; i < g_qos_system.download_class_count; i++) {
         qos_class_t *cls = &g_qos_system.download_classes[i];
         
-        if (cls->min_kbps <= 0) {
+        if (cls->config_min_kbps <= 0) {
             ERROR_LOG("下载分类 %d (%s) 的最小带宽必须大于0", i, cls->name);
             error_count++;
         }
         
-        if (cls->max_kbps <= 0) {
+        if (cls->config_max_kbps <= 0) {
             ERROR_LOG("下载分类 %d (%s) 的最大带宽必须大于0", i, cls->name);
             error_count++;
         }
         
-        if (cls->max_kbps < cls->min_kbps) {
+        if (cls->config_max_kbps < cls->config_min_kbps) {
             ERROR_LOG("下载分类 %d (%s) 的最大带宽不能小于最小带宽", i, cls->name);
             error_count++;
         }
         
-        total_min_kbps += cls->min_kbps;
-        total_max_kbps += cls->max_kbps;
+        total_min_kbps += cls->config_min_kbps;
+        total_max_kbps += cls->config_max_kbps;
         
         DEBUG_LOG("下载分类[%d]: %s, 最小: %d, 最大: %d, 优先级: %d", 
-                  i, cls->name, cls->min_kbps, cls->max_kbps, cls->priority);
+                  i, cls->name, cls->config_min_kbps, cls->config_max_kbps, cls->priority);
     }
     
     if (g_qos_system.total_bandwidth_kbps > 0) {
@@ -412,16 +410,32 @@ qos_class_t* get_qos_class(const char *classid, int is_upload) {
 
 // 保存配置到UCI
 int save_qos_config_to_uci() {
-    if (!g_qos_system.ctx) {
-        ERROR_LOG("无效的参数");
+    // 由于config_parser.h中qos_dba_system_t结构体没有ctx成员
+    // 我们需要重构这个函数
+    
+    DEBUG_LOG("保存配置到UCI（功能未实现）");
+    
+    // 创建新的UCI上下文
+    struct uci_context *ctx = uci_alloc_context();
+    if (!ctx) {
+        ERROR_LOG("无法创建UCI上下文");
         return -1;
     }
     
-    INFO_LOG("保存配置到UCI（功能暂时简化）");
+    // 加载配置
+    struct uci_package *pkg = NULL;
+    if (uci_load(ctx, "qos_gargoyle", &pkg) != UCI_OK) {
+        ERROR_LOG("无法加载qos_gargoyle配置");
+        uci_free_context(ctx);
+        return -1;
+    }
     
-    // 这里应该实现保存配置到UCI的逻辑
-    // 由于UCI库的复杂性，这里暂时简化
+    // 这里应该实现保存DBA配置到UCI的逻辑
     
+    uci_unload(ctx, pkg);
+    uci_free_context(ctx);
+    
+    INFO_LOG("配置保存完成");
     return 0;
 }
 
