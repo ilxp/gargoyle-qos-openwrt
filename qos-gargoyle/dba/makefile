@@ -7,8 +7,15 @@ TARGET = qosdba
 OBJS = config_parser.o dba_core.o qos_dba_impl.o qos_dba.o main.o tc_monitor.o
 
 # 源文件列表（用于显示和参考）
-SRC_FILES = src/config_parser.c src/dba_core.c src/qos_dba_impl.c src/qos_dba.c src/main.c src/tc_monitor.c
+SRC_FILES = config_parser.c dba_core.c qos_dba_impl.c qos_dba.c main.c tc_monitor.c
 OBJ_FILES = $(SRC_FILES:.c=.o)
+
+# 添加flex/bison规则
+config_parser.c: config_parser.l
+	flex -o config_parser.c config_parser.l
+
+config_parser.h: config_parser.y
+	bison -d -o config_parser.h config_parser.y
 
 all: $(TARGET)
 

@@ -9,6 +9,9 @@ PKG_RELEASE:=1
 
 PKG_BUILD_DIR := $(BUILD_DIR)/$(PKG_NAME)
 
+# 添加对主机工具flex和bison的依赖
+PKG_BUILD_DEPENDS:=flex/host bison/host
+
 include $(INCLUDE_DIR)/package.mk
 include $(INCLUDE_DIR)/kernel.mk
 
@@ -30,6 +33,14 @@ endef
 define Build/Prepare
 	mkdir -p $(PKG_BUILD_DIR)
 	$(CP) ./dba/* $(PKG_BUILD_DIR)/
+	
+	# 在构建前生成config_parser.c和config_parser.h
+	if [ -f $(PKG_BUILD_DIR)/config_parser.l ] && [ -f $(PKG_BUILD_DIR)/config_parser.y ]; then \
+		echo "Generating config_parser files from Lex/Yacc..."; \
+		cd $(PKG_BUILD_DIR) && \
+		flex -o config_parser.c config_parser.l && \
+		bison -d -o config_parser.h config_parser.y; \
+	fi
 endef
 
 
