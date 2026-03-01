@@ -182,7 +182,7 @@ end
 -- 负载显示
 o = s:option(DummyValue, "_ld", "%s (kbps)" % translate("Load"))
 o.rawhtml = true
-o.value   = "0 kbps"
+o.value   = "<em class=\"ld-upload\">*</em>"
 
 -- 2. 分类规则部分
 local r = m:section(TypedSection, "upload_rule", translate("Classification Rules"),
@@ -294,11 +294,6 @@ if qos.has_ndpi() then
     end
 end
 
-o = r:option(DummyValue, "description", translate("Description"))
-o.cfgvalue = function(self, section)
-    local v = Value.cfgvalue(self, section)
-    return v or "-"
-end
 
 -- 3. 修复排序和保存
 function m.on_before_commit(self)

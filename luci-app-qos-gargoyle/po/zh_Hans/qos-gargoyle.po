@@ -111,10 +111,9 @@ msgstr "主动拥塞控制"
 
 msgid ""
 "Each download service class is specified by five main parameters: priority, percent "
-"bandwidth at capacity, minimum bandwidth and maximum bandwidth and the minimimze round "
-"trip time flag."
+"bandwidth at capacity, minimum bandwidth and maximum bandwidth，MinRTT."
 msgstr "每个下载服务类型由五个主要参数指定：优先级、带宽占用百分比、最小带宽和最大带宽。"
-"往返延时标志。"
+"往返延时标志MinRTT。"
 
 msgid ""
 "Each upload service class is specified by four main parameters: priority, percent "
@@ -125,7 +124,7 @@ msgid "Priority"
 msgstr "优先级"
 
 msgid "Description"
-msgstr "猫叔"
+msgstr "描述"
 
 msgid "Load"
 msgstr "负载"
@@ -220,6 +219,12 @@ msgstr "分类描述"
 
 msgid "Optional description for this rule."
 msgstr "规则描述"
+
+msgid "Priority of this class. Lower number means higher priority. Used for sorting and bandwidth allocation."
+msgstr "分类优先级。数字越小表示优先级越高，用于排序和带宽分配"
+
+msgid "Dynamic Bandwidth Adjustment"
+msgstr "动态带宽调整"
 
 msgid "Network Interface"
 msgstr "外部网络接口"

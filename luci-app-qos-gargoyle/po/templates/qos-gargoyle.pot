@@ -105,6 +105,11 @@ msgid ""
 "bandwidth at capacity, minimum bandwidth and maximum bandwidth."
 msgstr ""
 
+msgid ""
+"Each download service class is specified by five main parameters: priority, percent "
+"bandwidth at capacity, minimum bandwidth and maximum bandwidth，MinRTT."
+msgstr ""
+
 msgid "Priority"
 msgstr ""
 
@@ -188,6 +193,13 @@ msgstr ""
 
 msgid "Optional description for this rule."
 msgstr ""
+
+msgid "Priority of this class. Lower number means higher priority. Used for sorting and bandwidth allocation."
+msgstr ""
+
+msgid "Dynamic Bandwidth Adjustment"
+msgstr ""
+
 
 msgid "Minimize RTT"
 msgstr ""

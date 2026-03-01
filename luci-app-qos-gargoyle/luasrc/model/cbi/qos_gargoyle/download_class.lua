@@ -20,6 +20,12 @@ s.addremove = false
 o = s:option(Value, "name", translate("Service Class Name"))
 o.rmempty = false
 
+o = s:option(Value, "priority", translate("Priority"),
+    translate("Priority of this class. Lower number means higher priority. Used for sorting and bandwidth allocation."))
+o.datatype = "uinteger"
+o.default = "1"
+o.rmempty = false
+
 o = s:option(Value, "percent_bandwidth", translate("Percent Bandwidth At Capacity"),
 	translate("The percentage of the total available bandwidth that should be allocated to this class "
 	.. "when all available bandwidth is being used. If unused bandwidth is available, more can (and "
@@ -57,5 +63,9 @@ o = s:option(Flag, "minRTT", translate("Minimize RTT"),
 	.. "(usually around 20%)."))
 o.enabled  = "Yes"
 o.disabled = "No"
+
+o = s:option(Value, "description", translate("Description"),
+    translate("Optional description for this service class."))
+o.rmempty = true
 
 return m
