@@ -1,0 +1,106 @@
+#!/bin/sh /etc/rc.common
+# IFB 设备管理脚本
+# 版本: 2.0
+# 描述: 创建和管理 ifb0 虚拟网络设备
+
+USE_PROCD=1
+START=21
+STOP=99
+
+# 启动服务
+start_service() {
+    procd_open_instance
+    procd_set_param command /bin/true
+    procd_set_param respawn
+    procd_close_instance
+    
+    echo "正在启动 IFB 设备服务..."
+    
+    # 等待网络系统就绪
+    sleep 2
+    
+    # 加载 IFB 内核模块（如果未加载）
+    if ! lsmod | grep -q "^ifb"; then
+        echo "加载 IFB 内核模块..."
+        modprobe ifb 2>/dev/null
+    fi
+    
+    # 检查设备是否已存在
+    if ip link show ifb0 >/dev/null 2>&1; then
+        echo "ifb0 设备已存在，确保启用..."
+        
+        # 确保设备处于 UP 状态
+        if ip link set dev ifb0 up 2>/dev/null; then
+            echo "ifb0 设备已启用"
+        else
+            echo "警告: 无法启用 ifb0 设备"
+        fi
+    else
+        # 创建设备
+        echo "创建 ifb0 设备..."
+        if ip link add ifb0 type ifb 2>/dev/null; then
+            echo "ifb0 设备创建成功"
+            
+            # 启用设备
+            if ip link set dev ifb0 up 2>/dev/null; then
+                echo "ifb0 设备已启用"
+            else
+                echo "警告: 启用 ifb0 设备失败"
+            fi
+        else
+            echo "错误: 创建 ifb0 设备失败"
+            return 1
+        fi
+    fi
+    
+    # 设置 MTU（与 WAN 接口匹配）
+    if [ -f "/sys/class/net/pppoe-wan/mtu" ]; then
+        local mtu=$(cat /sys/class/net/pppoe-wan/mtu 2>/dev/null)
+        if [ -n "$mtu" ] && [ "$mtu" -gt 0 ]; then
+            ip link set dev ifb0 mtu $mtu 2>/dev/null && echo "设置 ifb0 MTU: $mtu"
+        fi
+    fi
+    
+    # 设置队列长度
+    if [ -f "/sys/class/net/ifb0/tx_queue_len" ]; then
+        echo 1000 > /sys/class/net/ifb0/tx_queue_len 2>/dev/null
+    fi
+    
+    echo "IFB 设备服务启动完成"
+    return 0
+}
+
+# 停止服务
+stop_service() {
+    echo "停止 IFB 设备服务..."
+    # 注意：通常不需要手动删除 ifb0 设备
+    # 它会随网络命名空间自动清理
+    echo "IFB 设备服务已停止"
+}
+
+# 重启服务
+restart() {
+    echo "重启 IFB 设备服务..."
+    
+    # 先停止
+    stop_service
+    sleep 1
+    
+    # 再启动
+    start_service
+}
+
+# 服务状态
+status() {
+    if ip link show ifb0 >/dev/null 2>&1; then
+        echo "ifb0 设备状态:"
+        ip -o link show ifb0
+        echo ""
+        echo "接口统计:"
+        ip -s link show ifb0
+        return 0
+    else
+        echo "ifb0 设备不存在"
+        return 1
+    fi
+}
