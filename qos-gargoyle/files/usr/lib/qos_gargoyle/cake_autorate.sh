@@ -349,6 +349,43 @@ save_bandwidth_to_config() {
 
 #自动调整
 autorate_adjustment_loop() {
+    # 错误处理：捕获所有异常
+    set -e
+    trap 'echo "CAKE-autorate异常退出，错误码: $?"; exit 1' ERR
+    trap 'echo "收到信号，清理退出"; rm -f /var/run/cake_autorate.pid /tmp/run/cake_autorate.pid; exit 0' INT TERM EXIT
+    
+    # 创建PID文件
+    echo $$ > /var/run/cake_autorate.pid
+    [ -d "/tmp/run" ] && echo $$ > /tmp/run/cake_autorate.pid
+    echo "CAKE-autorate进程启动: $$"
+    
+    # 检查网络连通性
+    echo "检查网络连通性..."
+    for host in 223.5.5.5 119.29.29.29; do
+        if ping -c 1 -W 2 "$host" >/dev/null 2>&1; then
+            echo "主机 $host 可达"
+            break
+        fi
+    done
+    # --- PID文件管理开始 ---
+    # 创建PID文件
+    PID_FILE_1="/var/run/cake-autorate.pid"
+    PID_FILE_2="/tmp/run/cake-autorate.pid"
+    echo $$ > "$PID_FILE_1"
+    [ -d "/tmp/run" ] && echo $$ > "$PID_FILE_2"
+    logger -t "CAKE-autorate" "PID文件已创建: $$"
+    
+    # 设置退出时清理
+    cleanup_pid_files() {
+        rm -f "$PID_FILE_1"
+        rm -f "$PID_FILE_2"
+        logger -t "CAKE-autorate" "PID文件已清理"
+    }
+    trap cleanup_pid_files EXIT INT TERM
+    # --- PID文件管理结束 ---
+    # 立即创建PID文件
+    echo $$ > /var/run/cake_autorate.pid
+    trap "rm -f /var/run/cake_autorate.pid" EXIT INT TERM
     log_info "启动cake_autorate调整循环 (间隔: ${CAKE_AUTORATE_INTERVAL}s)"
     
     AUTORATE_RUNNING=1

@@ -15,6 +15,7 @@
 #include <netinet/in.h>
 #include <netinet/ip.h>
 #include <netinet/ip_icmp.h>
+#include <netinet/icmp6.h>
 #include <arpa/inet.h>
 #include <netdb.h>
 #include <poll.h>  // 修复poll.h包含

@@ -310,20 +310,6 @@ function m.on_after_apply(self)
     uci:save("qos_gargoyle")
     uci:commit("qos_gargoyle")
     
-    -- 如果启用了CAKE-autorate，则重启服务
-    local current_algo = get_active_algorithm()
-    if current_algo == "cake" then
-        local autorate_enabled = uci:get("qos_gargoyle", "cake", "autorate_enabled")
-        if autorate_enabled == "1" then
-            -- 停止CAKE-autorate服务
-            os.execute("/etc/init.d/cake_autorate stop 2>/dev/null")
-            -- 等待一段时间
-            os.execute("sleep 2")
-            -- 重新启动服务
-            os.execute("/etc/init.d/cake_autorate start 2>/dev/null")
-        end
-    end
-    
     -- 重启qos_gargoyle服务以确保所有配置生效
     os.execute("/etc/init.d/qos_gargoyle restart 2>/dev/null")
     
