@@ -18,7 +18,7 @@ define Package/qos-gargoyle
 	SECTION:=net
 	CATEGORY:=Network
 	TITLE:=A set of QoS scripts designed for use with Gargoyle Web Interface
-	DEPENDS:=+libnl +tc-full +ip +bc +kmod-ifb +kmod-sched +kmod-sched-connmark +kmod-sched-prio +nftables \
+	DEPENDS:=+tc-full +ip +bc +kmod-ifb +kmod-sched +kmod-sched-connmark +kmod-sched-prio +nftables \
 							+kmod-nf-conntrack +kmod-nf-conntrack6 +kmod-nf-nat +kmod-nf-nat6 +kmod-nf-nathelper +kmod-nf-nathelper-extra
 	MAINTAINER:=Eric Bishop <eric@gargoyle-router.com>
 endef
