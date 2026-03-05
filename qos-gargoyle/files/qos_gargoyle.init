@@ -908,9 +908,19 @@ initialize_qos() {
         generate_class_marks
     fi
     
-    # 应用分类规则 - 现在标记文件已存在
-    echo "调用分类规则应用..."
-    apply_classification_rules
+    # 应用分类规则 - cake算法不应用
+    echo "调用分类规则应用..."	
+	if [ "$algorithm" != "cake" ]; then
+        echo "调用分类规则应用..."
+        apply_classification_rules
+    else
+        echo "CAKE算法，跳过外部分类规则加载"
+        echo "CAKE使用内置DiffServ分类机制，无需NFTables分类规则"
+        
+        # 清空规则链，确保没有残留规则
+        nft flush chain inet gargoyle-qos-priority filter_qos_egress
+        nft flush chain inet gargoyle-qos-priority filter_qos_ingress
+    fi
     
     # 调用算法特定的初始化
     case "$algorithm" in

@@ -541,8 +541,12 @@ auto_tune_cake() {
 setup_ingress_redirect() {
     log_info "设置入口重定向: $qos_interface -> $IFB_DEVICE"
     
+    # 先尝试清理现有的ingress队列
     tc qdisc del dev "$qos_interface" ingress 2>/dev/null
+    # 短暂延迟，确保内核资源释放
+    sleep 1
     
+    # 创建ingress队列
     if ! tc qdisc add dev "$qos_interface" handle ffff: ingress; then
         log_error "无法在$qos_interface上创建入口队列"
         return 1
@@ -551,26 +555,42 @@ setup_ingress_redirect() {
     local ipv4_success=false
     local ipv6_success=false
     
+    # 添加IPv4重定向规则
     if tc filter add dev "$qos_interface" parent ffff: protocol ip \
         u32 match u32 0 0 \
-        action mirred egress redirect dev "$IFB_DEVICE" 2>/dev/null; then
+        action mirred egress redirect dev "$IFB_DEVICE" 2>&1; then
         ipv4_success=true
+        log_info "IPv4入口重定向规则添加成功"
     else
-        log_error "IPv4入口重定向规则添加失败"
+        # 捕获错误输出
+        local error_output=$(tc filter add dev "$qos_interface" parent ffff: protocol ip \
+            u32 match u32 0 0 \
+            action mirred egress redirect dev "$IFB_DEVICE" 2>&1)
+        log_error "IPv4入口重定向规则添加失败: $error_output"
     fi
     
+    # 添加IPv6重定向规则
     if tc filter add dev "$qos_interface" parent ffff: protocol ipv6 \
         u32 match u32 0 0 \
-        action mirred egress redirect dev "$IFB_DEVICE" 2>/dev/null; then
+        action mirred egress redirect dev "$IFB_DEVICE" 2>&1; then
         ipv6_success=true
+        log_info "IPv6入口重定向规则添加成功"
     else
-        log_error "IPv6入口重定向规则添加失败"
+        local error_output=$(tc filter add dev "$qos_interface" parent ffff: protocol ipv6 \
+            u32 match u32 0 0 \
+            action mirred egress redirect dev "$IFB_DEVICE" 2>&1)
+        log_error "IPv6入口重定向规则添加失败: $error_output"
     fi
     
-    if [ "$ipv4_success" = false ] || [ "$ipv6_success" = false ]; then
-        log_warn "部分入口重定向规则添加失败，清理已创建的队列"
+    # 即使部分失败，也不清理已创建的队列，因为可能部分流量仍需要重定向
+    if [ "$ipv4_success" = false ] && [ "$ipv6_success" = false ]; then
+        log_error "所有入口重定向规则均添加失败，清理ingress队列"
         tc qdisc del dev "$qos_interface" ingress 2>/dev/null
         return 1
+    elif [ "$ipv4_success" = false ] || [ "$ipv6_success" = false ]; then
+        log_warn "部分入口重定向规则添加失败，但保留已创建的队列"
+        # 返回0，表示部分成功，但系统可以继续运行
+        return 0
     fi
     
     log_info "入口重定向设置完成"
@@ -583,16 +603,29 @@ check_ingress_redirect() {
     local has_ipv4=false
     local has_ipv6=false
     
-    if tc filter show dev "$qos_interface" parent ffff: protocol ip 2>/dev/null | \
-        grep -q "mirred.*redirect dev $IFB_DEVICE"; then
+    # 检查是否有ingress队列
+    if ! tc qdisc show dev "$qos_interface" 2>/dev/null | grep -q "ingress"; then
+        echo "❌ 入口队列未创建"
+        return 1
+    fi
+    
+    # 获取tc filter输出
+    local filter_output
+    filter_output=$(tc filter show dev "$qos_interface" parent ffff: 2>/dev/null)
+    
+    # 调试：显示filter输出
+    log_debug "tc filter输出: $filter_output"
+    
+    # 检查IPv4规则
+    if echo "$filter_output" | grep -q "protocol ip"; then
         has_ipv4=true
         echo "✅ IPv4入口重定向: 已生效"
     else
         echo "❌ IPv4入口重定向: 未生效"
     fi
     
-    if tc filter show dev "$qos_interface" parent ffff: protocol ipv6 2>/dev/null | \
-        grep -q "mirred.*redirect dev $IFB_DEVICE"; then
+    # 检查IPv6规则
+    if echo "$filter_output" | grep -q "protocol ipv6"; then
         has_ipv6=true
         echo "✅ IPv6入口重定向: 已生效"
     else
@@ -848,9 +881,9 @@ initialize_cake_qos() {
         check_ingress_redirect
     fi
     
-	# 启动 cake-autorate
+	# 启动 cake_autorate
     if [ "$CAKE_AUTORATE_ENABLED" = "1" ]; then
-        log_info "检测到CAKE-autorate启用，启动自动带宽调整"
+        log_info "检测到CAKE_autorate启用，启动自动带宽调整"
         # 在后台启动 autorate
         /usr/lib/qos_gargoyle/cake_autorate.sh start &
     fi

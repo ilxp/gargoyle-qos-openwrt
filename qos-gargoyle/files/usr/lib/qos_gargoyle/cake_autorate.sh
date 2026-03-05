@@ -17,6 +17,10 @@ LAST_UPLOAD_BANDWIDTH=0
 LAST_DOWNLOAD_BANDWIDTH=0
 MEASUREMENT_HISTORY=""  # 用于存储延迟测量历史
 MONITORING_INTERVAL=10  # 每10次循环执行一次性能监控
+# 必要的路径变量
+SHARED_CONFIG_DIR="/tmp/qos_gargoyle"
+AUTORATE_STATUS_FILE="$SHARED_CONFIG_DIR/cake_autorate.status"
+CONFIG_LOCK="$SHARED_CONFIG_DIR/autorate.lock"
 
 # ========== 延迟测量函数 ==========
 measure_latency() {
@@ -598,7 +602,7 @@ stop_cake_autorate() {
 	# 清理所有临时文件，但排除正在使用的
     if [ -d "/proc" ]; then
         # 查找所有可能属于本脚本的临时文件
-        for tmpfile in "$AUTORATE_STATUS_FILE.tmp."* 2>/dev/null; do
+        for tmpfile in "$AUTORATE_STATUS_FILE.tmp."*; do
             # 检查文件是否被使用
             if [ -f "$tmpfile" ]; then
                 # 尝试删除，忽略错误
@@ -645,34 +649,38 @@ show_autorate_status() {
     echo ""
     
     if [ -f "$AUTORATE_STATUS_FILE" ]; then
-        echo "当前实时状态:"
-        
-        if acquire_lock "$CONFIG_LOCK" 2; then
-            if [ -f "$AUTORATE_STATUS_FILE" ]; then
-			# 使用临时变量存储文件内容，避免读取过程中文件被修改
-			local status_content=$(cat "$AUTORATE_STATUS_FILE" 2>/dev/null)
-			if [ -n "$status_content" ]; then
-				while IFS=':' read -r key value; do
-					case "$key" in
-						upload)
-							echo "  上传带宽: ${value}kbit/s"
-							;;
-						download)
-							echo "  下载带宽: ${value}kbit/s"
-							;;
-						rtt)
-							echo "  当前延迟: ${value}ms"
-							;;
-						cycle)
-							echo "  调整周期: 第${value}次"
-							;;
-						timestamp)
-							local age=$(($(date +%s) - value))
-							echo "  最后更新: ${age}秒前"
-							;;
-					esac
-            done <<< "$status_content"
-		fi
+		echo "当前实时状态:"
+    
+		if acquire_lock "$CONFIG_LOCK" 2; then
+			if [ -f "$AUTORATE_STATUS_FILE" ]; then
+				# 使用临时变量存储文件内容，避免读取过程中文件被修改
+				local status_content=$(cat "$AUTORATE_STATUS_FILE" 2>/dev/null)
+				if [ -n "$status_content" ]; then
+					# 使用管道而不是here-string，确保shell兼容性
+					echo "$status_content" | while IFS=':' read -r key value; do
+						case "$key" in
+							upload)
+								echo "  上传带宽: ${value}kbit/s"
+								;;
+							download)
+								echo "  下载带宽: ${value}kbit/s"
+								;;
+							rtt)
+								echo "  当前延迟: ${value}ms"
+								;;
+							cycle)
+								echo "  调整周期: 第${value}次"
+								;;
+							timestamp)
+								local age=$(($(date +%s) - value))
+								echo "  最后更新: ${age}秒前"
+								;;
+						esac
+					done
+				fi  
+			fi  
+			release_lock "$CONFIG_LOCK"  # 添加释放锁
+		fi 
 	fi
     
     if [ "$AUTORATE_RUNNING" -eq 1 ]; then
