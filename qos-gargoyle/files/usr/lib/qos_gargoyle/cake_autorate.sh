@@ -27,58 +27,63 @@ measure_latency() {
     local target_host="$1"
     local result=""
     
-	# 检查ping命令是否存在
-    if ! command -v ping >/dev/null 2>&1 && ! command -v fping >/dev/null 2>&1; then
-        log_error "既没有找到ping也没有找到fping命令，无法测量延迟"
-        echo "0"
-        return
-    fi
-	
-    # 使用ping测量延迟，取最小值
+    # 使用ping测量延迟
     if command -v ping >/dev/null 2>&1; then
-        result=$(ping -c 3 -i 0.2 -W 1 "$target_host" 2>/dev/null | \
-            grep -E "min/avg/max" | \
-            awk -F'/' '{print $5}' | \
-            awk '{print $1}')
+        # 使用更严格的参数
+        result=$(ping -c 1 -W 2 "$target_host" 2>/dev/null | \
+            grep -o "time=[0-9.]*" | \
+            cut -d= -f2 2>/dev/null)
+        
+        # 如果没有结果，尝试多次测量
+        if [ -z "$result" ]; then
+            result=$(ping -c 3 -i 0.2 -W 1 "$target_host" 2>/dev/null | \
+                grep -E "min/avg/max" | \
+                awk -F'/' '{print $5}' 2>/dev/null)
+        fi
     fi
     
-    # 如果ping失败，尝试使用fping
-    if [ -z "$result" ] && command -v fping >/dev/null 2>&1; then
-        result=$(fping -c 3 -p 200 -t 1000 "$target_host" 2>/dev/null | \
-            grep -E "min/avg/max" | \
-            awk -F'/' '{print $5}' | \
-            awk '{print $1}')
+    # 如果还是没有结果，返回空
+    if [ -z "$result" ]; then
+        echo ""
+    else
+        # 清理结果，只返回数字
+        echo "$result" | grep -oE '[0-9]+(\.[0-9]+)?' | head -1
     fi
-    
-    echo "$result"
 }
 
 # 测量多个目标，取最佳延迟
 measure_best_latency() {
-    local best_rtt="9999"
+    local best_rtt=""
     local valid_measurements=0
     
     for host in $CAKE_AUTORATE_PING_HOSTS; do
         local rtt=$(measure_latency "$host")
-        if [ -n "$rtt" ] && [ "$rtt" != "0" ]; then
-            # 转换为整数比较
-            local rtt_int=$(echo "$rtt" | awk -F'.' '{print $1}')
-            local best_int=$(echo "$best_rtt" | awk -F'.' '{print $1}')
+        
+        # 调试：记录原始测量结果
+        log_debug "测量 $host: 原始结果='$rtt'"
+        
+        # 清理结果：只保留数字和小数点
+        if [ -n "$rtt" ]; then
+            # 提取纯数字（包括小数点）
+            rtt=$(echo "$rtt" | grep -oE '[0-9]+(\.[0-9]+)?' | head -1)
             
-            if [ "$rtt_int" -lt "$best_int" ] 2>/dev/null; then
-                best_rtt="$rtt"
-                valid_measurements=$((valid_measurements + 1))
+            if [ -n "$rtt" ] && [ "$rtt" != "0" ] && [ "$rtt" != "0.0" ]; then
+                if [ -z "$best_rtt" ] || [ "$(echo "$rtt < $best_rtt" | bc 2>/dev/null || echo 0)" = "1" ]; then
+                    best_rtt="$rtt"
+                    valid_measurements=$((valid_measurements + 1))
+                fi
             fi
         fi
     done
     
     # 如果没有测量到有效延迟
     if [ "$valid_measurements" -eq 0 ]; then
-        # 返回空字符串表示测量失败
+        # 只记录日志，不返回任何信息
         log_warn "所有ping目标均无响应，延迟测量失败"
-        echo ""
+        echo ""  # 返回空字符串
     else
-        echo "$best_rtt"
+        # 再次清理确保只有数字
+        echo "$best_rtt" | grep -oE '[0-9]+(\.[0-9]+)?' | head -1
     fi
 }
 
@@ -375,6 +380,7 @@ autorate_adjustment_loop() {
         
         # 1. 测量当前延迟
         local current_rtt=$(measure_best_latency)
+		log_debug "测量结果: '$current_rtt'"
         
         if [ "$current_rtt" = "0" ] || [ -z "$current_rtt" ]; then
 			log_warn "延迟测量失败，所有测量目标均无响应"

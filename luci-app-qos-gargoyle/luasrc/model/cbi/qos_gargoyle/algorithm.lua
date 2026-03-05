@@ -246,12 +246,7 @@ elseif current_algo == "cake" then
     quantum_cake.datatype = "uinteger"
     quantum_cake.rmempty = false
 	
-	 -- CAKE-autorate 参数配置
-    local autorate_title = s_cake:option(DummyValue, "_autorate_title", " ")
-    autorate_title.template = "cbi/tvalue"
-    autorate_title.title = translate("<h3>CAKE-autorate Configuration</h3>")
-    autorate_title.description = translate("Dynamic bandwidth adjustment based on network latency")
-    
+	 -- CAKE-autorate 参数配置 
     local autorate_enabled = s_cake:option(ListValue, "autorate_enabled", translate("AutoRate Enabled"))
     autorate_enabled:value("0", translate("Disable"))
     autorate_enabled:value("1", translate("Enable"))
@@ -273,12 +268,12 @@ elseif current_algo == "cake" then
     autorate_interval.description = translate("Time between each bandwidth adjustment (5-60 seconds)")
     
     local autorate_ping_hosts = s_cake:option(Value, "autorate_ping_hosts", translate("Ping Hosts"))
-    autorate_ping_hosts.default = "1.1.1.1 8.8.8.8"
+    autorate_ping_hosts.default = "223.5.5.5 119.29.29.29 180.76.76.76"
     autorate_ping_hosts.rmempty = false
     autorate_ping_hosts.description = translate("Target hosts for latency measurement, separated by spaces")
     
     local autorate_min_rtt = s_cake:option(ListValue, "autorate_min_rtt", translate("Minimum Target RTT"))
-    autorate_min_rtt.default = "20ms"
+    autorate_min_rtt.default = "10ms"
     autorate_min_rtt:value("5ms", "5ms")
     autorate_min_rtt:value("10ms", "10ms")
     autorate_min_rtt:value("20ms", "20ms")
@@ -288,7 +283,7 @@ elseif current_algo == "cake" then
     autorate_min_rtt.description = translate("Target minimum latency. When RTT is below this, increase bandwidth")
     
     local autorate_max_rtt = s_cake:option(ListValue, "autorate_max_rtt", translate("Maximum Target RTT"))
-    autorate_max_rtt.default = "100ms"
+    autorate_max_rtt.default = "50ms"
     autorate_max_rtt:value("50ms", "50ms")
     autorate_max_rtt:value("80ms", "80ms")
     autorate_max_rtt:value("100ms", "100ms")
@@ -314,6 +309,23 @@ end
 function m.on_after_apply(self)
     uci:save("qos_gargoyle")
     uci:commit("qos_gargoyle")
+    
+    -- 如果启用了CAKE-autorate，则重启服务
+    local current_algo = get_active_algorithm()
+    if current_algo == "cake" then
+        local autorate_enabled = uci:get("qos_gargoyle", "cake", "autorate_enabled")
+        if autorate_enabled == "1" then
+            -- 停止CAKE-autorate服务
+            os.execute("/etc/init.d/cake-autorate stop 2>/dev/null")
+            -- 等待一段时间
+            os.execute("sleep 2")
+            -- 重新启动服务
+            os.execute("/etc/init.d/cake-autorate start 2>/dev/null")
+        end
+    end
+    
+    -- 重启qos_gargoyle服务以确保所有配置生效
+    os.execute("/etc/init.d/qos_gargoyle restart 2>/dev/null")
     
     -- 重定向回当前页面
     http.redirect(dsp.build_url("admin/qos/qos_gargoyle/algorithm"))

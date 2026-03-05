@@ -1,31 +1,31 @@
 BINDIR = /usr/sbin
+#TCDIR:=$(BUILD_DIR)/iproute2-tc*/ip*
+TCDIR:=$(shell if [ -e "${BUILD_DIR}/iproute2-tcfull" ] ; then echo "${BUILD_DIR}/iproute2-tcfull"/ip* ; else echo "${BUILD_DIR}/iproute2-tctiny"/ip* ; fi ; )
+#The ncurses library only needed if we remove the ONLYBG switch
+#below.  Mostly for debug
+#LDLIBS += -lncurses
 
-# 不再需要iproute2的路径设置
-# TCDIR:=$(shell if [ -e "${BUILD_DIR}/iproute2-tcfull" ] ; then echo "${BUILD_DIR}/iproute2-tcfull"/ip* ; else echo "${BUILD_DIR}/iproute2-tctiny"/ip* ; fi ; )
+LDLIBS += -lm
 
-# 链接库设置 - 添加libnl
-LDLIBS += -lm -lnl-3 -lnl-route-3
-# 如果需要支持ncurses（调试界面），可以取消下面注释
-# LDLIBS += -lncurses
 
-# 编译标志
-CFLAGS += -Wall -O2
+TCOBJS := $(TCDIR)/tc/tc_util.o
+TCOBJS += $(TCDIR)/tc/tc_core.o
+TCOBJS += $(TCDIR)/tc/q_hfsc.o
+TCOBJS += $(TCDIR)/lib/libnetlink.a
+TCOBJS += $(TCDIR)/lib/libutil.a
 LDFLAGS += -Wl,-export-dynamic 
-
-# 移除ONLYBG标志，因为代码中已不依赖此宏
-# 如果需要后台模式，代码中已通过命令行参数控制
 
 all: qosmon
 
 qosmon: qosmon.o
-	$(CC) $(LDFLAGS) $^ -o $@ $(LDLIBS)
+	$(CC) $(LDFLAGS) $^ $(TCOBJS) -o $@ $(LDLIBS)
 
 qosmon.o: qosmon.c
-	$(CC) $(CFLAGS) -c $^ -o $@
+	$(CC) -D ONLYBG $(CFLAGS) -I $(TCDIR)/include -I $(TCDIR)/tc -c $^ -o $@
 
 install: all uninstall
 	-mkdir -p $(BINDIR)
-	cp qosmon $(BINDIR)
+	cp qosmon  $(BINDIR)
 
 uninstall:
 	rm -f $(BINDIR)/qosmon
