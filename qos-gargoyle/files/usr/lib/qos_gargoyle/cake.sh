@@ -379,7 +379,7 @@ load_cake_config() {
     
     log_info "CAKE配置: diffserv=$CAKE_DIFFSERV_MODE, overhead=$CAKE_OVERHEAD, mpu=$CAKE_MPU, rtt=$CAKE_RTT, ack_filter=$CAKE_ACK_FILTER, nat=$CAKE_NAT, wash=$CAKE_WASH, split_gso=$CAKE_SPLIT_GSO, ingress=$CAKE_INGRESS, autorate_ingress=$CAKE_AUTORATE_INGRESS, memlimit=$CAKE_MEMORY_LIMIT"
     
-	# cake-autorate 配置
+	# cake_autorate 配置
     CAKE_AUTORATE_ENABLED=$(uci -q get qos_gargoyle.cake.autorate_enabled 2>/dev/null)
     CAKE_AUTORATE_ENABLED="${CAKE_AUTORATE_ENABLED:-0}"
 	
@@ -407,7 +407,7 @@ load_cake_config() {
     
 	validate_cake_autorate_config
 	
-    log_info "CAKE-autorate配置: enabled=$CAKE_AUTORATE_ENABLED, persist=$CAKE_AUTORATE_PERSIST, interval=${CAKE_AUTORATE_INTERVAL}s"
+    log_info "cake_autorate配置: enabled=$CAKE_AUTORATE_ENABLED, persist=$CAKE_AUTORATE_PERSIST, interval=${CAKE_AUTORATE_INTERVAL}s"
 }
 
 # 动态更新 CAKE 队列的带宽参数
@@ -883,9 +883,31 @@ initialize_cake_qos() {
     
 	# 启动 cake_autorate
     if [ "$CAKE_AUTORATE_ENABLED" = "1" ]; then
-        log_info "检测到CAKE_autorate启用，启动自动带宽调整"
+        log_info "检测到cake_autorate启用，启动自动带宽调整"
         # 在后台启动 autorate
+    # 单实例检查 - 防止重复启动
+    if [ -f "/var/run/cake_autorate.pid" ]; then
+        local existing_pid=$(cat /var/run/cake_autorate.pid 2>/dev/null)
+        if [ -n "$existing_pid" ] && kill -0 "$existing_pid" 2>/dev/null; then
+            log_info "cake_autorate已经在运行中 (PID: $existing_pid)，跳过启动"
+            return 0
+        fi
+    fi
+    
+    # 检查是否已有同名进程在运行
+    if pgrep -f "cake_autorate.sh start" >/dev/null; then
+        local running_pid=$(pgrep -f "cake_autorate.sh start" | head -1)
+        log_info "cake_autorate已经在运行中 (PID: $running_pid)，跳过启动"
+        return 0
+    fi
+    
+    # 启动前创建PID文件（空文件，进程启动后更新）
+    touch /var/run/cake_autorate.pid
         /usr/lib/qos_gargoyle/cake_autorate.sh start &
+    
+    # 保存PID到文件
+    echo $! > /var/run/cake_autorate.pid
+    log_info "cake_autorate服务已启动 (PID: $!)"
     fi
 	
     health_check_cake
@@ -904,7 +926,7 @@ initialize_cake_qos() {
 stop_cake_qos() {
     log_info "停止CAKE QoS"
 	
-	 # 先停止 cake-autorate
+	 # 先停止 cake_autorate
     if [ -f "/usr/lib/qos_gargoyle/cake_autorate.sh" ]; then
         /usr/lib/qos_gargoyle/cake_autorate.sh stop
     fi
@@ -1394,12 +1416,12 @@ show_cake_status() {
         echo "入口重定向: 未配置"
     fi
     
-	# 显示 cake-autorate 状态
-    echo -e "\n===== CAKE-autorate 状态 ====="
+	# 显示 cake_autorate 状态
+    echo -e "\n===== cake_autorate 状态 ====="
     if [ "$CAKE_AUTORATE_ENABLED" = "1" ]; then
         echo "状态: 已启用 ✅"
         
-        # 调用 cake-autorate 的状态函数
+        # 调用 cake_autorate 的状态函数
         if [ -f "/usr/lib/qos_gargoyle/cake_autorate.sh" ]; then
             /usr/lib/qos_gargoyle/cake_autorate.sh status
         else

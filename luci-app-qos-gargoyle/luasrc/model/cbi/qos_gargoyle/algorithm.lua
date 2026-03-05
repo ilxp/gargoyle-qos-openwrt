@@ -316,11 +316,11 @@ function m.on_after_apply(self)
         local autorate_enabled = uci:get("qos_gargoyle", "cake", "autorate_enabled")
         if autorate_enabled == "1" then
             -- 停止CAKE-autorate服务
-            os.execute("/etc/init.d/cake-autorate stop 2>/dev/null")
+            os.execute("/etc/init.d/cake_autorate stop 2>/dev/null")
             -- 等待一段时间
             os.execute("sleep 2")
             -- 重新启动服务
-            os.execute("/etc/init.d/cake-autorate start 2>/dev/null")
+            os.execute("/etc/init.d/cake_autorate start 2>/dev/null")
         end
     end
     

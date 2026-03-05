@@ -1,5 +1,5 @@
 #!/bin/sh
-# CAKE-autorate 动态带宽调整模块
+# cake_autorate 动态带宽调整模块
 # 通过测量延迟自动调整CAKE带宽参数
 # version=1.0
 
@@ -349,7 +349,7 @@ save_bandwidth_to_config() {
 
 #自动调整
 autorate_adjustment_loop() {
-    log_info "启动CAKE-autorate调整循环 (间隔: ${CAKE_AUTORATE_INTERVAL}s)"
+    log_info "启动cake_autorate调整循环 (间隔: ${CAKE_AUTORATE_INTERVAL}s)"
     
     AUTORATE_RUNNING=1
     local cycle_count=0
@@ -571,33 +571,73 @@ autorate_adjustment_loop() {
 
 # ========== 控制函数 ==========
 start_cake_autorate() {
+    # 强化的单实例检查
+    local lock_file="/var/run/cake_autorate.lock"
+    local pid_file="/var/run/cake_autorate.pid"
+    
+    # 检查锁文件
+    if [ -f "$lock_file" ]; then
+        local lock_pid=$(cat "$lock_file" 2>/dev/null)
+        if [ -n "$lock_pid" ] && kill -0 "$lock_pid" 2>/dev/null 2>&1; then
+            echo "cake_autorate已经在运行中 (PID: $lock_pid)，跳过启动"
+            return 0
+        else
+            # 锁文件存在但进程不存在，清理
+            rm -f "$lock_file"
+        fi
+    fi
+    
+    # 检查PID文件
+    if [ -f "$pid_file" ]; then
+        local existing_pid=$(cat "$pid_file" 2>/dev/null)
+        if [ -n "$existing_pid" ] && kill -0 "$existing_pid" 2>/dev/null 2>&1; then
+            echo "cake_autorate已经在运行中 (PID: $existing_pid)，跳过启动"
+            return 0
+        else
+            # PID文件存在但进程不存在，清理
+            rm -f "$pid_file"
+        fi
+    fi
+    
+    # 检查进程
+    if pgrep -f "cake_autorate.sh start" | grep -v "^$$$" >/dev/null; then
+        local running_pid=$(pgrep -f "cake_autorate.sh start" | grep -v "^$$$" | head -1)
+        echo "cake_autorate已经在运行中 (PID: $running_pid)，跳过启动"
+        return 0
+    fi
+    
+    # 创建锁文件
+    echo "$$$" > "$lock_file"
+    trap "rm -f $lock_file" EXIT
+    
+    # 原有的启动代码...
     if [ "$CAKE_AUTORATE_ENABLED" != "1" ]; then
-        log_info "CAKE-autorate未启用，跳过启动"
+        log_info "cake_autorate未启用，跳过启动"
         return 1
     fi
     
     if [ "$AUTORATE_RUNNING" -eq 1 ]; then
-        log_info "CAKE-autorate已经在运行中"
+        log_info "cake_autorate已经在运行中"
         return 0
     fi
     
-    log_info "启动CAKE-autorate服务"
+    log_info "启动cake_autorate服务"
     
     # 在后台启动调整循环
     autorate_adjustment_loop &
     AUTORATE_PID=$!
     
-    log_info "CAKE-autorate服务已启动 (PID: $AUTORATE_PID)"
+    log_info "cake_autorate服务已启动 (PID: $AUTORATE_PID)"
     return 0
 }
 
 stop_cake_autorate() {
     if [ "$AUTORATE_RUNNING" -eq 0 ]; then
-        log_info "CAKE-autorate未在运行"
+        log_info "cake_autorate未在运行"
         return 0
     fi
     
-    log_info "停止CAKE-autorate服务"
+    log_info "停止cake_autorate服务"
     AUTORATE_RUNNING=0
     
     if [ -n "$AUTORATE_PID" ]; then
@@ -630,13 +670,13 @@ stop_cake_autorate() {
     # 清理所有 .lock 文件
     [ -d "$SHARED_CONFIG_DIR" ] && find "$SHARED_CONFIG_DIR" -name "*.lock" -delete 2>/dev/null
     
-    log_info "CAKE-autorate服务已停止"
+    log_info "cake_autorate服务已停止"
     return 0
 }
 
 # ========== 状态查询函数 ==========
 show_autorate_status() {
-    echo "===== CAKE-autorate 状态报告 ====="
+    echo "===== cake_autorate 状态报告 ====="
     echo "运行状态: $([ "$AUTORATE_RUNNING" -eq 1 ] && echo "✅ 运行中" || echo "❌ 已停止")"
     echo "进程PID: ${AUTORATE_PID:-无}"
     echo "测量间隔: ${CAKE_AUTORATE_INTERVAL}s"
