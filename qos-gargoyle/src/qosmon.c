@@ -1,6 +1,6 @@
-/* qosmon - 基于netlink的精简版QoS监控器
+/* qosmon - 基于netlink的优化版QoS监控器
  * 功能：通过ping监控延迟，使用netlink动态调整ifb0根类的带宽
- * 基于Paul Bixel的原始代码优化,poll机制，完整HFSC和HTB支持
+ * 基于Paul Bixel的原始代码优化,poll机制，完整支持HFSC\HTB\CAKE算法。
  */
  
 #include <stdio.h>
@@ -56,6 +56,7 @@ typedef enum {
     QMON_ERR_CONFIG = -4,
     QMON_ERR_SYSTEM = -5,
     QMON_ERR_SIGNAL = -6
+	QMON_HELP_REQUESTED = -99  // 表示用户请求查看帮助
 } qosmon_result_t;
 
 /* ==================== 配置结构 ==================== */
@@ -144,6 +145,42 @@ typedef struct qosmon_context_s {
     // 控制标志
     int sigterm;
 } qosmon_context_t;
+
+/* ==================== 帮助信息 ==================== */
+const char qosmon_usage[] =
+"qosmon - 基于netlink的优化版QoS监控器\n"
+"版本: 基于Paul Bixel代码优化，支持poll机制与HFSC/HTB/CAKE\n\n"
+"用法:\n"
+"  qosmon [ping间隔(ms)] [目标地址] [最大带宽(kbps)] [ping限制(ms)]\n"
+"  qosmon [选项]\n\n"
+"位置参数（传统用法）:\n"
+"  ping间隔        发送ICMP ping的间隔，单位毫秒 (范围: 50-5000, 默认: 200)\n"
+"  目标地址        用于测量延迟的IP地址或主机名 (默认: 8.8.8.8)\n"
+"  最大带宽        网络接口的物理最大带宽，单位kbps (范围: 100-1000000, 默认: 10000)\n"
+"  ping限制        期望的ping延迟上限，单位毫秒，超过此值会触发限流 (范围: 5-1000, 默认: 20)\n\n"
+"选项:\n"
+"  -h, -help, --help\n"
+"                  显示此帮助信息并退出\n"
+"  -c <文件>        从指定配置文件读取参数\n"
+"  -d <设备>        目标网络设备名称 (默认: ifb0)\n"
+"  -t <地址/域名>  ping目标地址 (默认: 8.8.8.8)\n"
+"  -s <文件>        状态文件路径 (默认: /tmp/qosmon.status)\n"
+"  -l <文件>        调试日志文件路径 (默认: /var/log/qosmon.log)\n"
+"  -v               启用详细输出模式\n"
+"  -b               在后台（守护进程）模式运行\n"
+"  -S               启用安全模式（不实际修改TC配置，仅模拟）\n"
+"  -A               启用ACTIVE/IDLE状态自动切换\n"
+"  -I               跳过初始链路测量\n"
+"  -p <间隔>        设置ping间隔(ms)，覆盖位置参数\n"
+"  -m <带宽>        设置最大带宽(kbps)，覆盖位置参数\n"
+"  -P <限制>        设置ping限制(ms)，覆盖位置参数\n\n"
+"示例:\n"
+"  qosmon 200 8.8.8.8 10000 20\n"
+"  qosmon -b -v -A -d eth0 -p 100 -t 1.1.1.1 -m 50000 -P 15\n"
+"  qosmon -c /etc/qosmon.conf\n\n"
+"信号处理:\n"
+"  SIGTERM, SIGINT  安全终止程序，并尝试恢复TC配置\n"
+"  SIGUSR1          重置链路带宽到初始值\n";
 
 /* ==================== 前向声明 ==================== */
 // Ping管理器结构
@@ -303,21 +340,30 @@ void qosmon_config_init(qosmon_config_t* cfg) {
     cfg->auto_switch_mode = 0;
     cfg->background_mode = 0;
     cfg->skip_initial = 0;
-    cfg->min_bw_change_kbps = 10;
-    cfg->min_bw_ratio = 0.1f;
-    cfg->max_bw_ratio = 1.0f;
-    cfg->smoothing_factor = 0.3f;
-    cfg->active_threshold = 0.7f;
-    cfg->idle_threshold = 0.3f;
+    cfg->min_bw_change_kbps = 10;	// 最小带宽变化阈值
+    cfg->min_bw_ratio = 0.1f;	 // 最小带宽比例（最大带宽的10%）
+    cfg->max_bw_ratio = 1.0f;	 // 最大带宽比例
+    cfg->smoothing_factor = 0.3f;   // ping延迟平滑因子
+    cfg->active_threshold = 0.7f;   // 切换到活跃状态的利用率阈值
+    cfg->idle_threshold = 0.3f;    // 切换到空闲状态的利用率阈值
     cfg->safe_start_ratio = 0.5f;
     strcpy(cfg->device, "ifb0");
     strcpy(cfg->target, "8.8.8.8");
-    strcpy(cfg->status_file, "/var/run/qosmon.status");
+    strcpy(cfg->status_file, "/tmp/qosmon.status");
     strcpy(cfg->debug_log, "/var/log/qosmon.log");
 }
 
 int qosmon_config_parse(qosmon_config_t* cfg, int argc, char* argv[]) {
     if (!cfg) return QMON_ERR_MEMORY;
+	
+	 // 检查是否为帮助请求
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "-h") == 0 || 
+            strcmp(argv[i], "-help") == 0 || 
+            strcmp(argv[i], "--help") == 0) {
+            return QMON_HELP_REQUESTED; // 特殊返回码
+        }
+    }
     
     // 设置默认值
     qosmon_config_init(cfg);
@@ -358,8 +404,14 @@ int qosmon_config_parse(qosmon_config_t* cfg, int argc, char* argv[]) {
 }
 
 int qosmon_config_validate(qosmon_config_t* cfg, char* error, int error_len) {
-    if (!cfg || !error) return QMON_ERR_MEMORY;
-    
+    	 // 检查是否只有程序名（没有参数）
+    if (argc == 1) {
+        snprintf(error, error_len, "缺少参数。使用 -h 查看帮助。");
+        return QMON_ERR_CONFIG;
+    }
+	
+	if (!cfg || !error) return QMON_ERR_MEMORY;
+
     if (cfg->ping_interval < 50 || cfg->ping_interval > 5000) {
         snprintf(error, error_len, "ping间隔必须在50-5000ms之间");
         return QMON_ERR_CONFIG;
@@ -1614,21 +1666,43 @@ int main(int argc, char* argv[]) {
     int ret = EXIT_FAILURE;
     qosmon_context_t context = {0};
     ping_manager_t ping_mgr = {0};
-    tc_controller_t tc_mgr = {0};
+    tc_controller_t tc_mgr = {0};  
     
     qosmon_config_init(&context.config);
     
+    // 解析配置，并捕获“帮助请求”
     int config_result = qosmon_config_parse(&context.config, argc, argv);
+    
+    // 情况1：用户显式请求帮助
+    if (config_result == QMON_HELP_REQUESTED) {
+        fprintf(stderr, "%s", qosmon_usage);
+        return EXIT_SUCCESS; // 帮助是正常功能，返回成功
+    }
+    
+    // 情况2：配置解析发生其他错误
     if (config_result != QMON_OK) {
-        fprintf(stderr, "配置解析失败\n");
+        fprintf(stderr, "错误：配置解析失败。\n");
         return EXIT_FAILURE;
     }
     
+    // 情况3：配置解析成功，进行验证
     char config_error[256] = {0};
-    if (qosmon_config_validate(&context.config, config_error, sizeof(config_error)) != QMON_OK) {
-        fprintf(stderr, "配置验证失败: %s\n", config_error);
+    int validation_result = qosmon_config_validate(&context.config, config_error, sizeof(config_error));
+    
+    // 情况3a：验证失败，给出引导性错误
+    if (validation_result != QMON_OK) {
+        // 特别处理“无位置参数”的情况，给予更明确的提示
+        if (argc == 1) {
+            fprintf(stderr, "错误：未提供任何参数。\n");
+            fprintf(stderr, "请使用 'qosmon -h' 查看完整的用法说明。\n");
+        } else {
+            fprintf(stderr, "错误：%s\n", config_error);
+            fprintf(stderr, "请使用 'qosmon -h' 查看详细的参数要求与示例。\n");
+        }
         return EXIT_FAILURE;
     }
+    
+    // 情况3b：验证通过，继续执行程序...
     
     if (context.config.background_mode) {
         if (daemon(0, 0) < 0) {
