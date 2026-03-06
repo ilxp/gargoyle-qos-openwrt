@@ -164,21 +164,21 @@ load_htb_class_config() {
     logger -t "qos_gargoyle" "加载HTB类别配置: $class_name"
     
     # 清空所有相关变量
-    unset percent_bandwidth min_bandwidth max_bandwidth minRTT priority name
+    unset percent_bandwidth per_min_bandwidth per_max_bandwidth minRTT priority name class_mark
     
     # 直接通过UCI读取HTB类别配置
     percent_bandwidth=$(uci -q get qos_gargoyle.$class_name.percent_bandwidth 2>/dev/null)
-    min_bandwidth=$(uci -q get qos_gargoyle.$class_name.min_bandwidth 2>/dev/null)
-    max_bandwidth=$(uci -q get qos_gargoyle.$class_name.max_bandwidth 2>/dev/null)
+    per_min_bandwidth=$(uci -q get qos_gargoyle.$class_name.per_min_bandwidth 2>/dev/null)
+    per_max_bandwidth=$(uci -q get qos_gargoyle.$class_name.per_max_bandwidth 2>/dev/null)
     minRTT=$(uci -q get qos_gargoyle.$class_name.minRTT 2>/dev/null)
     priority=$(uci -q get qos_gargoyle.$class_name.priority 2>/dev/null)
     name=$(uci -q get qos_gargoyle.$class_name.name 2>/dev/null)
     
     # 调试日志
-    logger -t "qos_gargoyle" "HTB配置: $class_name -> percent=$percent_bandwidth, min=$min_bandwidth, max=$max_bandwidth, minRTT=$minRTT"
+    logger -t "qos_gargoyle" "HTB配置: $class_name -> percent=$percent_bandwidth, min=$per_min_bandwidth, max=$per_max_bandwidth, minRTT=$minRTT"
     
     # 验证是否加载了关键参数
-    if [ -z "$percent_bandwidth" ] && [ -z "$min_bandwidth" ] && [ -z "$max_bandwidth" ]; then
+    if [ -z "$percent_bandwidth" ] && [ -z "$per_min_bandwidth" ] && [ -z "$per_max_bandwidth" ]; then
         logger -t "qos_gargoyle" "警告: 未找到 $class_name 的带宽参数"
         return 1
     fi
@@ -420,12 +420,10 @@ create_htb_root_qdisc() {
 
 # 计算HTB参数
 calculate_htb_parameters() {
-    local percent_bandwidth="$1"
-    local min_bandwidth="$2"
-    local max_bandwidth="$3"
-    local direction="$4"
-    local class_name="$5"
+    local class_name="$1"
+    local direction="$2"  # upload 或 download
     
+    # 获取方向总带宽
     local total_bandwidth=0
     if [ "$direction" = "upload" ]; then
         total_bandwidth=$total_upload_bandwidth
@@ -433,44 +431,86 @@ calculate_htb_parameters() {
         total_bandwidth=$total_download_bandwidth
     fi
     
-    local rate=""
-    local ceil=""
-    local burst=""
-    local cburst=""
-    
-    # 计算rate（保证带宽）
-    if [ -n "$min_bandwidth" ] && [ "$min_bandwidth" -gt 0 ] 2>/dev/null; then
-        rate="${min_bandwidth}kbit"
-    elif [ -n "$percent_bandwidth" ] && [ "$percent_bandwidth" -gt 0 ] 2>/dev/null; then
-        local calculated_rate=$((total_bandwidth * percent_bandwidth / 100))
-        rate="${calculated_rate}kbit"
+    # 计算类别总带宽（基于总带宽的百分比）
+    local class_total_bw=0
+    if [ -n "$percent_bandwidth" ] && [ "$percent_bandwidth" -gt 0 ] 2>/dev/null; then
+        if [ -n "$total_bandwidth" ] && [ "$total_bandwidth" -gt 0 ] 2>/dev/null; then
+            class_total_bw=$((total_bandwidth * percent_bandwidth / 100))
+            logger -t "qos_gargoyle" "类别 $class_name 总带宽: ${class_total_bw}kbit (${percent_bandwidth}% of ${total_bandwidth}kbit)"
+        else
+            class_total_bw=$total_bandwidth
+            logger -t "qos_gargoyle" "警告: total_${direction}_bandwidth无效，使用默认值: $class_total_bw kbit"
+        fi
     else
-        # 默认使用total_bandwidth的1/类别数量
-        rate="$((total_bandwidth / 10))kbit"
+        class_total_bw=$total_bandwidth
+        logger -t "qos_gargoyle" "类别 $class_name 使用总带宽作为类别总带宽: $class_total_bw kbit"
     fi
     
-    # 计算ceil（最大带宽）
-    if [ -n "$max_bandwidth" ] && [ "$max_bandwidth" -gt 0 ] 2>/dev/null; then
-        ceil="${max_bandwidth}kbit"
+    # 计算rate（保证带宽）：基于类别总带宽的百分比
+    local rate=""
+    if [ -n "$per_min_bandwidth" ] && [ "$per_min_bandwidth" -ge 0 ] 2>/dev/null; then
+        if [ "$per_min_bandwidth" -eq 0 ]; then
+            rate="1kbit"  # 最小保证带宽，不能为0
+            logger -t "qos_gargoyle" "类别 $class_name 设置最小保证带宽: $rate (per_min_bandwidth=0)"
+        else
+            rate="$((class_total_bw * per_min_bandwidth / 100))kbit"
+            logger -t "qos_gargoyle" "类别 $class_name 使用百分比计算保证带宽: $rate (${per_min_bandwidth}% of ${class_total_bw}kbit)"
+        fi
     else
-        ceil="${total_bandwidth}kbit"
+        # 默认保证带宽为类别总带宽的50%
+        rate="$((class_total_bw * 50 / 100))kbit"
+        logger -t "qos_gargoyle" "类别 $class_name 使用默认保证带宽: $rate (50% of ${class_total_bw}kbit)"
+    fi
+    
+    # 计算ceil（最大带宽）：基于类别总带宽的百分比
+    local ceil=""
+    if [ -n "$per_max_bandwidth" ] && [ "$per_max_bandwidth" -gt 0 ] 2>/dev/null; then
+        ceil="$((class_total_bw * per_max_bandwidth / 100))kbit"
+        logger -t "qos_gargoyle" "类别 $class_name 使用百分比计算上限带宽: $ceil (${per_max_bandwidth}% of ${class_total_bw}kbit)"
+    else
+        ceil="${class_total_bw}kbit"
+        logger -t "qos_gargoyle" "类别 $class_name 使用类别总带宽作为上限带宽: $ceil"
+    fi
+    
+    # 验证rate不超过ceil
+    local rate_value=$(echo "$rate" | sed 's/kbit//')
+    local ceil_value=$(echo "$ceil" | sed 's/kbit//')
+    
+    if [ "$rate_value" -gt "$ceil_value" ]; then
+        logger -t "qos_gargoyle" "警告: 类别 $class_name 保证带宽($rate)超过上限带宽($ceil)，调整为上限带宽"
+        rate="$ceil"
+        rate_value=$ceil_value
     fi
     
     # 计算burst和cburst
-    # burst通常为rate * latency，这里使用固定公式
-    local rate_num=$(echo "$rate" | sed 's/kbit//')
-    burst="$((rate_num * 1000 / 8 / 100))"
-    burst="${burst}b"
-    cburst="$((rate_num * 1000 / 8 / 50))"
-    cburst="${cburst}b"
+    # HTB的burst和cburst计算公式：burst = rate * 1ms
+    # 这里我们使用更保守的计算
+    local burst=""
+    local cburst=""
     
-    # 调整burst大小，避免过小
-    if [ "$burst" = "0b" ]; then
+    # burst通常为rate * 1ms的字节数
+    burst="$((rate_value * 1000 / 8 / 1000))"
+    if [ "$burst" -lt 1 ]; then
+        burst=1
+    fi
+    burst="${burst}kb"
+    
+    # cburst通常是burst的2倍
+    cburst="$((rate_value * 1000 / 8 / 500))"
+    if [ "$cburst" -lt 2 ]; then
+        cburst=2
+    fi
+    cburst="${cburst}kb"
+    
+    # 调整最小burst大小
+    if [ "$burst" = "0kb" ]; then
         burst="1kb"
     fi
-    if [ "$cburst" = "0b" ]; then
+    if [ "$cburst" = "0kb" ]; then
         cburst="2kb"
     fi
+    
+    logger -t "qos_gargoyle" "HTB参数计算完成: rate=$rate, ceil=$ceil, burst=$burst, cburst=$cburst"
     
     echo "$rate $ceil $burst $cburst"
 }
@@ -498,8 +538,8 @@ create_htb_upload_class() {
         logger -t "qos_gargoyle" "从文件获取上传标记: $class_mark"
     fi
     
-    # 计算HTB参数
-    local htb_params=$(calculate_htb_parameters "$percent_bandwidth" "$min_bandwidth" "$max_bandwidth" "upload" "$class_name")
+    # ========== 计算HTB参数 ==========
+    local htb_params=$(calculate_htb_parameters "$class_name" "upload")
     local rate=$(echo "$htb_params" | awk '{print $1}')
     local ceil=$(echo "$htb_params" | awk '{print $2}')
     local burst=$(echo "$htb_params" | awk '{print $3}')
@@ -517,9 +557,12 @@ create_htb_upload_class() {
     # 如果是最小延迟类别
     if [ "${minRTT:-No}" = "Yes" ]; then
         prio="prio 1"  # 最高优先级
+        logger -t "qos_gargoyle" "类别 $class_name 设置为最高优先级(prio 1)"
     fi
     
     # 创建HTB类别
+    logger -t "qos_gargoyle" "正在创建上传HTB类别 1:$class_index (rate=$rate, ceil=$ceil, burst=$burst, cburst=$cburst, $prio)"
+    
     if ! tc class add dev "$qos_interface" parent 1:1 \
         classid 1:$class_index htb \
         rate $rate ceil $ceil burst $burst cburst $cburst $prio; then
@@ -569,7 +612,7 @@ create_htb_upload_class() {
         fi
     fi
     
-    logger -t "qos_gargoyle" "上传类别创建成功: $class_name -> 1:$class_index (标记: $class_mark, rate=$rate, ceil=$ceil)"
+    logger -t "qos_gargoyle" "上传类别创建成功: $class_name -> 1:$class_index (标记: $class_mark, rate=$rate, ceil=$ceil, priority=$prio)"
     return 0
 }
 
@@ -597,8 +640,8 @@ create_htb_download_class() {
         logger -t "qos_gargoyle" "从文件获取下载标记: $class_mark"
     fi
     
-    # 计算HTB参数
-    local htb_params=$(calculate_htb_parameters "$percent_bandwidth" "$min_bandwidth" "$max_bandwidth" "download" "$class_name")
+    # ========== 【修复】计算HTB参数 ==========
+    local htb_params=$(calculate_htb_parameters "$class_name" "download")
     local rate=$(echo "$htb_params" | awk '{print $1}')
     local ceil=$(echo "$htb_params" | awk '{print $2}')
     local burst=$(echo "$htb_params" | awk '{print $3}')
@@ -609,16 +652,23 @@ create_htb_download_class() {
     if [ -n "$priority" ] && [ "$priority" -ge 1 ] && [ "$priority" -le 7 ] 2>/dev/null; then
         prio="prio $priority"
     else
-        # 默认优先级
-        prio="prio 3"
+        # 使用配置中的优先级
+        if [ -n "$priority" ] && [ "$priority" -ge 1 ] && [ "$priority" -le 7 ] 2>/dev/null; then
+            prio="prio $priority"
+        else
+            prio="prio 3"
+        fi
     fi
     
     # 如果是最小延迟类别
     if [ "${minRTT:-No}" = "Yes" ]; then
         prio="prio 1"  # 最高优先级
+        logger -t "qos_gargoyle" "类别 $class_name 设置为最高优先级(prio 1)"
     fi
     
     # 创建HTB类别
+    logger -t "qos_gargoyle" "正在创建下载HTB类别 1:$class_index (rate=$rate, ceil=$ceil, burst=$burst, cburst=$cburst, $prio)"
+    
     if ! tc class add dev "$IFB_DEVICE" parent 1:1 \
         classid 1:$class_index htb \
         rate $rate ceil $ceil burst $burst cburst $cburst $prio; then
@@ -676,7 +726,7 @@ create_htb_download_class() {
         fi
     fi
     
-    logger -t "qos_gargoyle" "下载类别创建成功: $class_name -> 1:$class_index (标记: $class_mark, rate=$rate, ceil=$ceil)"
+    logger -t "qos_gargoyle" "下载类别创建成功: $class_name -> 1:$class_index (标记: $class_mark, rate=$rate, ceil=$ceil, priority=$prio)"
     return 0
 }
 

@@ -332,8 +332,8 @@ msgstr ""
 msgid "Manual Ping Limit"
 msgstr "手动 Ping 限制"
 
-msgid "Max (kbps)"
-msgstr "最大带宽(kbps)"
+msgid "Max bandwidth(%)"
+msgstr "最大带宽(百分比)"
 
 msgid "Max Packet"
 msgstr "最大数据包"
@@ -341,8 +341,8 @@ msgstr "最大数据包"
 msgid "Minimize RTT"
 msgstr "最小往返延时"
 
-msgid "Min (kbps)"
-msgstr "最小带宽(kbps)"
+msgid "Min bandwidth(%)"
+msgstr "最小带宽(百分比)"
 
 msgid "Min Packet"
 msgstr "最小数据包"

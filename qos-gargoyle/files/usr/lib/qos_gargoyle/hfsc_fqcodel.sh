@@ -156,21 +156,21 @@ load_hfsc_class_config() {
     logger -t "qos_gargoyle" "加载HFSC类别配置: $class_name"
     
     # 清空所有相关变量
-    unset percent_bandwidth min_bandwidth max_bandwidth minRTT priority name
+    unset percent_bandwidth per_min_bandwidth per_max_bandwidth minRTT priority name class_mark
     
     # 直接通过UCI读取HFSC类别配置
     percent_bandwidth=$(uci -q get qos_gargoyle.$class_name.percent_bandwidth 2>/dev/null)
-    min_bandwidth=$(uci -q get qos_gargoyle.$class_name.min_bandwidth 2>/dev/null)
-    max_bandwidth=$(uci -q get qos_gargoyle.$class_name.max_bandwidth 2>/dev/null)
+    per_min_bandwidth=$(uci -q get qos_gargoyle.$class_name.per_min_bandwidth 2>/dev/null)
+    per_max_bandwidth=$(uci -q get qos_gargoyle.$class_name.per_max_bandwidth 2>/dev/null)
     minRTT=$(uci -q get qos_gargoyle.$class_name.minRTT 2>/dev/null)
     priority=$(uci -q get qos_gargoyle.$class_name.priority 2>/dev/null)
     name=$(uci -q get qos_gargoyle.$class_name.name 2>/dev/null)
     
     # 调试日志
-    logger -t "qos_gargoyle" "HFSC配置: $class_name -> percent=$percent_bandwidth, min=$min_bandwidth, max=$max_bandwidth, minRTT=$minRTT"
+    logger -t "qos_gargoyle" "HFSC配置: $class_name -> percent=$percent_bandwidth, min=$per_min_bandwidth, max=$per_max_bandwidth, minRTT=$minRTT"
     
     # 验证是否加载了关键参数
-    if [ -z "$percent_bandwidth" ] && [ -z "$min_bandwidth" ] && [ -z "$max_bandwidth" ]; then
+    if [ -z "$percent_bandwidth" ] && [ -z "$per_min_bandwidth" ] && [ -z "$per_max_bandwidth" ]; then
         logger -t "qos_gargoyle" "警告: 未找到 $class_name 的带宽参数"
         return 1
     fi
@@ -420,8 +420,8 @@ create_hfsc_upload_class() {
     
     # 加载类别配置
     if ! load_hfsc_class_config "$class_name"; then
-		logger -t "qos_gargoyle" "警告: 加载HFSC配置失败，使用默认值"
-	fi
+        logger -t "qos_gargoyle" "警告: 加载HFSC配置失败，使用默认值"
+    fi
     
     # 获取标记值
     local class_mark=$(read_mark_from_file "$class_name" "upload")
@@ -434,47 +434,72 @@ create_hfsc_upload_class() {
         logger -t "qos_gargoyle" "从文件获取上传标记: $class_mark"
     fi
     
-    # ========== 【修复】计算带宽参数 ==========
+    # ========== 计算带宽参数 ==========
     local m1="0bit"
     local d="0us"
     local m2=""  # 保证带宽
     local ul_m2="" # 上限带宽
     
-    # 1. 计算保证带宽 (m2)：优先 min_bandwidth，其次 percent_bandwidth，最后默认总带宽
-    if [ -n "$min_bandwidth" ] && [ "$min_bandwidth" -gt 0 ] 2>/dev/null; then
-        m2="${min_bandwidth}kbit"
-        logger -t "qos_gargoyle" "类别 $class_name 使用配置的最小保证带宽: $m2"
-    elif [ -n "$percent_bandwidth" ] && [ "$percent_bandwidth" -gt 0 ] 2>/dev/null; then
-        # 确保 total_upload_bandwidth 是数字
+    # 1. 计算类别总带宽（基于总上传带宽的百分比）
+    local class_total_bw=0
+    if [ -n "$percent_bandwidth" ] && [ "$percent_bandwidth" -gt 0 ] 2>/dev/null; then
         if [ -n "$total_upload_bandwidth" ] && [ "$total_upload_bandwidth" -gt 0 ] 2>/dev/null; then
-            m2="$((total_upload_bandwidth * percent_bandwidth / 100))kbit"
-            logger -t "qos_gargoyle" "类别 $class_name 使用百分比计算保证带宽: $m2 (${percent_bandwidth}% of ${total_upload_bandwidth}kbit)"
+            class_total_bw=$((total_upload_bandwidth * percent_bandwidth / 100))
+            logger -t "qos_gargoyle" "类别 $class_name 总带宽: ${class_total_bw}kbit (${percent_bandwidth}% of ${total_upload_bandwidth}kbit)"
         else
-            m2="${total_upload_bandwidth}kbit"
-            logger -t "qos_gargoyle" "警告: total_upload_bandwidth无效，使用默认值: $m2"
+            class_total_bw=$total_upload_bandwidth
+            logger -t "qos_gargoyle" "警告: total_upload_bandwidth无效，使用默认值: $class_total_bw kbit"
         fi
     else
-        m2="${total_upload_bandwidth}kbit"
-        logger -t "qos_gargoyle" "类别 $class_name 使用总带宽作为保证带宽: $m2"
+        class_total_bw=$total_upload_bandwidth
+        logger -t "qos_gargoyle" "类别 $class_name 使用总带宽作为类别总带宽: $class_total_bw kbit"
     fi
     
-    # 2. 计算上限带宽 (ul_m2)：优先 max_bandwidth，其次默认总带宽
-    if [ -n "$max_bandwidth" ] && [ "$max_bandwidth" -gt 0 ] 2>/dev/null; then
-        ul_m2="${max_bandwidth}kbit"
-        logger -t "qos_gargoyle" "类别 $class_name 使用配置的最大上限带宽: $ul_m2"
+    # 2. 计算保证带宽 (m2)：基于类别总带宽的百分比
+    if [ -n "$per_min_bandwidth" ] && [ "$per_min_bandwidth" -ge 0 ] 2>/dev/null; then
+        if [ "$per_min_bandwidth" -eq 0 ]; then
+            m2="0kbit"  # 不保证带宽
+            logger -t "qos_gargoyle" "类别 $class_name 不保证最小带宽 (per_min_bandwidth=0)"
+        else
+            m2="$((class_total_bw * per_min_bandwidth / 100))kbit"
+            logger -t "qos_gargoyle" "类别 $class_name 使用百分比计算保证带宽: $m2 (${per_min_bandwidth}% of ${class_total_bw}kbit)"
+        fi
+    fi
+    
+    # 3. 计算上限带宽 (ul_m2)：基于类别总带宽的百分比
+    if [ -n "$per_max_bandwidth" ] && [ "$per_max_bandwidth" -gt 0 ] 2>/dev/null; then
+        ul_m2="$((class_total_bw * per_max_bandwidth / 100))kbit"
+        logger -t "qos_gargoyle" "类别 $class_name 使用百分比计算上限带宽: $ul_m2 (${per_max_bandwidth}% of ${class_total_bw}kbit)"
     else
-        ul_m2="${total_upload_bandwidth}kbit"
-        logger -t "qos_gargoyle" "类别 $class_name 使用总带宽作为上限带宽: $ul_m2"
+        # 回退到旧配置（如果存在 max_bandwidth 固定值）
+        if [ -n "$max_bandwidth" ] && [ "$max_bandwidth" -gt 0 ] 2>/dev/null; then
+            ul_m2="${max_bandwidth}kbit"
+            logger -t "qos_gargoyle" "类别 $class_name 使用旧配置的最大上限带宽: $ul_m2"
+        else
+            ul_m2="${class_total_bw}kbit"
+            logger -t "qos_gargoyle" "类别 $class_name 使用类别总带宽作为上限带宽: $ul_m2"
+        fi
     fi
     
-    # 3. 应用最小延迟参数 (minRTT)
+    # 4. 验证保证带宽不超过上限带宽
+    local m2_value=$(echo "$m2" | sed 's/kbit//')
+    local ul_m2_value=$(echo "$ul_m2" | sed 's/kbit//')
+    
+    if [ "$m2_value" -gt "$ul_m2_value" ]; then
+        logger -t "qos_gargoyle" "警告: 类别 $class_name 保证带宽($m2)超过上限带宽($ul_m2)，调整为上限带宽"
+        m2="$ul_m2"
+    fi
+    
+    # 5. 应用最小延迟参数 (minRTT)
     if [ "${minRTT:-No}" = "Yes" ]; then
         d="5ms"  # 5毫秒延迟上限
         logger -t "qos_gargoyle" "类别 $class_name 启用最小延迟模式 (d=$d)"
     fi
-	# ========== 【修复结束】 ==========
+    # ========== 计算带宽参数 ==========
     
     # 创建HFSC类别
+    logger -t "qos_gargoyle" "正在创建HFSC类别 1:$class_index (带宽: ls=$m2, ul=$ul_m2)"
+    
     if ! tc class add dev "$qos_interface" parent 1:1 \
         classid 1:$class_index hfsc \
         ls m1 $m1 d $d m2 $m2 \
@@ -483,7 +508,7 @@ create_hfsc_upload_class() {
         return 1
     fi
     
-    # 创建fq_codel队列 (修复：移除参数中的"us"后缀)
+    # 创建fq_codel队列
     local fq_codel_params="limit ${FQCODEL_LIMIT} target ${FQCODEL_TARGET} interval ${FQCODEL_INTERVAL} flows ${FQCODEL_FLOWS} quantum ${FQCODEL_QUANTUM}"
     if [ -n "$FQCODEL_ECN" ]; then
         fq_codel_params="$fq_codel_params $FQCODEL_ECN"
@@ -531,8 +556,8 @@ create_hfsc_download_class() {
     
     # 加载类别配置
     if ! load_hfsc_class_config "$class_name"; then
-		logger -t "qos_gargoyle" "警告: 加载HFSC配置失败，使用默认值"
-	fi
+        logger -t "qos_gargoyle" "警告: 加载HFSC配置失败，使用默认值"
+    fi
     
     # 获取标记值
     local class_mark=$(read_mark_from_file "$class_name" "download")
@@ -545,47 +570,72 @@ create_hfsc_download_class() {
         logger -t "qos_gargoyle" "从文件获取下载标记: $class_mark"
     fi
     
-    # ========== 【修复】计算带宽参数 ==========
+    # ========== 计算带宽参数 ==========
     local m1="0bit"
     local d="0us"
     local m2=""  # 保证带宽
     local ul_m2="" # 上限带宽
     
-    # 1. 计算保证带宽 (m2)：优先 min_bandwidth，其次 percent_bandwidth，最后默认总带宽
-    if [ -n "$min_bandwidth" ] && [ "$min_bandwidth" -gt 0 ] 2>/dev/null; then
-        m2="${min_bandwidth}kbit"
-        logger -t "qos_gargoyle" "类别 $class_name 使用配置的最小保证带宽: $m2"
-    elif [ -n "$percent_bandwidth" ] && [ "$percent_bandwidth" -gt 0 ] 2>/dev/null; then
-        # 确保 total_download_bandwidth 是数字
+    # 1. 计算类别总带宽（基于总下载带宽的百分比）
+    local class_total_bw=0
+    if [ -n "$percent_bandwidth" ] && [ "$percent_bandwidth" -gt 0 ] 2>/dev/null; then
         if [ -n "$total_download_bandwidth" ] && [ "$total_download_bandwidth" -gt 0 ] 2>/dev/null; then
-            m2="$((total_download_bandwidth * percent_bandwidth / 100))kbit"
-            logger -t "qos_gargoyle" "类别 $class_name 使用百分比计算保证带宽: $m2 (${percent_bandwidth}% of ${total_download_bandwidth}kbit)"
+            class_total_bw=$((total_download_bandwidth * percent_bandwidth / 100))
+            logger -t "qos_gargoyle" "类别 $class_name 总带宽: ${class_total_bw}kbit (${percent_bandwidth}% of ${total_download_bandwidth}kbit)"
         else
-            m2="${total_download_bandwidth}kbit"
-            logger -t "qos_gargoyle" "警告: total_download_bandwidth无效，使用默认值: $m2"
+            class_total_bw=$total_download_bandwidth
+            logger -t "qos_gargoyle" "警告: total_download_bandwidth无效，使用默认值: $class_total_bw kbit"
         fi
     else
-        m2="${total_download_bandwidth}kbit"
-        logger -t "qos_gargoyle" "类别 $class_name 使用总带宽作为保证带宽: $m2"
+        class_total_bw=$total_download_bandwidth
+        logger -t "qos_gargoyle" "类别 $class_name 使用总带宽作为类别总带宽: $class_total_bw kbit"
     fi
     
-    # 2. 计算上限带宽 (ul_m2)：优先 max_bandwidth，其次默认总带宽
-    if [ -n "$max_bandwidth" ] && [ "$max_bandwidth" -gt 0 ] 2>/dev/null; then
-        ul_m2="${max_bandwidth}kbit"
-        logger -t "qos_gargoyle" "类别 $class_name 使用配置的最大上限带宽: $ul_m2"
+    # 2. 计算保证带宽 (m2)：基于类别总带宽的百分比
+    if [ -n "$per_min_bandwidth" ] && [ "$per_min_bandwidth" -ge 0 ] 2>/dev/null; then
+        if [ "$per_min_bandwidth" -eq 0 ]; then
+            m2="0kbit"  # 不保证带宽
+            logger -t "qos_gargoyle" "类别 $class_name 不保证最小带宽 (per_min_bandwidth=0)"
+        else
+            m2="$((class_total_bw * per_min_bandwidth / 100))kbit"
+            logger -t "qos_gargoyle" "类别 $class_name 使用百分比计算保证带宽: $m2 (${per_min_bandwidth}% of ${class_total_bw}kbit)"
+        fi
+    fi
+    
+    # 3. 计算上限带宽 (ul_m2)：基于类别总带宽的百分比
+    if [ -n "$per_max_bandwidth" ] && [ "$per_max_bandwidth" -gt 0 ] 2>/dev/null; then
+        ul_m2="$((class_total_bw * per_max_bandwidth / 100))kbit"
+        logger -t "qos_gargoyle" "类别 $class_name 使用百分比计算上限带宽: $ul_m2 (${per_max_bandwidth}% of ${class_total_bw}kbit)"
     else
-        ul_m2="${total_download_bandwidth}kbit"
-        logger -t "qos_gargoyle" "类别 $class_name 使用总带宽作为上限带宽: $ul_m2"
+        # 回退到旧配置（如果存在 max_bandwidth 固定值）
+        if [ -n "$max_bandwidth" ] && [ "$max_bandwidth" -gt 0 ] 2>/dev/null; then
+            ul_m2="${max_bandwidth}kbit"
+            logger -t "qos_gargoyle" "类别 $class_name 使用旧配置的最大上限带宽: $ul_m2"
+        else
+            ul_m2="${class_total_bw}kbit"
+            logger -t "qos_gargoyle" "类别 $class_name 使用类别总带宽作为上限带宽: $ul_m2"
+        fi
     fi
     
-    # 3. 应用最小延迟参数 (minRTT)
+    # 4. 验证保证带宽不超过上限带宽
+    local m2_value=$(echo "$m2" | sed 's/kbit//')
+    local ul_m2_value=$(echo "$ul_m2" | sed 's/kbit//')
+    
+    if [ "$m2_value" -gt "$ul_m2_value" ]; then
+        logger -t "qos_gargoyle" "警告: 类别 $class_name 保证带宽($m2)超过上限带宽($ul_m2)，调整为上限带宽"
+        m2="$ul_m2"
+    fi
+    
+    # 5. 应用最小延迟参数 (minRTT)
     if [ "${minRTT:-No}" = "Yes" ]; then
         d="5ms"  # 5毫秒延迟上限
         logger -t "qos_gargoyle" "类别 $class_name 启用最小延迟模式 (d=$d)"
     fi
-    # ========== 【修复结束】 ==========
+    # ========== 计算带宽结束 ==========
     
     # 创建HFSC类别
+    logger -t "qos_gargoyle" "正在创建下载HFSC类别 1:$class_index (带宽: ls=$m2, ul=$ul_m2)"
+    
     if ! tc class add dev "$IFB_DEVICE" parent 1:1 \
         classid 1:$class_index hfsc \
         ls m1 $m1 d $d m2 $m2 \
@@ -594,7 +644,7 @@ create_hfsc_download_class() {
         return 1
     fi
     
-    # 创建fq_codel队列 (修复：移除参数中的"us"后缀)
+    # 创建fq_codel队列
     local fq_codel_params="limit ${FQCODEL_LIMIT} target ${FQCODEL_TARGET} interval ${FQCODEL_INTERVAL} flows ${FQCODEL_FLOWS} quantum ${FQCODEL_QUANTUM}"
     if [ -n "$FQCODEL_ECN" ]; then
         fq_codel_params="$fq_codel_params $FQCODEL_ECN"

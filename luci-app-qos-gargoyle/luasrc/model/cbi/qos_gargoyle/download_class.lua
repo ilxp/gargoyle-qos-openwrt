@@ -36,7 +36,7 @@ o = s:option(Value, "percent_bandwidth", translate("Percent"),
 o.datatype = "range(1, 100)"
 o.rmempty  = false
 
-o = s:option(Value, "min_bandwidth", translate("Min (kbps)"),
+o = s:option(Value, "per_min_bandwidth", translate("Min bandwidth(%)"),
 	translate("The minimum service this class will be allocated when the link is at capacity. Classes "
 	.. "which specify minimum service are known as realtime classes by the active congestion "
 	.. "controller. Streaming video, VoIP and interactive online gaming are all examples of "
@@ -49,8 +49,8 @@ o:value("0", translate("Zero"))
 o.datatype = "uinteger"
 o.default  = "0"
 
-o = s:option(Value, "max_bandwidth", translate("Max (kbps)"),
-	translate("The maximum amount of bandwidth this class will be allocated in kbit/s. Even if unused "
+o = s:option(Value, "per_max_bandwidth", translate("Max bandwidth(%)"),
+	translate("The maximum amount of bandwidth this class will be allocated in %. Even if unused "
 	.. "bandwidth is available, this service class will never be permitted to use more than this "
 	.. "amount of bandwidth."))
 o:value("", translate("Unlimited"))
