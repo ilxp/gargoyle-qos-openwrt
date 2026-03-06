@@ -184,35 +184,35 @@ validate_cake_config() {
 # 验证 cake_autorate 配置
 validate_cake_autorate_config() {
     if [ "$CAKE_AUTORATE_ENABLED" = "1" ]; then
-        log_info "验证cake_autorate配置"
+        log_info "验证CAKE-autorate配置"
         
         # 检查ping主机
         if [ -z "$CAKE_AUTORATE_PING_HOSTS" ]; then
-            log_error "cake_autorate未配置ping目标主机"
+            log_error "CAKE-autorate未配置ping目标主机"
             return 1
         fi
         
         # 检查RTT阈值
         if [ "$(echo "$CAKE_AUTORATE_MIN_RTT" | sed 's/ms//')" -ge "$(echo "$CAKE_AUTORATE_MAX_RTT" | sed 's/ms//')" ]; then
-            log_error "cake_autorate RTT阈值配置错误: 最小RTT应小于最大RTT"
+            log_error "CAKE-autorate RTT阈值配置错误: 最小RTT应小于最大RTT"
             return 1
         fi
         
         # 检查带宽百分比范围
         if [ "$CAKE_AUTORATE_MIN_BW_PERCENT" -ge "$CAKE_AUTORATE_MAX_BW_PERCENT" ]; then
-            log_error "cake_autorate带宽百分比配置错误: 最小百分比应小于最大百分比"
+            log_error "CAKE-autorate带宽百分比配置错误: 最小百分比应小于最大百分比"
             return 1
         fi
         
         if [ "$CAKE_AUTORATE_MIN_BW_PERCENT" -lt 10 ]; then
-            log_warn "cake_autorate最小带宽百分比过低: ${CAKE_AUTORATE_MIN_BW_PERCENT}% (建议至少10%)"
+            log_warn "CAKE-autorate最小带宽百分比过低: ${CAKE_AUTORATE_MIN_BW_PERCENT}% (建议至少10%)"
         fi
         
         if [ "$CAKE_AUTORATE_MAX_BW_PERCENT" -gt 200 ]; then
-            log_warn "cake_autorate最大带宽百分比过高: ${CAKE_AUTORATE_MAX_BW_PERCENT}% (不建议超过200%)"
+            log_warn "CAKE-autorate最大带宽百分比过高: ${CAKE_AUTORATE_MAX_BW_PERCENT}% (不建议超过200%)"
         fi
         
-        log_info "✅ cake_autorate配置验证通过"
+        log_info "✅ CAKE-autorate配置验证通过"
     fi
     
     return 0
@@ -883,42 +883,16 @@ initialize_cake_qos() {
     
 	# 启动 cake_autorate
     if [ "$CAKE_AUTORATE_ENABLED" = "1" ]; then
-        log_info "检测到cake_autorate启用，启动自动带宽调整"
-		
-    # 检查PID文件 - 防止重复启动
-	if [ -f "/var/run/cake_autorate.pid" ]; then
-		local pid_file="/var/run/cake_autorate.pid"
-		local existing_pid=$(cat "$pid_file" 2>/dev/null)
-		if [ -n "$existing_pid" ] && kill -0 "$existing_pid" 2>/dev/null; then
-			log_info "cake_autorate已经在运行中 (PID: $existing_pid)，跳过启动"
-			return 0
+		log_info "检测到cake_autorate启用，启动自动带宽调整"
+		# 在启动前，先执行一次 cake_autorate.sh 自身的单实例检查
+		if ! pgrep -f "cake_autorate.sh start" > /dev/null; then
+			/usr/lib/qos_gargoyle/cake_autorate.sh start &
+			echo $! > /var/run/cake_autorate.pid
+			log_info "cake_autorate服务已启动 (PID: $!)"
 		else
-			# 清理无效的PID文件
-			rm -f  "/var/run/cake_autorate.pid"
+			log_info "cake_autorate已经在运行中，跳过启动"
 		fi
 	fi
-    
-    # 检查是否已有同名进程在运行
-    if pgrep -f "cake_autorate.sh start" >/dev/null; then
-        local running_pid=$(pgrep -f "cake_autorate.sh start" | head -1)
-        log_info "cake_autorate已经在运行中 (PID: $running_pid)，跳过启动"
-        return 0
-    fi
-    
-    /usr/lib/qos_gargoyle/cake_autorate.sh start &
-    log_info "cake_autorate启动命令已执行"
-    
-    # 不保存PID，由cake_autorate.sh自己管理PID文件
-    # 等待3秒让进程启动
-    sleep 3
-    
-    # 检查是否成功启动
-    if [ -f "/var/run/cake_autorate.pid" ]; then
-        local pid=$(cat /var/run/cake_autorate.pid 2>/dev/null)
-        if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
-            log_info "cake_autorate服务已启动 (PID: $pid)"
-        fi
-    fi
 	
     health_check_cake
     local health_status=$?
@@ -1333,8 +1307,8 @@ show_cake_status() {
             fi
         fi
     fi
+    
     # 新增：流量类别分析
-	fi
     echo -e "\n===== 流量类别分析 ====="
     
     # 上传方向类别分析

@@ -349,25 +349,43 @@ save_bandwidth_to_config() {
 
 #自动调整
 autorate_adjustment_loop() {
-    # 错误处理：捕获所有异常
-    set -e
-    trap 'echo "cake_autorate异常退出，错误码: $?"; exit 1' ERR
-    trap 'echo "收到信号，清理退出"; rm -f /var/run/cake_autorate.pid /tmp/run/cake_autorate.pid; exit 0' INT TERM EXIT
+    # 禁用立即退出，改为记录错误但继续
+    set +e
     
-    # 创建PID文件
+    # 修改错误处理，不立即退出
+    trap 'log_debug "cake_autorate遇到错误: $?"' ERR
+    trap 'log_info "收到退出信号"; cleanup_and_exit' INT TERM EXIT
+    
+    cleanup_and_exit() {
+        rm -f /var/run/cake_autorate.pid 2>/dev/null
+        exit 0
+    }
+    
+    # 立即写入PID文件，让父进程知道我们已启动
     echo $$ > /var/run/cake_autorate.pid
+    
     echo "cake_autorate进程启动: $$"
     
-    # 检查网络连通性
+    # 原有的网络检查，但不因失败而退出
     echo "检查网络连通性..."
+    local reachable=0
     for host in 223.5.5.5 119.29.29.29; do
         if ping -c 1 -W 2 "$host" >/dev/null 2>&1; then
             echo "主机 $host 可达"
+            reachable=1
             break
+        else
+            echo "主机 $host 不可达（继续尝试）"
         fi
     done
     
+    if [ "$reachable" -eq 0 ]; then
+        log_warn "所有ping目标均不可达，但继续运行主循环"
+    fi
+    
+    # 进入主循环
     AUTORATE_RUNNING=1
+ 
     local cycle_count=0
     local consecutive_failures=0
     local max_failures=5
@@ -638,13 +656,42 @@ start_cake_autorate() {
     fi
     
     log_info "启动cake_autorate服务"
+	
+	# 启动前先清理可能的残留PID文件
+    rm -f /var/run/cake_autorate.pid 2>/dev/null
     
-    # 在后台启动调整循环
-    autorate_adjustment_loop &
+    # 在后台启动
+    (
+        # 短暂延迟，确保父进程已继续执行
+        sleep 1
+        
+        # 检查自己是否还活着（防止竞争）
+        if kill -0 $$ 2>/dev/null; then
+            # 写入自己的PID
+            echo $$ > /var/run/cake_autorate.pid
+            log_info "子进程 $$ 已就绪，开始主循环"
+            
+            # 执行主循环
+            autorate_adjustment_loop
+        fi
+    ) &
+    
     AUTORATE_PID=$!
     
-    log_info "cake_autorate服务已启动 (PID: $AUTORATE_PID)"
-    return 0
+    # 等待一会儿，让子进程有机会写入PID文件
+    sleep 2
+    
+    # 检查PID文件是否被创建
+    if [ -f "/var/run/cake_autorate.pid" ]; then
+        local file_pid=$(cat /var/run/cake_autorate.pid 2>/dev/null)
+        if [ -n "$file_pid" ] && kill -0 "$file_pid" 2>/dev/null; then
+            log_info "cake_autorate服务已启动 (PID: $file_pid)"
+            return 0
+        fi
+    fi
+    
+    log_error "启动失败：子进程可能已退出"
+    return 1
 }
 
 stop_cake_autorate() {
