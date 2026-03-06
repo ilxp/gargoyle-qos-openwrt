@@ -694,7 +694,7 @@ int load_monitor_update(qosmon_context_t* ctx) {
     return QMON_OK;
 }
 
-/* ==================== TC控制器实现（改进版） ==================== */
+/* ==================== TC控制器实现（修复为调整总带宽） ==================== */
 struct tc_controller_s {
     qosmon_context_t* ctx;
 };
@@ -714,52 +714,50 @@ char* detect_qdisc_kind(qosmon_context_t* ctx) {
         return qdisc_kind;
     }
     
-    int htb_found = 0, hfsc_found = 0;
+    int htb_found = 0, hfsc_found = 0, cake_found = 0;
     char* root_line = NULL;
     
     while (fgets(line, sizeof(line), fp)) {
-        // 清理行尾换行符
         char* newline = strchr(line, '\n');
         if (newline) *newline = '\0';
         
-        // 跳过空行
         if (strlen(line) == 0) continue;
         
         qosmon_log(ctx, QMON_LOG_DEBUG, "TC输出: %s\n", line);
         
-        // 检查是否包含htb
-        if (strstr(line, "htb") != NULL) {
-            htb_found = 1;
-            // 检查是否是根队列
-            if (strstr(line, "root") != NULL || strstr(line, "parent root") != NULL) {
+        // 检查根队列
+        if (strstr(line, "root") != NULL) {
+            if (strstr(line, "htb") != NULL) {
+                htb_found = 1;
                 strcpy(qdisc_kind, "htb");
                 root_line = line;
                 break;
+            } else if (strstr(line, "hfsc") != NULL) {
+                hfsc_found = 1;
+                strcpy(qdisc_kind, "hfsc");
+                root_line = line;
+                break;
+            } else if (strstr(line, "cake") != NULL) {
+                cake_found = 1;
+                strcpy(qdisc_kind, "cake");
+                root_line = line;
+                break;
             }
         }
-        // 检查是否包含hfsc
-        else if (strstr(line, "hfsc") != NULL) {
-            hfsc_found = 1;
-            if (strstr(line, "root") != NULL || strstr(line, "parent root") != NULL) {
-                strcpy(qdisc_kind, "hfsc");
+        // 检查ingress队列
+        else if (strstr(line, "ingress") != NULL) {
+            if (strstr(line, "cake") != NULL) {
+                cake_found = 1;
+                strcpy(qdisc_kind, "cake");
                 root_line = line;
                 break;
             }
         }
     }
     
-    int status = pclose(fp);
+    pclose(fp);
     
-    // 如果没找到明确的根队列，但检测到了队列类型
-    if (strcmp(qdisc_kind, "htb") == 0 && !htb_found) {
-        // 回退到默认
-        strcpy(qdisc_kind, "htb");
-    } else if (strcmp(qdisc_kind, "hfsc") == 0 && !hfsc_found) {
-        strcpy(qdisc_kind, "hfsc");
-    }
-    
-    // 如果什么都没找到，尝试检查是否存在类
-    if (!htb_found && !hfsc_found) {
+    if (!htb_found && !hfsc_found && !cake_found) {
         qosmon_log(ctx, QMON_LOG_INFO, "未检测到现有队列，将使用HTB队列\n");
     } else {
         qosmon_log(ctx, QMON_LOG_INFO, "检测到队列算法: %s\n", qdisc_kind);
@@ -771,30 +769,106 @@ char* detect_qdisc_kind(qosmon_context_t* ctx) {
     return qdisc_kind;
 }
 
-// 检查是否存在TC类
-int check_existing_classes(qosmon_context_t* ctx) {
+// 获取根类ID
+int get_root_classid(qosmon_context_t* ctx, int* root_classid) {
+    if (!ctx || !root_classid) return QMON_ERR_MEMORY;
+    
     char cmd[256];
     char line[512];
-    int class_count = 0;
+    int found = 0;
     
+    // 默认根类ID
+    *root_classid = 0x10001;  // 1:1
+    
+    // 尝试查找根类
     snprintf(cmd, sizeof(cmd), "tc -s class show dev %s 2>&1", ctx->config.device);
     
     FILE* fp = popen(cmd, "r");
     if (!fp) {
-        return 0;
+        return QMON_ERR_SYSTEM;
     }
     
     while (fgets(line, sizeof(line), fp)) {
-        if (strlen(line) > 1) {
-            class_count++;
+        // 查找根类（父类为root或1:0）
+        if (strstr(line, "parent root") != NULL || 
+            strstr(line, "parent 1:0") != NULL ||
+            (strstr(line, "parent") == NULL && strstr(line, "class") != NULL)) {
+            
+            // 解析类ID
+            int major, minor;
+            if (sscanf(line, "class htb 1:%x", &minor) == 1) {
+                *root_classid = 0x10000 | minor;
+                found = 1;
+                break;
+            } else if (sscanf(line, "class hfsc 1:%x", &minor) == 1) {
+                *root_classid = 0x10000 | minor;
+                found = 1;
+                break;
+            }
         }
     }
     
     pclose(fp);
-    return class_count;
+    
+    if (found) {
+        qosmon_log(ctx, QMON_LOG_DEBUG, "检测到根类ID: 1:%x\n", *root_classid & 0xFFFF);
+    } else {
+        qosmon_log(ctx, QMON_LOG_INFO, "使用默认根类ID: 1:1\n");
+    }
+    
+    return QMON_OK;
 }
 
-// 改进的带宽设置函数
+// 获取CAKE参数
+int get_cake_parameters(qosmon_context_t* ctx, char* cake_params, int params_len) {
+    if (!ctx || !cake_params || params_len <= 0) return QMON_ERR_MEMORY;
+    
+    char cmd[256];
+    char line[512];
+    
+    snprintf(cmd, sizeof(cmd), "tc qdisc show dev %s 2>&1", ctx->config.device);
+    qosmon_log(ctx, QMON_LOG_DEBUG, "获取CAKE参数命令: %s\n", cmd);
+    
+    FILE* fp = popen(cmd, "r");
+    if (!fp) {
+        return QMON_ERR_SYSTEM;
+    }
+    
+    cake_params[0] = '\0';
+    
+    while (fgets(line, sizeof(line), fp)) {
+        if (strstr(line, "cake") != NULL) {
+            // 找到cake行，提取参数
+            char* cake_start = strstr(line, "cake");
+            if (cake_start) {
+                cake_start += 4; // 跳过"cake"
+                while (*cake_start == ' ') cake_start++;
+                
+                // 复制参数直到行尾
+                char* end = strchr(cake_start, '\n');
+                if (end) *end = '\0';
+                
+                strncpy(cake_params, cake_start, params_len - 1);
+                cake_params[params_len - 1] = '\0';
+                
+                qosmon_log(ctx, QMON_LOG_DEBUG, "提取到的CAKE参数: %s\n", cake_params);
+                break;
+            }
+        }
+    }
+    
+    pclose(fp);
+    
+    if (strlen(cake_params) == 0) {
+        // 如果没有找到现有参数，使用一些合理的默认值
+        strcpy(cake_params, "besteffort dual-dsthost nat wash ingress rtt 100ms no-ack-filter split-gso");
+        qosmon_log(ctx, QMON_LOG_INFO, "使用默认CAKE参数: %s\n", cake_params);
+    }
+    
+    return QMON_OK;
+}
+
+// 改进的带宽设置函数，调整为总带宽
 int tc_set_bandwidth(qosmon_context_t* ctx, int bandwidth_bps) {
     if (!ctx) return QMON_ERR_MEMORY;
     
@@ -830,45 +904,88 @@ int tc_set_bandwidth(qosmon_context_t* ctx, int bandwidth_bps) {
     char output_buf[512] = {0};
     
     if (strcmp(ctx->detected_qdisc, "hfsc") == 0) {
-        // 改进的HFSC参数设置
-        // rt: 实时服务曲线（用于低延迟流量）
-        // ls: 保证服务曲线（用于保证带宽）
-        // ul: 上限服务曲线（限制最大带宽）
+        // 获取根类ID
+        int root_classid = 0;
+        if (get_root_classid(ctx, &root_classid) != QMON_OK) {
+            root_classid = 0x10001;  // 默认1:1
+        }
         
-        // 计算实时服务曲线参数（通常设置为保证带宽的70%）
+        int major = (root_classid >> 16) & 0xFF;
+        int minor = root_classid & 0xFFFF;
+        
+        // HFSC根类带宽设置
         int rt_bandwidth = bandwidth_kbps * 7 / 10;
         if (rt_bandwidth < 1) rt_bandwidth = 1;
         
-        // 计算突发参数
-        int burst_kbit = bandwidth_kbps / 8;  // 突发大小为带宽的1/8秒
+        int burst_kbit = bandwidth_kbps / 8;
         if (burst_kbit < 2) burst_kbit = 2;
         
+        // 使用"tc class change"调整根类带宽
         snprintf(cmd, sizeof(cmd), 
-                 "tc class change dev %s parent 1: classid 1:%x hfsc "
+                 "tc class change dev %s parent %d:%x classid %d:%x hfsc "
                  "rt m1 %dkbit d 100ms m2 %dkbit "
                  "ls m1 0b d 0us m2 %dkbit "
                  "ul m1 0b d 0us m2 %dkbit 2>&1",
-                 ctx->config.device, ctx->config.classid,
-                 rt_bandwidth, rt_bandwidth,  // rt曲线
-                 bandwidth_kbps,              // ls曲线（保证带宽）
-                 bandwidth_kbps);             // ul曲线（上限带宽）
-    } else {
-        // HTB参数设置
-        // rate: 保证带宽
-        // ceil: 最大带宽（通常与rate相同，除非允许突发）
-        // burst: 突发大小
-        // cburst: 承诺突发大小
+                 ctx->config.device, major, 0,  // 父类为1:0
+                 major, minor,                  // 类ID
+                 rt_bandwidth, rt_bandwidth,
+                 bandwidth_kbps,
+                 bandwidth_kbps);
+    } 
+    else if (strcmp(ctx->detected_qdisc, "cake") == 0) {
+        // CAKE根队列带宽设置
+        char cake_params[256] = {0};
+        if (get_cake_parameters(ctx, cake_params, sizeof(cake_params)) != QMON_OK) {
+            strcpy(cake_params, "besteffort dual-dsthost nat wash no-ack-filter split-gso");
+        }
         
-        int burst_kbit = bandwidth_kbps / 8;  // 突发大小为带宽的1/8秒
+        char bandwidth_str[32];
+        if (bandwidth_kbps >= 1000000) {
+            double bandwidth_gbps = bandwidth_kbps / 1000000.0;
+            snprintf(bandwidth_str, sizeof(bandwidth_str), "%.2fGbit", bandwidth_gbps);
+        } else if (bandwidth_kbps >= 1000) {
+            double bandwidth_mbps = bandwidth_kbps / 1000.0;
+            snprintf(bandwidth_str, sizeof(bandwidth_str), "%.2fMbit", bandwidth_mbps);
+        } else {
+            snprintf(bandwidth_str, sizeof(bandwidth_str), "%dKbit", bandwidth_kbps);
+        }
+        
+        // 检查是否是ingress队列
+        char* is_ingress = strstr(cake_params, "ingress");
+        
+        if (is_ingress != NULL) {
+            snprintf(cmd, sizeof(cmd), 
+                     "tc qdisc change dev %s ingress cake bandwidth %s %s 2>&1",
+                     ctx->config.device, bandwidth_str, cake_params);
+        } else {
+            snprintf(cmd, sizeof(cmd), 
+                     "tc qdisc change dev %s root cake bandwidth %s %s 2>&1",
+                     ctx->config.device, bandwidth_str, cake_params);
+        }
+    }
+    else {
+        // HTB根类带宽设置（默认）
+        int root_classid = 0;
+        if (get_root_classid(ctx, &root_classid) != QMON_OK) {
+            root_classid = 0x10001;  // 默认1:1
+        }
+        
+        int major = (root_classid >> 16) & 0xFF;
+        int minor = root_classid & 0xFFFF;
+        
+        int burst_kbit = bandwidth_kbps / 8;
         if (burst_kbit < 2) burst_kbit = 2;
         
-        int cburst_kbit = burst_kbit * 2;  // 承诺突发大小为突发的2倍
+        int cburst_kbit = burst_kbit * 2;
         if (cburst_kbit < 4) cburst_kbit = 4;
         
+        // 使用"tc class change"调整根类带宽
+        // 注意：这里使用ceil=rate，表示不允许借用额外带宽
         snprintf(cmd, sizeof(cmd), 
-                 "tc class change dev %s parent 1: classid 1:%x htb "
+                 "tc class change dev %s parent %d:%x classid %d:%x htb "
                  "rate %dkbit ceil %dkbit burst %dkbit cburst %dkbit 2>&1",
-                 ctx->config.device, ctx->config.classid, 
+                 ctx->config.device, major, 0,  // 父类为1:0
+                 major, minor,                  // 类ID
                  bandwidth_kbps, bandwidth_kbps, burst_kbit, cburst_kbit);
     }
     
@@ -882,7 +999,6 @@ int tc_set_bandwidth(qosmon_context_t* ctx, int bandwidth_bps) {
             char* newline = strchr(output, '\n');
             if (newline) *newline = '\0';
             if (strlen(output) > 0) {
-                // 保存输出信息
                 strncpy(output_buf + output_len, output, sizeof(output_buf) - output_len - 1);
                 output_len += strlen(output);
                 if (output_len < sizeof(output_buf) - 1) {
@@ -906,15 +1022,43 @@ int tc_set_bandwidth(qosmon_context_t* ctx, int bandwidth_bps) {
         
         // 如果失败，尝试回退到简单命令
         if (strcmp(ctx->detected_qdisc, "hfsc") == 0) {
-            // 简化HFSC命令
+            int root_classid = 0;
+            if (get_root_classid(ctx, &root_classid) != QMON_OK) {
+                root_classid = 0x10001;
+            }
+            
+            int major = (root_classid >> 16) & 0xFF;
+            int minor = root_classid & 0xFFFF;
+            
             snprintf(cmd, sizeof(cmd), 
-                     "tc class change dev %s parent 1: classid 1:%x hfsc ls m1 0b d 0us m2 %dkbit 2>&1",
-                     ctx->config.device, ctx->config.classid, bandwidth_kbps);
-        } else {
-            // 简化HTB命令
+                     "tc class change dev %s parent %d:%x classid %d:%x hfsc ls m1 0b d 0us m2 %dkbit 2>&1",
+                     ctx->config.device, major, 0, major, minor, bandwidth_kbps);
+        } 
+        else if (strcmp(ctx->detected_qdisc, "cake") == 0) {
+            char bandwidth_str[32];
+            if (bandwidth_kbps >= 1000) {
+                double bandwidth_mbps = bandwidth_kbps / 1000.0;
+                snprintf(bandwidth_str, sizeof(bandwidth_str), "%.2fMbit", bandwidth_mbps);
+            } else {
+                snprintf(bandwidth_str, sizeof(bandwidth_str), "%dKbit", bandwidth_kbps);
+            }
+            
             snprintf(cmd, sizeof(cmd), 
-                     "tc class change dev %s parent 1: classid 1:%x htb rate %dkbit 2>&1",
-                     ctx->config.device, ctx->config.classid, bandwidth_kbps);
+                     "tc qdisc change dev %s root cake bandwidth %s 2>&1",
+                     ctx->config.device, bandwidth_str);
+        }
+        else {
+            int root_classid = 0;
+            if (get_root_classid(ctx, &root_classid) != QMON_OK) {
+                root_classid = 0x10001;
+            }
+            
+            int major = (root_classid >> 16) & 0xFF;
+            int minor = root_classid & 0xFFFF;
+            
+            snprintf(cmd, sizeof(cmd), 
+                     "tc class change dev %s parent %d:%x classid %d:%x htb rate %dkbit 2>&1",
+                     ctx->config.device, major, 0, major, minor, bandwidth_kbps);
         }
         
         qosmon_log(ctx, QMON_LOG_INFO, "尝试简化命令: %s\n", cmd);
@@ -937,14 +1081,14 @@ int tc_set_bandwidth(qosmon_context_t* ctx, int bandwidth_bps) {
     }
     
     ctx->last_tc_bw_kbps = bandwidth_kbps;
-    qosmon_log(ctx, QMON_LOG_INFO, "带宽设置成功: %d kbps (算法: %s)\n", 
+    qosmon_log(ctx, QMON_LOG_INFO, "总带宽设置成功: %d kbps (算法: %s)\n", 
               bandwidth_kbps, ctx->detected_qdisc);
     
     return QMON_OK;
 }
 
-// 改进的类带宽检测
-int detect_class_bandwidth(qosmon_context_t* ctx, int* current_bw_kbps) {
+// 改进的带宽检测，检测总带宽
+int detect_total_bandwidth(qosmon_context_t* ctx, int* current_bw_kbps) {
     if (!ctx || !current_bw_kbps) return QMON_ERR_MEMORY;
     
     char cmd[256];
@@ -952,92 +1096,123 @@ int detect_class_bandwidth(qosmon_context_t* ctx, int* current_bw_kbps) {
     int found = 0;
     *current_bw_kbps = 0;
     
-    // 尝试多种可能的类显示格式
-    snprintf(cmd, sizeof(cmd), 
-             "tc -s -d class show dev %s 2>&1", ctx->config.device);
-    
-    FILE* fp = popen(cmd, "r");
-    if (!fp) {
-        return QMON_ERR_SYSTEM;
+    if (strcmp(ctx->detected_qdisc, "cake") == 0) {
+        // CAKE的带宽在qdisc中
+        snprintf(cmd, sizeof(cmd), 
+                 "tc -s qdisc show dev %s 2>&1", ctx->config.device);
+        
+        FILE* fp = popen(cmd, "r");
+        if (!fp) {
+            return QMON_ERR_SYSTEM;
+        }
+        
+        while (fgets(line, sizeof(line), fp)) {
+            if (strstr(line, "cake") != NULL) {
+                char* bw_pos = strstr(line, "bandwidth");
+                if (bw_pos) {
+                    double bandwidth = 0;
+                    char unit[8] = {0};
+                    
+                    if (sscanf(bw_pos, "bandwidth %lf%3s", &bandwidth, unit) == 2) {
+                        if (strncmp(unit, "Gbit", 4) == 0) {
+                            *current_bw_kbps = (int)(bandwidth * 1000000);
+                        } else if (strncmp(unit, "Mbit", 4) == 0) {
+                            *current_bw_kbps = (int)(bandwidth * 1000);
+                        } else if (strncmp(unit, "Kbit", 4) == 0) {
+                            *current_bw_kbps = (int)bandwidth;
+                        } else if (strncmp(unit, "bit", 3) == 0) {
+                            *current_bw_kbps = (int)(bandwidth / 1000);
+                        }
+                        
+                        if (*current_bw_kbps > 0) {
+                            found = 1;
+                        }
+                    }
+                }
+                break;
+            }
+        }
+        
+        pclose(fp);
+    } else {
+        // HTB/HFSC的带宽在根类中
+        int root_classid = 0;
+        if (get_root_classid(ctx, &root_classid) != QMON_OK) {
+            root_classid = 0x10001;  // 默认1:1
+        }
+        
+        int major = (root_classid >> 16) & 0xFF;
+        int minor = root_classid & 0xFFFF;
+        
+        snprintf(cmd, sizeof(cmd), 
+                 "tc -s -d class show dev %s 2>&1", ctx->config.device);
+        
+        FILE* fp = popen(cmd, "r");
+        if (!fp) {
+            return QMON_ERR_SYSTEM;
+        }
+        
+        char target_class[32];
+        snprintf(target_class, sizeof(target_class), "%d:%x", major, minor);
+        
+        while (fgets(line, sizeof(line), fp)) {
+            if (strstr(line, target_class) != NULL) {
+                // 尝试解析HTB参数
+                char* rate_pos = strstr(line, "rate");
+                if (rate_pos) {
+                    int rate_mbit, rate_kbit;
+                    if (sscanf(rate_pos, "rate %dMbit", &rate_mbit) == 1) {
+                        *current_bw_kbps = rate_mbit * 1000;
+                        found = 1;
+                        break;
+                    } else if (sscanf(rate_pos, "rate %dkbit", &rate_kbit) == 1) {
+                        *current_bw_kbps = rate_kbit;
+                        found = 1;
+                        break;
+                    } else if (sscanf(rate_pos, "rate %dbps", current_bw_kbps) == 1) {
+                        *current_bw_kbps /= 1000;
+                        found = 1;
+                        break;
+                    }
+                }
+                
+                // 尝试解析HFSC参数
+                char* ls_pos = strstr(line, "ls m2");
+                char* ul_pos = strstr(line, "ul m2");
+                
+                if (ls_pos) {
+                    int rate_mbit, rate_kbit;
+                    if (sscanf(ls_pos, "ls m2 %dMbit", &rate_mbit) == 1) {
+                        *current_bw_kbps = rate_mbit * 1000;
+                        found = 1;
+                        break;
+                    } else if (sscanf(ls_pos, "ls m2 %dkbit", &rate_kbit) == 1) {
+                        *current_bw_kbps = rate_kbit;
+                        found = 1;
+                        break;
+                    }
+                } else if (ul_pos) {
+                    int rate_mbit, rate_kbit;
+                    if (sscanf(ul_pos, "ul m2 %dMbit", &rate_mbit) == 1) {
+                        *current_bw_kbps = rate_mbit * 1000;
+                        found = 1;
+                        break;
+                    } else if (sscanf(ul_pos, "ul m2 %dkbit", &rate_kbit) == 1) {
+                        *current_bw_kbps = rate_kbit;
+                        found = 1;
+                        break;
+                    }
+                }
+            }
+        }
+        
+        pclose(fp);
     }
-    
-    char target_class[32];
-    snprintf(target_class, sizeof(target_class), "1:%x", ctx->config.classid);
-    
-    while (fgets(line, sizeof(line), fp)) {
-        // 查找目标类
-        if (strstr(line, target_class) == NULL) {
-            continue;
-        }
-        
-        qosmon_log(ctx, QMON_LOG_DEBUG, "找到目标类: %s", line);
-        
-        // 尝试解析HTB参数
-        char* rate_pos = strstr(line, "rate");
-        if (rate_pos) {
-            int rate_mbit, rate_kbit;
-            if (sscanf(rate_pos, "rate %dMbit", &rate_mbit) == 1) {
-                *current_bw_kbps = rate_mbit * 1000;
-                found = 1;
-                break;
-            } else if (sscanf(rate_pos, "rate %dkbit", &rate_kbit) == 1) {
-                *current_bw_kbps = rate_kbit;
-                found = 1;
-                break;
-            } else if (sscanf(rate_pos, "rate %dbps", current_bw_kbps) == 1) {
-                *current_bw_kbps /= 1000;
-                found = 1;
-                break;
-            }
-        }
-        
-        // 尝试解析HFSC参数
-        char* ls_pos = strstr(line, "ls m2");
-        char* ul_pos = strstr(line, "ul m2");
-        char* rt_pos = strstr(line, "rt m2");
-        
-        if (ls_pos) {
-            int rate_mbit, rate_kbit;
-            if (sscanf(ls_pos, "ls m2 %dMbit", &rate_mbit) == 1) {
-                *current_bw_kbps = rate_mbit * 1000;
-                found = 1;
-                break;
-            } else if (sscanf(ls_pos, "ls m2 %dkbit", &rate_kbit) == 1) {
-                *current_bw_kbps = rate_kbit;
-                found = 1;
-                break;
-            }
-        } else if (ul_pos) {
-            int rate_mbit, rate_kbit;
-            if (sscanf(ul_pos, "ul m2 %dMbit", &rate_mbit) == 1) {
-                *current_bw_kbps = rate_mbit * 1000;
-                found = 1;
-                break;
-            } else if (sscanf(ul_pos, "ul m2 %dkbit", &rate_kbit) == 1) {
-                *current_bw_kbps = rate_kbit;
-                found = 1;
-                break;
-            }
-        } else if (rt_pos) {
-            int rate_mbit, rate_kbit;
-            if (sscanf(rt_pos, "rt m2 %dMbit", &rate_mbit) == 1) {
-                *current_bw_kbps = rate_mbit * 1000;
-                found = 1;
-                break;
-            } else if (sscanf(rt_pos, "rt m2 %dkbit", &rate_kbit) == 1) {
-                *current_bw_kbps = rate_kbit;
-                found = 1;
-                break;
-            }
-        }
-    }
-    
-    pclose(fp);
     
     if (found) {
-        qosmon_log(ctx, QMON_LOG_DEBUG, "检测到类带宽: %d kbps\n", *current_bw_kbps);
+        qosmon_log(ctx, QMON_LOG_DEBUG, "检测到当前总带宽: %d kbps\n", *current_bw_kbps);
     } else {
-        qosmon_log(ctx, QMON_LOG_DEBUG, "未检测到类带宽信息\n");
+        qosmon_log(ctx, QMON_LOG_DEBUG, "未检测到总带宽信息\n");
     }
     
     return found ? QMON_OK : QMON_ERR_SYSTEM;
@@ -1053,9 +1228,9 @@ int tc_controller_init(tc_controller_t* tc, qosmon_context_t* ctx) {
     ctx->detected_qdisc[sizeof(ctx->detected_qdisc) - 1] = '\0';
     
     int current_bw_kbps = 0;
-    if (detect_class_bandwidth(ctx, &current_bw_kbps) == QMON_OK) {
+    if (detect_total_bandwidth(ctx, &current_bw_kbps) == QMON_OK) {
         ctx->last_tc_bw_kbps = current_bw_kbps;
-        qosmon_log(ctx, QMON_LOG_INFO, "检测到当前带宽: %d kbps (算法: %s)\n", 
+        qosmon_log(ctx, QMON_LOG_INFO, "检测到当前总带宽: %d kbps (算法: %s)\n", 
                   current_bw_kbps, ctx->detected_qdisc);
     } else {
         qosmon_log(ctx, QMON_LOG_INFO, "使用新的带宽设置 (算法: %s)\n", ctx->detected_qdisc);
@@ -1086,7 +1261,7 @@ void tc_controller_cleanup(tc_controller_t* tc) {
     if (!ctx->config.safe_mode) {
         int default_bw = ctx->config.max_bandwidth_kbps * 1000;
         tc_set_bandwidth(ctx, default_bw);
-        qosmon_log(ctx, QMON_LOG_INFO, "TC控制器清理: 恢复带宽到 %d kbps\n", 
+        qosmon_log(ctx, QMON_LOG_INFO, "TC控制器清理: 恢复总带宽到 %d kbps\n", 
                   ctx->config.max_bandwidth_kbps);
     }
     
@@ -1568,47 +1743,48 @@ int main(int argc, char* argv[]) {
                 continue;  // 被信号中断，继续循环
             }
             qosmon_log(&context, QMON_LOG_ERROR, "poll失败: %s\n", strerror(errno));
-        break;
-    }
-    
-    if (poll_ret > 0) {
-        if (fds[0].revents & POLLIN) {
-            int ping_result = ping_manager_receive(&ping_mgr);
-            if (ping_result < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
-                qosmon_log(&context, QMON_LOG_ERROR, "接收ping时发生错误\n");
+            break;
+        }
+        
+        if (poll_ret > 0) {
+            if (fds[0].revents & POLLIN) {
+                int ping_result = ping_manager_receive(&ping_mgr);
+                if (ping_result < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
+                    qosmon_log(&context, QMON_LOG_ERROR, "接收ping时发生错误\n");
+                }
+            }
+            
+            if (fds[0].revents & (POLLERR | POLLHUP | POLLNVAL)) {
+                qosmon_log(&context, QMON_LOG_ERROR, "socket错误，revents=0x%x\n", fds[0].revents);
+                break;
             }
         }
         
-        if (fds[0].revents & (POLLERR | POLLHUP | POLLNVAL)) {
-            qosmon_log(&context, QMON_LOG_ERROR, "socket错误，revents=0x%x\n", fds[0].revents);
+        // 无论poll是否超时，都执行状态机
+        state_machine_run(&context, &ping_mgr, &tc_mgr);
+        
+        status_file_update(&context);
+        
+        if (context.sigterm) {
+            qosmon_log(&context, QMON_LOG_INFO, "收到退出信号\n");
             break;
+        }
+        
+        if (poll_elapsed > 50) {
+            qosmon_log(&context, QMON_LOG_DEBUG, "循环处理时间过长: %d ms\n", poll_elapsed);
         }
     }
     
-    // 无论poll是否超时，都执行状态机
-    state_machine_run(&context, &ping_mgr, &tc_mgr);
+    ret = EXIT_SUCCESS;
     
-    status_file_update(&context);
-    
-    if (context.sigterm) {
-        qosmon_log(&context, QMON_LOG_INFO, "收到退出信号\n");
-        break;
-    }
-    
-    if (poll_elapsed > 50) {
-        qosmon_log(&context, QMON_LOG_DEBUG, "循环处理时间过长: %d ms\n", poll_elapsed);
-    }
-}
-
-ret = EXIT_SUCCESS;
-
 cleanup:
-qosmon_cleanup(&context, &ping_mgr, &tc_mgr);
-
-qosmon_log(&context, QMON_LOG_INFO, "QoS监控器已退出\n");
-
-if (context.config.background_mode) {
-    closelog();
+    qosmon_cleanup(&context, &ping_mgr, &tc_mgr);
+    
+    qosmon_log(&context, QMON_LOG_INFO, "QoS监控器已退出\n");
+    
+    if (context.config.background_mode) {
+        closelog();
+    }
+    
+    return ret;
 }
-
-return ret;
