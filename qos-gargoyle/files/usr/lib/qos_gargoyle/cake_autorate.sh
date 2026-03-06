@@ -351,13 +351,12 @@ save_bandwidth_to_config() {
 autorate_adjustment_loop() {
     # 错误处理：捕获所有异常
     set -e
-    trap 'echo "CAKE-autorate异常退出，错误码: $?"; exit 1' ERR
+    trap 'echo "cake_autorate异常退出，错误码: $?"; exit 1' ERR
     trap 'echo "收到信号，清理退出"; rm -f /var/run/cake_autorate.pid /tmp/run/cake_autorate.pid; exit 0' INT TERM EXIT
     
     # 创建PID文件
     echo $$ > /var/run/cake_autorate.pid
-    [ -d "/tmp/run" ] && echo $$ > /tmp/run/cake_autorate.pid
-    echo "CAKE-autorate进程启动: $$"
+    echo "cake_autorate进程启动: $$"
     
     # 检查网络连通性
     echo "检查网络连通性..."
@@ -367,26 +366,6 @@ autorate_adjustment_loop() {
             break
         fi
     done
-    # --- PID文件管理开始 ---
-    # 创建PID文件
-    PID_FILE_1="/var/run/cake-autorate.pid"
-    PID_FILE_2="/tmp/run/cake-autorate.pid"
-    echo $$ > "$PID_FILE_1"
-    [ -d "/tmp/run" ] && echo $$ > "$PID_FILE_2"
-    logger -t "CAKE-autorate" "PID文件已创建: $$"
-    
-    # 设置退出时清理
-    cleanup_pid_files() {
-        rm -f "$PID_FILE_1"
-        rm -f "$PID_FILE_2"
-        logger -t "CAKE-autorate" "PID文件已清理"
-    }
-    trap cleanup_pid_files EXIT INT TERM
-    # --- PID文件管理结束 ---
-    # 立即创建PID文件
-    echo $$ > /var/run/cake_autorate.pid
-    trap "rm -f /var/run/cake_autorate.pid" EXIT INT TERM
-    log_info "启动cake_autorate调整循环 (间隔: ${CAKE_AUTORATE_INTERVAL}s)"
     
     AUTORATE_RUNNING=1
     local cycle_count=0
@@ -645,7 +624,7 @@ start_cake_autorate() {
     
     # 创建锁文件
     echo "$$$" > "$lock_file"
-    trap "rm -f $lock_file" EXIT
+    trap 'rm -f "$lock_file" 2>/dev/null' EXIT INT TERM
     
     # 原有的启动代码...
     if [ "$CAKE_AUTORATE_ENABLED" != "1" ]; then
@@ -669,18 +648,19 @@ start_cake_autorate() {
 }
 
 stop_cake_autorate() {
-    if [ "$AUTORATE_RUNNING" -eq 0 ]; then
-        log_info "cake_autorate未在运行"
-        return 0
-    fi
-    
     log_info "停止cake_autorate服务"
-    AUTORATE_RUNNING=0
     
-    if [ -n "$AUTORATE_PID" ]; then
-        kill "$AUTORATE_PID" 2>/dev/null
-        wait "$AUTORATE_PID" 2>/dev/null
-    fi
+    # 清理PID文件
+    rm -f /var/run/cake_autorate.pid
+	rm -f /tmp/run/cake_autorate.pid
+    
+    # 停止所有相关进程
+    killall "cake_autorate.sh start" 2>/dev/null || true
+    
+    # 设置运行标志
+    AUTORATE_RUNNING=0
+    AUTORATE_PID=""
+
     
 	# 清理所有临时文件，但排除正在使用的
     if [ -d "/proc" ]; then
@@ -714,8 +694,35 @@ stop_cake_autorate() {
 # ========== 状态查询函数 ==========
 show_autorate_status() {
     echo "===== cake_autorate 状态报告 ====="
-    echo "运行状态: $([ "$AUTORATE_RUNNING" -eq 1 ] && echo "✅ 运行中" || echo "❌ 已停止")"
-    echo "进程PID: ${AUTORATE_PID:-无}"
+	
+    # 检查PID文件
+    local pid_file="/var/run/cake_autorate.pid"
+    local pid=""
+    local status="❌ 已停止"
+    
+    if [ -f "$pid_file" ]; then
+        pid=$(cat "$pid_file" 2>/dev/null)
+        if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+            status="✅ 运行中"
+        else
+            # PID文件存在但进程已停止，清理无效PID文件
+            rm -f "$pid_file"
+            pid=""
+        fi
+    fi
+    
+    # 如果没有PID文件，尝试通过进程名查找
+    if [ -z "$pid" ]; then
+        pid=$(ps w | grep "cake_autorate.sh start" | grep -v grep | awk '{print $1}' | head -1)
+        if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+            status="✅ 运行中"
+            # 修复丢失的PID文件
+            echo "$pid" > "$pid_file"
+        fi
+    fi
+    
+    echo "运行状态: $status"
+    echo "进程PID: ${pid:-无}"
     echo "测量间隔: ${CAKE_AUTORATE_INTERVAL}s"
     echo "测量目标: $CAKE_AUTORATE_PING_HOSTS"
     echo "RTT目标范围: ${CAKE_AUTORATE_MIN_RTT} - ${CAKE_AUTORATE_MAX_RTT}"
