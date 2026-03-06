@@ -1,2890 +1,1614 @@
-/*
- * qosmon - QoS Monitor for OpenWrt with epoll-based event loop
- * 修复版本 - 包含Netlink通信、TC命令、状态机、内存泄漏和信号处理的修复
+/* qosmon - 基于netlink的精简版QoS监控器
+ * 功能：通过ping监控延迟，使用netlink动态调整ifb0根类的带宽
+ * 基于Paul Bixel的原始代码优化,poll机制，完整HFSC和HTB支持
  */
-
+ 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <stdint.h>
+#include <stdarg.h>  // 添加可变参数支持
 #include <signal.h>
-#include <sys/types.h>
-#include <sys/socket.h>
-#include <sys/epoll.h>
-#include <sys/timerfd.h>
+#include <syslog.h>
 #include <sys/time.h>
+#include <sys/socket.h>
+#include <sys/types.h>
+#include <sys/wait.h>
+#include <sys/resource.h>
 #include <sys/ioctl.h>
 #include <netinet/in.h>
 #include <netinet/ip.h>
 #include <netinet/ip_icmp.h>
+#include <netinet/icmp6.h>
 #include <arpa/inet.h>
 #include <netdb.h>
+#include <poll.h>  // 修复poll.h包含
 #include <fcntl.h>
 #include <errno.h>
-#include <time.h>
 #include <math.h>
-#include <linux/if.h>
-#include <linux/netlink.h>
-#include <linux/rtnetlink.h>
-#include <linux/pkt_sched.h>
+#include <pthread.h>
+#include <sys/stat.h>
 
-/* 定义 */
-#define QMON_VERSION "2.0.0"
-#define MAX_PING_TIME_MS 1000
+/* ==================== 宏定义 ==================== */
+#define MAX_PACKET_SIZE 4096
+#define PING_HISTORY_SIZE 10
 #define MIN_PING_TIME_MS 1
-#define PING_HISTORY_SIZE 20
-#define MAX_CONFIG_FILE_SIZE 4096
-#define MAX_LOG_SIZE 4096
-#define MAX_DEVICE_NAME 16
-#define MAX_TARGET_NAME 64
-#define MAX_STATUS_FILE 256
-#define MAX_DEBUG_LOG 256
-#define MAX_QDISC_KIND_LEN 16
-#define DEFAULT_PING_INTERVAL 200
-#define DEFAULT_MAX_BANDWIDTH_KBPS 10000
-#define DEFAULT_PING_LIMIT_MS 20
-#define CONTROL_INTERVAL_MS 100
-#define HEARTBEAT_INTERVAL_MS 30000
-#define STATS_INTERVAL_MS 10000
-#define REALTIME_DETECT_MS 5000
+#define MAX_PING_TIME_MS 5000
+#define STATS_INTERVAL_MS 1000
+#define CONTROL_INTERVAL_MS 1000
+#define REALTIME_DETECT_MS 1000
+#define HEARTBEAT_INTERVAL_MS 10000
+#define POLL_TIMEOUT_MS 10  // poll 超时时间
 
-/* 枚举 */
+// 修改日志宏定义，避免与系统定义冲突
+#define QMON_LOG_ERROR 0
+#define QMON_LOG_WARN  1
+#define QMON_LOG_INFO  2
+#define QMON_LOG_DEBUG 3
+
+/* ==================== 返回码 ==================== */
 typedef enum {
     QMON_OK = 0,
     QMON_ERR_MEMORY = -1,
     QMON_ERR_SOCKET = -2,
-    QMON_ERR_SYSTEM = -3,
+    QMON_ERR_FILE = -3,
     QMON_ERR_CONFIG = -4,
-    QMON_ERR_TIMER = -5,
-    QMON_ERR_NETLINK = -6,
-    QMON_ERR_TC = -7,
-    QMON_ERR_PING = -8,
-    QMON_ERR_BUFFER = -9,
-    QMON_ERR_STATE = -10
-} qosmon_error_t;
+    QMON_ERR_SYSTEM = -5,
+    QMON_ERR_SIGNAL = -6
+} qosmon_result_t;
 
-typedef enum {
-    QMON_CHK = 0,
-    QMON_INIT = 1,
-    QMON_IDLE = 2,
-    QMON_ACTIVE = 3,
-    QMON_REALTIME = 4,
-    QMON_EXIT = 5
-} qosmon_state_t;
-
-typedef enum {
-    QDISC_HTB = 0,
-    QDISC_HFSC = 1,
-    QDISC_TBF = 2,
-    QDISC_DRR = 3,
-    QDISC_SFQ = 4,
-    QDISC_CODEL = 5,
-    QDISC_FQ_CODEL = 6,
-    QDISC_PFIFO_FAST = 7
-} qdisc_kind_t;
-
-/* 日志级别 */
-typedef enum {
-    QMON_LOG_ERROR = 0,
-    QMON_LOG_WARN = 1,
-    QMON_LOG_INFO = 2,
-    QMON_LOG_DEBUG = 3
-} qosmon_log_level_t;
-
-/* 结构体 */
+/* ==================== 配置结构 ==================== */
 typedef struct {
-    int ping_interval;
-    int max_bandwidth_kbps;
-    int ping_limit_ms;
-    int classid;
-    int safe_mode;
-    int verbose;
-    int auto_switch_mode;
-    int background_mode;
-    int skip_initial;
-    int min_bw_change_kbps;
-    float min_bw_ratio;
-    float max_bw_ratio;
-    float smoothing_factor;
-    float active_threshold;
-    float idle_threshold;
-    float safe_start_ratio;
-    int use_netlink;
-    int mtu;
-    int buffer;
-    int cbuffer;
-    int quantum;
-    int hfsc_m1;
-    int hfsc_d;
-    int hfsc_m2;
-    int tbf_burst;
-    int tbf_limit;
-    int tbf_mtu;
-    char device[MAX_DEVICE_NAME];
-    char target[MAX_TARGET_NAME];
-    char config_file[256];
-    char status_file[MAX_STATUS_FILE];
-    char debug_log[MAX_DEBUG_LOG];
+    int ping_interval;          // ping间隔(ms)
+    int max_bandwidth_kbps;     // 最大带宽(kbps)
+    int ping_limit_ms;          // ping限制(ms)
+    int classid;                // TC类ID
+    int safe_mode;              // 安全模式
+    int verbose;                // 详细输出
+    int auto_switch_mode;       // 自动切换模式
+    int background_mode;        // 后台模式
+    int skip_initial;           // 跳过初始测量
+    int min_bw_change_kbps;     // 最小带宽变化(kbps)
+    float min_bw_ratio;         // 最小带宽比例
+    float max_bw_ratio;         // 最大带宽比例
+    float smoothing_factor;     // 平滑因子
+    float active_threshold;     // 激活阈值
+    float idle_threshold;       // 空闲阈值
+    float safe_start_ratio;     // 安全启动比例
+    char target[64];            // 目标地址
+    char device[16];            // 网络设备
+    char config_file[256];      // 配置文件
+    char debug_log[256];        // 调试日志
+    char status_file[256];      // 状态文件
 } qosmon_config_t;
 
-typedef struct {
-    float times[PING_HISTORY_SIZE];
+/* ==================== 状态枚举 ==================== */
+typedef enum {
+    QMON_CHK,
+    QMON_INIT,
+    QMON_IDLE,
+    QMON_ACTIVE,
+    QMON_REALTIME,
+    QMON_EXIT
+} qosmon_state_t;
+
+/* ==================== 数据结构 ==================== */
+typedef struct ping_history_s {
+    int64_t times[PING_HISTORY_SIZE];
     int index;
     int count;
     float smoothed;
 } ping_history_t;
 
-typedef struct {
-    int64_t start_time;
-    int64_t total_time_ms;
-    float avg_bandwidth_kbps;
-    float packet_loss_rate;
-} qosmon_stats_t;
-
-typedef struct qosmon_context {
-    qosmon_config_t config;
-    int epoll_fd;
-    int ping_socket;
-    int timer_fd;
-    int signal_pipe[2];
-    int netlink_fd;
-    int sigterm;
+/* ==================== 主上下文结构 ==================== */
+typedef struct qosmon_context_s {
     qosmon_state_t state;
+    qosmon_config_t config;
     
-    struct sockaddr_storage target_addr;
-    socklen_t target_addr_len;
-    
+    // 网络相关
+    int ping_socket;
     int ident;
-    int sequence;
     int ntransmitted;
     int nreceived;
+    struct sockaddr_in6 target_addr;
     
-    int64_t last_ping_time_ms;
-    int64_t last_tc_update_time_ms;
-    int64_t last_stats_time_ms;
-    int64_t last_realtime_detect_time_ms;
-    int64_t last_heartbeat_ms;
-    int64_t filtered_ping_time_us;
+    // 统计数据
     int64_t raw_ping_time_us;
+    int64_t filtered_ping_time_us;
     int64_t max_ping_time_us;
-    int64_t min_ping_time_us;
+    int filtered_total_load_bps;
+    ping_history_t ping_history;
     
+    // 带宽控制
     int current_limit_bps;
     int saved_active_limit;
     int saved_realtime_limit;
     
-    ping_history_t ping_history;
-    qosmon_stats_t stats;
+    // TC相关
+    int last_tc_bw_kbps;
+    int realtime_classes;
+    char detected_qdisc[16];
     
-    char detected_qdisc[MAX_QDISC_KIND_LEN];
-    qdisc_kind_t detected_qdisc_type;
+    // 时间戳
+    int64_t last_ping_time_ms;
+    int64_t last_stats_time_ms;
+    int64_t last_tc_update_time_ms;
+    int64_t last_realtime_detect_time_ms;
+    int64_t last_heartbeat_ms;
     
-    struct epoll_timer* timer_list;
-    int timer_count;
+    // 文件
+    FILE* status_file;
+    FILE* debug_log_file;
+    
+    // 控制标志
+    int sigterm;
 } qosmon_context_t;
 
-typedef struct ping_manager {
-    qosmon_context_t* ctx;
-    int ident;
-    int sequence;
-    int ntransmitted;
-    int nreceived;
-} ping_manager_t;
+/* ==================== 前向声明 ==================== */
+// Ping管理器结构
+struct ping_manager_s;
+typedef struct ping_manager_s ping_manager_t;
 
-typedef struct tc_controller {
-    qosmon_context_t* ctx;
-    int netlink_fd;
-    int seq;
-    qdisc_kind_t qdisc_kind;
-} tc_controller_t;
+// TC控制器结构
+struct tc_controller_s;
+typedef struct tc_controller_s tc_controller_t;
 
-typedef struct epoll_timer {
-    int fd;
-    int id;
-    int64_t expire_time;
-    int interval;
-    int repeat;
-    void (*callback)(void*);
-    void* data;
-    struct epoll_timer* next;
-} epoll_timer_t;
+// Ping管理器函数
+int ping_manager_init(ping_manager_t* pm, qosmon_context_t* ctx);
+int ping_manager_send(ping_manager_t* pm);
+int ping_manager_receive(ping_manager_t* pm);
+void ping_manager_cleanup(ping_manager_t* pm);
 
-/* 函数原型 */
-void qosmon_log(qosmon_context_t* ctx, qosmon_log_level_t level, const char* fmt, ...);
-int64_t qosmon_time_ms(void);
-void qosmon_config_init(qosmon_config_t* cfg);
-int qosmon_config_parse(qosmon_config_t* cfg, int argc, char* argv[]);
-int qosmon_config_load_file(qosmon_config_t* cfg, const char* filename);
-void qosmon_config_print(const qosmon_config_t* cfg);
-
-int epoll_init(qosmon_context_t* ctx);
-int epoll_add_fd(qosmon_context_t* ctx, int fd, uint32_t events, 
-                void (*handler)(void*), void* data);
-int epoll_add_timer(qosmon_context_t* ctx, int64_t expire_time, int id, 
-                   void (*callback)(void*), void* data, int repeat, int interval);
-void epoll_handle_timers(qosmon_context_t* ctx);
-int epoll_run(qosmon_context_t* ctx);
-void epoll_cleanup(qosmon_context_t* ctx);
-
-int ping_manager_init(qosmon_context_t* ctx);
-int ping_manager_send(qosmon_context_t* ctx);
-int ping_manager_receive(qosmon_context_t* ctx);
-void ping_manager_cleanup(qosmon_context_t* ctx);
-
+// TC控制器函数
 int tc_controller_init(tc_controller_t* tc, qosmon_context_t* ctx);
 int tc_controller_set_bandwidth(tc_controller_t* tc, int bandwidth_bps);
 void tc_controller_cleanup(tc_controller_t* tc);
-char* detect_qdisc_kind(qosmon_context_t* ctx);
-int detect_class_bandwidth(qosmon_context_t* ctx, int* current_bw_kbps, tc_controller_t* tc);
 
+// 配置函数
+void qosmon_config_init(qosmon_config_t* cfg);
+int qosmon_config_parse(qosmon_config_t* cfg, int argc, char* argv[]);
+int qosmon_config_validate(qosmon_config_t* cfg, char* error, int error_len);
+
+// 状态机函数
 void state_machine_init(qosmon_context_t* ctx);
-void state_machine_run(qosmon_context_t* ctx, ping_manager_t* ping_mgr, tc_controller_t* tc_mgr);
-void state_machine_cleanup(qosmon_context_t* ctx);
+void state_machine_run(qosmon_context_t* ctx, ping_manager_t* pm, tc_controller_t* tc);
 
-int status_file_update(qosmon_context_t* ctx);
-void qosmon_cleanup(qosmon_context_t* ctx);
+// 清理函数
+void qosmon_cleanup(qosmon_context_t* ctx, ping_manager_t* pm, tc_controller_t* tc);
 
-/* 静态函数声明 */
-static void ping_event_handler(void* data);
-static void signal_event_handler(void* data);
-static void timer_event_handler(void* data);
-static void ping_timer_callback(void* data);
-static void state_machine_timer_callback(void* data);
-static void status_update_timer_callback(void* data);
-static void bandwidth_adjust_timer_callback(void* data);
-static void update_ping_history(qosmon_context_t* ctx, int64_t ping_time_us);
-static unsigned short in_cksum(unsigned short* addr, int len);
-static int tc_set_bandwidth_netlink(tc_controller_t* tc, int bandwidth_bps);
-static int tc_set_bandwidth_shell(qosmon_context_t* ctx, int bandwidth_bps);
-static int netlink_open(void);
-static int netlink_receive_ack(tc_controller_t* tc);
-static int adjust_bandwidth_by_ping(qosmon_context_t* ctx, tc_controller_t* tc_mgr);
-static int calculate_realtime_bandwidth(qosmon_context_t* ctx);
-static int detect_realtime_traffic(qosmon_context_t* ctx);
-static float calculate_ping_jitter(qosmon_context_t* ctx);
-static void update_statistics(qosmon_context_t* ctx);
-static void state_machine_chk(qosmon_context_t* ctx, int64_t now, 
-                              ping_manager_t* ping_mgr, tc_controller_t* tc_mgr);
-static void state_machine_init_state(qosmon_context_t* ctx, int64_t now,
-                                     ping_manager_t* ping_mgr, tc_controller_t* tc_mgr);
-static void state_machine_idle(qosmon_context_t* ctx, int64_t now,
-                               ping_manager_t* ping_mgr, tc_controller_t* tc_mgr);
-static void state_machine_active(qosmon_context_t* ctx, int64_t now,
-                                 ping_manager_t* ping_mgr, tc_controller_t* tc_mgr);
-static void state_machine_realtime(qosmon_context_t* ctx, int64_t now,
-                                   ping_manager_t* ping_mgr, tc_controller_t* tc_mgr);
-
-/* 全局上下文指针 */
-static qosmon_context_t* g_ctx = NULL;
-
-/* 信号处理器 */
-static void signal_handler(int sig) {
-    if (sig == SIGTERM || sig == SIGINT) {
-        if (g_ctx) {
-            g_ctx->sigterm = 1;
-        }
-    }
-}
-
-/* 主函数 */
-int main(int argc, char* argv[]) {
-    qosmon_context_t ctx = {0};
-    g_ctx = &ctx;
-    
-    qosmon_config_t config = {0};
-    qosmon_config_init(&config);
-    
-    int ret = qosmon_config_parse(&config, argc, argv);
-    if (ret != QMON_OK) {
-        fprintf(stderr, "配置解析失败\n");
-        return EXIT_FAILURE;
-    }
-    
-    ctx.config = config;
-    
-    /* 设置信号处理器 */
-    struct sigaction sa = {0};
-    sa.sa_handler = signal_handler;
-    sigemptyset(&sa.sa_mask);
-    sigaction(SIGTERM, &sa, NULL);
-    sigaction(SIGINT, &sa, NULL);
-    
-    /* 忽略SIGPIPE */
-    signal(SIGPIPE, SIG_IGN);
-    
-    qosmon_log(&ctx, QMON_LOG_INFO, "qosmon v%s 启动\n", QMON_VERSION);
-    
-    /* 初始化epoll */
-    ret = epoll_init(&ctx);
-    if (ret != QMON_OK) {
-        fprintf(stderr, "epoll初始化失败\n");
-        return EXIT_FAILURE;
-    }
-    
-    /* 初始化ping管理器 */
-    ret = ping_manager_init(&ctx);
-    if (ret != QMON_OK) {
-        fprintf(stderr, "ping管理器初始化失败\n");
-        epoll_cleanup(&ctx);
-        return EXIT_FAILURE;
-    }
-    
-    /* 添加ping socket到epoll */
-    ret = epoll_add_fd(&ctx, ctx.ping_socket, EPOLLIN, ping_event_handler, &ctx);
-    if (ret != QMON_OK) {
-        fprintf(stderr, "添加ping socket到epoll失败\n");
-        ping_manager_cleanup(&ctx);
-        epoll_cleanup(&ctx);
-        return EXIT_FAILURE;
-    }
-    
-    /* 添加信号管道到epoll */
-    ret = epoll_add_fd(&ctx, ctx.signal_pipe[0], EPOLLIN, signal_event_handler, &ctx);
-    if (ret != QMON_OK) {
-        fprintf(stderr, "添加信号管道到epoll失败\n");
-        ping_manager_cleanup(&ctx);
-        epoll_cleanup(&ctx);
-        return EXIT_FAILURE;
-    }
-    
-    /* 初始化TC控制器 */
-    tc_controller_t* tc_mgr = (tc_controller_t*)calloc(1, sizeof(tc_controller_t));
-    if (!tc_mgr) {
-        fprintf(stderr, "分配TC控制器内存失败\n");
-        ping_manager_cleanup(&ctx);
-        epoll_cleanup(&ctx);
-        return EXIT_FAILURE;
-    }
-    
-    tc_mgr->ctx = &ctx;
-    ret = tc_controller_init(tc_mgr, &ctx);
-    if (ret != QMON_OK) {
-        fprintf(stderr, "TC控制器初始化失败\n");
-        free(tc_mgr);
-        ping_manager_cleanup(&ctx);
-        epoll_cleanup(&ctx);
-        return EXIT_FAILURE;
-    }
-    
-    /* 初始化状态机 */
-    state_machine_init(&ctx);
-    
-    /* 启动定时器 */
-    int64_t now = qosmon_time_ms();
-    epoll_add_timer(&ctx, now + ctx.config.ping_interval, 1, ping_timer_callback, &ctx, 1, ctx.config.ping_interval);
-    epoll_add_timer(&ctx, now + 10, 2, state_machine_timer_callback, &ctx, 1, 10);
-    epoll_add_timer(&ctx, now + 1000, 3, status_update_timer_callback, &ctx, 1, 1000);
-    epoll_add_timer(&ctx, now + CONTROL_INTERVAL_MS, 4, bandwidth_adjust_timer_callback, &ctx, 1, CONTROL_INTERVAL_MS);
-    
-    qosmon_log(&ctx, QMON_LOG_INFO, "启动主事件循环\n");
-    
-    /* 主事件循环 */
-    while (!ctx.sigterm) {
-        ret = epoll_run(&ctx);
-        if (ret != QMON_OK && ret != EAGAIN && ret != EWOULDBLOCK) {
-            qosmon_log(&ctx, QMON_LOG_ERROR, "epoll运行错误: %d\n", ret);
-            break;
-        }
-        
-        if (ctx.state == QMON_EXIT) {
-            qosmon_log(&ctx, QMON_LOG_INFO, "收到退出信号\n");
-            ctx.sigterm = 1;
-        }
-    }
-    
-    qosmon_log(&ctx, QMON_LOG_INFO, "清理资源\n");
-    
-    /* 清理 */
-    tc_controller_cleanup(tc_mgr);
-    free(tc_mgr);
-    ping_manager_cleanup(&ctx);
-    epoll_cleanup(&ctx);
-    
-    qosmon_log(&ctx, QMON_LOG_INFO, "qosmon退出\n");
-    return EXIT_SUCCESS;
-}
-
-/* 日志函数 */
-void qosmon_log(qosmon_context_t* ctx, qosmon_log_level_t level, const char* fmt, ...) {
-    va_list args;
-    va_start(args, fmt);
-    
-    const char* level_str = "UNKNOWN";
-    switch (level) {
-        case QMON_LOG_ERROR: level_str = "ERROR"; break;
-        case QMON_LOG_WARN: level_str = "WARN"; break;
-        case QMON_LOG_INFO: level_str = "INFO"; break;
-        case QMON_LOG_DEBUG: level_str = "DEBUG"; break;
-    }
-    
-    char timestamp[64];
-    time_t now = time(NULL);
-    struct tm* tm_info = localtime(&now);
-    strftime(timestamp, sizeof(timestamp), "%Y-%m-%d %H:%M:%S", tm_info);
-    
-    if (ctx && ctx->config.verbose >= level) {
-        fprintf(stderr, "[%s] [%s] ", timestamp, level_str);
-        vfprintf(stderr, fmt, args);
-    } else if (!ctx && level <= QMON_LOG_INFO) {
-        fprintf(stderr, "[%s] [%s] ", timestamp, level_str);
-        vfprintf(stderr, fmt, args);
-    }
-    
-    if (ctx && ctx->config.debug_log[0]) {
-        FILE* f = fopen(ctx->config.debug_log, "a");
-        if (f) {
-            fprintf(f, "[%s] [%s] ", timestamp, level_str);
-            vfprintf(f, fmt, args);
-            fclose(f);
-        }
-    }
-    
-    va_end(args);
-}
-
-/* 获取当前时间（毫秒） */
+/* ==================== 辅助函数 ==================== */
 int64_t qosmon_time_ms(void) {
     struct timeval tv;
     gettimeofday(&tv, NULL);
-    return (int64_t)tv.tv_sec * 1000 + (int64_t)tv.tv_usec / 1000;
+    return (int64_t)tv.tv_sec * 1000 + tv.tv_usec / 1000;
 }
 
-/* epoll初始化 */
-int epoll_init(qosmon_context_t* ctx) {
-    if (!ctx) return QMON_ERR_MEMORY;
+uint16_t icmp_checksum(void* data, int len) {
+    uint16_t* p = (uint16_t*)data;
+    uint32_t sum = 0;
     
-    /* 创建epoll实例 */
-    ctx->epoll_fd = epoll_create1(0);
-    if (ctx->epoll_fd < 0) {
-        qosmon_log(ctx, QMON_LOG_ERROR, "创建epoll失败: %s\n", strerror(errno));
+    for (; len > 1; len -= 2) {
+        sum += *p++;
+    }
+    
+    if (len == 1) {
+        sum += *(uint8_t*)p;
+    }
+    
+    sum = (sum >> 16) + (sum & 0xFFFF);
+    sum += (sum >> 16);
+    
+    return (uint16_t)~sum;
+}
+
+int resolve_target(const char* target, struct sockaddr_in6* addr, char* error, int error_len) {
+    if (!target || !addr || !error) return QMON_ERR_MEMORY;
+    
+    struct addrinfo hints, *result = NULL;
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_RAW;
+    
+    int ret = getaddrinfo(target, NULL, &hints, &result);
+    if (ret != 0) {
+        snprintf(error, error_len, "无法解析地址 %s: %s", target, gai_strerror(ret));
         return QMON_ERR_SYSTEM;
     }
     
-    /* 创建定时器 */
-    ctx->timer_fd = timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK | TFD_CLOEXEC);
-    if (ctx->timer_fd < 0) {
-        qosmon_log(ctx, QMON_LOG_ERROR, "创建定时器失败: %s\n", strerror(errno));
-        close(ctx->epoll_fd);
+    if (result->ai_family == AF_INET) {
+        memset(addr, 0, sizeof(struct sockaddr_in6));
+        addr->sin6_family = AF_INET6;
+        addr->sin6_addr.s6_addr[10] = 0xFF;
+        addr->sin6_addr.s6_addr[11] = 0xFF;
+        memcpy(&addr->sin6_addr.s6_addr[12], 
+               &((struct sockaddr_in*)result->ai_addr)->sin_addr, 4);
+    } else if (result->ai_family == AF_INET6) {
+        memcpy(addr, result->ai_addr, sizeof(struct sockaddr_in6));
+    } else {
+        snprintf(error, error_len, "不支持的地址族: %d", result->ai_family);
+        freeaddrinfo(result);
         return QMON_ERR_SYSTEM;
     }
     
-    /* 初始化定时器列表 */
-    ctx->timer_list = NULL;
-    ctx->timer_count = 0;
-    
-    /* 创建信号管道 */
-    if (pipe(ctx->signal_pipe) < 0) {
-        qosmon_log(ctx, QMON_LOG_ERROR, "创建信号管道失败: %s\n", strerror(errno));
-        close(ctx->timer_fd);
-        close(ctx->epoll_fd);
-        return QMON_ERR_SYSTEM;
-    }
-    
-    /* 设置信号管道为非阻塞 */
-    fcntl(ctx->signal_pipe[0], F_SETFL, O_NONBLOCK);
-    fcntl(ctx->signal_pipe[1], F_SETFL, O_NONBLOCK);
-    
-    /* 添加定时器到epoll */
-    struct epoll_event ev = {0};
-    ev.events = EPOLLIN | EPOLLET;
-    ev.data.ptr = NULL;
-    
-    if (epoll_ctl(ctx->epoll_fd, EPOLL_CTL_ADD, ctx->timer_fd, &ev) < 0) {
-        qosmon_log(ctx, QMON_LOG_ERROR, "添加定时器到epoll失败: %s\n", strerror(errno));
-        close(ctx->signal_pipe[0]);
-        close(ctx->signal_pipe[1]);
-        close(ctx->timer_fd);
-        close(ctx->epoll_fd);
-        return QMON_ERR_SYSTEM;
-    }
-    
-    qosmon_log(ctx, QMON_LOG_INFO, "epoll初始化完成: epoll_fd=%d, timer_fd=%d\n", 
-              ctx->epoll_fd, ctx->timer_fd);
+    freeaddrinfo(result);
     return QMON_OK;
 }
 
-/* 添加fd到epoll */
-int epoll_add_fd(qosmon_context_t* ctx, int fd, uint32_t events, 
-                void (*handler)(void*), void* data) {
-    if (!ctx || fd < 0) return QMON_ERR_MEMORY;
-    
-    struct epoll_event ev = {0};
-    ev.events = events | EPOLLET;
-    ev.data.fd = fd;
-    
-    if (epoll_ctl(ctx->epoll_fd, EPOLL_CTL_ADD, fd, &ev) < 0) {
-        qosmon_log(ctx, QMON_LOG_ERROR, "添加fd到epoll失败: %s\n", strerror(errno));
-        return QMON_ERR_SYSTEM;
-    }
-    
-    /* 保存回调信息 */
-    epoll_timer_t* timer = (epoll_timer_t*)malloc(sizeof(epoll_timer_t));
-    if (!timer) {
-        qosmon_log(ctx, QMON_LOG_ERROR, "分配定时器内存失败\n");
-        return QMON_ERR_MEMORY;
-    }
-    
-    memset(timer, 0, sizeof(*timer));
-    timer->fd = fd;
-    timer->callback = handler;
-    timer->data = data;
-    timer->next = ctx->timer_list;
-    ctx->timer_list = timer;
-    
-    qosmon_log(ctx, QMON_LOG_DEBUG, "添加fd到epoll: fd=%d, events=%u\n", fd, events);
-    return QMON_OK;
-}
-
-/* 添加定时器 */
-int epoll_add_timer(qosmon_context_t* ctx, int64_t expire_time, int id, 
-                   void (*callback)(void*), void* data, int repeat, int interval) {
-    if (!ctx || expire_time <= 0) return QMON_ERR_MEMORY;
-    
-    epoll_timer_t* timer = (epoll_timer_t*)malloc(sizeof(epoll_timer_t));
-    if (!timer) {
-        qosmon_log(ctx, QMON_LOG_ERROR, "分配定时器内存失败\n");
-        return QMON_ERR_MEMORY;
-    }
-    
-    memset(timer, 0, sizeof(*timer));
-    timer->fd = -1;
-    timer->id = id;
-    timer->expire_time = expire_time;
-    timer->callback = callback;
-    timer->data = data;
-    timer->repeat = repeat;
-    timer->interval = interval;
-    
-    /* 添加到链表头部 */
-    timer->next = ctx->timer_list;
-    ctx->timer_list = timer;
-    ctx->timer_count++;
-    
-    qosmon_log(ctx, QMON_LOG_DEBUG, "添加定时器: id=%d, expire=%ld, interval=%d\n", 
-              id, (long)expire_time, interval);
-    return QMON_OK;
-}
-
-/* 处理定时器 */
-void epoll_handle_timers(qosmon_context_t* ctx) {
+/* ==================== 日志系统 ==================== */
+void qosmon_log(qosmon_context_t* ctx, int level, const char* format, ...) {
     if (!ctx) return;
     
-    int64_t now = qosmon_time_ms();
-    epoll_timer_t** prev = &ctx->timer_list;
-    epoll_timer_t* current = ctx->timer_list;
+    va_list args;
+    char buffer[1024];
+    time_t now = time(NULL);
+    struct tm* tm_info = localtime(&now);
     
-    while (current) {
-        if (current->fd == -1 && current->expire_time <= now) {
-            /* 调用回调 */
-            if (current->callback) {
-                current->callback(current->data);
-            }
-            
-            /* 如果需要重复，重新调度 */
-            if (current->repeat) {
-                current->expire_time = now + current->interval;
-                prev = &current->next;
-                current = current->next;
-            } else {
-                /* 移除定时器 */
-                epoll_timer_t* to_remove = current;
-                *prev = current->next;
-                current = current->next;
-                free(to_remove);
-                ctx->timer_count--;
-            }
-        } else {
-            prev = &current->next;
-            current = current->next;
+    va_start(args, format);
+    vsnprintf(buffer, sizeof(buffer), format, args);
+    va_end(args);
+    
+    if (ctx->config.background_mode) {
+        int syslog_level = LOG_INFO;
+        switch (level) {
+            case QMON_LOG_ERROR: syslog_level = LOG_ERR; break;
+            case QMON_LOG_WARN:  syslog_level = LOG_WARNING; break;
+            case QMON_LOG_INFO:  syslog_level = LOG_INFO; break;
+            case QMON_LOG_DEBUG: syslog_level = LOG_DEBUG; break;
         }
-    }
-}
-
-/* 运行epoll循环 */
-int epoll_run(qosmon_context_t* ctx) {
-    if (!ctx) return QMON_ERR_MEMORY;
-    
-    struct epoll_event events[10];
-    int nfds = epoll_wait(ctx->epoll_fd, events, 10, 100);  /* 100ms超时 */
-    
-    if (nfds < 0) {
-        if (errno == EINTR) {
-            return EAGAIN;
-        }
-        qosmon_log(ctx, QMON_LOG_ERROR, "epoll_wait失败: %s\n", strerror(errno));
-        return QMON_ERR_SYSTEM;
-    }
-    
-    /* 处理事件 */
-    for (int i = 0; i < nfds; i++) {
-        int fd = events[i].data.fd;
+        syslog(syslog_level, "%s", buffer);
+    } else {
+        char time_str[32];
+        strftime(time_str, sizeof(time_str), "%Y-%m-%d %H:%M:%S", tm_info);
         
-        /* 查找对应的处理器 */
-        epoll_timer_t* timer = ctx->timer_list;
-        while (timer) {
-            if (timer->fd == fd) {
-                if (timer->callback) {
-                    timer->callback(timer->data);
-                }
-                break;
-            }
-            timer = timer->next;
+        const char* level_str = "UNKNOWN";
+        switch (level) {
+            case QMON_LOG_ERROR: level_str = "ERROR"; break;
+            case QMON_LOG_WARN:  level_str = "WARN"; break;
+            case QMON_LOG_INFO:  level_str = "INFO"; break;
+            case QMON_LOG_DEBUG: level_str = "DEBUG"; break;
+        }
+        
+        if (ctx->config.verbose || level <= QMON_LOG_INFO) {
+            fprintf(stderr, "[%s] [%s] %s", time_str, level_str, buffer);
         }
     }
     
-    /* 处理定时器 */
-    epoll_handle_timers(ctx);
+    if (ctx->debug_log_file && (ctx->config.verbose || level <= QMON_LOG_INFO)) {
+        char time_str[32];
+        strftime(time_str, sizeof(time_str), "%Y-%m-%d %H:%M:%S", tm_info);
+        const char* level_str = "UNKNOWN";
+        switch (level) {
+            case QMON_LOG_ERROR: level_str = "ERROR"; break;
+            case QMON_LOG_WARN:  level_str = "WARN"; break;
+            case QMON_LOG_INFO:  level_str = "INFO"; break;
+            case QMON_LOG_DEBUG: level_str = "DEBUG"; break;
+        }
+        fprintf(ctx->debug_log_file, "[%s] [%s] %s", time_str, level_str, buffer);
+        fflush(ctx->debug_log_file);
+    }
+}
+
+/* ==================== 配置处理 ==================== */
+void qosmon_config_init(qosmon_config_t* cfg) {
+    if (!cfg) return;
+    
+    memset(cfg, 0, sizeof(qosmon_config_t));
+    cfg->ping_interval = 200;
+    cfg->max_bandwidth_kbps = 10000;
+    cfg->ping_limit_ms = 20;
+    cfg->classid = 0x101;
+    cfg->safe_mode = 0;
+    cfg->verbose = 0;
+    cfg->auto_switch_mode = 0;
+    cfg->background_mode = 0;
+    cfg->skip_initial = 0;
+    cfg->min_bw_change_kbps = 10;
+    cfg->min_bw_ratio = 0.1f;
+    cfg->max_bw_ratio = 1.0f;
+    cfg->smoothing_factor = 0.3f;
+    cfg->active_threshold = 0.7f;
+    cfg->idle_threshold = 0.3f;
+    cfg->safe_start_ratio = 0.5f;
+    strcpy(cfg->device, "ifb0");
+    strcpy(cfg->target, "8.8.8.8");
+    strcpy(cfg->status_file, "/var/run/qosmon.status");
+    strcpy(cfg->debug_log, "/var/log/qosmon.log");
+}
+
+int qosmon_config_parse(qosmon_config_t* cfg, int argc, char* argv[]) {
+    if (!cfg) return QMON_ERR_MEMORY;
+    
+    // 设置默认值
+    qosmon_config_init(cfg);
+    
+    // 简单参数解析
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "-c") == 0 && i + 1 < argc) {
+            strncpy(cfg->config_file, argv[++i], sizeof(cfg->config_file) - 1);
+        } else if (strcmp(argv[i], "-d") == 0 && i + 1 < argc) {
+            strncpy(cfg->device, argv[++i], sizeof(cfg->device) - 1);
+        } else if (strcmp(argv[i], "-t") == 0 && i + 1 < argc) {
+            strncpy(cfg->target, argv[++i], sizeof(cfg->target) - 1);
+        } else if (strcmp(argv[i], "-s") == 0 && i + 1 < argc) {
+            strncpy(cfg->status_file, argv[++i], sizeof(cfg->status_file) - 1);
+        } else if (strcmp(argv[i], "-l") == 0 && i + 1 < argc) {
+            strncpy(cfg->debug_log, argv[++i], sizeof(cfg->debug_log) - 1);
+        } else if (strcmp(argv[i], "-v") == 0) {
+            cfg->verbose = 1;
+        } else if (strcmp(argv[i], "-b") == 0) {
+            cfg->background_mode = 1;
+        } else if (strcmp(argv[i], "-S") == 0) {
+            cfg->safe_mode = 1;
+        } else if (strcmp(argv[i], "-A") == 0) {
+            cfg->auto_switch_mode = 1;
+        } else if (strcmp(argv[i], "-I") == 0) {
+            cfg->skip_initial = 1;
+        } else if (i == 1 && argc >= 4) {
+            // 位置参数: ping_interval target max_bandwidth_kbps ping_limit_ms
+            cfg->ping_interval = atoi(argv[1]);
+            if (argc >= 2) strncpy(cfg->target, argv[2], sizeof(cfg->target) - 1);
+            if (argc >= 3) cfg->max_bandwidth_kbps = atoi(argv[3]);
+            if (argc >= 4) cfg->ping_limit_ms = atoi(argv[4]);
+            i += 3; // 跳过已处理的参数
+        }
+    }
     
     return QMON_OK;
 }
 
-/* 清理epoll */
-void epoll_cleanup(qosmon_context_t* ctx) {
-    if (!ctx) return;
+int qosmon_config_validate(qosmon_config_t* cfg, char* error, int error_len) {
+    if (!cfg || !error) return QMON_ERR_MEMORY;
     
-    /* 清理定时器列表 */
-    epoll_timer_t* current = ctx->timer_list;
-    while (current) {
-        epoll_timer_t* next = current->next;
-        free(current);
-        current = next;
-    }
-    ctx->timer_list = NULL;
-    ctx->timer_count = 0;
-    
-    /* 关闭文件描述符 */
-    if (ctx->timer_fd >= 0) {
-        close(ctx->timer_fd);
-        ctx->timer_fd = -1;
+    if (cfg->ping_interval < 50 || cfg->ping_interval > 5000) {
+        snprintf(error, error_len, "ping间隔必须在50-5000ms之间");
+        return QMON_ERR_CONFIG;
     }
     
-    if (ctx->signal_pipe[0] >= 0) {
-        close(ctx->signal_pipe[0]);
-        ctx->signal_pipe[0] = -1;
+    if (cfg->max_bandwidth_kbps < 100 || cfg->max_bandwidth_kbps > 1000000) {
+        snprintf(error, error_len, "最大带宽必须在100-1000000kbps之间");
+        return QMON_ERR_CONFIG;
     }
     
-    if (ctx->signal_pipe[1] >= 0) {
-        close(ctx->signal_pipe[1]);
-        ctx->signal_pipe[1] = -1;
+    if (cfg->ping_limit_ms < 5 || cfg->ping_limit_ms > 1000) {
+        snprintf(error, error_len, "ping限制必须在5-1000ms之间");
+        return QMON_ERR_CONFIG;
     }
     
-    if (ctx->epoll_fd >= 0) {
-        close(ctx->epoll_fd);
-        ctx->epoll_fd = -1;
+    if (strlen(cfg->target) == 0) {
+        snprintf(error, error_len, "必须指定目标地址");
+        return QMON_ERR_CONFIG;
     }
     
-    qosmon_log(ctx, QMON_LOG_INFO, "epoll清理完成\n");
+    if (strlen(cfg->device) == 0) {
+        snprintf(error, error_len, "必须指定网络设备");
+        return QMON_ERR_CONFIG;
+    }
+    
+    if (cfg->min_bw_ratio < 0.01f || cfg->min_bw_ratio > 0.5f) {
+        snprintf(error, error_len, "最小带宽比例必须在0.01-0.5之间");
+        return QMON_ERR_CONFIG;
+    }
+    
+    if (cfg->max_bw_ratio < 0.5f || cfg->max_bw_ratio > 1.0f) {
+        snprintf(error, error_len, "最大带宽比例必须在0.5-1.0之间");
+        return QMON_ERR_CONFIG;
+    }
+    
+    if (cfg->smoothing_factor <= 0.0f || cfg->smoothing_factor >= 1.0f) {
+        snprintf(error, error_len, "平滑因子必须在0.0-1.0之间");
+        return QMON_ERR_CONFIG;
+    }
+    
+    return QMON_OK;
 }
 
-/* Ping管理器初始化 */
-int ping_manager_init(qosmon_context_t* ctx) {
-    if (!ctx) return QMON_ERR_MEMORY;
+/* ==================== Ping管理器实现 ==================== */
+struct ping_manager_s {
+    qosmon_context_t* ctx;
+    char packet[MAX_PACKET_SIZE];
+};
+
+int ping_manager_init(ping_manager_t* pm, qosmon_context_t* ctx) {
+    if (!pm || !ctx) return QMON_ERR_MEMORY;
     
-    /* 创建raw socket */
-    ctx->ping_socket = socket(AF_INET, SOCK_RAW, IPPROTO_ICMP);
+    pm->ctx = ctx;
+    
+    int af = ctx->target_addr.sin6_family;
+    int socktype = SOCK_RAW;
+    int protocol = (af == AF_INET6) ? IPPROTO_ICMPV6 : IPPROTO_ICMP;
+    
+    ctx->ping_socket = socket(af, socktype, protocol);
     if (ctx->ping_socket < 0) {
-        qosmon_log(ctx, QMON_LOG_ERROR, "创建ping socket失败: %s\n", strerror(errno));
+        qosmon_log(ctx, QMON_LOG_ERROR, "创建ping套接字失败: %s\n", strerror(errno));
         return QMON_ERR_SOCKET;
     }
     
-    /* 设置socket选项 */
     int ttl = 64;
     if (setsockopt(ctx->ping_socket, IPPROTO_IP, IP_TTL, &ttl, sizeof(ttl)) < 0) {
         qosmon_log(ctx, QMON_LOG_WARN, "设置TTL失败: %s\n", strerror(errno));
     }
     
-    int on = 1;
-    if (setsockopt(ctx->ping_socket, SOL_SOCKET, SO_TIMESTAMP, &on, sizeof(on)) < 0) {
-        qosmon_log(ctx, QMON_LOG_WARN, "设置时间戳失败: %s\n", strerror(errno));
-    }
-    
-    /* 设置接收超时 */
-    struct timeval tv = {1, 0};  /* 1秒超时 */
-    if (setsockopt(ctx->ping_socket, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv)) < 0) {
+    int timeout = 2000;
+    if (setsockopt(ctx->ping_socket, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)) < 0) {
         qosmon_log(ctx, QMON_LOG_WARN, "设置接收超时失败: %s\n", strerror(errno));
     }
     
-    /* 设置非阻塞 */
     int flags = fcntl(ctx->ping_socket, F_GETFL, 0);
-    if (flags < 0) {
-        qosmon_log(ctx, QMON_LOG_ERROR, "获取socket标志失败: %s\n", strerror(errno));
-        close(ctx->ping_socket);
-        ctx->ping_socket = -1;
-        return QMON_ERR_SOCKET;
+    if (flags >= 0) {
+        fcntl(ctx->ping_socket, F_SETFL, flags | O_NONBLOCK);
     }
     
-    if (fcntl(ctx->ping_socket, F_SETFL, flags | O_NONBLOCK) < 0) {
-        qosmon_log(ctx, QMON_LOG_ERROR, "设置socket非阻塞失败: %s\n", strerror(errno));
-        close(ctx->ping_socket);
-        ctx->ping_socket = -1;
-        return QMON_ERR_SOCKET;
-    }
-    
-    /* 初始化目标地址 */
-    struct sockaddr_in* addr_in = (struct sockaddr_in*)&ctx->target_addr;
-    memset(addr_in, 0, sizeof(*addr_in));
-    addr_in->sin_family = AF_INET;
-    
-    /* 解析目标地址 */
-    struct hostent* host = gethostbyname(ctx->config.target);
-    if (!host) {
-        qosmon_log(ctx, QMON_LOG_ERROR, "解析目标地址失败: %s\n", ctx->config.target);
-        close(ctx->ping_socket);
-        ctx->ping_socket = -1;
-        return QMON_ERR_NETWORK;
-    }
-    
-    memcpy(&addr_in->sin_addr, host->h_addr_list[0], host->h_length);
-    ctx->target_addr_len = sizeof(*addr_in);
-    
-    /* 生成标识符 */
-    ctx->ident = getpid() & 0xFFFF;
-    ctx->sequence = 0;
-    ctx->ntransmitted = 0;
-    ctx->nreceived = 0;
-    
-    qosmon_log(ctx, QMON_LOG_INFO, "Ping管理器初始化完成，标识符: %d, 目标: %s\n", 
-              ctx->ident, inet_ntoa(addr_in->sin_addr));
     return QMON_OK;
 }
 
-/* 发送Ping */
-int ping_manager_send(qosmon_context_t* ctx) {
-    if (!ctx || ctx->ping_socket < 0) return QMON_ERR_SOCKET;
+int ping_manager_send(ping_manager_t* pm) {
+    if (!pm || !pm->ctx) return QMON_ERR_MEMORY;
     
-    struct icmphdr icmp_hdr;
-    char packet[64];
-    int packet_len = sizeof(packet);
+    qosmon_context_t* ctx = pm->ctx;
     
-    /* 构建ICMP包 */
-    memset(&icmp_hdr, 0, sizeof(icmp_hdr));
-    icmp_hdr.type = ICMP_ECHO;
-    icmp_hdr.code = 0;
-    icmp_hdr.un.echo.id = htons(ctx->ident);
-    icmp_hdr.un.echo.sequence = htons(ctx->sequence);
-    
-    /* 填充数据 */
-    memset(packet, 0, sizeof(packet));
-    
-    /* 添加时间戳 */
-    struct timeval* tv = (struct timeval*)(packet + sizeof(icmp_hdr));
-    gettimeofday(tv, NULL);
-    
-    /* 填充剩余数据 */
-    for (int i = sizeof(icmp_hdr) + sizeof(struct timeval); i < packet_len; i++) {
-        packet[i] = i & 0xFF;
+    if (ctx->ping_socket < 0) {
+        return QMON_ERR_SOCKET;
     }
     
-    /* 复制ICMP头部 */
-    memcpy(packet, &icmp_hdr, sizeof(icmp_hdr));
-    
-    /* 计算校验和 */
-    icmp_hdr.checksum = 0;
-    icmp_hdr.checksum = in_cksum((unsigned short*)packet, packet_len);
-    memcpy(packet, &icmp_hdr, sizeof(icmp_hdr));
-    
-    /* 发送 */
-    struct sockaddr_in* addr_in = (struct sockaddr_in*)&ctx->target_addr;
-    int sent = sendto(ctx->ping_socket, packet, packet_len, 0,
-                      (struct sockaddr*)addr_in, sizeof(*addr_in));
-    
-    if (sent < 0) {
-        if (errno != EAGAIN && errno != EWOULDBLOCK) {
-            qosmon_log(ctx, QMON_LOG_ERROR, "发送ping失败: %s\n", strerror(errno));
+    int cc = 0;
+    if (ctx->target_addr.sin6_family == AF_INET6) {
+        struct icmp6_hdr* icp6 = (struct icmp6_hdr*)pm->packet;
+        icp6->icmp6_type = ICMP6_ECHO_REQUEST;
+        icp6->icmp6_code = 0;
+        icp6->icmp6_id = htons(ctx->ident);
+        icp6->icmp6_seq = htons(ctx->ntransmitted);
+        
+        struct timeval* tv = (struct timeval*)(pm->packet + sizeof(struct icmp6_hdr));
+        gettimeofday(tv, NULL);
+        
+        cc = 8 + sizeof(struct timeval);
+        for (int i = 8; i < cc; i++) {
+            pm->packet[8 + sizeof(struct icmp6_hdr) + i] = i;
         }
-        return QMON_ERR_SOCKET;
+        
+        icp6->icmp6_cksum = 0;
+    } else {
+        struct icmp* icp = (struct icmp*)pm->packet;
+        icp->icmp_type = ICMP_ECHO;
+        icp->icmp_code = 0;
+        icp->icmp_id = ctx->ident;
+        icp->icmp_seq = ctx->ntransmitted;
+        
+        struct timeval* tv = (struct timeval*)(pm->packet + 8);
+        gettimeofday(tv, NULL);
+        
+        cc = 8 + sizeof(struct timeval);
+        for (int i = 8; i < cc; i++) {
+            pm->packet[8 + sizeof(struct timeval) + i] = i;
+        }
+        
+        icp->icmp_cksum = icmp_checksum(icp, cc);
     }
     
     ctx->ntransmitted++;
-    ctx->sequence++;
-    ctx->last_ping_time_ms = qosmon_time_ms();
     
-    if (ctx->config.verbose) {
-        qosmon_log(ctx, QMON_LOG_DEBUG, "发送ping #%d 到 %s\n", 
-                  ctx->sequence, inet_ntoa(addr_in->sin_addr));
+    int ret = sendto(ctx->ping_socket, pm->packet, cc, 0,
+                     (struct sockaddr*)&ctx->target_addr, 
+                     sizeof(ctx->target_addr));
+    
+    if (ret < 0) {
+        qosmon_log(ctx, QMON_LOG_ERROR, "发送ping失败: %s\n", strerror(errno));
+        return QMON_ERR_SOCKET;
     }
+    
+    ctx->last_ping_time_ms = qosmon_time_ms();
+    qosmon_log(ctx, QMON_LOG_DEBUG, "发送ping, seq=%d\n", ctx->ntransmitted);
     
     return QMON_OK;
 }
 
-/* 接收Ping响应 */
-int ping_manager_receive(qosmon_context_t* ctx) {
-    if (!ctx || ctx->ping_socket < 0) return QMON_ERR_SOCKET;
+int ping_manager_receive(ping_manager_t* pm) {
+    if (!pm || !pm->ctx) return QMON_ERR_MEMORY;
     
-    char packet[256];
-    struct sockaddr_in from;
+    qosmon_context_t* ctx = pm->ctx;
+    char buf[MAX_PACKET_SIZE];
+    struct sockaddr_storage from;
     socklen_t fromlen = sizeof(from);
     
-    int n = recvfrom(ctx->ping_socket, packet, sizeof(packet), 0,
-                     (struct sockaddr*)&from, &fromlen);
+    int cc = recvfrom(ctx->ping_socket, buf, sizeof(buf), 0,
+                      (struct sockaddr*)&from, &fromlen);
     
-    if (n < 0) {
+    if (cc < 0) {
         if (errno != EAGAIN && errno != EWOULDBLOCK) {
             qosmon_log(ctx, QMON_LOG_ERROR, "接收ping失败: %s\n", strerror(errno));
         }
-        return -1;
+        return QMON_ERR_SOCKET;
     }
     
-    if (n < (int)sizeof(struct ip) + ICMP_MINLEN) {
-        qosmon_log(ctx, QMON_LOG_WARN, "收到过短的ping包: %d bytes\n", n);
-        return 0;
+    struct ip* ip = NULL;
+    struct icmp* icp = NULL;
+    struct icmp6_hdr* icp6 = NULL;
+    struct timeval tv, *tp = NULL;
+    int hlen, triptime = 0;
+    uint16_t seq = 0;
+    
+    if (gettimeofday(&tv, NULL) != 0) {
+        qosmon_log(ctx, QMON_LOG_ERROR, "获取时间失败: %s\n", strerror(errno));
+        return QMON_ERR_SYSTEM;
     }
     
-    /* 解析IP头部 */
-    struct ip* ip_hdr = (struct ip*)packet;
-    int hlen = ip_hdr->ip_hl << 2;  /* IP头部长度（字节） */
-    
-    if (n < hlen + ICMP_MINLEN) {
-        qosmon_log(ctx, QMON_LOG_WARN, "IP头部长度错误\n");
-        return 0;
-    }
-    
-    /* 解析ICMP头部 */
-    struct icmphdr* icmp_hdr = (struct icmphdr*)(packet + hlen);
-    
-    /* 检查是否是我们发送的echo回复 */
-    if (icmp_hdr->type != ICMP_ECHOREPLY) {
-        return 0;  /* 不是echo回复 */
-    }
-    
-    uint16_t recv_id = ntohs(icmp_hdr->un.echo.id);
-    if (recv_id != ctx->ident) {
-        if (ctx->config.verbose) {
-            qosmon_log(ctx, QMON_LOG_DEBUG, "收到非本进程的ICMP包: ID=%d (期望: %d)\n", 
-                      recv_id, ctx->ident);
+    if (from.ss_family == AF_INET6) {
+        if (cc < (int)sizeof(struct icmp6_hdr)) return 0;
+        icp6 = (struct icmp6_hdr*)buf;
+        
+        if (icp6->icmp6_type != ICMP6_ECHO_REPLY) return 0;
+        if (ntohs(icp6->icmp6_id) != ctx->ident) return 0;
+        
+        seq = ntohs(icp6->icmp6_seq);
+        if (cc >= 8 + (int)sizeof(struct timeval)) {
+            tp = (struct timeval*)&icp6->icmp6_dataun.icmp6_un_data32[1];
         }
-        return 0;
+    } else {
+        ip = (struct ip*)buf;
+        hlen = ip->ip_hl << 2;
+        if (cc < hlen + 8) return 0;
+        icp = (struct icmp*)(buf + hlen);
+        
+        if (icp->icmp_type != ICMP_ECHOREPLY) return 0;
+        if (icp->icmp_id != ctx->ident) return 0;
+        
+        seq = icp->icmp_seq;
+        if (cc >= hlen + 8 + (int)sizeof(struct timeval)) {
+            tp = (struct timeval*)&icp->icmp_data[0];
+        }
     }
     
-    /* 获取发送时间戳 */
-    struct timeval* send_tv = (struct timeval*)(packet + hlen + sizeof(struct icmphdr));
-    struct timeval recv_tv;
-    gettimeofday(&recv_tv, NULL);
-    
-    /* 计算延迟（微秒） */
-    int64_t rtt_us = (recv_tv.tv_sec - send_tv->tv_sec) * 1000000L + 
-                     (recv_tv.tv_usec - send_tv->tv_usec);
-    
-    if (rtt_us < 0) rtt_us = 0;
-    if (rtt_us > MAX_PING_TIME_MS * 1000) rtt_us = MAX_PING_TIME_MS * 1000;
-    if (rtt_us < MIN_PING_TIME_MS * 1000) rtt_us = MIN_PING_TIME_MS * 1000;
+    if (seq != ctx->ntransmitted) return 0;
     
     ctx->nreceived++;
     
-    /* 更新ping历史 */
-    ctx->raw_ping_time_us = rtt_us;
-    update_ping_history(ctx, rtt_us);
-    
-    if (ctx->config.verbose) {
-        qosmon_log(ctx, QMON_LOG_DEBUG, "收到ping回复 #%d, ID=%d, 序列=%d, 延迟: %.1f ms\n", 
-                  ctx->nreceived, recv_id, ntohs(icmp_hdr->un.echo.sequence),
-                  rtt_us / 1000.0f);
+    if (tp) {
+        triptime = (tv.tv_sec - tp->tv_sec) * 1000 + 
+                   (tv.tv_usec - tp->tv_usec) / 1000;
     }
+    
+    if (triptime < 0) {
+        qosmon_log(ctx, QMON_LOG_WARN, "检测到时间回绕，重置ping计时\n");
+        triptime = MIN_PING_TIME_MS;
+    }
+    
+    if (triptime < MIN_PING_TIME_MS) triptime = MIN_PING_TIME_MS;
+    if (triptime > MAX_PING_TIME_MS) triptime = MAX_PING_TIME_MS;
+    
+    ctx->raw_ping_time_us = triptime * 1000;
+    
+    if (ctx->raw_ping_time_us > ctx->max_ping_time_us) {
+        ctx->max_ping_time_us = ctx->raw_ping_time_us;
+    }
+    
+    ping_history_t* hist = &ctx->ping_history;
+    if (hist->count < PING_HISTORY_SIZE) {
+        hist->times[hist->index] = ctx->raw_ping_time_us;
+    } else {
+        hist->times[hist->index] = ctx->raw_ping_time_us;
+    }
+    hist->index = (hist->index + 1) % PING_HISTORY_SIZE;
+    if (hist->count < PING_HISTORY_SIZE) hist->count++;
+    
+    if (hist->count == 1) {
+        hist->smoothed = ctx->raw_ping_time_us;
+    } else {
+        hist->smoothed = hist->smoothed * (1.0f - ctx->config.smoothing_factor) +
+                          ctx->raw_ping_time_us * ctx->config.smoothing_factor;
+    }
+    
+    ctx->filtered_ping_time_us = (int)hist->smoothed;
+    
+    qosmon_log(ctx, QMON_LOG_DEBUG, "收到ping回复: seq=%d, 时间=%dms, 平滑=%dms\n",
+               seq, triptime, ctx->filtered_ping_time_us / 1000);
     
     return 1;
 }
 
-/* 更新ping历史 */
-static void update_ping_history(qosmon_context_t* ctx, int64_t ping_time_us) {
-    if (!ctx) return;
-    
-    /* 更新历史记录 */
-    ctx->ping_history.times[ctx->ping_history.index] = ping_time_us;
-    ctx->ping_history.index = (ctx->ping_history.index + 1) % PING_HISTORY_SIZE;
-    if (ctx->ping_history.count < PING_HISTORY_SIZE) {
-        ctx->ping_history.count++;
-    }
-    
-    /* 计算平滑延迟 */
-    float alpha = 0.3f;  /* 平滑因子 */
-    if (ctx->ping_history.smoothed == 0) {
-        ctx->ping_history.smoothed = ping_time_us;
-    } else {
-        ctx->ping_history.smoothed = alpha * ping_time_us + (1 - alpha) * ctx->ping_history.smoothed;
-    }
-    
-    ctx->filtered_ping_time_us = (int64_t)ctx->ping_history.smoothed;
-    
-    /* 更新最大延迟 */
-    if (ping_time_us > ctx->max_ping_time_us) {
-        ctx->max_ping_time_us = ping_time_us;
-    }
-    
-    /* 更新最小延迟 */
-    if (ctx->min_ping_time_us == 0 || ping_time_us < ctx->min_ping_time_us) {
-        ctx->min_ping_time_us = ping_time_us;
+void ping_manager_cleanup(ping_manager_t* pm) {
+    if (pm && pm->ctx && pm->ctx->ping_socket >= 0) {
+        close(pm->ctx->ping_socket);
+        pm->ctx->ping_socket = -1;
     }
 }
 
-/* ICMP校验和计算 */
-static unsigned short in_cksum(unsigned short* addr, int len) {
-    int nleft = len;
-    int sum = 0;
-    unsigned short* w = addr;
-    unsigned short answer = 0;
+/* ==================== 流量统计 ==================== */
+int load_monitor_update(qosmon_context_t* ctx) {
+    if (!ctx) return QMON_ERR_MEMORY;
     
-    while (nleft > 1) {
-        sum += *w++;
-        nleft -= 2;
+    static unsigned long long last_rx_bytes = 0;
+    static int64_t last_read_time = 0;
+    
+    char line[256];
+    unsigned long long rx_bytes = 0;
+    int found = 0;
+    
+    FILE* fp = fopen("/proc/net/dev", "r");
+    if (!fp) {
+        qosmon_log(ctx, QMON_LOG_ERROR, "无法打开 /proc/net/dev: %s\n", strerror(errno));
+        return QMON_ERR_FILE;
     }
     
-    if (nleft == 1) {
-        *(unsigned char*)(&answer) = *(unsigned char*)w;
-        sum += answer;
-    }
-    
-    sum = (sum >> 16) + (sum & 0xFFFF);
-    sum += (sum >> 16);
-    answer = ~sum;
-    return answer;
-}
-
-/* 清理Ping管理器 */
-void ping_manager_cleanup(qosmon_context_t* ctx) {
-    if (!ctx) return;
-    
-    if (ctx->ping_socket >= 0) {
-        close(ctx->ping_socket);
-        ctx->ping_socket = -1;
-    }
-    
-    qosmon_log(ctx, QMON_LOG_INFO, "Ping管理器清理完成\n");
-}
-
-/* TC控制器初始化 */
-int tc_controller_init(tc_controller_t* tc, qosmon_context_t* ctx) {
-    if (!tc || !ctx) return QMON_ERR_MEMORY;
-    
-    tc->ctx = ctx;
-    tc->seq = 0;
-    
-    /* 检测队列算法 */
-    char* qdisc_kind = detect_qdisc_kind(ctx);
-    strncpy(ctx->detected_qdisc, qdisc_kind, MAX_QDISC_KIND_LEN - 1);
-    ctx->detected_qdisc[MAX_QDISC_KIND_LEN - 1] = '\0';
-    
-    /* 映射队列类型枚举 */
-    if (strcmp(qdisc_kind, "htb") == 0) {
-        tc->qdisc_kind = QDISC_HTB;
-    } else if (strcmp(qdisc_kind, "hfsc") == 0) {
-        tc->qdisc_kind = QDISC_HFSC;
-    } else if (strcmp(qdisc_kind, "tbf") == 0) {
-        tc->qdisc_kind = QDISC_TBF;
-    } else if (strcmp(qdisc_kind, "drr") == 0) {
-        tc->qdisc_kind = QDISC_DRR;
-    } else if (strcmp(qdisc_kind, "sfq") == 0) {
-        tc->qdisc_kind = QDISC_SFQ;
-    } else if (strcmp(qdisc_kind, "codel") == 0) {
-        tc->qdisc_kind = QDISC_CODEL;
-    } else if (strcmp(qdisc_kind, "fq_codel") == 0) {
-        tc->qdisc_kind = QDISC_FQ_CODEL;
-    } else {
-        tc->qdisc_kind = QDISC_PFIFO_FAST;
-    }
-    
-    /* 检测当前带宽 */
-    int current_bw_kbps = 0;
-    int ret = detect_class_bandwidth(ctx, &current_bw_kbps, tc);
-    if (ret == QMON_OK && current_bw_kbps > 0) {
-        ctx->current_limit_bps = current_bw_kbps * 1000;
-        qosmon_log(ctx, QMON_LOG_INFO, "检测到当前带宽: %d kbps\n", current_bw_kbps);
-    } else {
-        ctx->current_limit_bps = ctx->config.max_bandwidth_kbps * 1000;
-        qosmon_log(ctx, QMON_LOG_INFO, "使用默认带宽: %d kbps\n", ctx->config.max_bandwidth_kbps);
-    }
-    
-    /* 打开netlink socket（如果启用） */
-    if (ctx->config.use_netlink) {
-        tc->netlink_fd = netlink_open();
-        if (tc->netlink_fd < 0) {
-            qosmon_log(ctx, QMON_LOG_WARN, "Netlink初始化失败，将使用shell命令\n");
-        } else {
-            qosmon_log(ctx, QMON_LOG_INFO, "Netlink初始化成功\n");
+    for (int i = 0; i < 2; i++) {
+        if (!fgets(line, sizeof(line), fp)) {
+            fclose(fp);
+            return QMON_ERR_FILE;
         }
-    } else {
-        tc->netlink_fd = -1;
-        qosmon_log(ctx, QMON_LOG_INFO, "Netlink被禁用，将使用shell命令\n");
     }
     
-    qosmon_log(ctx, QMON_LOG_INFO, "TC控制器初始化完成，队列算法: %s\n", qdisc_kind);
+    while (fgets(line, sizeof(line), fp)) {
+        char* colon = strchr(line, ':');
+        if (!colon) continue;
+        
+        *colon = '\0';
+        char* ifname = line;
+        while (*ifname == ' ') ifname++;
+        
+        if (strcmp(ifname, ctx->config.device) == 0) {
+            if (sscanf(colon + 1, "%llu", &rx_bytes) == 1) {
+                found = 1;
+            }
+            break;
+        }
+    }
+    
+    fclose(fp);
+    
+    if (!found) {
+        qosmon_log(ctx, QMON_LOG_ERROR, "接口 %s 未找到\n", ctx->config.device);
+        return QMON_ERR_SYSTEM;
+    }
+    
+    int64_t now = qosmon_time_ms();
+    
+    if (last_read_time > 0 && last_rx_bytes > 0 && rx_bytes >= last_rx_bytes) {
+        int time_diff = (int)(now - last_read_time);
+        if (time_diff > 0) {
+            unsigned long long bytes_diff = rx_bytes - last_rx_bytes;
+            int bps = (int)((bytes_diff * 8000) / time_diff);
+            
+            if (bps < 0) {
+                qosmon_log(ctx, QMON_LOG_WARN, "流量统计溢出，重置\n");
+                bps = 0;
+            }
+            
+            float alpha = 0.1f;
+            ctx->filtered_total_load_bps += (int)((bps - ctx->filtered_total_load_bps) * alpha);
+            
+            int max_bps = ctx->config.max_bandwidth_kbps * 1000;
+            if (ctx->filtered_total_load_bps < 0) {
+                ctx->filtered_total_load_bps = 0;
+            } else if (ctx->filtered_total_load_bps > max_bps) {
+                ctx->filtered_total_load_bps = max_bps;
+            }
+            
+            qosmon_log(ctx, QMON_LOG_DEBUG, "流量统计: 原始=%d bps, 平滑=%d bps\n", 
+                      bps, ctx->filtered_total_load_bps);
+        }
+    }
+    
+    last_rx_bytes = rx_bytes;
+    last_read_time = now;
+    
     return QMON_OK;
 }
 
-/* 修复1: Netlink通信修复 */
-static int tc_set_bandwidth_netlink(tc_controller_t* tc, int bandwidth_bps) {
-    if (!tc || tc->netlink_fd < 0) {
-        return QMON_ERR_NETLINK;
-    }
-    
-    char buf[4096];
-    struct nlmsghdr* n = (struct nlmsghdr*)buf;
-    struct tcmsg* t = NLMSG_DATA(n);
-    
-    memset(buf, 0, sizeof(buf));
-    
-    /* 设置netlink消息头 */
-    n->nlmsg_len = NLMSG_LENGTH(sizeof(*t));
-    n->nlmsg_type = RTM_NEWTCLASS;
-    n->nlmsg_flags = NLM_F_REQUEST | NLM_F_REPLACE | NLM_F_CREATE | NLM_F_ACK;
-    n->nlmsg_seq = ++tc->seq;
-    n->nlmsg_pid = getpid();
-    
-    /* 设置TC消息 */
-    t->tcm_family = AF_UNSPEC;
-    t->tcm_ifindex = 0;  /* 将在后面设置 */
-    t->tcm_handle = tc->ctx->config.classid;
-    t->tcm_parent = 1;  /* 父类 */
-    
-    /* 获取接口索引 */
-    struct ifreq ifr;
-    int sock = socket(AF_INET, SOCK_DGRAM, 0);
-    if (sock < 0) {
-        qosmon_log(tc->ctx, QMON_LOG_ERROR, "创建socket失败: %s\n", strerror(errno));
-        return QMON_ERR_SOCKET;
-    }
-    
-    strncpy(ifr.ifr_name, tc->ctx->config.device, IFNAMSIZ - 1);
-    ifr.ifr_name[IFNAMSIZ - 1] = '\0';
-    
-    if (ioctl(sock, SIOCGIFINDEX, &ifr) < 0) {
-        qosmon_log(tc->ctx, QMON_LOG_ERROR, "获取接口索引失败: %s\n", strerror(errno));
-        close(sock);
-        return QMON_ERR_SYSTEM;
-    }
-    
-    t->tcm_ifindex = ifr.ifr_ifindex;
-    close(sock);
-    
-    /* 根据队列规则类型设置参数 */
-    int bandwidth_kbps = (bandwidth_bps + 500) / 1000;
-    
-    struct rtattr* tail = NLMSG_TAIL(n);
-    switch (tc->qdisc_kind) {
-        case QDISC_HTB: {
-            /* HTB参数 */
-            struct rtattr* opt = (struct rtattr*)tail;
-            opt->rta_type = TCA_OPTIONS;
-            opt->rta_len = RTA_LENGTH(sizeof(struct tc_htb_opt));
-            
-            struct tc_htb_opt htb_opt = {0};
-            htb_opt.rate.rate = bandwidth_kbps * 1024;  /* 转换为字节 */
-            htb_opt.ceil.rate = bandwidth_kbps * 1024;
-            htb_opt.buffer = tc->ctx->config.buffer;
-            htb_opt.cbuffer = tc->ctx->config.cbuffer;
-            htb_opt.quantum = tc->ctx->config.quantum;
-            
-            memcpy(RTA_DATA(opt), &htb_opt, sizeof(htb_opt));
-            tail = (struct rtattr*)((char*)tail + RTA_ALIGN(opt->rta_len));
-            break;
-        }
-        case QDISC_HFSC: {
-            /* HFSC参数 */
-            struct rtattr* opt = (struct rtattr*)tail;
-            opt->rta_type = TCA_OPTIONS;
-            opt->rta_len = RTA_LENGTH(sizeof(struct tc_hfsc_qopt));
-            
-            struct tc_hfsc_qopt hfsc_opt = {0};
-            hfsc_opt.defcls = tc->ctx->config.classid;
-            hfsc_opt.rt.m1 = tc->ctx->config.hfsc_m1;
-            hfsc_opt.rt.d = tc->ctx->config.hfsc_d;
-            hfsc_opt.rt.m2 = bandwidth_kbps * 1024;
-            hfsc_opt.ls.m1 = tc->ctx->config.hfsc_m1;
-            hfsc_opt.ls.d = tc->ctx->config.hfsc_d;
-            hfsc_opt.ls.m2 = bandwidth_kbps * 1024;
-            
-            memcpy(RTA_DATA(opt), &hfsc_opt, sizeof(hfsc_opt));
-            tail = (struct rtattr*)((char*)tail + RTA_ALIGN(opt->rta_len));
-            break;
-        }
-        case QDISC_TBF: {
-            /* TBF参数 */
-            struct rtattr* opt = (struct rtattr*)tail;
-            opt->rta_type = TCA_OPTIONS;
-            opt->rta_len = RTA_LENGTH(sizeof(struct tc_tbf_qopt));
-            
-            struct tc_tbf_qopt tbf_opt = {0};
-            tbf_opt.rate.rate = bandwidth_kbps * 1024;
-            tbf_opt.limit = tc->ctx->config.tbf_limit;
-            tbf_opt.buffer = tc->ctx->config.tbf_burst;
-            tbf_opt.mtu = tc->ctx->config.tbf_mtu;
-            
-            memcpy(RTA_DATA(opt), &tbf_opt, sizeof(tbf_opt));
-            tail = (struct rtattr*)((char*)tail + RTA_ALIGN(opt->rta_len));
-            break;
-        }
-        default:
-            /* 使用默认HTB参数 */
-            struct rtattr* opt = (struct rtattr*)tail;
-            opt->rta_type = TCA_OPTIONS;
-            opt->rta_len = RTA_LENGTH(sizeof(struct tc_htb_opt));
-            
-            struct tc_htb_opt htb_opt = {0};
-            htb_opt.rate.rate = bandwidth_kbps * 1024;
-            htb_opt.ceil.rate = bandwidth_kbps * 1024;
-            htb_opt.buffer = 1600;
-            htb_opt.cbuffer = 1600;
-            htb_opt.quantum = 1514;
-            
-            memcpy(RTA_DATA(opt), &htb_opt, sizeof(htb_opt));
-            tail = (struct rtattr*)((char*)tail + RTA_ALIGN(opt->rta_len));
-            break;
-    }
-    
-    /* 更新消息长度 */
-    n->nlmsg_len = (void*)tail - (void*)buf;
-    
-    /* 发送消息 */
-    struct sockaddr_nl nl_addr = {0};
-    nl_addr.nl_family = AF_NETLINK;
-    nl_addr.nl_pid = 0;  /* 发送到内核 */
-    
-    struct iovec iov = {buf, n->nlmsg_len};
-    struct msghdr msg = {0};
-    msg.msg_name = &nl_addr;
-    msg.msg_namelen = sizeof(nl_addr);
-    msg.msg_iov = &iov;
-    msg.msg_iovlen = 1;
-    
-    int ret = sendmsg(tc->netlink_fd, &msg, 0);
-    if (ret < 0) {
-        qosmon_log(tc->ctx, QMON_LOG_ERROR, "发送netlink消息失败: %s\n", strerror(errno));
-        return QMON_ERR_NETLINK;
-    }
-    
-    /* 接收ACK */
-    return netlink_receive_ack(tc);
-}
+/* ==================== TC控制器实现（改进版） ==================== */
+struct tc_controller_s {
+    qosmon_context_t* ctx;
+};
 
-/* 修复2: TC命令字符串构建修复 */
-static int tc_set_bandwidth_shell(qosmon_context_t* ctx, int bandwidth_bps) {
-    int bandwidth_kbps = (bandwidth_bps + 500) / 1000;
-    char cmd[512];
-    int ret = 0;
+// 改进的队列检测函数
+char* detect_qdisc_kind(qosmon_context_t* ctx) {
+    static char qdisc_kind[16] = "htb";
+    char cmd[256];
+    char line[512];
     
-    /* 构建安全的TC命令 */
-    int n = 0;
-    if (strcmp(ctx->detected_qdisc, "hfsc") == 0) {
-        n = snprintf(cmd, sizeof(cmd), 
-            "tc class change dev %s parent 1: classid 1:%x hfsc "
-            "ls m1 0b d 0us m2 %dkbit "
-            "ul m1 0b d 0us m2 %dkbit 2>&1",
-            ctx->config.device, ctx->config.classid, 
-            bandwidth_kbps, bandwidth_kbps);
-    } else {
-        n = snprintf(cmd, sizeof(cmd), 
-            "tc class change dev %s parent 1: classid 1:%x htb "
-            "rate %dkbit ceil %dkbit 2>&1",
-            ctx->config.device, ctx->config.classid, 
-            bandwidth_kbps, bandwidth_kbps);
-    }
+    snprintf(cmd, sizeof(cmd), "tc -s qdisc show dev %s 2>&1", ctx->config.device);
+    qosmon_log(ctx, QMON_LOG_DEBUG, "执行检测命令: %s\n", cmd);
     
-    /* 检查缓冲区是否足够 */
-    if (n >= sizeof(cmd)) {
-        qosmon_log(ctx, QMON_LOG_ERROR, "TC命令过长: %d > %zu\n", n, sizeof(cmd));
-        return QMON_ERR_BUFFER;
-    }
-    
-    qosmon_log(ctx, QMON_LOG_DEBUG, "执行TC命令: %s\n", cmd);
-    
-    /* 执行命令 */
     FILE* fp = popen(cmd, "r");
     if (!fp) {
-        qosmon_log(ctx, QMON_LOG_ERROR, "执行TC命令失败: %s\n", strerror(errno));
-        return QMON_ERR_SYSTEM;
+        qosmon_log(ctx, QMON_LOG_ERROR, "无法执行tc命令检测队列算法: %s\n", strerror(errno));
+        return qdisc_kind;
     }
     
-    char output[256];
-    while (fgets(output, sizeof(output), fp) != NULL) {
-        if (ctx->config.verbose) {
-            qosmon_log(ctx, QMON_LOG_DEBUG, "TC输出: %s", output);
+    int htb_found = 0, hfsc_found = 0;
+    char* root_line = NULL;
+    
+    while (fgets(line, sizeof(line), fp)) {
+        // 清理行尾换行符
+        char* newline = strchr(line, '\n');
+        if (newline) *newline = '\0';
+        
+        // 跳过空行
+        if (strlen(line) == 0) continue;
+        
+        qosmon_log(ctx, QMON_LOG_DEBUG, "TC输出: %s\n", line);
+        
+        // 检查是否包含htb
+        if (strstr(line, "htb") != NULL) {
+            htb_found = 1;
+            // 检查是否是根队列
+            if (strstr(line, "root") != NULL || strstr(line, "parent root") != NULL) {
+                strcpy(qdisc_kind, "htb");
+                root_line = line;
+                break;
+            }
+        }
+        // 检查是否包含hfsc
+        else if (strstr(line, "hfsc") != NULL) {
+            hfsc_found = 1;
+            if (strstr(line, "root") != NULL || strstr(line, "parent root") != NULL) {
+                strcpy(qdisc_kind, "hfsc");
+                root_line = line;
+                break;
+            }
         }
     }
     
-    ret = pclose(fp);
+    int status = pclose(fp);
     
-    if (WIFEXITED(ret)) {
-        ret = WEXITSTATUS(ret);
+    // 如果没找到明确的根队列，但检测到了队列类型
+    if (strcmp(qdisc_kind, "htb") == 0 && !htb_found) {
+        // 回退到默认
+        strcpy(qdisc_kind, "htb");
+    } else if (strcmp(qdisc_kind, "hfsc") == 0 && !hfsc_found) {
+        strcpy(qdisc_kind, "hfsc");
+    }
+    
+    // 如果什么都没找到，尝试检查是否存在类
+    if (!htb_found && !hfsc_found) {
+        qosmon_log(ctx, QMON_LOG_INFO, "未检测到现有队列，将使用HTB队列\n");
+    } else {
+        qosmon_log(ctx, QMON_LOG_INFO, "检测到队列算法: %s\n", qdisc_kind);
+        if (root_line) {
+            qosmon_log(ctx, QMON_LOG_DEBUG, "根队列信息: %s\n", root_line);
+        }
+    }
+    
+    return qdisc_kind;
+}
+
+// 检查是否存在TC类
+int check_existing_classes(qosmon_context_t* ctx) {
+    char cmd[256];
+    char line[512];
+    int class_count = 0;
+    
+    snprintf(cmd, sizeof(cmd), "tc -s class show dev %s 2>&1", ctx->config.device);
+    
+    FILE* fp = popen(cmd, "r");
+    if (!fp) {
+        return 0;
+    }
+    
+    while (fgets(line, sizeof(line), fp)) {
+        if (strlen(line) > 1) {
+            class_count++;
+        }
+    }
+    
+    pclose(fp);
+    return class_count;
+}
+
+// 改进的带宽设置函数
+int tc_set_bandwidth(qosmon_context_t* ctx, int bandwidth_bps) {
+    if (!ctx) return QMON_ERR_MEMORY;
+    
+    int bandwidth_kbps = (bandwidth_bps + 500) / 1000;
+    
+    // 确保带宽在合理范围内
+    if (bandwidth_kbps < 1) bandwidth_kbps = 1;
+    int max_bandwidth_kbps = ctx->config.max_bandwidth_kbps;
+    if (bandwidth_kbps > max_bandwidth_kbps) {
+        bandwidth_kbps = max_bandwidth_kbps;
+    }
+    
+    // 检查带宽变化是否足够大
+    if (ctx->last_tc_bw_kbps != 0) {
+        int diff = bandwidth_kbps - ctx->last_tc_bw_kbps;
+        if (diff < 0) diff = -diff;
+        if (diff < ctx->config.min_bw_change_kbps) {
+            qosmon_log(ctx, QMON_LOG_DEBUG, "跳过TC更新: 变化太小(%d -> %d kbps, 阈值=%d)\n",
+                      ctx->last_tc_bw_kbps, bandwidth_kbps, ctx->config.min_bw_change_kbps);
+            return QMON_OK;
+        }
+    }
+    
+    // 检测队列类型（如果需要）
+    if (strlen(ctx->detected_qdisc) == 0) {
+        char* qdisc_kind = detect_qdisc_kind(ctx);
+        strncpy(ctx->detected_qdisc, qdisc_kind, sizeof(ctx->detected_qdisc) - 1);
+        ctx->detected_qdisc[sizeof(ctx->detected_qdisc) - 1] = '\0';
+    }
+    
+    char cmd[512];
+    int ret = 0;
+    char output_buf[512] = {0};
+    
+    if (strcmp(ctx->detected_qdisc, "hfsc") == 0) {
+        // 改进的HFSC参数设置
+        // rt: 实时服务曲线（用于低延迟流量）
+        // ls: 保证服务曲线（用于保证带宽）
+        // ul: 上限服务曲线（限制最大带宽）
+        
+        // 计算实时服务曲线参数（通常设置为保证带宽的70%）
+        int rt_bandwidth = bandwidth_kbps * 7 / 10;
+        if (rt_bandwidth < 1) rt_bandwidth = 1;
+        
+        // 计算突发参数
+        int burst_kbit = bandwidth_kbps / 8;  // 突发大小为带宽的1/8秒
+        if (burst_kbit < 2) burst_kbit = 2;
+        
+        snprintf(cmd, sizeof(cmd), 
+                 "tc class change dev %s parent 1: classid 1:%x hfsc "
+                 "rt m1 %dkbit d 100ms m2 %dkbit "
+                 "ls m1 0b d 0us m2 %dkbit "
+                 "ul m1 0b d 0us m2 %dkbit 2>&1",
+                 ctx->config.device, ctx->config.classid,
+                 rt_bandwidth, rt_bandwidth,  // rt曲线
+                 bandwidth_kbps,              // ls曲线（保证带宽）
+                 bandwidth_kbps);             // ul曲线（上限带宽）
+    } else {
+        // HTB参数设置
+        // rate: 保证带宽
+        // ceil: 最大带宽（通常与rate相同，除非允许突发）
+        // burst: 突发大小
+        // cburst: 承诺突发大小
+        
+        int burst_kbit = bandwidth_kbps / 8;  // 突发大小为带宽的1/8秒
+        if (burst_kbit < 2) burst_kbit = 2;
+        
+        int cburst_kbit = burst_kbit * 2;  // 承诺突发大小为突发的2倍
+        if (cburst_kbit < 4) cburst_kbit = 4;
+        
+        snprintf(cmd, sizeof(cmd), 
+                 "tc class change dev %s parent 1: classid 1:%x htb "
+                 "rate %dkbit ceil %dkbit burst %dkbit cburst %dkbit 2>&1",
+                 ctx->config.device, ctx->config.classid, 
+                 bandwidth_kbps, bandwidth_kbps, burst_kbit, cburst_kbit);
+    }
+    
+    qosmon_log(ctx, QMON_LOG_INFO, "执行TC命令: %s\n", cmd);
+    
+    FILE* fp = popen(cmd, "r");
+    if (fp) {
+        char output[256];
+        int output_len = 0;
+        while (fgets(output, sizeof(output), fp)) {
+            char* newline = strchr(output, '\n');
+            if (newline) *newline = '\0';
+            if (strlen(output) > 0) {
+                // 保存输出信息
+                strncpy(output_buf + output_len, output, sizeof(output_buf) - output_len - 1);
+                output_len += strlen(output);
+                if (output_len < sizeof(output_buf) - 1) {
+                    output_buf[output_len++] = ';';
+                }
+                qosmon_log(ctx, QMON_LOG_DEBUG, "TC输出: %s\n", output);
+            }
+        }
+        ret = pclose(fp);
+        
+        if (WIFEXITED(ret)) {
+            ret = WEXITSTATUS(ret);
+        }
     } else {
         ret = -1;
     }
     
     if (ret != 0) {
-        qosmon_log(ctx, QMON_LOG_ERROR, "TC命令执行失败: 返回码=%d\n", ret);
+        qosmon_log(ctx, QMON_LOG_ERROR, "TC命令执行失败: 返回码=%d, 输出=%s\n", 
+                  ret, output_buf);
+        
+        // 如果失败，尝试回退到简单命令
+        if (strcmp(ctx->detected_qdisc, "hfsc") == 0) {
+            // 简化HFSC命令
+            snprintf(cmd, sizeof(cmd), 
+                     "tc class change dev %s parent 1: classid 1:%x hfsc ls m1 0b d 0us m2 %dkbit 2>&1",
+                     ctx->config.device, ctx->config.classid, bandwidth_kbps);
+        } else {
+            // 简化HTB命令
+            snprintf(cmd, sizeof(cmd), 
+                     "tc class change dev %s parent 1: classid 1:%x htb rate %dkbit 2>&1",
+                     ctx->config.device, ctx->config.classid, bandwidth_kbps);
+        }
+        
+        qosmon_log(ctx, QMON_LOG_INFO, "尝试简化命令: %s\n", cmd);
+        
+        fp = popen(cmd, "r");
+        if (fp) {
+            while (fgets(output_buf, sizeof(output_buf), fp)) {
+                // 忽略输出
+            }
+            ret = pclose(fp);
+            if (WIFEXITED(ret)) {
+                ret = WEXITSTATUS(ret);
+            }
+        }
+        
+        if (ret != 0) {
+            qosmon_log(ctx, QMON_LOG_ERROR, "简化TC命令也失败: 返回码=%d\n", ret);
+            return QMON_ERR_SYSTEM;
+        }
+    }
+    
+    ctx->last_tc_bw_kbps = bandwidth_kbps;
+    qosmon_log(ctx, QMON_LOG_INFO, "带宽设置成功: %d kbps (算法: %s)\n", 
+              bandwidth_kbps, ctx->detected_qdisc);
+    
+    return QMON_OK;
+}
+
+// 改进的类带宽检测
+int detect_class_bandwidth(qosmon_context_t* ctx, int* current_bw_kbps) {
+    if (!ctx || !current_bw_kbps) return QMON_ERR_MEMORY;
+    
+    char cmd[256];
+    char line[512];
+    int found = 0;
+    *current_bw_kbps = 0;
+    
+    // 尝试多种可能的类显示格式
+    snprintf(cmd, sizeof(cmd), 
+             "tc -s -d class show dev %s 2>&1", ctx->config.device);
+    
+    FILE* fp = popen(cmd, "r");
+    if (!fp) {
         return QMON_ERR_SYSTEM;
+    }
+    
+    char target_class[32];
+    snprintf(target_class, sizeof(target_class), "1:%x", ctx->config.classid);
+    
+    while (fgets(line, sizeof(line), fp)) {
+        // 查找目标类
+        if (strstr(line, target_class) == NULL) {
+            continue;
+        }
+        
+        qosmon_log(ctx, QMON_LOG_DEBUG, "找到目标类: %s", line);
+        
+        // 尝试解析HTB参数
+        char* rate_pos = strstr(line, "rate");
+        if (rate_pos) {
+            int rate_mbit, rate_kbit;
+            if (sscanf(rate_pos, "rate %dMbit", &rate_mbit) == 1) {
+                *current_bw_kbps = rate_mbit * 1000;
+                found = 1;
+                break;
+            } else if (sscanf(rate_pos, "rate %dkbit", &rate_kbit) == 1) {
+                *current_bw_kbps = rate_kbit;
+                found = 1;
+                break;
+            } else if (sscanf(rate_pos, "rate %dbps", current_bw_kbps) == 1) {
+                *current_bw_kbps /= 1000;
+                found = 1;
+                break;
+            }
+        }
+        
+        // 尝试解析HFSC参数
+        char* ls_pos = strstr(line, "ls m2");
+        char* ul_pos = strstr(line, "ul m2");
+        char* rt_pos = strstr(line, "rt m2");
+        
+        if (ls_pos) {
+            int rate_mbit, rate_kbit;
+            if (sscanf(ls_pos, "ls m2 %dMbit", &rate_mbit) == 1) {
+                *current_bw_kbps = rate_mbit * 1000;
+                found = 1;
+                break;
+            } else if (sscanf(ls_pos, "ls m2 %dkbit", &rate_kbit) == 1) {
+                *current_bw_kbps = rate_kbit;
+                found = 1;
+                break;
+            }
+        } else if (ul_pos) {
+            int rate_mbit, rate_kbit;
+            if (sscanf(ul_pos, "ul m2 %dMbit", &rate_mbit) == 1) {
+                *current_bw_kbps = rate_mbit * 1000;
+                found = 1;
+                break;
+            } else if (sscanf(ul_pos, "ul m2 %dkbit", &rate_kbit) == 1) {
+                *current_bw_kbps = rate_kbit;
+                found = 1;
+                break;
+            }
+        } else if (rt_pos) {
+            int rate_mbit, rate_kbit;
+            if (sscanf(rt_pos, "rt m2 %dMbit", &rate_mbit) == 1) {
+                *current_bw_kbps = rate_mbit * 1000;
+                found = 1;
+                break;
+            } else if (sscanf(rt_pos, "rt m2 %dkbit", &rate_kbit) == 1) {
+                *current_bw_kbps = rate_kbit;
+                found = 1;
+                break;
+            }
+        }
+    }
+    
+    pclose(fp);
+    
+    if (found) {
+        qosmon_log(ctx, QMON_LOG_DEBUG, "检测到类带宽: %d kbps\n", *current_bw_kbps);
+    } else {
+        qosmon_log(ctx, QMON_LOG_DEBUG, "未检测到类带宽信息\n");
+    }
+    
+    return found ? QMON_OK : QMON_ERR_SYSTEM;
+}
+
+int tc_controller_init(tc_controller_t* tc, qosmon_context_t* ctx) {
+    if (!tc || !ctx) return QMON_ERR_MEMORY;
+    
+    tc->ctx = ctx;
+    
+    char* qdisc_kind = detect_qdisc_kind(ctx);
+    strncpy(ctx->detected_qdisc, qdisc_kind, sizeof(ctx->detected_qdisc) - 1);
+    ctx->detected_qdisc[sizeof(ctx->detected_qdisc) - 1] = '\0';
+    
+    int current_bw_kbps = 0;
+    if (detect_class_bandwidth(ctx, &current_bw_kbps) == QMON_OK) {
+        ctx->last_tc_bw_kbps = current_bw_kbps;
+        qosmon_log(ctx, QMON_LOG_INFO, "检测到当前带宽: %d kbps (算法: %s)\n", 
+                  current_bw_kbps, ctx->detected_qdisc);
+    } else {
+        qosmon_log(ctx, QMON_LOG_INFO, "使用新的带宽设置 (算法: %s)\n", ctx->detected_qdisc);
     }
     
     return QMON_OK;
 }
 
-/* TC控制器设置带宽 */
 int tc_controller_set_bandwidth(tc_controller_t* tc, int bandwidth_bps) {
     if (!tc || !tc->ctx) return QMON_ERR_MEMORY;
     
-    /* 边界检查 */
-    int max_bps = tc->ctx->config.max_bandwidth_kbps * 1000;
-    int min_bps = (int)(max_bps * tc->ctx->config.min_bw_ratio);
+    qosmon_context_t* ctx = tc->ctx;
     
-    if (bandwidth_bps > max_bps) {
-        bandwidth_bps = max_bps;
-        qosmon_log(tc->ctx, QMON_LOG_WARN, "带宽超过最大值，限制为: %d bps\n", max_bps);
-    }
-    
-    if (bandwidth_bps < min_bps) {
-        bandwidth_bps = min_bps;
-        qosmon_log(tc->ctx, QMON_LOG_WARN, "带宽低于最小值，限制为: %d bps\n", min_bps);
-    }
-    
-    /* 检查变化是否达到最小阈值 */
-    int min_change_bps = tc->ctx->config.min_bw_change_kbps * 1000;
-    int diff = abs(bandwidth_bps - tc->ctx->current_limit_bps);
-    if (diff < min_change_bps) {
-        qosmon_log(tc->ctx, QMON_LOG_DEBUG, "带宽变化太小(%d bps < %d bps)，跳过\n", 
-                  diff, min_change_bps);
+    if (ctx->config.safe_mode) {
+        qosmon_log(ctx, QMON_LOG_INFO, "安全模式: 跳过带宽设置(%d kbps)\n", 
+                  bandwidth_bps / 1000);
         return QMON_OK;
     }
     
-    /* 选择设置方法 */
-    int ret = QMON_OK;
-    if (tc->netlink_fd >= 0 && tc->ctx->config.use_netlink) {
-        ret = tc_set_bandwidth_netlink(tc, bandwidth_bps);
-        if (ret != QMON_OK) {
-            qosmon_log(tc->ctx, QMON_LOG_WARN, "Netlink设置失败，尝试shell方法\n");
-            ret = tc_set_bandwidth_shell(tc->ctx, bandwidth_bps);
-        }
-    } else {
-        ret = tc_set_bandwidth_shell(tc->ctx, bandwidth_bps);
-    }
-    
-    if (ret == QMON_OK) {
-        tc->ctx->current_limit_bps = bandwidth_bps;
-        qosmon_log(tc->ctx, QMON_LOG_INFO, "带宽设置成功: %d kbps (%.2f Mbps)\n", 
-                  bandwidth_bps / 1000, bandwidth_bps / 1000000.0f);
-    } else {
-        qosmon_log(tc->ctx, QMON_LOG_ERROR, "带宽设置失败: %d\n", ret);
-    }
-    
-    return ret;
+    return tc_set_bandwidth(ctx, bandwidth_bps);
 }
 
-/* 修复3: 状态机逻辑修复 */
-static void state_machine_chk(qosmon_context_t* ctx, int64_t now,
-                              ping_manager_t* ping_mgr, tc_controller_t* tc_mgr) {
-    if (!ctx || !ping_mgr || !tc_mgr) {
-        return;
-    }
-    
-    /* 检查网络接口 */
-    struct ifreq ifr;
-    int sock = socket(AF_INET, SOCK_DGRAM, 0);
-    if (sock < 0) {
-        qosmon_log(ctx, QMON_LOG_ERROR, "创建socket失败: %s\n", strerror(errno));
-        ctx->state = QMON_EXIT;
-        return;
-    }
-    
-    strncpy(ifr.ifr_name, ctx->config.device, IFNAMSIZ - 1);
-    ifr.ifr_name[IFNAMSIZ - 1] = '\0';
-    
-    if (ioctl(sock, SIOCGIFFLAGS, &ifr) < 0) {
-        qosmon_log(ctx, QMON_LOG_ERROR, "网络接口 %s 不存在或不可用: %s\n", 
-                  ctx->config.device, strerror(errno));
-        close(sock);
-        ctx->state = QMON_EXIT;
-        return;
-    }
-    
-    if (!(ifr.ifr_flags & IFF_UP)) {
-        qosmon_log(ctx, QMON_LOG_WARN, "网络接口 %s 未启动\n", ctx->config.device);
-    }
-    
-    /* 检查路由 */
-    char cmd[256];
-    snprintf(cmd, sizeof(cmd), "ip route get %s 2>&1", ctx->config.target);
-    FILE* fp = popen(cmd, "r");
-    if (fp) {
-        char line[256];
-        int route_found = 0;
-        while (fgets(line, sizeof(line), fp)) {
-            if (strstr(line, ctx->config.target) && strstr(line, "via")) {
-                route_found = 1;
-                break;
-            }
-        }
-        pclose(fp);
-        
-        if (!route_found) {
-            qosmon_log(ctx, QMON_LOG_WARN, "到 %s 的路由未找到\n", ctx->config.target);
-        }
-    }
-    
-    close(sock);
-    
-    /* 初始化TC */
-    int ret = tc_controller_init(tc_mgr, ctx);
-    if (ret != QMON_OK) {
-        qosmon_log(ctx, QMON_LOG_WARN, "TC控制器初始化失败，但继续运行\n");
-    }
-    
-    ctx->state = QMON_INIT;
-    qosmon_log(ctx, QMON_LOG_INFO, "CHK完成，切换到INIT状态\n");
-}
-
-static void state_machine_init(qosmon_context_t* ctx, int64_t now,
-                              ping_manager_t* ping_mgr, tc_controller_t* tc_mgr) {
-    if (!ctx || !ping_mgr || !tc_mgr) {
-        return;
-    }
-    
-    /* 检查是否跳过初始化 */
-    if (ctx->config.skip_initial) {
-        ctx->state = QMON_IDLE;
-        qosmon_log(ctx, QMON_LOG_INFO, "跳过初始化，切换到IDLE状态\n");
-        return;
-    }
-    
-    /* 保存当前带宽限制 */
-    int saved_bandwidth_bps = ctx->current_limit_bps;
-    
-    /* 应用安全启动带宽 */
-    int safe_bandwidth_bps = (int)(ctx->config.max_bandwidth_kbps * 1000 * 
-                                 ctx->config.safe_start_ratio);
-    
-    if (tc_controller_set_bandwidth(tc_mgr, safe_bandwidth_bps) == QMON_OK) {
-        qosmon_log(ctx, QMON_LOG_INFO, "应用安全启动带宽: %d kbps (%.1f%%)\n", 
-                  safe_bandwidth_bps / 1000, 
-                  ctx->config.safe_start_ratio * 100.0f);
-        
-        /* 等待一段时间让网络稳定 */
-        usleep(2000000);  /* 2秒 */
-        
-        /* 恢复到之前设置的带宽 */
-        tc_controller_set_bandwidth(tc_mgr, saved_bandwidth_bps);
-    } else {
-        qosmon_log(ctx, QMON_LOG_ERROR, "安全启动带宽设置失败\n");
-    }
-    
-    ctx->state = QMON_IDLE;
-    qosmon_log(ctx, QMON_LOG_INFO, "INIT完成，切换到IDLE状态\n");
-}
-
-static void state_machine_idle(qosmon_context_t* ctx, int64_t now,
-                               ping_manager_t* ping_mgr, tc_controller_t* tc_mgr) {
-    if (!ctx || !ping_mgr || !tc_mgr) {
-        return;
-    }
-    
-    /* 检查延迟是否超过阈值 */
-    float current_ping_ms = ctx->filtered_ping_time_us / 1000.0f;
-    float active_threshold = ctx->config.active_threshold * ctx->config.ping_limit_ms;
-    
-    if (current_ping_ms > active_threshold) {
-        ctx->state = QMON_ACTIVE;
-        qosmon_log(ctx, QMON_LOG_INFO, 
-                   "网络延迟过高，切换到ACTIVE状态 (延迟: %.1f ms > %.1f ms)\n",
-                   current_ping_ms, active_threshold);
-        return;
-    }
-    
-    /* 检查实时流量 */
-    if (ctx->config.auto_switch_mode) {
-        if (now - ctx->last_realtime_detect_time_ms >= REALTIME_DETECT_MS) {
-            if (detect_realtime_traffic(ctx)) {
-                ctx->state = QMON_REALTIME;
-                ctx->last_realtime_detect_time_ms = now;
-                qosmon_log(ctx, QMON_LOG_INFO, "检测到实时流量，切换到REALTIME状态\n");
-                return;
-            }
-            ctx->last_realtime_detect_time_ms = now;
-        }
-    }
-    
-    /* 空闲状态下，可以执行一些维护任务 */
-    if (now - ctx->last_stats_time_ms >= STATS_INTERVAL_MS) {
-        update_statistics(ctx);
-        ctx->last_stats_time_ms = now;
-    }
-    
-    /* 发送心跳包 */
-    if (now - ctx->last_heartbeat_ms >= HEARTBEAT_INTERVAL_MS) {
-        qosmon_log(ctx, QMON_LOG_DEBUG, "IDLE状态运行正常 (延迟: %.1f ms)\n", current_ping_ms);
-        ctx->last_heartbeat_ms = now;
-    }
-}
-
-static void state_machine_active(qosmon_context_t* ctx, int64_t now,
-                                 ping_manager_t* ping_mgr, tc_controller_t* tc_mgr) {
-    if (!ctx || !ping_mgr || !tc_mgr) {
-        return;
-    }
-    
-    /* 检查是否需要切换到空闲状态 */
-    float current_ping_ms = ctx->filtered_ping_time_us / 1000.0f;
-    float idle_threshold = ctx->config.idle_threshold * ctx->config.ping_limit_ms;
-    
-    if (current_ping_ms < idle_threshold) {
-        ctx->state = QMON_IDLE;
-        qosmon_log(ctx, QMON_LOG_INFO, 
-                   "网络恢复空闲，切换到IDLE状态 (延迟: %.1f ms < %.1f ms)\n",
-                   current_ping_ms, idle_threshold);
-        return;
-    }
-    
-    /* 检查是否需要切换到实时状态 */
-    if (ctx->config.auto_switch_mode) {
-        if (now - ctx->last_realtime_detect_time_ms >= REALTIME_DETECT_MS) {
-            if (detect_realtime_traffic(ctx)) {
-                ctx->state = QMON_REALTIME;
-                ctx->last_realtime_detect_time_ms = now;
-                qosmon_log(ctx, QMON_LOG_INFO, "检测到实时流量，切换到REALTIME状态\n");
-                return;
-            }
-            ctx->last_realtime_detect_time_ms = now;
-        }
-    }
-    
-    /* 根据延迟调整带宽 */
-    if (now - ctx->last_tc_update_time_ms >= CONTROL_INTERVAL_MS) {
-        adjust_bandwidth_by_ping(ctx, tc_mgr);
-        ctx->last_tc_update_time_ms = now;
-    }
-}
-
-static void state_machine_realtime(qosmon_context_t* ctx, int64_t now,
-                                   ping_manager_t* ping_mgr, tc_controller_t* tc_mgr) {
-    if (!ctx || !ping_mgr || !tc_mgr) {
-        return;
-    }
-    
-    /* 计算实时流量所需的带宽 */
-    int realtime_bandwidth_bps = calculate_realtime_bandwidth(ctx);
-    
-    /* 保存当前限制（如果需要的话） */
-    if (ctx->saved_realtime_limit == 0) {
-        ctx->saved_realtime_limit = ctx->current_limit_bps;
-    }
-    
-    /* 设置带宽 */
-    if (realtime_bandwidth_bps > 0 && 
-        realtime_bandwidth_bps != ctx->current_limit_bps) {
-        if (tc_controller_set_bandwidth(tc_mgr, realtime_bandwidth_bps) == QMON_OK) {
-            qosmon_log(ctx, QMON_LOG_INFO, 
-                      "设置实时带宽: %d kbps (之前: %d kbps)\n",
-                      realtime_bandwidth_bps / 1000,
-                      ctx->current_limit_bps / 1000);
-        }
-    }
-    
-    /* 检查是否应该退出实时模式 */
-    if (!detect_realtime_traffic(ctx)) {
-        /* 恢复到之前保存的限制 */
-        if (ctx->saved_realtime_limit > 0 && 
-            ctx->saved_realtime_limit != ctx->current_limit_bps) {
-            tc_controller_set_bandwidth(tc_mgr, ctx->saved_realtime_limit);
-        }
-        ctx->saved_realtime_limit = 0;
-        ctx->state = QMON_ACTIVE;
-        qosmon_log(ctx, QMON_LOG_INFO, "实时流量结束，切换到ACTIVE状态\n");
-    }
-}
-
-/* 状态机主函数 */
-void state_machine_run(qosmon_context_t* ctx, ping_manager_t* ping_mgr, tc_controller_t* tc_mgr) {
-    if (!ctx) return;
-    
-    int64_t now = qosmon_time_ms();
-    
-    switch (ctx->state) {
-        case QMON_CHK:
-            state_machine_chk(ctx, now, ping_mgr, tc_mgr);
-            break;
-        case QMON_INIT:
-            state_machine_init(ctx, now, ping_mgr, tc_mgr);
-            break;
-        case QMON_IDLE:
-            state_machine_idle(ctx, now, ping_mgr, tc_mgr);
-            break;
-        case QMON_ACTIVE:
-            state_machine_active(ctx, now, ping_mgr, tc_mgr);
-            break;
-        case QMON_REALTIME:
-            state_machine_realtime(ctx, now, ping_mgr, tc_mgr);
-            break;
-        case QMON_EXIT:
-            qosmon_log(ctx, QMON_LOG_INFO, "退出状态机\n");
-            break;
-        default:
-            qosmon_log(ctx, QMON_LOG_ERROR, "未知状态: %d\n", ctx->state);
-            ctx->state = QMON_EXIT;
-            break;
-    }
-}
-
-/* 根据ping延迟调整带宽 */
-static int adjust_bandwidth_by_ping(qosmon_context_t* ctx, tc_controller_t* tc_mgr) {
-    if (!ctx || !tc_mgr) return QMON_ERR_MEMORY;
-    
-    float current_ping_ms = ctx->filtered_ping_time_us / 1000.0f;
-    float target_ping_ms = ctx->config.ping_limit_ms;
-    float max_bw_kbps = ctx->config.max_bandwidth_kbps;
-    
-    /* 计算延迟比率 */
-    float ping_ratio = current_ping_ms / target_ping_ms;
-    
-    /* 根据延迟调整带宽 */
-    int new_bandwidth_bps = ctx->current_limit_bps;
-    
-    if (ping_ratio > 1.5f) {
-        /* 延迟严重超标，大幅降低带宽 */
-        new_bandwidth_bps = (int)(ctx->current_limit_bps * 0.5f);
-    } else if (ping_ratio > 1.2f) {
-        /* 延迟超标，适当降低带宽 */
-        new_bandwidth_bps = (int)(ctx->current_limit_bps * 0.8f);
-    } else if (ping_ratio > 1.0f) {
-        /* 延迟略高，小幅降低带宽 */
-        new_bandwidth_bps = (int)(ctx->current_limit_bps * 0.9f);
-    } else if (ping_ratio < 0.8f) {
-        /* 延迟较低，可以尝试增加带宽 */
-        new_bandwidth_bps = (int)(ctx->current_limit_bps * 1.1f);
-        
-        /* 但不超过最大带宽 */
-        if (new_bandwidth_bps > max_bw_kbps * 1000) {
-            new_bandwidth_bps = max_bw_kbps * 1000;
-        }
-    } else {
-        /* 延迟在目标范围内，保持当前带宽 */
-        return QMON_OK;
-    }
-    
-    /* 确保带宽在最小和最大限制之间 */
-    int min_bps = (int)(max_bw_kbps * 1000 * ctx->config.min_bw_ratio);
-    int max_bps = max_bw_kbps * 1000;
-    
-    if (new_bandwidth_bps < min_bps) new_bandwidth_bps = min_bps;
-    if (new_bandwidth_bps > max_bps) new_bandwidth_bps = max_bps;
-    
-    /* 应用新带宽 */
-    int ret = tc_controller_set_bandwidth(tc_mgr, new_bandwidth_bps);
-    if (ret != QMON_OK) {
-        qosmon_log(ctx, QMON_LOG_ERROR, "调整带宽失败: %d\n", ret);
-        return ret;
-    }
-    
-    qosmon_log(ctx, QMON_LOG_INFO, 
-               "根据延迟调整带宽: 延迟=%.1fms, 目标=%.1fms, 新带宽=%dkbps\n",
-               current_ping_ms, target_ping_ms, new_bandwidth_bps / 1000);
-    
-    return QMON_OK;
-}
-
-/* 计算实时流量带宽 */
-static int calculate_realtime_bandwidth(qosmon_context_t* ctx) {
-    if (!ctx) return 0;
-    
-    /* 这里可以根据需要实现实时流量检测逻辑 */
-    /* 例如，可以通过检测特定端口的流量来确定 */
-    
-    /* 简单实现：使用最大带宽的一定比例 */
-    float realtime_ratio = 0.8f;  /* 实时流量占80% */
-    int realtime_bw = (int)(ctx->config.max_bandwidth_kbps * 1000 * realtime_ratio);
-    
-    /* 确保不低于最小带宽 */
-    int min_bw = (int)(ctx->config.max_bandwidth_kbps * 1000 * ctx->config.min_bw_ratio);
-    if (realtime_bw < min_bw) {
-        realtime_bw = min_bw;
-    }
-    
-    return realtime_bw;
-}
-
-/* 检测实时流量 */
-static int detect_realtime_traffic(qosmon_context_t* ctx) {
-    if (!ctx) return 0;
-    
-    /* 这里可以添加实时流量检测逻辑 */
-    /* 例如，通过检测特定端口（如RTP/RTCP, WebRTC等） */
-    
-    /* 简单实现：检查最近ping延迟的抖动 */
-    float jitter = calculate_ping_jitter(ctx);
-    
-    /* 如果抖动较大，可能表示有实时流量 */
-    if (jitter > ctx->config.ping_limit_ms * 0.5f) {
-        qosmon_log(ctx, QMON_LOG_DEBUG, "检测到可能的实时流量 (抖动: %.1fms)\n", jitter);
-        return 1;
-    }
-    
-    return 0;
-}
-
-/* 计算ping抖动 */
-static float calculate_ping_jitter(qosmon_context_t* ctx) {
-    if (!ctx || ctx->ping_history.count < 2) {
-        return 0.0f;
-    }
-    
-    float sum = 0.0f;
-    int count = 0;
-    
-    for (int i = 0; i < ctx->ping_history.count - 1; i++) {
-        float diff = fabsf(ctx->ping_history.times[(ctx->ping_history.index + i) % PING_HISTORY_SIZE] -
-                          ctx->ping_history.times[(ctx->ping_history.index + i + 1) % PING_HISTORY_SIZE]);
-        sum += diff;
-        count++;
-    }
-    
-    if (count > 0) {
-        return (sum / count) / 1000.0f;  /* 转换为毫秒 */
-    }
-    
-    return 0.0f;
-}
-
-/* 更新统计信息 */
-static void update_statistics(qosmon_context_t* ctx) {
-    if (!ctx) return;
-    
-    int64_t now = qosmon_time_ms();
-    ctx->stats.total_time_ms = now - ctx->stats.start_time;
-    
-    /* 计算平均带宽（这里只是示例，实际需要从接口获取） */
-    ctx->stats.avg_bandwidth_kbps = ctx->current_limit_bps / 1000.0f;
-    
-    /* 计算丢包率 */
-    if (ctx->ntransmitted > 0) {
-        ctx->stats.packet_loss_rate = 1.0f - ((float)ctx->nreceived / ctx->ntransmitted);
-    } else {
-        ctx->stats.packet_loss_rate = 0.0f;
-    }
-    
-    /* 更新状态文件 */
-    status_file_update(ctx);
-}
-
-/* 修复4: 内存泄漏修复 */
 void tc_controller_cleanup(tc_controller_t* tc) {
-    if (!tc) return;
+    if (!tc || !tc->ctx) return;
     
-    /* 关闭netlink socket */
-    if (tc->netlink_fd >= 0) {
-        close(tc->netlink_fd);
-        tc->netlink_fd = -1;
+    qosmon_context_t* ctx = tc->ctx;
+    
+    if (!ctx->config.safe_mode) {
+        int default_bw = ctx->config.max_bandwidth_kbps * 1000;
+        tc_set_bandwidth(ctx, default_bw);
+        qosmon_log(ctx, QMON_LOG_INFO, "TC控制器清理: 恢复带宽到 %d kbps\n", 
+                  ctx->config.max_bandwidth_kbps);
     }
     
-    /* 恢复默认带宽（如果不在安全模式） */
-    if (tc->ctx && !tc->ctx->config.safe_mode) {
-        int default_bw = tc->ctx->config.max_bandwidth_kbps * 1000;
-        tc_controller_set_bandwidth(tc, default_bw);
-    }
-    
-    qosmon_log(tc->ctx, QMON_LOG_INFO, "TC控制器清理完成\n");
+    qosmon_log(ctx, QMON_LOG_INFO, "TC控制器清理完成\n");
 }
 
-/* 辅助函数 */
-static int netlink_open(void) {
-    int fd = socket(AF_NETLINK, SOCK_RAW, NETLINK_ROUTE);
-    if (fd < 0) {
-        return -1;
-    }
-    
-    struct sockaddr_nl addr = {0};
-    addr.nl_family = AF_NETLINK;
-    addr.nl_pid = getpid();
-    addr.nl_groups = 0;
-    
-    if (bind(fd, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
-        close(fd);
-        return -1;
-    }
-    
-    return fd;
-}
-
-static int netlink_receive_ack(tc_controller_t* tc) {
-    if (!tc || tc->netlink_fd < 0) {
-        return QMON_ERR_NETLINK;
-    }
-    
-    char buf[4096];
-    struct iovec iov = {buf, sizeof(buf)};
-    struct msghdr msg = {0};
-    struct sockaddr_nl nl_addr = {0};
-    msg.msg_name = &nl_addr;
-    msg.msg_namelen = sizeof(nl_addr);
-    msg.msg_iov = &iov;
-    msg.msg_iovlen = 1;
-    
-    int ret = recvmsg(tc->netlink_fd, &msg, MSG_DONTWAIT);
-    if (ret < 0) {
-        if (errno == EAGAIN || errno == EWOULDBLOCK) {
-            return QMON_OK;  /* 没有响应，但可能成功 */
-        }
-        qosmon_log(tc->ctx, QMON_LOG_ERROR, "接收netlink响应失败: %s\n", strerror(errno));
-        return QMON_ERR_NETLINK;
-    }
-    
-    /* 解析netlink消息 */
-    struct nlmsghdr* nlh = (struct nlmsghdr*)buf;
-    for (; NLMSG_OK(nlh, ret); nlh = NLMSG_NEXT(nlh, ret)) {
-        if (nlh->nlmsg_type == NLMSG_ERROR) {
-            struct nlmsgerr* err = (struct nlmsgerr*)NLMSG_DATA(nlh);
-            if (err->error != 0) {
-                qosmon_log(tc->ctx, QMON_LOG_ERROR, "Netlink错误: %s\n", strerror(-err->error));
-                return QMON_ERR_NETLINK;
-            }
-        }
-    }
-    
-    return QMON_OK;
-}
-
-static char* detect_qdisc_kind(qosmon_context_t* ctx) {
-    if (!ctx) return "htb";
-    
-    char cmd[256];
-    snprintf(cmd, sizeof(cmd), "tc qdisc show dev %s 2>&1", ctx->config.device);
-    
-    FILE* fp = popen(cmd, "r");
-    if (!fp) {
-        qosmon_log(ctx, QMON_LOG_ERROR, "执行tc命令失败\n");
-        return "htb";
-    }
-    
-    static char kind[MAX_QDISC_KIND_LEN] = "htb";
-    char line[256];
-    
-    while (fgets(line, sizeof(line), fp)) {
-        if (strstr(line, "qdisc htb")) {
-            strncpy(kind, "htb", MAX_QDISC_KIND_LEN - 1);
-            break;
-        } else if (strstr(line, "qdisc hfsc")) {
-            strncpy(kind, "hfsc", MAX_QDISC_KIND_LEN - 1);
-            break;
-        } else if (strstr(line, "qdisc tbf")) {
-            strncpy(kind, "tbf", MAX_QDISC_KIND_LEN - 1);
-            break;
-        } else if (strstr(line, "qdisc drr")) {
-            strncpy(kind, "drr", MAX_QDISC_KIND_LEN - 1);
-            break;
-        } else if (strstr(line, "qdisc sfq")) {
-            strncpy(kind, "sfq", MAX_QDISC_KIND_LEN - 1);
-            break;
-        } else if (strstr(line, "qdisc codel")) {
-            strncpy(kind, "codel", MAX_QDISC_KIND_LEN - 1);
-            break;
-        } else if (strstr(line, "qdisc fq_codel")) {
-            strncpy(kind, "fq_codel", MAX_QDISC_KIND_LEN - 1);
-            break;
-        }
-    }
-    
-    pclose(fp);
-    qosmon_log(ctx, QMON_LOG_INFO, "检测到队列算法: %s\n", kind);
-    return kind;
-}
-
-static int detect_class_bandwidth(qosmon_context_t* ctx, int* current_bw_kbps, tc_controller_t* tc) {
-    if (!ctx || !current_bw_kbps) return QMON_ERR_MEMORY;
-    
-    char cmd[512];
-    snprintf(cmd, sizeof(cmd), 
-             "tc class show dev %s classid 1:%x 2>&1", 
-             ctx->config.device, ctx->config.classid);
-    
-    FILE* fp = popen(cmd, "r");
-    if (!fp) {
-        return QMON_ERR_SYSTEM;
-    }
-    
-    *current_bw_kbps = 0;
-    char line[256];
-    
-    while (fgets(line, sizeof(line), fp)) {
-        /* 解析HTB */
-        char* rate_pos = strstr(line, "rate");
-        if (rate_pos) {
-            char* rate_end = strstr(rate_pos, "kbit");
-            if (rate_end) {
-                *rate_end = '\0';
-                char* rate_str = rate_pos + 5;  /* 跳过"rate " */
-                *current_bw_kbps = atoi(rate_str);
-                break;
-            }
-        }
-        
-        /* 解析HFSC */
-        char* m2_pos = strstr(line, "m2");
-        if (m2_pos) {
-            char* m2_end = strstr(m2_pos, "kbit");
-            if (m2_end) {
-                *m2_end = '\0';
-                char* m2_str = m2_pos + 3;  /* 跳过"m2 " */
-                *current_bw_kbps = atoi(m2_str);
-                break;
-            }
-        }
-    }
-    
-    pclose(fp);
-    return QMON_OK;
-}
-
-/* 状态文件更新 */
-int status_file_update(qosmon_context_t* ctx) {
-    if (!ctx || ctx->config.status_file[0] == '\0') {
-        return QMON_OK;
-    }
-    
-    FILE* f = fopen(ctx->config.status_file, "w");
-    if (!f) {
-        qosmon_log(ctx, QMON_LOG_ERROR, "无法打开状态文件: %s\n", ctx->config.status_file);
-        return QMON_ERR_SYSTEM;
-    }
-    
-    fprintf(f, "{\n");
-    fprintf(f, "  \"state\": %d,\n", ctx->state);
-    fprintf(f, "  \"filtered_ping_ms\": %.1f,\n", ctx->filtered_ping_time_us / 1000.0f);
-    fprintf(f, "  \"raw_ping_ms\": %.1f,\n", ctx->raw_ping_time_us / 1000.0f);
-    fprintf(f, "  \"max_ping_ms\": %.1f,\n", ctx->max_ping_time_us / 1000.0f);
-    fprintf(f, "  \"min_ping_ms\": %.1f,\n", ctx->min_ping_time_us / 1000.0f);
-    fprintf(f, "  \"current_bandwidth_kbps\": %d,\n", ctx->current_limit_bps / 1000);
-    fprintf(f, "  \"max_bandwidth_kbps\": %d,\n", ctx->config.max_bandwidth_kbps);
-    fprintf(f, "  \"ping_limit_ms\": %d,\n", ctx->config.ping_limit_ms);
-    fprintf(f, "  \"packet_loss_rate\": %.2f,\n", ctx->stats.packet_loss_rate);
-    fprintf(f, "  \"avg_bandwidth_kbps\": %.1f,\n", ctx->stats.avg_bandwidth_kbps);
-    fprintf(f, "  \"transmitted\": %d,\n", ctx->ntransmitted);
-    fprintf(f, "  \"received\": %d,\n", ctx->nreceived);
-    fprintf(f, "  \"timestamp\": %ld\n", (long)time(NULL));
-    fprintf(f, "}\n");
-    
-    fclose(f);
-    return QMON_OK;
-}
-
-/* 初始化状态机 */
+/* ==================== 状态机 ==================== */
 void state_machine_init(qosmon_context_t* ctx) {
     if (!ctx) return;
     
     ctx->state = QMON_CHK;
-    ctx->stats.start_time = qosmon_time_ms();
-    ctx->last_ping_time_ms = 0;
-    ctx->last_tc_update_time_ms = 0;
-    ctx->last_stats_time_ms = 0;
-    ctx->last_realtime_detect_time_ms = 0;
-    ctx->last_heartbeat_ms = 0;
+    ctx->ident = getpid() & 0xFFFF;
+    ctx->current_limit_bps = (int)(ctx->config.max_bandwidth_kbps * 1000 * 
+                                  ctx->config.safe_start_ratio);
+    ctx->saved_active_limit = ctx->current_limit_bps;
+    ctx->saved_realtime_limit = ctx->current_limit_bps;
     
-    memset(&ctx->ping_history, 0, sizeof(ctx->ping_history));
-    memset(&ctx->stats, 0, sizeof(ctx->stats));
+    int64_t now = qosmon_time_ms();
+    ctx->last_ping_time_ms = now;
+    ctx->last_stats_time_ms = now;
+    ctx->last_tc_update_time_ms = now;
+    ctx->last_realtime_detect_time_ms = now;
+    ctx->last_heartbeat_ms = now;
     
-    qosmon_log(ctx, QMON_LOG_INFO, "状态机初始化完成，初始状态: CHK\n");
+    memset(&ctx->ping_history, 0, sizeof(ping_history_t));
+    memset(ctx->detected_qdisc, 0, sizeof(ctx->detected_qdisc));
 }
 
-/* 事件处理器 */
-static void ping_event_handler(void* data) {
-    qosmon_context_t* ctx = (qosmon_context_t*)data;
-    if (!ctx) return;
+void state_machine_check(qosmon_context_t* ctx, ping_manager_t* pm) {
+    if (!ctx || !pm) return;
     
-    ping_manager_receive(ctx);
-}
-
-static void signal_event_handler(void* data) {
-    qosmon_context_t* ctx = (qosmon_context_t*)data;
-    if (!ctx) return;
-    
-    char buf[64];
-    ssize_t n = read(ctx->signal_pipe[0], buf, sizeof(buf));
-    if (n > 0) {
-        qosmon_log(ctx, QMON_LOG_INFO, "收到信号\n");
-        ctx->sigterm = 1;
-    }
-}
-
-static void timer_event_handler(void* data) {
-    /* 处理定时器事件 */
-    qosmon_context_t* ctx = (qosmon_context_t*)data;
-    if (!ctx) return;
-    
-    uint64_t expirations;
-    ssize_t n = read(ctx->timer_fd, &expirations, sizeof(expirations));
-    if (n != sizeof(expirations)) {
-        qosmon_log(ctx, QMON_LOG_ERROR, "读取定时器失败\n");
-    }
-}
-
-static void ping_timer_callback(void* data) {
-    qosmon_context_t* ctx = (qosmon_context_t*)data;
-    if (!ctx) return;
-    
-    ping_manager_send(ctx);
-}
-
-static void state_machine_timer_callback(void* data) {
-    qosmon_context_t* ctx = (qosmon_context_t*)data;
-    if (!ctx) return;
-    
-    /* 这里可以调用状态机更新，但状态机已经在主循环中运行 */
-    /* 我们主要更新一些定期检查 */
-}
-
-static void status_update_timer_callback(void* data) {
-    qosmon_context_t* ctx = (qosmon_context_t*)data;
-    if (!ctx) return;
-    
-    status_file_update(ctx);
-}
-
-static void bandwidth_adjust_timer_callback(void* data) {
-    qosmon_context_t* ctx = (qosmon_context_t*)data;
-    if (!ctx) return;
-    
-    /* 在主循环中处理 */
-}
-
-/* 配置初始化 */
-void qosmon_config_init(qosmon_config_t* cfg) {
-    if (!cfg) return;
-    
-    memset(cfg, 0, sizeof(*cfg));
-    
-    /* 默认值 */
-    strncpy(cfg->device, "ifb0", MAX_DEVICE_NAME - 1);
-    strncpy(cfg->target, "8.8.8.8", MAX_TARGET_NAME - 1);
-    cfg->ping_interval = DEFAULT_PING_INTERVAL;
-    cfg->max_bandwidth_kbps = DEFAULT_MAX_BANDWIDTH_KBPS;
-    cfg->ping_limit_ms = DEFAULT_PING_LIMIT_MS;
-    cfg->classid = 0x101;
-    cfg->safe_mode = 0;
-    cfg->verbose = 0;
-    cfg->auto_switch_mode = 1;
-    cfg->background_mode = 0;
-    cfg->skip_initial = 0;
-    cfg->min_bw_change_kbps = 100;
-    cfg->min_bw_ratio = 0.1f;
-    cfg->max_bw_ratio = 1.0f;
-    cfg->smoothing_factor = 0.3f;
-    cfg->active_threshold = 0.8f;
-    cfg->idle_threshold = 0.5f;
-    cfg->safe_start_ratio = 0.5f;
-    cfg->use_netlink = 1;
-    cfg->mtu = 1500;
-    cfg->buffer = 1600;
-    cfg->cbuffer = 1600;
-    cfg->quantum = 1514;
-    cfg->hfsc_m1 = 0;
-    cfg->hfsc_d = 0;
-    cfg->hfsc_m2 = 10000;
-    cfg->tbf_burst = 32;
-    cfg->tbf_limit = 1000;
-    cfg->tbf_mtu = 1500;
-    
-    cfg->status_file[0] = '\0';
-    cfg->debug_log[0] = '\0';
-    cfg->config_file[0] = '\0';
-}
-
-/* 配置解析 */
-int qosmon_config_parse(qosmon_config_t* cfg, int argc, char* argv[]) {
-    /* 解析命令行参数 */
-    /* 这里简化处理，实际应用中需要完整的参数解析 */
-    
-    if (argc < 5) {
-        fprintf(stderr, "用法: %s <device> <target> <ping_interval_ms> <max_bandwidth_kbps> <ping_limit_ms>\n", argv[0]);
-        fprintf(stderr, "示例: %s ifb0 8.8.8.8 200 10000 20\n", argv[0]);
-        fprintf(stderr, "可选参数:\n");
-        fprintf(stderr, "  -c <classid>     : 类ID (十六进制, 默认: 0x101)\n");
-        fprintf(stderr, "  -s              : 安全模式 (退出时恢复带宽)\n");
-        fprintf(stderr, "  -v              : 详细输出\n");
-        fprintf(stderr, "  -b              : 后台模式\n");
-        fprintf(stderr, "  -f <config_file>: 配置文件\n");
-        fprintf(stderr, "  -l <log_file>   : 日志文件\n");
-        fprintf(stderr, "  -S <status_file>: 状态文件\n");
-        fprintf(stderr, "  -n              : 不使用netlink (使用shell命令)\n");
-        fprintf(stderr, "  -A              : 自动切换到实时模式\n");
-        fprintf(stderr, "  -I              : 跳过初始带宽测试\n");
-        return QMON_ERR_CONFIG;
-    }
-    
-    /* 基本参数 */
-    strncpy(cfg->device, argv[1], MAX_DEVICE_NAME - 1);
-    strncpy(cfg->target, argv[2], MAX_TARGET_NAME - 1);
-    cfg->ping_interval = atoi(argv[3]);
-    cfg->max_bandwidth_kbps = atoi(argv[4]);
-    
-    if (argc > 5) {
-        cfg->ping_limit_ms = atoi(argv[5]);
-    }
-    
-    /* 可选参数 */
-    for (int i = 6; i < argc; i++) {
-        if (strcmp(argv[i], "-c") == 0 && i + 1 < argc) {
-            cfg->classid = (int)strtol(argv[++i], NULL, 0);
-        } else if (strcmp(argv[i], "-s") == 0) {
-            cfg->safe_mode = 1;
-        } else if (strcmp(argv[i], "-v") == 0) {
-            cfg->verbose = 1;
-        } else if (strcmp(argv[i], "-b") == 0) {
-            cfg->background_mode = 1;
-        } else if (strcmp(argv[i], "-f") == 0 && i + 1 < argc) {
-            strncpy(cfg->config_file, argv[++i], sizeof(cfg->config_file) - 1);
-        } else if (strcmp(argv[i], "-l") == 0 && i + 1 < argc) {
-            strncpy(cfg->debug_log, argv[++i], sizeof(cfg->debug_log) - 1);
-        } else if (strcmp(argv[i], "-S") == 0 && i + 1 < argc) {
-            strncpy(cfg->status_file, argv[++i], sizeof(cfg->status_file) - 1);
-        } else if (strcmp(argv[i], "-n") == 0) {
-            cfg->use_netlink = 0;
-        } else if (strcmp(argv[i], "-A") == 0) {
-            cfg->auto_switch_mode = 1;
-        } else if (strcmp(argv[i], "-I") == 0) {
-            cfg->skip_initial = 1;
-        } else if (strcmp(argv[i], "-h") == 0) {
-            return QMON_ERR_CONFIG;
+    if (ctx->nreceived >= 2) {
+        if (ctx->config.ping_limit_ms > 0 && !ctx->config.auto_switch_mode) {
+            ctx->current_limit_bps = 0;
+            tc_controller_set_bandwidth(NULL, ctx->current_limit_bps);
+            ctx->state = QMON_IDLE;
+        } else {
+            tc_controller_set_bandwidth(NULL, 10000);
+            ctx->nreceived = 0;
+            ctx->state = QMON_INIT;
         }
     }
-    
-    /* 加载配置文件（如果有） */
-    if (cfg->config_file[0] != '\0') {
-        qosmon_config_load_file(cfg, cfg->config_file);
-    }
-    
-    return QMON_OK;
 }
 
-int qosmon_config_load_file(qosmon_config_t* cfg, const char* filename) {
-    if (!cfg || !filename) return QMON_ERR_MEMORY;
+void state_machine_init_state(qosmon_context_t* ctx) {
+    if (!ctx) return;
     
-    FILE* f = fopen(filename, "r");
-    if (!f) {
-        return QMON_ERR_CONFIG;
-    }
+    static int init_count = 0;
+    init_count++;
     
-    char line[256];
-    while (fgets(line, sizeof(line), f)) {
-        /* 跳过注释和空行 */
-        if (line[0] == '#' || line[0] == '\n') continue;
+    int needed_pings = 15000 / ctx->config.ping_interval;
+    if (needed_pings <= 0) needed_pings = 1;
+    
+    if (init_count > needed_pings) {
+        ctx->state = QMON_IDLE;
+        tc_controller_set_bandwidth(NULL, ctx->current_limit_bps);
         
-        char key[64], value[128];
-        if (sscanf(line, "%63s = %127s", key, value) == 2) {
-            if (strcmp(key, "device") == 0) {
-                strncpy(cfg->device, value, MAX_DEVICE_NAME - 1);
-            } else if (strcmp(key, "target") == 0) {
-                strncpy(cfg->target, value, MAX_TARGET_NAME - 1);
-            } else if (strcmp(key, "ping_interval") == 0) {
-                cfg->ping_interval = atoi(value);
-            } else if (strcmp(key, "max_bandwidth_kbps") == 0) {
-                cfg->max_bandwidth_kbps = atoi(value);
-            } else if (strcmp(key, "ping_limit_ms") == 0) {
-                cfg->ping_limit_ms = atoi(value);
-            } else if (strcmp(key, "classid") == 0) {
-                cfg->classid = (int)strtol(value, NULL, 0);
-            } else if (strcmp(key, "safe_mode") == 0) {
-                cfg->safe_mode = atoi(value);
-            } else if (strcmp(key, "verbose") == 0) {
-                cfg->verbose = atoi(value);
-            } else if (strcmp(key, "auto_switch_mode") == 0) {
-                cfg->auto_switch_mode = atoi(value);
-            } else if (strcmp(key, "background_mode") == 0) {
-                cfg->background_mode = atoi(value);
-            } else if (strcmp(key, "skip_initial") == 0) {
-                cfg->skip_initial = atoi(value);
-            } else if (strcmp(key, "min_bw_change_kbps") == 0) {
-                cfg->min_bw_change_kbps = atoi(value);
-            } else if (strcmp(key, "min_bw_ratio") == 0) {
-                cfg->min_bw_ratio = atof(value);
-            } else if (strcmp(key, "max_bw_ratio") == 0) {
-                cfg->max_bw_ratio = atof(value);
-            } else if (strcmp(key, "smoothing_factor") == 0) {
-                cfg->smoothing_factor = atof(value);
-            } else if (strcmp(key, "active_threshold") == 0) {
-                cfg->active_threshold = atof(value);
-            } else if (strcmp(key, "idle_threshold") == 0) {
-                cfg->idle_threshold = atof(value);
-            } else if (strcmp(key, "safe_start_ratio") == 0) {
-                cfg->safe_start_ratio = atof(value);
-            } else if (strcmp(key, "use_netlink") == 0) {
-                cfg->use_netlink = atoi(value);
-            } else if (strcmp(key, "mtu") == 0) {
-                cfg->mtu = atoi(value);
-            } else if (strcmp(key, "buffer") == 0) {
-                cfg->buffer = atoi(value);
-            } else if (strcmp(key, "cbuffer") == 0) {
-                cfg->cbuffer = atoi(value);
-            } else if (strcmp(key, "quantum") == 0) {
-                cfg->quantum = atoi(value);
-            } else if (strcmp(key, "hfsc_m1") == 0) {
-                cfg->hfsc_m1 = atoi(value);
-            } else if (strcmp(key, "hfsc_d") == 0) {
-                cfg->hfsc_d = atoi(value);
-            } else if (strcmp(key, "hfsc_m2") == 0) {
-                cfg->hfsc_m2 = atoi(value);
-            } else if (strcmp(key, "tbf_burst") == 0) {
-                cfg->tbf_burst = atoi(value);
-            } else if (strcmp(key, "tbf_limit") == 0) {
-                cfg->tbf_limit = atoi(value);
-            } else if (strcmp(key, "tbf_mtu") == 0) {
-                cfg->tbf_mtu = atoi(value);
-            } else if (strcmp(key, "status_file") == 0) {
-                strncpy(cfg->status_file, value, MAX_STATUS_FILE - 1);
-            } else if (strcmp(key, "debug_log") == 0) {
-                strncpy(cfg->debug_log, value, MAX_DEBUG_LOG - 1);
-            }
+        if (ctx->config.auto_switch_mode) {
+            ctx->config.ping_limit_ms = (int)(ctx->filtered_ping_time_us * 1.1f / 1000);
+        } else {
+            ctx->config.ping_limit_ms = ctx->filtered_ping_time_us * 2 / 1000;
+        }
+        
+        if (ctx->config.ping_limit_ms < 10) ctx->config.ping_limit_ms = 10;
+        if (ctx->config.ping_limit_ms > 800) ctx->config.ping_limit_ms = 800;
+        
+        ctx->max_ping_time_us = ctx->config.ping_limit_ms * 2 * 1000;
+        init_count = 0;
+        
+        qosmon_log(ctx, QMON_LOG_INFO, "初始化完成: ping限制=%dms\n", 
+                  ctx->config.ping_limit_ms);
+    }
+}
+
+void state_machine_idle(qosmon_context_t* ctx) {
+    if (!ctx) return;
+    
+    int max_bps = ctx->config.max_bandwidth_kbps * 1000;
+    if (max_bps == 0) {
+        qosmon_log(ctx, QMON_LOG_ERROR, "最大带宽为0\n");
+        return;
+    }
+    
+    float utilization = (float)ctx->filtered_total_load_bps / max_bps;
+    
+    if (utilization > ctx->config.active_threshold) {
+        if (ctx->realtime_classes == 0 && ctx->config.auto_switch_mode) {
+            ctx->state = QMON_ACTIVE;
+            ctx->current_limit_bps = ctx->saved_active_limit;
+        } else {
+            ctx->state = QMON_REALTIME;
+            ctx->current_limit_bps = ctx->saved_realtime_limit;
+        }
+        
+        qosmon_log(ctx, QMON_LOG_INFO, "切换到%s状态: 利用率=%.1f%%\n",
+                  (ctx->state == QMON_ACTIVE) ? "ACTIVE" : "REALTIME",
+                  utilization * 100.0f);
+    }
+}
+
+void state_machine_active(qosmon_context_t* ctx) {
+    if (!ctx) return;
+    
+    if (ctx->state == QMON_REALTIME) {
+        ctx->saved_realtime_limit = ctx->current_limit_bps;
+    } else {
+        ctx->saved_active_limit = ctx->current_limit_bps;
+    }
+    
+    int max_bps = ctx->config.max_bandwidth_kbps * 1000;
+    if (max_bps == 0) {
+        return;
+    }
+    
+    float utilization = (float)ctx->filtered_total_load_bps / max_bps;
+    
+    if (utilization < ctx->config.idle_threshold) {
+        ctx->state = QMON_IDLE;
+        qosmon_log(ctx, QMON_LOG_INFO, "切换到IDLE状态: 利用率=%.1f%%\n", 
+                  utilization * 100.0f);
+        return;
+    }
+    
+    int current_plimit_us = ctx->config.ping_limit_ms * 1000;
+    if (current_plimit_us <= 0) {
+        current_plimit_us = 10000;
+    }
+    
+    float error = ctx->filtered_ping_time_us - current_plimit_us;
+    float error_ratio = error / (float)current_plimit_us;
+    
+    float adjust_factor = 1.0f;
+    if (error_ratio < 0) {
+        if (ctx->filtered_total_load_bps < ctx->current_limit_bps * 0.85f) {
+            return;
+        }
+        adjust_factor = 1.0f - 0.002f * error_ratio;
+    } else {
+        adjust_factor = 1.0f - 0.004f * (error_ratio + 0.1f);
+        if (adjust_factor < 0.85f) adjust_factor = 0.85f;
+    }
+    
+    int old_limit = ctx->current_limit_bps;
+    int new_limit = (int)(ctx->current_limit_bps * adjust_factor);
+    
+    int min_bw = (int)(ctx->config.max_bandwidth_kbps * 1000 * ctx->config.min_bw_ratio);
+    int max_bw = (int)(ctx->config.max_bandwidth_kbps * 1000 * ctx->config.max_bw_ratio);
+    
+    if (new_limit > max_bw) new_limit = max_bw;
+    else if (new_limit < min_bw) new_limit = min_bw;
+    
+    int change = new_limit - old_limit;
+    if (change < 0) change = -change;
+    if (change > ctx->config.min_bw_change_kbps * 1000) {
+        ctx->current_limit_bps = new_limit;
+        qosmon_log(ctx, QMON_LOG_INFO, "带宽调整: %d -> %d kbps (误差比例=%.3f)\n",
+                  old_limit / 1000, new_limit / 1000, error_ratio);
+    }
+    
+    if (ctx->max_ping_time_us > current_plimit_us) {
+        ctx->max_ping_time_us -= 100;
+    }
+}
+
+void heart_beat_check(qosmon_context_t* ctx) {
+    if (!ctx) return;
+    
+    static int64_t last_heartbeat = 0;
+    int64_t now = qosmon_time_ms();
+    
+    if (now - last_heartbeat > HEARTBEAT_INTERVAL_MS) {
+        qosmon_log(ctx, QMON_LOG_DEBUG, "心跳检测: 系统运行正常\n");
+        qosmon_log(ctx, QMON_LOG_DEBUG, "  - 状态: %d\n", ctx->state);
+        qosmon_log(ctx, QMON_LOG_DEBUG, "  - 当前带宽: %d kbps\n", ctx->current_limit_bps / 1000);
+        qosmon_log(ctx, QMON_LOG_DEBUG, "  - 当前ping: %ld ms\n", ctx->filtered_ping_time_us / 1000);
+        qosmon_log(ctx, QMON_LOG_DEBUG, "  - 最大ping: %ld ms\n", ctx->max_ping_time_us / 1000);
+        qosmon_log(ctx, QMON_LOG_DEBUG, "  - 已发送ping: %d\n", ctx->ntransmitted);
+        qosmon_log(ctx, QMON_LOG_DEBUG, "  - 已接收ping: %d\n", ctx->nreceived);
+        qosmon_log(ctx, QMON_LOG_DEBUG, "  - 流量负载: %d kbps\n", ctx->filtered_total_load_bps / 1000);
+        qosmon_log(ctx, QMON_LOG_DEBUG, "  - 检测队列算法: %s\n", ctx->detected_qdisc);
+        
+        last_heartbeat = now;
+    }
+}
+
+void state_machine_run(qosmon_context_t* ctx, ping_manager_t* pm, tc_controller_t* tc) {
+    if (!ctx || !pm || !tc) return;
+    
+    int64_t now = qosmon_time_ms();
+    
+    if (ctx->state != QMON_EXIT) {
+        int time_since_last_ping = now - ctx->last_ping_time_ms;
+        if (time_since_last_ping >= ctx->config.ping_interval) {
+            ping_manager_send(pm);
         }
     }
     
-    fclose(f);
-    return QMON_OK;
+    if (now - ctx->last_stats_time_ms > STATS_INTERVAL_MS) {
+        load_monitor_update(ctx);
+        ctx->last_stats_time_ms = now;
+    }
+    
+    if (now - ctx->last_tc_update_time_ms > CONTROL_INTERVAL_MS) {
+        int ret = tc_controller_set_bandwidth(tc, ctx->current_limit_bps);
+        if (ret == QMON_OK) {
+            ctx->last_tc_update_time_ms = now;
+        } else {
+            qosmon_log(ctx, QMON_LOG_WARN, "带宽设置失败，将在下次重试\n");
+        }
+    }
+    
+    if (ctx->config.auto_switch_mode && 
+        now - ctx->last_realtime_detect_time_ms > REALTIME_DETECT_MS) {
+        ctx->realtime_classes = 0;
+        ctx->last_realtime_detect_time_ms = now;
+    }
+    
+    heart_beat_check(ctx);
+    
+    switch (ctx->state) {
+        case QMON_CHK:
+            state_machine_check(ctx, pm);
+            break;
+        case QMON_INIT:
+            state_machine_init_state(ctx);
+            break;
+        case QMON_IDLE:
+            state_machine_idle(ctx);
+            break;
+        case QMON_ACTIVE:
+        case QMON_REALTIME:
+            state_machine_active(ctx);
+            break;
+        case QMON_EXIT:
+            break;
+    }
 }
 
-/* 清理函数 */
-void qosmon_cleanup(qosmon_context_t* ctx) {
-    if (!ctx) return;
-    
-    /* 清理状态机 */
-    state_machine_cleanup(ctx);
-    
-    /* 关闭所有文件描述符 */
-    if (ctx->ping_socket >= 0) {
-        close(ctx->ping_socket);
-    }
-    
-    if (ctx->epoll_fd >= 0) {
-        close(ctx->epoll_fd);
-    }
-    
-    if (ctx->timer_fd >= 0) {
-        close(ctx->timer_fd);
-    }
-    
-    if (ctx->signal_pipe[0] >= 0) {
-        close(ctx->signal_pipe[0]);
-    }
-    
-    if (ctx->signal_pipe[1] >= 0) {
-        close(ctx->signal_pipe[1]);
-    }
-}
-
-void state_machine_cleanup(qosmon_context_t* ctx) {
-    /* 这里可以添加状态机特定的清理 */
-    qosmon_log(ctx, QMON_LOG_DEBUG, "状态机清理完成\n");
-}
-
-/* 主循环调用 */
-int main_loop(qosmon_context_t* ctx, ping_manager_t* ping_mgr, tc_controller_t* tc_mgr) {
+/* ==================== 状态文件更新 ==================== */
+int status_file_update(qosmon_context_t* ctx) {
     if (!ctx) return QMON_ERR_MEMORY;
     
-    qosmon_log(ctx, QMON_LOG_INFO, "进入主循环\n");
+    static int64_t last_update = 0;
+    int64_t now = qosmon_time_ms();
     
-    /* 创建epoll实例 */
-    ctx->epoll_fd = epoll_create1(0);
-    if (ctx->epoll_fd < 0) {
-        qosmon_log(ctx, QMON_LOG_ERROR, "创建epoll失败: %s\n", strerror(errno));
-        return QMON_ERR_SYSTEM;
+    if (now - last_update < 5000) {
+        return QMON_OK;
     }
     
-    /* 设置定时器 */
-    ctx->timer_fd = timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK);
-    if (ctx->timer_fd < 0) {
-        qosmon_log(ctx, QMON_LOG_ERROR, "创建定时器失败: %s\n", strerror(errno));
-        close(ctx->epoll_fd);
-        ctx->epoll_fd = -1;
-        return QMON_ERR_SYSTEM;
+    if (!ctx->status_file) {
+        ctx->status_file = fopen(ctx->config.status_file, "w");
+        if (!ctx->status_file) {
+            qosmon_log(ctx, QMON_LOG_ERROR, "无法打开状态文件: %s\n", strerror(errno));
+            return QMON_ERR_FILE;
+        }
     }
     
-    struct itimerspec timer_spec = {0};
-    timer_spec.it_interval.tv_sec = 1;  /* 每秒触发一次 */
-    timer_spec.it_interval.tv_nsec = 0;
-    timer_spec.it_value.tv_sec = 1;     /* 1秒后开始 */
-    timer_spec.it_value.tv_nsec = 0;
+    // 使用%ld格式化int64_t
+    fprintf(ctx->status_file, "状态: %d\n", ctx->state);
+    fprintf(ctx->status_file, "当前带宽: %d kbps\n", ctx->current_limit_bps / 1000);
+    fprintf(ctx->status_file, "当前ping: %ld ms\n", ctx->filtered_ping_time_us / 1000);
+    fprintf(ctx->status_file, "最大ping: %ld ms\n", ctx->max_ping_time_us / 1000);
+    fprintf(ctx->status_file, "流量负载: %d kbps\n", ctx->filtered_total_load_bps / 1000);
+    fprintf(ctx->status_file, "已发送ping: %d\n", ctx->ntransmitted);
+    fprintf(ctx->status_file, "已接收ping: %d\n", ctx->nreceived);
+    fprintf(ctx->status_file, "队列算法: %s\n", ctx->detected_qdisc);
+    fprintf(ctx->status_file, "最后更新: %ld\n", (long)now);
     
-    if (timerfd_settime(ctx->timer_fd, 0, &timer_spec, NULL) < 0) {
-        qosmon_log(ctx, QMON_LOG_ERROR, "设置定时器失败: %s\n", strerror(errno));
-        close(ctx->timer_fd);
-        close(ctx->epoll_fd);
-        ctx->timer_fd = -1;
-        ctx->epoll_fd = -1;
-        return QMON_ERR_SYSTEM;
-    }
+    fflush(ctx->status_file);
+    fseek(ctx->status_file, 0, SEEK_SET);
     
-    /* 创建信号管道 */
-    if (pipe(ctx->signal_pipe) < 0) {
-        qosmon_log(ctx, QMON_LOG_ERROR, "创建信号管道失败: %s\n", strerror(errno));
-        close(ctx->timer_fd);
-        close(ctx->epoll_fd);
-        ctx->timer_fd = -1;
-        ctx->epoll_fd = -1;
-        return QMON_ERR_SYSTEM;
-    }
+    last_update = now;
+    return QMON_OK;
+}
+
+/* ==================== 信号处理 ==================== */
+void signal_handler(int sig) {
+    // 空函数，通过全局变量控制退出
+}
+
+int setup_signal_handlers(qosmon_context_t* ctx) {
+    if (!ctx) return QMON_ERR_MEMORY;
     
-    /* 设置非阻塞IO */
-    fcntl(ctx->signal_pipe[0], F_SETFL, O_NONBLOCK);
-    fcntl(ctx->signal_pipe[1], F_SETFL, O_NONBLOCK);
-    
-    /* 注册信号处理 */
-    struct sigaction sa = {0};
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
     sa.sa_handler = signal_handler;
-    sa.sa_flags = SA_RESTART;
     sigemptyset(&sa.sa_mask);
     
-    if (sigaction(SIGINT, &sa, NULL) < 0 ||
-        sigaction(SIGTERM, &sa, NULL) < 0 ||
-        sigaction(SIGQUIT, &sa, NULL) < 0) {
-        qosmon_log(ctx, QMON_LOG_ERROR, "注册信号处理失败: %s\n", strerror(errno));
-        close(ctx->signal_pipe[0]);
-        close(ctx->signal_pipe[1]);
-        close(ctx->timer_fd);
-        close(ctx->epoll_fd);
-        return QMON_ERR_SYSTEM;
+    if (sigaction(SIGTERM, &sa, NULL) < 0) {
+        qosmon_log(ctx, QMON_LOG_ERROR, "设置SIGTERM处理失败: %s\n", strerror(errno));
+        return QMON_ERR_SIGNAL;
     }
     
-    /* 将描述符添加到epoll */
-    struct epoll_event ev = {0};
-    ev.events = EPOLLIN;
+    if (sigaction(SIGINT, &sa, NULL) < 0) {
+        qosmon_log(ctx, QMON_LOG_ERROR, "设置SIGINT处理失败: %s\n", strerror(errno));
+        return QMON_ERR_SIGNAL;
+    }
     
-    /* 添加ping socket */
+    if (sigaction(SIGUSR1, &sa, NULL) < 0) {
+        qosmon_log(ctx, QMON_LOG_ERROR, "设置SIGUSR1处理失败: %s\n", strerror(errno));
+        return QMON_ERR_SIGNAL;
+    }
+    
+    signal(SIGPIPE, SIG_IGN);
+    signal(SIGCHLD, SIG_IGN);
+    
+    return QMON_OK;
+}
+
+/* ==================== 清理函数 ==================== */
+void qosmon_cleanup(qosmon_context_t* ctx, ping_manager_t* pm, tc_controller_t* tc) {
+    if (!ctx) return;
+    
+    qosmon_log(ctx, QMON_LOG_INFO, "开始清理资源...\n");
+    
+    if (!ctx->config.safe_mode) {
+        int default_bw = ctx->config.max_bandwidth_kbps * 1000;
+        tc_set_bandwidth(ctx, default_bw);
+        qosmon_log(ctx, QMON_LOG_INFO, "重置TC带宽为默认值\n");
+    }
+    
+    if (tc) {
+        tc_controller_cleanup(tc);
+    }
+    
+    if (pm) {
+        ping_manager_cleanup(pm);
+    }
+    
+    if (ctx->status_file) {
+        fclose(ctx->status_file);
+        ctx->status_file = NULL;
+    }
+    
+    if (ctx->debug_log_file) {
+        fclose(ctx->debug_log_file);
+        ctx->debug_log_file = NULL;
+    }
+    
     if (ctx->ping_socket >= 0) {
-        ev.data.fd = ctx->ping_socket;
-        ev.data.ptr = ping_event_handler;
-        if (epoll_ctl(ctx->epoll_fd, EPOLL_CTL_ADD, ctx->ping_socket, &ev) < 0) {
-            qosmon_log(ctx, QMON_LOG_ERROR, "添加ping socket到epoll失败: %s\n", strerror(errno));
+        close(ctx->ping_socket);
+        ctx->ping_socket = -1;
+    }
+    
+    qosmon_log(ctx, QMON_LOG_INFO, "资源清理完成\n");
+}
+
+/* ==================== 主函数（使用poll） ==================== */
+int main(int argc, char* argv[]) {
+    int ret = EXIT_FAILURE;
+    qosmon_context_t context = {0};
+    ping_manager_t ping_mgr = {0};
+    tc_controller_t tc_mgr = {0};
+    
+    qosmon_config_init(&context.config);
+    
+    int config_result = qosmon_config_parse(&context.config, argc, argv);
+    if (config_result != QMON_OK) {
+        fprintf(stderr, "配置解析失败\n");
+        return EXIT_FAILURE;
+    }
+    
+    char config_error[256] = {0};
+    if (qosmon_config_validate(&context.config, config_error, sizeof(config_error)) != QMON_OK) {
+        fprintf(stderr, "配置验证失败: %s\n", config_error);
+        return EXIT_FAILURE;
+    }
+    
+    if (context.config.background_mode) {
+        if (daemon(0, 0) < 0) {
+            perror("后台运行失败");
+            return EXIT_FAILURE;
+        }
+        openlog("qosmon", LOG_PID, LOG_USER);
+    }
+    
+    if (strlen(context.config.debug_log) > 0) {
+        context.debug_log_file = fopen(context.config.debug_log, "a");
+        if (!context.debug_log_file) {
+            qosmon_log(&context, QMON_LOG_WARN, "无法打开调试日志文件: %s\n", context.config.debug_log);
+        } else {
+            qosmon_log(&context, QMON_LOG_INFO, "调试日志已启用: %s\n", context.config.debug_log);
         }
     }
     
-    /* 添加定时器 */
-    ev.data.fd = ctx->timer_fd;
-    ev.data.ptr = timer_event_handler;
-    if (epoll_ctl(ctx->epoll_fd, EPOLL_CTL_ADD, ctx->timer_fd, &ev) < 0) {
-        qosmon_log(ctx, QMON_LOG_ERROR, "添加定时器到epoll失败: %s\n", strerror(errno));
+    if (setup_signal_handlers(&context) != QMON_OK) {
+        qosmon_log(&context, QMON_LOG_ERROR, "信号处理设置失败\n");
+        goto cleanup;
     }
     
-    /* 添加信号管道 */
-    ev.data.fd = ctx->signal_pipe[0];
-    ev.data.ptr = signal_event_handler;
-    if (epoll_ctl(ctx->epoll_fd, EPOLL_CTL_ADD, ctx->signal_pipe[0], &ev) < 0) {
-        qosmon_log(ctx, QMON_LOG_ERROR, "添加信号管道到epoll失败: %s\n", strerror(errno));
+    state_machine_init(&context);
+    
+    char resolve_error[256];
+    if (resolve_target(context.config.target, &context.target_addr, 
+                       resolve_error, sizeof(resolve_error)) != QMON_OK) {
+        qosmon_log(&context, QMON_LOG_ERROR, "目标地址解析失败: %s\n", resolve_error);
+        goto cleanup;
     }
     
-    /* 主循环 */
-    qosmon_log(ctx, QMON_LOG_INFO, "开始主循环\n");
+    if (ping_manager_init(&ping_mgr, &context) != QMON_OK) {
+        qosmon_log(&context, QMON_LOG_ERROR, "ping管理器初始化失败\n");
+        goto cleanup;
+    }
     
-    int64_t last_ping_time_ms = 0;
-    int64_t last_state_machine_time_ms = 0;
-    int64_t last_status_update_time_ms = 0;
-    int64_t last_bandwidth_adjust_time_ms = 0;
+    if (tc_controller_init(&tc_mgr, &context) != QMON_OK) {
+        qosmon_log(&context, QMON_LOG_ERROR, "TC控制器初始化失败\n");
+        goto cleanup;
+    }
     
-    while (!ctx->sigterm) {
-        struct epoll_event events[MAX_EPOLL_EVENTS];
-        int timeout = ctx->config.ping_interval;  /* 毫秒 */
-        
-        int nfds = epoll_wait(ctx->epoll_fd, events, MAX_EPOLL_EVENTS, timeout);
-        
+    if (setpriority(PRIO_PROCESS, 0, -10) < 0) {
+        qosmon_log(&context, QMON_LOG_WARN, "无法设置进程优先级: %s\n", strerror(errno));
+    }
+    
+    qosmon_log(&context, QMON_LOG_INFO, "========================================\n");
+    qosmon_log(&context, QMON_LOG_INFO, "QoS监控器启动（使用poll机制）\n");
+    qosmon_log(&context, QMON_LOG_INFO, "目标地址: %s\n", context.config.target);
+    qosmon_log(&context, QMON_LOG_INFO, "网络接口: %s\n", context.config.device);
+    qosmon_log(&context, QMON_LOG_INFO, "最大带宽: %d kbps\n", context.config.max_bandwidth_kbps);
+    qosmon_log(&context, QMON_LOG_INFO, "ping间隔: %d ms\n", context.config.ping_interval);
+    qosmon_log(&context, QMON_LOG_INFO, "ping限制: %d ms\n", context.config.ping_limit_ms);
+    qosmon_log(&context, QMON_LOG_INFO, "TC类ID: 0x%x\n", context.config.classid);
+    qosmon_log(&context, QMON_LOG_INFO, "安全模式: %s\n", context.config.safe_mode ? "是" : "否");
+    qosmon_log(&context, QMON_LOG_INFO, "自动切换: %s\n", context.config.auto_switch_mode ? "是" : "否");
+    qosmon_log(&context, QMON_LOG_INFO, "详细输出: %s\n", context.config.verbose ? "启用" : "禁用");
+    qosmon_log(&context, QMON_LOG_INFO, "========================================\n");
+    
+    qosmon_log(&context, QMON_LOG_INFO, "开始监控循环（使用poll机制）...\n");
+    
+    context.state = QMON_CHK;
+    context.last_heartbeat_ms = qosmon_time_ms();
+    
+    if (!context.config.skip_initial) {
+        for (int i = 0; i < 5; i++) {
+            ping_manager_send(&ping_mgr);
+            usleep(context.config.ping_interval * 1000);
+        }
+    }
+    
+    // 使用poll进行事件驱动
+    struct pollfd fds[1];
+    fds[0].fd = context.ping_socket;
+    fds[0].events = POLLIN;
+    
+    while (!context.sigterm) {
         int64_t now = qosmon_time_ms();
         
-        /* 处理事件 */
-        for (int i = 0; i < nfds; i++) {
-            event_handler_t handler = (event_handler_t)events[i].data.ptr;
-            if (handler) {
-                handler((void*)ctx);
+        // 计算下一个定时任务的时间
+        int next_timeout = context.config.ping_interval;
+        
+        // 计算下一个需要执行的任务时间
+        int64_t next_ping = context.last_ping_time_ms + context.config.ping_interval - now;
+        int64_t next_stats = context.last_stats_time_ms + STATS_INTERVAL_MS - now;
+        int64_t next_tc_update = context.last_tc_update_time_ms + CONTROL_INTERVAL_MS - now;
+        int64_t next_realtime_detect = context.last_realtime_detect_time_ms + REALTIME_DETECT_MS - now;
+        int64_t next_heartbeat = context.last_heartbeat_ms + HEARTBEAT_INTERVAL_MS - now;
+        int64_t next_status_update = 5000;  // 状态文件更新间隔5秒
+        
+        // 找到最小的正超时时间
+        int min_timeout = POLL_TIMEOUT_MS;
+        if (next_ping > 0 && next_ping < min_timeout) min_timeout = next_ping;
+        if (next_stats > 0 && next_stats < min_timeout) min_timeout = next_stats;
+        if (next_tc_update > 0 && next_tc_update < min_timeout) min_timeout = next_tc_update;
+        if (next_realtime_detect > 0 && next_realtime_detect < min_timeout) min_timeout = next_realtime_detect;
+        if (next_heartbeat > 0 && next_heartbeat < min_timeout) min_timeout = next_heartbeat;
+        
+        if (min_timeout <= 0) {
+            min_timeout = 1;  // 至少等待1ms
+        } else if (min_timeout > POLL_TIMEOUT_MS) {
+            min_timeout = POLL_TIMEOUT_MS;
+        }
+        
+        int poll_ret = poll(fds, 1, min_timeout);
+        
+        int64_t poll_end = qosmon_time_ms();
+        int poll_elapsed = poll_end - now;
+        
+        if (poll_ret < 0) {
+            if (errno == EINTR) {
+                continue;  // 被信号中断，继续循环
+            }
+            qosmon_log(&context, QMON_LOG_ERROR, "poll失败: %s\n", strerror(errno));
+        break;
+    }
+    
+    if (poll_ret > 0) {
+        if (fds[0].revents & POLLIN) {
+            int ping_result = ping_manager_receive(&ping_mgr);
+            if (ping_result < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
+                qosmon_log(&context, QMON_LOG_ERROR, "接收ping时发生错误\n");
             }
         }
         
-        /* 定期发送ping */
-        if (now - last_ping_time_ms >= ctx->config.ping_interval) {
-            ping_manager_send(ctx);
-            last_ping_time_ms = now;
-        }
-        
-        /* 运行状态机 */
-        if (now - last_state_machine_time_ms >= 100) {  /* 每100毫秒运行一次 */
-            state_machine_run(ctx, ping_mgr, tc_mgr);
-            last_state_machine_time_ms = now;
-        }
-        
-        /* 更新状态文件 */
-        if (now - last_status_update_time_ms >= 1000) {  /* 每秒更新一次 */
-            status_file_update(ctx);
-            last_status_update_time_ms = now;
-        }
-        
-        /* 检查是否需要调整带宽 */
-        if (now - last_bandwidth_adjust_time_ms >= 2000) {  /* 每2秒检查一次 */
-            if (ctx->state == QMON_ACTIVE) {
-                adjust_bandwidth_by_ping(ctx, tc_mgr);
-            }
-            last_bandwidth_adjust_time_ms = now;
-        }
-        
-        /* 检查退出条件 */
-        if (ctx->state == QMON_EXIT) {
-            qosmon_log(ctx, QMON_LOG_INFO, "状态机请求退出\n");
+        if (fds[0].revents & (POLLERR | POLLHUP | POLLNVAL)) {
+            qosmon_log(&context, QMON_LOG_ERROR, "socket错误，revents=0x%x\n", fds[0].revents);
             break;
         }
     }
     
-    qosmon_log(ctx, QMON_LOG_INFO, "主循环结束\n");
+    // 无论poll是否超时，都执行状态机
+    state_machine_run(&context, &ping_mgr, &tc_mgr);
     
-    /* 清理 */
-    if (ctx->epoll_fd >= 0) {
-        close(ctx->epoll_fd);
-        ctx->epoll_fd = -1;
+    status_file_update(&context);
+    
+    if (context.sigterm) {
+        qosmon_log(&context, QMON_LOG_INFO, "收到退出信号\n");
+        break;
     }
     
-    if (ctx->timer_fd >= 0) {
-        close(ctx->timer_fd);
-        ctx->timer_fd = -1;
-    }
-    
-    if (ctx->signal_pipe[0] >= 0) {
-        close(ctx->signal_pipe[0]);
-        ctx->signal_pipe[0] = -1;
-    }
-    
-    if (ctx->signal_pipe[1] >= 0) {
-        close(ctx->signal_pipe[1]);
-        ctx->signal_pipe[1] = -1;
-    }
-    
-    return QMON_OK;
-}
-
-/* 信号处理函数 */
-static void signal_handler(int sig) {
-    /* 这个函数是信号处理程序，不能做太多事情 */
-    /* 我们只是在信号管道中写入一个字节 */
-    qosmon_context_t* ctx = global_ctx;  /* 全局上下文指针 */
-    
-    if (ctx && ctx->signal_pipe[1] >= 0) {
-        char c = 1;
-        if (write(ctx->signal_pipe[1], &c, 1) < 0) {
-            /* 忽略写错误 */
-        }
+    if (poll_elapsed > 50) {
+        qosmon_log(&context, QMON_LOG_DEBUG, "循环处理时间过长: %d ms\n", poll_elapsed);
     }
 }
 
-/* 修复5: 资源管理修复 */
-static qosmon_context_t* create_context(void) {
-    qosmon_context_t* ctx = (qosmon_context_t*)calloc(1, sizeof(qosmon_context_t));
-    if (!ctx) {
-        return NULL;
-    }
-    
-    /* 初始化所有文件描述符为-1 */
-    ctx->ping_socket = -1;
-    ctx->epoll_fd = -1;
-    ctx->timer_fd = -1;
-    ctx->signal_pipe[0] = -1;
-    ctx->signal_pipe[1] = -1;
-    
-    /* 初始化其他成员 */
-    ctx->ident = 0;
-    ctx->sequence = 0;
-    ctx->ntransmitted = 0;
-    ctx->nreceived = 0;
-    ctx->sigterm = 0;
-    ctx->state = QMON_CHK;
-    
-    ctx->raw_ping_time_us = 0;
-    ctx->filtered_ping_time_us = 0;
-    ctx->max_ping_time_us = 0;
-    ctx->min_ping_time_us = 0;
-    
-    ctx->current_limit_bps = 0;
-    ctx->saved_realtime_limit = 0;
-    
-    ctx->last_ping_time_ms = 0;
-    ctx->last_tc_update_time_ms = 0;
-    ctx->last_stats_time_ms = 0;
-    ctx->last_realtime_detect_time_ms = 0;
-    ctx->last_heartbeat_ms = 0;
-    
-    memset(&ctx->target_addr, 0, sizeof(ctx->target_addr));
-    ctx->target_addr_len = 0;
-    
-    memset(&ctx->ping_history, 0, sizeof(ctx->ping_history));
-    memset(&ctx->stats, 0, sizeof(ctx->stats));
-    
-    memset(ctx->detected_qdisc, 0, sizeof(ctx->detected_qdisc));
-    
-    return ctx;
+ret = EXIT_SUCCESS;
+
+cleanup:
+qosmon_cleanup(&context, &ping_mgr, &tc_mgr);
+
+qosmon_log(&context, QMON_LOG_INFO, "QoS监控器已退出\n");
+
+if (context.config.background_mode) {
+    closelog();
 }
 
-static void destroy_context(qosmon_context_t* ctx) {
-    if (!ctx) return;
-    
-    /* 关闭所有打开的资源 */
-    if (ctx->ping_socket >= 0) {
-        close(ctx->ping_socket);
-    }
-    
-    if (ctx->epoll_fd >= 0) {
-        close(ctx->epoll_fd);
-    }
-    
-    if (ctx->timer_fd >= 0) {
-        close(ctx->timer_fd);
-    }
-    
-    if (ctx->signal_pipe[0] >= 0) {
-        close(ctx->signal_pipe[0]);
-    }
-    
-    if (ctx->signal_pipe[1] >= 0) {
-        close(ctx->signal_pipe[1]);
-    }
-    
-    /* 释放内存 */
-    free(ctx);
-}
-
-/* 修复6: 错误处理增强 */
-int handle_epoll_errors(qosmon_context_t* ctx) {
-    if (!ctx || ctx->epoll_fd < 0) {
-        return QMON_ERR_SOCKET;
-    }
-    
-    /* 检查epoll错误 */
-    int error = 0;
-    socklen_t len = sizeof(error);
-    if (getsockopt(ctx->epoll_fd, SOL_SOCKET, SO_ERROR, &error, &len) < 0) {
-        error = errno;
-    }
-    
-    if (error != 0) {
-        qosmon_log(ctx, QMON_LOG_ERROR, "epoll错误: %s\n", strerror(error));
-        return QMON_ERR_SOCKET;
-    }
-    
-    /* 检查其他描述符的错误 */
-    int fds[] = {ctx->ping_socket, ctx->timer_fd, ctx->signal_pipe[0]};
-    const char* fd_names[] = {"ping socket", "timer", "signal pipe"};
-    
-    for (int i = 0; i < 3; i++) {
-        if (fds[i] >= 0) {
-            error = 0;
-            len = sizeof(error);
-            if (getsockopt(fds[i], SOL_SOCKET, SO_ERROR, &error, &len) < 0) {
-                if (errno != ENOTSOCK) {
-                    error = errno;
-                } else {
-                    error = 0;  /* 不是socket，跳过 */
-                }
-            }
-            
-            if (error != 0) {
-                qosmon_log(ctx, QMON_LOG_ERROR, "%s错误: %s\n", fd_names[i], strerror(error));
-                return QMON_ERR_SOCKET;
-            }
-        }
-    }
-    
-    return QMON_OK;
-}
-
-/* 日志系统增强 */
-void qosmon_log(qosmon_context_t* ctx, qosmon_log_level_t level, const char* format, ...) {
-    if (!ctx) return;
-    
-    static const char* level_strings[] = {
-        "DEBUG", "INFO", "WARN", "ERROR", "FATAL"
-    };
-    
-    if (level < ctx->config.log_level) {
-        return;  /* 日志级别低于配置级别，不记录 */
-    }
-    
-    time_t now = time(NULL);
-    struct tm* tm_info = localtime(&now);
-    char time_str[32];
-    strftime(time_str, sizeof(time_str), "%Y-%m-%d %H:%M:%S", tm_info);
-    
-    FILE* output = stdout;
-    if (ctx->config.debug_log[0] != '\0') {
-        output = fopen(ctx->config.debug_log, "a");
-        if (!output) {
-            output = stderr;
-        }
-    } else if (ctx->config.background_mode) {
-        output = fopen("/dev/null", "a");
-        if (!output) {
-            output = stdout;
-        }
-    }
-    
-    if (ctx->config.verbose || level >= QMON_LOG_WARN) {
-        fprintf(output, "[%s] [%s] ", time_str, level_strings[level]);
-        
-        va_list args;
-        va_start(args, format);
-        vfprintf(output, format, args);
-        va_end(args);
-        
-        fflush(output);
-    }
-    
-    if (output != stdout && output != stderr) {
-        fclose(output);
-    }
-}
-
-/* 信号处理初始化 */
-static int setup_signals(qosmon_context_t* ctx) {
-    if (!ctx) return QMON_ERR_MEMORY;
-    
-    /* 设置全局上下文（用于信号处理程序） */
-    global_ctx = ctx;
-    
-    struct sigaction sa = {0};
-    sa.sa_handler = signal_handler;
-    sa.sa_flags = SA_RESTART;
-    sigemptyset(&sa.sa_mask);
-    
-    if (sigaction(SIGINT, &sa, NULL) < 0 ||
-        sigaction(SIGTERM, &sa, NULL) < 0 ||
-        sigaction(SIGQUIT, &sa, NULL) < 0) {
-        qosmon_log(ctx, QMON_LOG_ERROR, "设置信号处理失败: %s\n", strerror(errno));
-        return QMON_ERR_SYSTEM;
-    }
-    
-    /* 忽略SIGPIPE */
-    signal(SIGPIPE, SIG_IGN);
-    
-    return QMON_OK;
-}
-
-/* 后台模式 */
-static int daemonize(qosmon_context_t* ctx) {
-    if (!ctx) return QMON_ERR_MEMORY;
-    
-    pid_t pid = fork();
-    if (pid < 0) {
-        qosmon_log(ctx, QMON_LOG_ERROR, "创建守护进程失败: %s\n", strerror(errno));
-        return QMON_ERR_SYSTEM;
-    }
-    
-    if (pid > 0) {
-        /* 父进程退出 */
-        exit(0);
-    }
-    
-    /* 子进程继续 */
-    setsid();
-    
-    /* 关闭标准文件描述符 */
-    close(STDIN_FILENO);
-    close(STDOUT_FILENO);
-    close(STDERR_FILENO);
-    
-    /* 重新打开到/dev/null */
-    open("/dev/null", O_RDONLY);
-    open("/dev/null", O_WRONLY);
-    open("/dev/null", O_WRONLY);
-    
-    /* 记录PID文件 */
-    if (ctx->config.pid_file[0] != '\0') {
-        FILE* pid_file = fopen(ctx->config.pid_file, "w");
-        if (pid_file) {
-            fprintf(pid_file, "%d\n", getpid());
-            fclose(pid_file);
-        }
-    }
-    
-    return QMON_OK;
-}
-
-/* 主函数 */
-int main(int argc, char* argv[]) {
-    qosmon_config_t config = {0};
-    qosmon_config_init(&config);
-    
-    /* 解析命令行参数 */
-    int ret = qosmon_config_parse(&config, argc, argv);
-    if (ret != QMON_OK) {
-        if (ret != QMON_ERR_CONFIG) {
-            fprintf(stderr, "配置解析失败: %d\n", ret);
-        }
-        return EXIT_FAILURE;
-    }
-    
-    /* 验证配置 */
-    if (config.max_bandwidth_kbps <= 0) {
-        fprintf(stderr, "错误: 最大带宽必须大于0\n");
-        return EXIT_FAILURE;
-    }
-    
-    if (config.ping_limit_ms <= 0) {
-        fprintf(stderr, "错误: ping限制必须大于0\n");
-        return EXIT_FAILURE;
-    }
-    
-    if (config.ping_interval <= 0) {
-        fprintf(stderr, "错误: ping间隔必须大于0\n");
-        return EXIT_FAILURE;
-    }
-    
-    /* 创建上下文 */
-    qosmon_context_t* ctx = create_context();
-    if (!ctx) {
-        fprintf(stderr, "创建上下文失败: 内存不足\n");
-        return EXIT_FAILURE;
-    }
-    
-    /* 复制配置 */
-    memcpy(&ctx->config, &config, sizeof(config));
-    
-    /* 初始化日志 */
-    qosmon_log(ctx, QMON_LOG_INFO, "QoSMonitor启动\n");
-    qosmon_log(ctx, QMON_LOG_INFO, "设备: %s\n", ctx->config.device);
-    qosmon_log(ctx, QMON_LOG_INFO, "目标: %s\n", ctx->config.target);
-    qosmon_log(ctx, QMON_LOG_INFO, "最大带宽: %d kbps\n", ctx->config.max_bandwidth_kbps);
-    qosmon_log(ctx, QMON_LOG_INFO, "Ping限制: %d ms\n", ctx->config.ping_limit_ms);
-    qosmon_log(ctx, QMON_LOG_INFO, "Ping间隔: %d ms\n", ctx->config.ping_interval);
-    
-    /* 后台模式 */
-    if (ctx->config.background_mode) {
-        qosmon_log(ctx, QMON_LOG_INFO, "进入后台模式\n");
-        if (daemonize(ctx) != QMON_OK) {
-            qosmon_log(ctx, QMON_LOG_ERROR, "后台化失败\n");
-            destroy_context(ctx);
-            return EXIT_FAILURE;
-        }
-    }
-    
-    /* 设置信号处理 */
-    if (setup_signals(ctx) != QMON_OK) {
-        qosmon_log(ctx, QMON_LOG_ERROR, "信号处理设置失败\n");
-        destroy_context(ctx);
-        return EXIT_FAILURE;
-    }
-    
-    /* 初始化ping管理器 */
-    ping_manager_t ping_mgr = {0};
-    ping_mgr.ctx = ctx;
-    
-    if (ping_manager_init(&ping_mgr) != QMON_OK) {
-        qosmon_log(ctx, QMON_LOG_ERROR, "Ping管理器初始化失败\n");
-        destroy_context(ctx);
-        return EXIT_FAILURE;
-    }
-    
-    /* 初始化TC控制器 */
-    tc_controller_t tc_mgr = {0};
-    
-    if (tc_controller_init(&tc_mgr, ctx) != QMON_OK) {
-        qosmon_log(ctx, QMON_LOG_WARN, "TC控制器初始化失败，继续以监控模式运行\n");
-    }
-    
-    /* 初始化状态机 */
-    state_machine_init(ctx);
-    
-    /* 运行主循环 */
-    ret = main_loop(ctx, &ping_mgr, &tc_mgr);
-    
-    /* 清理 */
-    qosmon_log(ctx, QMON_LOG_INFO, "开始清理...\n");
-    
-    ping_manager_cleanup(&ping_mgr);
-    tc_controller_cleanup(&tc_mgr);
-    
-    /* 恢复原始带宽设置（如果启用安全模式） */
-    if (ctx->config.safe_mode) {
-        int default_bw = ctx->config.max_bandwidth_kbps * 1000;
-        tc_controller_set_bandwidth(&tc_mgr, default_bw);
-        qosmon_log(ctx, QMON_LOG_INFO, "恢复原始带宽: %d kbps\n", default_bw / 1000);
-    }
-    
-    /* 删除PID文件 */
-    if (ctx->config.pid_file[0] != '\0') {
-        unlink(ctx->config.pid_file);
-    }
-    
-    destroy_context(ctx);
-    
-    qosmon_log(NULL, QMON_LOG_INFO, "QoSMonitor退出\n");
-    
-    if (ret == QMON_OK) {
-        return EXIT_SUCCESS;
-    } else {
-        return EXIT_FAILURE;
-    }
-}
-
-/* 时间函数 */
-int64_t qosmon_time_ms(void) {
-    struct timeval tv = {0};
-    gettimeofday(&tv, NULL);
-    return (int64_t)tv.tv_sec * 1000 + tv.tv_usec / 1000;
-}
-
-int64_t qosmon_time_us(void) {
-    struct timeval tv = {0};
-    gettimeofday(&tv, NULL);
-    return (int64_t)tv.tv_sec * 1000000 + tv.tv_usec;
-}
-
-/* 辅助宏定义 */
-#define MAX_EPOLL_EVENTS 10
-#define MAX_PING_TIME_MS 1000
-#define MIN_PING_TIME_MS 1
-#define PING_HISTORY_SIZE 10
-#define HEARTBEAT_INTERVAL_MS 10000
-#define STATS_INTERVAL_MS 5000
-#define CONTROL_INTERVAL_MS 2000
-#define REALTIME_DETECT_MS 1000
-
-/* 类型定义 */
-typedef enum {
-    QMON_CHK = 0,       /* 检查网络状态 */
-    QMON_INIT,          /* 初始化状态 */
-    QMON_IDLE,          /* 空闲状态 */
-    QMON_ACTIVE,        /* 活动状态（高延迟） */
-    QMON_REALTIME,      /* 实时流量状态 */
-    QMON_EXIT           /* 退出状态 */
-} qosmon_state_t;
-
-typedef enum {
-    QDISC_HTB = 0,
-    QDISC_HFSC,
-    QDISC_TBF,
-    QDISC_DRR,
-    QDISC_SFQ,
-    QDISC_CODEL,
-    QDISC_FQ_CODEL,
-    QDISC_PFIFO_FAST
-} qdisc_kind_t;
-
-typedef enum {
-    QMON_LOG_DEBUG = 0,
-    QMON_LOG_INFO,
-    QMON_LOG_WARN,
-    QMON_LOG_ERROR,
-    QMON_LOG_FATAL
-} qosmon_log_level_t;
-
-typedef enum {
-    QMON_OK = 0,
-    QMON_ERR_MEMORY = -1,
-    QMON_ERR_SOCKET = -2,
-    QMON_ERR_SYSTEM = -3,
-    QMON_ERR_CONFIG = -4,
-    QMON_ERR_NETLINK = -5,
-    QMON_ERR_BUFFER = -6
-} qosmon_error_t;
-
-/* 回调函数类型 */
-typedef void (*event_handler_t)(void* data);
-
-/* 全局上下文指针（用于信号处理） */
-static qosmon_context_t* global_ctx = NULL;
-
-/* 配置结构体 */
-typedef struct {
-    char device[MAX_DEVICE_NAME];           /* 网络设备名称 */
-    char target[MAX_TARGET_NAME];           /* 目标地址 */
-    int ping_interval;                      /* ping间隔（毫秒） */
-    int max_bandwidth_kbps;                 /* 最大带宽（kbps） */
-    int ping_limit_ms;                      /* ping限制（毫秒） */
-    int classid;                            /* 类ID */
-    int safe_mode;                          /* 安全模式 */
-    int verbose;                            /* 详细输出 */
-    int auto_switch_mode;                   /* 自动切换到实时模式 */
-    int background_mode;                    /* 后台模式 */
-    int skip_initial;                       /* 跳过初始化测试 */
-    int min_bw_change_kbps;                 /* 最小带宽变化（kbps） */
-    float min_bw_ratio;                     /* 最小带宽比例 */
-    float max_bw_ratio;                     /* 最大带宽比例 */
-    float smoothing_factor;                  /* 平滑因子 */
-    float active_threshold;                  /* 激活阈值 */
-    float idle_threshold;                    /* 空闲阈值 */
-    float safe_start_ratio;                 /* 安全启动比例 */
-    int use_netlink;                        /* 使用netlink */
-    int mtu;                                /* MTU */
-    int buffer;                             /* 缓冲区 */
-    int cbuffer;                            /* 限速缓冲区 */
-    int quantum;                            /* 量子值 */
-    int hfsc_m1;                            /* HFSC M1 */
-    int hfsc_d;                             /* HFSC D */
-    int hfsc_m2;                            /* HFSC M2 */
-    int tbf_burst;                          /* TBF突发值 */
-    int tbf_limit;                          /* TBF限制 */
-    int tbf_mtu;                            /* TBF MTU */
-    char status_file[MAX_STATUS_FILE];      /* 状态文件 */
-    char debug_log[MAX_DEBUG_LOG];          /* 调试日志 */
-    char config_file[MAX_CONFIG_FILE];       /* 配置文件 */
-    char pid_file[MAX_PID_FILE];            /* PID文件 */
-    qosmon_log_level_t log_level;           /* 日志级别 */
-} qosmon_config_t;
-
-/* Ping历史结构体 */
-typedef struct {
-    int64_t times[PING_HISTORY_SIZE];       /* 历史ping时间 */
-    int index;                              /* 当前索引 */
-    int count;                              /* 历史数量 */
-    float smoothed;                         /* 平滑值 */
-} ping_history_t;
-
-/* 统计结构体 */
-typedef struct {
-    int64_t start_time;                     /* 开始时间 */
-    int64_t total_time_ms;                  /* 总运行时间 */
-    float avg_bandwidth_kbps;               /* 平均带宽 */
-    float packet_loss_rate;                  /* 丢包率 */
-} statistics_t;
-
-/* 主上下文结构体 */
-typedef struct {
-    qosmon_config_t config;                 /* 配置 */
-    
-    /* 网络相关 */
-    int ping_socket;                        /* ping套接字 */
-    struct sockaddr target_addr;            /* 目标地址 */
-    socklen_t target_addr_len;              /* 地址长度 */
-    uint16_t ident;                         /* ping标识符 */
-    uint16_t sequence;                      /* ping序列号 */
-    int ntransmitted;                       /* 发送计数 */
-    int nreceived;                          /* 接收计数 */
-    
-    /* 状态管理 */
-    qosmon_state_t state;                   /* 当前状态 */
-    int sigterm;                            /* 终止信号 */
-    
-    /* 时间相关 */
-    int64_t raw_ping_time_us;               /* 原始ping时间 */
-    int64_t filtered_ping_time_us;          /* 过滤后ping时间 */
-    int64_t max_ping_time_us;               /* 最大ping时间 */
-    int64_t min_ping_time_us;               /* 最小ping时间 */
-    
-    /* 带宽管理 */
-    int current_limit_bps;                  /* 当前限制（bps） */
-    int saved_realtime_limit;               /* 保存的实时限制 */
-    
-    /* 时间戳 */
-    int64_t last_ping_time_ms;              /* 上次ping时间 */
-    int64_t last_tc_update_time_ms;         /* 上次TC更新时间 */
-    int64_t last_stats_time_ms;             /* 上次统计时间 */
-    int64_t last_realtime_detect_time_ms;   /* 上次实时检测时间 */
-    int64_t last_heartbeat_ms;              /* 上次心跳时间 */
-    
-    /* 历史数据 */
-    ping_history_t ping_history;            /* ping历史 */
-    statistics_t stats;                     /* 统计信息 */
-    
-    /* 检测到的队列算法 */
-    char detected_qdisc[MAX_QDISC_KIND_LEN]; /* 队列算法 */
-    
-    /* 文件描述符 */
-    int epoll_fd;                           /* epoll描述符 */
-    int timer_fd;                           /* 定时器描述符 */
-    int signal_pipe[2];                     /* 信号管道 */
-} qosmon_context_t;
-
-/* Ping管理器结构体 */
-typedef struct {
-    qosmon_context_t* ctx;                  /* 上下文指针 */
-} ping_manager_t;
-
-/* TC控制器结构体 */
-typedef struct {
-    qosmon_context_t* ctx;                  /* 上下文指针 */
-    int netlink_fd;                         /* netlink描述符 */
-    int seq;                                /* 序列号 */
-    qdisc_kind_t qdisc_kind;                /* 队列算法类型 */
-} tc_controller_t;
-
-/* 主程序结束 */
+return ret;

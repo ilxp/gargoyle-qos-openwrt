@@ -1,3 +1,8 @@
+/* qosmon - 基于netlink的精简版QoS监控器
+ * 功能：通过ping监控延迟，使用netlink动态调整ifb0根类的带宽
+ * 基于Paul Bixel的原始代码优化
+ */
+ 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>

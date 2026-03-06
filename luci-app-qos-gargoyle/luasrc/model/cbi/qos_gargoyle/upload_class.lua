@@ -29,32 +29,19 @@ o.default = "1"
 o.rmempty = false
 
 o = s:option(Value, "percent_bandwidth", translate("Percent"),
-    translate("The percentage of the total available bandwidth that should be allocated to this class "
-    .. "when all available bandwidth is being used. If unused bandwidth is available, more can (and "
-    .. "will) be allocated. The percentages can be configured to equal more (or less) than 100, but "
-    .. "when the settings are applied the percentages will be adjusted proportionally so that they "
-    .. "add to 100. This setting only comes into effect when the WAN link is saturated."))
+    translate("The percentage of total bandwidth occupied by this service type."))
 o.datatype = "range(1, 100)"
 o.default = "10"
 o.rmempty  = false
 
 o = s:option(Value, "per_min_bandwidth", translate("Min bandwidth(%)"),
-    translate("The minimum service this class will be allocated when the link is at capacity. Classes "
-    .. "which specify minimum service are known as realtime classes by the active congestion "
-    .. "controller. Streaming video, VoIP and interactive online gaming are all examples of "
-    .. "applications that must have a minimum bandwith to function. To determine what to enter use "
-    .. "the application on an unloaded LAN and observe how much bandwidth it uses. Then enter a "
-    .. "number only slightly higher than this into this field. QoS will satisfiy the minimum service "
-    .. "of all classes first before allocating to other waiting classes so be careful to use minimum "
-    .. "bandwidths sparingly."))
+    translate("The minimum percentage of bandwidth that can be allocated to this service type."))
 o:value("0", translate("Zero"))
 o.datatype = "uinteger"
 o.default  = "0"
 
 o = s:option(Value, "per_max_bandwidth", translate("Max bandwidth(%)"),
-    translate("The maximum amount of bandwidth this class will be allocated in %. Even if unused "
-    .. "bandwidth is available, this service class will never be permitted to use more than this "
-    .. "amount of bandwidth."))
+    translate("The maximum percentage of bandwidth that can be allocated to this service type."))
 o:value("", translate("Unlimited"))
 o.datatype = "uinteger"
 
