@@ -205,7 +205,7 @@ void tc_controller_cleanup(tc_controller_t* tc);
 // 配置函数
 void qosmon_config_init(qosmon_config_t* cfg);
 int qosmon_config_parse(qosmon_config_t* cfg, int argc, char* argv[]);
-int qosmon_config_validate(qosmon_config_t* cfg, char* error, int error_len);
+int qosmon_config_validate(qosmon_config_t* cfg, int argc, char* argv[], char* error, int error_len);
 
 // 状态机函数
 void state_machine_init(qosmon_context_t* ctx);
@@ -1141,6 +1141,11 @@ int tc_set_bandwidth(qosmon_context_t* ctx, int bandwidth_bps) {
     return QMON_OK;
 }
 
+int tc_set_bandwidth_direct(qosmon_context_t* ctx, int bandwidth_bps) {
+    if (!ctx) return QMON_ERR_MEMORY;
+    return tc_set_bandwidth(ctx, bandwidth_bps);
+}
+
 // 改进的带宽检测，检测总带宽
 int detect_total_bandwidth(qosmon_context_t* ctx, int* current_bw_kbps) {
     if (!ctx || !current_bw_kbps) return QMON_ERR_MEMORY;
@@ -1344,24 +1349,24 @@ void state_machine_init(qosmon_context_t* ctx) {
     memset(ctx->detected_qdisc, 0, sizeof(ctx->detected_qdisc));
 }
 
-void state_machine_check(qosmon_context_t* ctx, ping_manager_t* pm) {
-    if (!ctx || !pm) return;
+void state_machine_check(qosmon_context_t* ctx, ping_manager_t* pm, tc_controller_t* tc) {
+    if (!ctx || !pm || !tc) return;
     
     if (ctx->nreceived >= 2) {
         if (ctx->config.ping_limit_ms > 0 && !ctx->config.auto_switch_mode) {
             ctx->current_limit_bps = 0;
-            tc_controller_set_bandwidth(NULL, ctx->current_limit_bps);
+            tc_controller_set_bandwidth(tc, ctx->current_limit_bps);
             ctx->state = QMON_IDLE;
         } else {
-            tc_controller_set_bandwidth(NULL, 10000);
+            tc_controller_set_bandwidth(tc, 10000);
             ctx->nreceived = 0;
             ctx->state = QMON_INIT;
         }
     }
 }
 
-void state_machine_init_state(qosmon_context_t* ctx) {
-    if (!ctx) return;
+void state_machine_init_state(qosmon_context_t* ctx, tc_controller_t* tc) {
+    if (!ctx || !tc) return;
     
     static int init_count = 0;
     init_count++;
@@ -1371,7 +1376,7 @@ void state_machine_init_state(qosmon_context_t* ctx) {
     
     if (init_count > needed_pings) {
         ctx->state = QMON_IDLE;
-        tc_controller_set_bandwidth(NULL, ctx->current_limit_bps);
+        tc_controller_set_bandwidth(tc, ctx->current_limit_bps);
         
         if (ctx->config.auto_switch_mode) {
             ctx->config.ping_limit_ms = (int)(ctx->filtered_ping_time_us * 1.1f / 1000);
@@ -1537,10 +1542,10 @@ void state_machine_run(qosmon_context_t* ctx, ping_manager_t* pm, tc_controller_
     
     switch (ctx->state) {
         case QMON_CHK:
-            state_machine_check(ctx, pm);
+            state_machine_check(ctx, pm, tc);  // 添加 tc 参数
             break;
         case QMON_INIT:
-            state_machine_init_state(ctx);
+            state_machine_init_state(ctx, tc);  // 添加 tc 参数
             break;
         case QMON_IDLE:
             state_machine_idle(ctx);
@@ -1667,6 +1672,8 @@ void qosmon_cleanup(qosmon_context_t* ctx, ping_manager_t* pm, tc_controller_t* 
 int main(int argc, char* argv[]) {
     int ret = EXIT_FAILURE;
     qosmon_context_t context = {0};
+	ping_manager_t ping_mgr = {0};
+    tc_controller_t tc_mgr = {0};
     
     // 情况1：无任何参数，直接提示帮助
     if (argc == 1) {
