@@ -55,7 +55,7 @@ typedef enum {
     QMON_ERR_FILE = -3,
     QMON_ERR_CONFIG = -4,
     QMON_ERR_SYSTEM = -5,
-    QMON_ERR_SIGNAL = -6
+    QMON_ERR_SIGNAL = -6,
 	QMON_HELP_REQUESTED = -99  // 表示用户请求查看帮助
 } qosmon_result_t;
 
@@ -148,7 +148,7 @@ typedef struct qosmon_context_s {
 
 /* ==================== 帮助信息 ==================== */
 const char qosmon_usage[] =
-"qosmon - 基于netlink的优化版QoS监控器\n"
+"qosmon - 基于netlink的精简版QoS监控器\n"
 "版本: 基于Paul Bixel代码优化，支持poll机制与HFSC/HTB/CAKE\n\n"
 "用法:\n"
 "  qosmon [ping间隔(ms)] [目标地址] [最大带宽(kbps)] [ping限制(ms)]\n"
@@ -164,7 +164,7 @@ const char qosmon_usage[] =
 "  -c <文件>        从指定配置文件读取参数\n"
 "  -d <设备>        目标网络设备名称 (默认: ifb0)\n"
 "  -t <地址/域名>  ping目标地址 (默认: 8.8.8.8)\n"
-"  -s <文件>        状态文件路径 (默认: /tmp/qosmon.status)\n"
+"  -s <文件>        状态文件路径 (默认: /var/run/qosmon.status)\n"
 "  -l <文件>        调试日志文件路径 (默认: /var/log/qosmon.log)\n"
 "  -v               启用详细输出模式\n"
 "  -b               在后台（守护进程）模式运行\n"
@@ -353,10 +353,11 @@ void qosmon_config_init(qosmon_config_t* cfg) {
     strcpy(cfg->debug_log, "/var/log/qosmon.log");
 }
 
+/* ==================== 配置解析函数 ==================== */
 int qosmon_config_parse(qosmon_config_t* cfg, int argc, char* argv[]) {
     if (!cfg) return QMON_ERR_MEMORY;
-	
-	 // 检查是否为帮助请求
+    
+    // 检查是否为帮助请求
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "-h") == 0 || 
             strcmp(argv[i], "-help") == 0 || 
@@ -403,10 +404,11 @@ int qosmon_config_parse(qosmon_config_t* cfg, int argc, char* argv[]) {
     return QMON_OK;
 }
 
-int qosmon_config_validate(qosmon_config_t* cfg, char* error, int error_len) {
-    	 // 检查是否只有程序名（没有参数）
+/* ==================== 配置验证函数 ==================== */
+int qosmon_config_validate(qosmon_config_t* cfg, int argc, char* argv[], char* error, int error_len) {
+    // 检查是否只有程序名（没有参数）
     if (argc == 1) {
-        snprintf(error, error_len, "缺少参数。使用 -h 查看帮助。");
+        snprintf(error, error_len, "未提供任何参数");
         return QMON_ERR_CONFIG;
     }
 	
@@ -1665,44 +1667,42 @@ void qosmon_cleanup(qosmon_context_t* ctx, ping_manager_t* pm, tc_controller_t* 
 int main(int argc, char* argv[]) {
     int ret = EXIT_FAILURE;
     qosmon_context_t context = {0};
-    ping_manager_t ping_mgr = {0};
-    tc_controller_t tc_mgr = {0};  
+    
+    // 情况1：无任何参数，直接提示帮助
+    if (argc == 1) {
+        fprintf(stderr, "qosmon: 错误: 未提供任何参数。\n");
+        fprintf(stderr, "使用 'qosmon -h' 查看完整的用法说明。\n");
+        return EXIT_FAILURE;
+    }
     
     qosmon_config_init(&context.config);
     
-    // 解析配置，并捕获“帮助请求”
+    // 解析配置
     int config_result = qosmon_config_parse(&context.config, argc, argv);
     
-    // 情况1：用户显式请求帮助
+    // 情况2：用户显式请求帮助
     if (config_result == QMON_HELP_REQUESTED) {
         fprintf(stderr, "%s", qosmon_usage);
         return EXIT_SUCCESS; // 帮助是正常功能，返回成功
     }
     
-    // 情况2：配置解析发生其他错误
+    // 情况3：配置解析发生其他错误
     if (config_result != QMON_OK) {
-        fprintf(stderr, "错误：配置解析失败。\n");
+        fprintf(stderr, "错误: 配置解析失败。\n");
         return EXIT_FAILURE;
     }
     
-    // 情况3：配置解析成功，进行验证
+    // 情况4：配置验证
     char config_error[256] = {0};
-    int validation_result = qosmon_config_validate(&context.config, config_error, sizeof(config_error));
+    int validation_result = qosmon_config_validate(&context.config, argc, argv, config_error, sizeof(config_error));
     
-    // 情况3a：验证失败，给出引导性错误
     if (validation_result != QMON_OK) {
-        // 特别处理“无位置参数”的情况，给予更明确的提示
-        if (argc == 1) {
-            fprintf(stderr, "错误：未提供任何参数。\n");
-            fprintf(stderr, "请使用 'qosmon -h' 查看完整的用法说明。\n");
-        } else {
-            fprintf(stderr, "错误：%s\n", config_error);
-            fprintf(stderr, "请使用 'qosmon -h' 查看详细的参数要求与示例。\n");
-        }
+        fprintf(stderr, "错误: %s\n", config_error);
+        fprintf(stderr, "使用 'qosmon -h' 查看详细的参数要求与示例。\n");
         return EXIT_FAILURE;
     }
     
-    // 情况3b：验证通过，继续执行程序...
+    // 验证通过，继续执行程序...
     
     if (context.config.background_mode) {
         if (daemon(0, 0) < 0) {

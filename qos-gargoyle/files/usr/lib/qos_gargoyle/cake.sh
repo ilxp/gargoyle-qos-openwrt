@@ -1333,8 +1333,8 @@ show_cake_status() {
             fi
         fi
     fi
-    
     # 新增：流量类别分析
+	fi
     echo -e "\n===== 流量类别分析 ====="
     
     # 上传方向类别分析

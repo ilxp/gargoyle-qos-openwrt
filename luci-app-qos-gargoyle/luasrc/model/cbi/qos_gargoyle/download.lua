@@ -51,8 +51,8 @@ local function create_class()
         name = "Class " .. new_id,
 		priority = new_id,
         percent_bandwidth = "10",
-        min_bandwidth = "0",
-        max_bandwidth = "",
+        per_min_bandwidth = "0",
+        per_max_bandwidth = "",
         minRTT = "No",  -- 保留minRTT默认值
         description = ""
     })
@@ -173,13 +173,13 @@ o.cfgvalue = function(self, section)
     return translate("Not set")
 end
 
-o = s:option(DummyValue, "min_bandwidth", translate("Min (kbps)"))
+o = s:option(DummyValue, "per_min_bandwidth", translate("Min bandwidth(%)"))
 o.cfgvalue = function(self, section)
     local v = tonumber(Value.cfgvalue(self, section))
     return v or translate("Zero")
 end
 
-o = s:option(DummyValue, "max_bandwidth", translate("Max (kbps)"))
+o = s:option(DummyValue, "per_max_bandwidth", translate("Max bandwidth(%)"))
 o.cfgvalue = function(self, section)
     local v = tonumber(Value.cfgvalue(self, section))
     if v and v > 0 then
