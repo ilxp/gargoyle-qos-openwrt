@@ -695,46 +695,68 @@ start_cake_autorate() {
 }
 
 stop_cake_autorate() {
-    log_info "停止cake_autorate服务"
+    log_info "强制停止cake_autorate服务及所有相关进程"
+
+    # 1. 读取并尝试通过PID文件杀死进程
+    local pid_file="/var/run/cake_autorate.pid"
+    if [ -f "$pid_file" ]; then
+        local pid=$(cat "$pid_file" 2>/dev/null | head -n1)
+        if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+            log_info "通过PID文件杀死进程: $pid"
+            kill -TERM "$pid" 2>/dev/null && sleep 2
+            # 如果TERM信号无效，使用KILL
+            if kill -0 "$pid" 2>/dev/null; then
+                log_warn "进程 $pid 未响应TERM，发送SIGKILL"
+                kill -KILL "$pid" 2>/dev/null
+            fi
+        fi
+        rm -f "$pid_file"
+    fi
+
+    # 2. 使用兼容 OpenWRT 的方式杀死所有相关进程
+    # 方案A: 使用 killall (OpenWRT 通常包含 busybox 的 killall)
+    killall "cake_autorate.sh" 2>/dev/null || true
     
-    # 清理PID文件
-    rm -f /var/run/cake_autorate.pid
-	rm -f /tmp/run/cake_autorate.pid
+    # 方案B: 使用 ps 命令查找进程，然后用 kill 命令终止
+    # 这种方法不依赖 pkill，完全兼容 OpenWRT
+    local pids
+    pids=$(ps | grep -E "[c]ake_autorate|[a]utorate" | awk '{print $1}' 2>/dev/null)
+    for pid in $pids; do
+        if [ -n "$pid" ] && [ "$pid" -gt 0 ] 2>/dev/null; then
+            log_info "杀死相关进程 PID: $pid"
+            kill -TERM "$pid" 2>/dev/null && sleep 1
+            if kill -0 "$pid" 2>/dev/null; then
+                kill -KILL "$pid" 2>/dev/null
+            fi
+        fi
+    done
     
-    # 停止所有相关进程
-    killall "cake_autorate.sh start" 2>/dev/null || true
-    
-    # 设置运行标志
+    # 方案C: 特别处理包含 "autorate" 的子进程
+    pids=$(ps | grep -i autorate | grep -v grep | awk '{print $1}' 2>/dev/null)
+    for pid in $pids; do
+        if [ -n "$pid" ] && [ "$pid" -gt 0 ] 2>/dev/null; then
+            log_info "杀死 autorate 相关进程 PID: $pid"
+            kill -TERM "$pid" 2>/dev/null
+            sleep 0.5
+            if kill -0 "$pid" 2>/dev/null; then
+                kill -KILL "$pid" 2>/dev/null
+            fi
+        fi
+    done
+
+    # 3. 设置运行标志
     AUTORATE_RUNNING=0
     AUTORATE_PID=""
 
+    # 4. 彻底清理所有状态文件和锁文件
+    rm -f /var/run/cake_autorate.pid /tmp/run/cake_autorate.pid 2>/dev/null
+    rm -f /var/run/cake_autorate.lock 2>/dev/null
+    rm -rf /tmp/qos_gargoyle 2>/dev/null
     
-	# 清理所有临时文件，但排除正在使用的
-    if [ -d "/proc" ]; then
-        # 查找所有可能属于本脚本的临时文件
-        for tmpfile in "$AUTORATE_STATUS_FILE.tmp."*; do
-            # 检查文件是否被使用
-            if [ -f "$tmpfile" ]; then
-                # 尝试删除，忽略错误
-                rm -f "$tmpfile" 2>/dev/null || true
-            fi
-        done
-    else
-        rm -f "$AUTORATE_STATUS_FILE.tmp."* 2>/dev/null
-    fi
-	
-    # 清理锁和状态文件
-    rm -f "$CONFIG_LOCK" 2>/dev/null
-    rm -f "$AUTORATE_STATUS_FILE" 2>/dev/null
-    rm -f "$SHARED_CONFIG_DIR/autorate_monitor" 2>/dev/null
-    rm -f "$SHARED_CONFIG_DIR/adaptive_tuning" 2>/dev/null
-    rm -f "$SHARED_CONFIG_DIR/upload_bandwidth_history" 2>/dev/null
-    rm -f "$SHARED_CONFIG_DIR/download_bandwidth_history" 2>/dev/null
-    
-    # 清理所有 .lock 文件
-    [ -d "$SHARED_CONFIG_DIR" ] && find "$SHARED_CONFIG_DIR" -name "*.lock" -delete 2>/dev/null
-    
-    log_info "cake_autorate服务已停止"
+    # 5. 清理临时文件（使用更安全的 find 命令）
+    find /tmp -maxdepth 1 \( -name "*cake_autorate*" -o -name "*autorate*" \) -type f 2>/dev/null | xargs rm -f 2>/dev/null || true
+
+    log_info "cake_autorate服务已强制停止，所有相关文件已清理"
     return 0
 }
 

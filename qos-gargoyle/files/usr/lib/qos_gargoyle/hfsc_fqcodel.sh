@@ -89,6 +89,35 @@ load_bandwidth_from_config() {
     fi
 }
 
+calculate_memory_limit() {
+    local config_value="$1"
+    local total_mem_kb=$(grep -E '^MemTotal:' /proc/meminfo 2>/dev/null | awk '{print $2}')
+    local result
+
+    # 如果用户明确指定了 'auto' 或配置为空，则自动计算
+    if [ -z "$config_value" ] || [ "$config_value" = "auto" ]; then
+        if [ -n "$total_mem_kb" ] && [ "$total_mem_kb" -gt 0 ]; then
+            if [ "$total_mem_kb" -lt 128000 ]; then
+                result="4Mb"  # < 128MB RAM
+            elif [ "$total_mem_kb" -lt 256000 ]; then
+                result="8Mb"   # < 256MB RAM
+            elif [ "$total_mem_kb" -lt 512000 ]; then
+                result="16Mb"   # < 512MB RAM
+            else
+                result="32Mb"   # > 512MB RAM
+            fi
+            logger -t "qos_gargoyle" "系统内存 ${total_mem_kb}KB，自动计算 memory_limit=${result}"
+        else
+            logger -t "qos_gargoyle" "警告: 无法读取内存信息，使用保守默认值 16Mb"
+            result="16Mb"
+        fi
+    else
+        # 用户提供了具体值，直接使用（格式验证在调用前完成）
+        result="$config_value"
+    fi
+    echo "$result"
+}
+
 # 加载HFSC与fq_codel专属配置
 load_hfsc_config() {
     logger -t "qos_gargoyle" "加载HFSC与fq_codel配置"
@@ -119,6 +148,34 @@ load_hfsc_config() {
     FQCODEL_QUANTUM=$(uci -q get qos_gargoyle.fq_codel.quantum 2>/dev/null)
     FQCODEL_QUANTUM="${FQCODEL_QUANTUM:-1514}"
     
+	# === 读取 memory_limit 参数,支持 'auto' 或空值触发自动计算 ===
+	# 1. 从UCI读取原始配置值
+    local mem_limit_config=$(uci -q get qos_gargoyle.fq_codel.memory_limit 2>/dev/null)
+    
+    # 2. （可选）在调用计算函数前进行基础格式验证
+    if [ -n "$mem_limit_config" ] && [ "$mem_limit_config" != "auto" ]; then
+        if ! echo "$mem_limit_config" | grep -qiE '^[0-9]+(\.[0-9]+)?[KMGT]?[Bb]?$'; then
+            logger -t "qos_gargoyle" "警告: memory_limit 配置值 '$mem_limit_config' 格式无效，将按 'auto' 处理"
+            mem_limit_config="auto"
+        fi
+    fi
+
+    # 3. 调用函数获取最终值
+    FQCODEL_MEMORY_LIMIT=$(calculate_memory_limit "$mem_limit_config")
+    
+    # 4. 记录最终决定使用的值
+    logger -t "qos_gargoyle" "最终确定的 fq_codel memory_limit: ${FQCODEL_MEMORY_LIMIT}"
+
+    # === 读取 ce_threshold 参数 ===
+    FQCODEL_CE_THRESHOLD=$(uci -q get qos_gargoyle.fq_codel.ce_threshold 2>/dev/null)
+    # 默认值为 0，即不主动启用此特性。配置示例：1ms, 5ms
+    FQCODEL_CE_THRESHOLD="${FQCODEL_CE_THRESHOLD:-0}"
+    # 验证格式（支持 0, 1ms, 5.5ms, 1000us）
+    if ! echo "$FQCODEL_CE_THRESHOLD" | grep -qiE '^0$|^[0-9]+(\.[0-9]+)?(us|ms)$'; then
+        logger -t "qos_gargoyle" "警告: 无效的 ce_threshold 格式 '$FQCODEL_CE_THRESHOLD'，使用默认值 0"
+        FQCODEL_CE_THRESHOLD="0"
+    fi
+	
     # 处理ecn参数
     FQCODEL_ECN=$(uci -q get qos_gargoyle.fq_codel.ecn 2>/dev/null)
     if [ -n "$FQCODEL_ECN" ]; then
@@ -145,7 +202,8 @@ load_hfsc_config() {
         logger -t "qos_gargoyle" "fq_codel ECN: 未配置，将不使用ECN"
     fi
     
-    logger -t "qos_gargoyle" "fq_codel参数: limit=${FQCODEL_LIMIT}, interval=${FQCODEL_INTERVAL}ms, target=${FQCODEL_TARGET}ms, flows=${FQCODEL_FLOWS}, quantum=${FQCODEL_QUANTUM}, ecn=${FQCODEL_ECN:-未配置}"
+	logger -t "qos_gargoyle" "HFSC配置: latency_mode=${HFSC_LATENCY_MODE}, minrtt_enabled=${HFSC_MINRTT_ENABLED}"
+    logger -t "qos_gargoyle" "fq_codel参数: limit=${FQCODEL_LIMIT}, interval=${FQCODEL_INTERVAL}ms, target=${FQCODEL_TARGET}ms, flows=${FQCODEL_FLOWS}, quantum=${FQCODEL_QUANTUM}, memory_limit=${FQCODEL_MEMORY_LIMIT}, ce_threshold=${FQCODEL_CE_THRESHOLD}, ecn=${FQCODEL_ECN:-未配置}"
 }
 
 
@@ -509,7 +567,8 @@ create_hfsc_upload_class() {
     fi
     
     # 创建fq_codel队列
-    local fq_codel_params="limit ${FQCODEL_LIMIT} target ${FQCODEL_TARGET} interval ${FQCODEL_INTERVAL} flows ${FQCODEL_FLOWS} quantum ${FQCODEL_QUANTUM}"
+	local fq_codel_params="limit ${FQCODEL_LIMIT} target ${FQCODEL_TARGET} interval ${FQCODEL_INTERVAL} flows ${FQCODEL_FLOWS} quantum ${FQCODEL_QUANTUM} memory_limit ${FQCODEL_MEMORY_LIMIT} ce_threshold ${FQCODEL_CE_THRESHOLD}"
+
     if [ -n "$FQCODEL_ECN" ]; then
         fq_codel_params="$fq_codel_params $FQCODEL_ECN"
     fi
@@ -645,7 +704,7 @@ create_hfsc_download_class() {
     fi
     
     # 创建fq_codel队列
-    local fq_codel_params="limit ${FQCODEL_LIMIT} target ${FQCODEL_TARGET} interval ${FQCODEL_INTERVAL} flows ${FQCODEL_FLOWS} quantum ${FQCODEL_QUANTUM}"
+    local fq_codel_params="limit ${FQCODEL_LIMIT} target ${FQCODEL_TARGET} interval ${FQCODEL_INTERVAL} flows ${FQCODEL_FLOWS} quantum ${FQCODEL_QUANTUM} memory_limit ${FQCODEL_MEMORY_LIMIT} ce_threshold ${FQCODEL_CE_THRESHOLD}"
     if [ -n "$FQCODEL_ECN" ]; then
         fq_codel_params="$fq_codel_params $FQCODEL_ECN"
     fi
@@ -700,7 +759,7 @@ create_default_upload_class() {
     fi
     
     # 添加fq_codel队列 (修复：移除参数中的"us"后缀)
-    local fq_codel_params="limit ${FQCODEL_LIMIT} target ${FQCODEL_TARGET} interval ${FQCODEL_INTERVAL} flows ${FQCODEL_FLOWS} quantum ${FQCODEL_QUANTUM}"
+    local fq_codel_params="limit ${FQCODEL_LIMIT} target ${FQCODEL_TARGET} interval ${FQCODEL_INTERVAL} flows ${FQCODEL_FLOWS} quantum ${FQCODEL_QUANTUM} memory_limit ${FQCODEL_MEMORY_LIMIT} ce_threshold ${FQCODEL_CE_THRESHOLD}"
     if [ -n "$FQCODEL_ECN" ]; then
         fq_codel_params="$fq_codel_params $FQCODEL_ECN"
     fi
@@ -765,7 +824,7 @@ create_default_download_class() {
     fi
     
     # 添加fq_codel队列 (修复：移除参数中的"us"后缀)
-    local fq_codel_params="limit ${FQCODEL_LIMIT} target ${FQCODEL_TARGET} interval ${FQCODEL_INTERVAL} flows ${FQCODEL_FLOWS} quantum ${FQCODEL_QUANTUM}"
+    local fq_codel_params="limit ${FQCODEL_LIMIT} target ${FQCODEL_TARGET} interval ${FQCODEL_INTERVAL} flows ${FQCODEL_FLOWS} quantum ${FQCODEL_QUANTUM} memory_limit ${FQCODEL_MEMORY_LIMIT} ce_threshold ${FQCODEL_CE_THRESHOLD}"
     if [ -n "$FQCODEL_ECN" ]; then
         fq_codel_params="$fq_codel_params $FQCODEL_ECN"
     fi
@@ -1480,6 +1539,93 @@ show_hfsc_status() {
             fi
         done
     fi
+	
+	# 显示活动连接标记
+	echo -e "\n======== 活动连接标记 ========"
+
+	# 获取 WAN 接口的 IP 地址
+	local wan_ipv4=""
+	local wan_ipv6=""
+
+	# 多种方法获取 IPv4 地址
+	wan_ipv4=$(ip -4 addr show dev "$qos_interface" 2>/dev/null | grep "inet " | awk '{print $2}' | cut -d/ -f1 | head -1)
+	if [ -z "$wan_ipv4" ]; then
+		wan_ipv4=$(ifconfig "$qos_interface" 2>/dev/null | grep "inet addr:" | awk '{print $2}' | cut -d: -f2)
+	fi
+
+	# 多种方法获取 IPv6 地址
+	wan_ipv6=$(ip -6 addr show dev "$qos_interface" 2>/dev/null | grep "inet6 " | grep -v "fe80::" | awk '{print $2}' | cut -d/ -f1 | head -1)
+	if [ -z "$wan_ipv6" ]; then
+		wan_ipv6=$(ifconfig "$qos_interface" 2>/dev/null | grep "inet6 addr:" | grep -v "fe80::" | awk '{print $3}' | cut -d/ -f1)
+	fi
+
+	# IPv4 连接标记
+	echo -e "\nIPv4 连接标记 (目标地址为 WAN):"
+	if [ -n "$wan_ipv4" ]; then
+		echo "WAN IPv4: $wan_ipv4"
+		local ipv4_marks=$(conntrack -L -d "$wan_ipv4" 2>/dev/null | grep -E "mark=0x[0-9A-Fa-f]+" | head -n 5)
+		if [ -n "$ipv4_marks" ]; then
+			echo "$ipv4_marks" | while read -r line; do
+				# 提取并格式化显示
+				local src_ip=$(echo "$line" | grep -o "src=[0-9.]\+" | cut -d= -f2)
+				local dst_ip=$(echo "$line" | grep -o "dst=[0-9.]\+" | cut -d= -f2)
+				local mark=$(echo "$line" | grep -o "mark=0x[0-9A-Fa-f]\+" | cut -d= -f2)
+				local proto=$(echo "$line" | awk '{print $1}')
+				local sport=$(echo "$line" | grep -o "sport=[0-9]\+" | cut -d= -f2)
+				local dport=$(echo "$line" | grep -o "dport=[0-9]\+" | cut -d= -f2)
+				
+				printf "  %-7s %-15s:%-5s → %-15s:%-5s [标记: %s]\n" \
+					"$proto" "${src_ip:-N/A}" "${sport:-N/A}" "${dst_ip:-N/A}" "${dport:-N/A}" "${mark:-无}"
+			done
+		else
+			echo "  未找到带标记的 IPv4 连接"
+		fi
+	else
+		echo "  WAN IPv4 地址不可用"
+	fi
+
+	# IPv6 连接标记
+	echo -e "\nIPv6 连接标记 (目标地址为 WAN):"
+	if [ -n "$wan_ipv6" ]; then
+		echo "WAN IPv6: $wan_ipv6"
+		local ipv6_marks=$(conntrack -L -d "$wan_ipv6" 2>/dev/null | grep -E "mark=0x[0-9A-Fa-f]+" | head -n 5)
+		if [ -n "$ipv6_marks" ]; then
+			echo "$ipv6_marks" | while read -r line; do
+				# 提取并格式化显示
+				local src_ip=$(echo "$line" | grep -o "src=[0-9a-fA-F:]\+" | cut -d= -f2)
+				local dst_ip=$(echo "$line" | grep -o "dst=[0-9a-fA-F:]\+" | cut -d= -f2)
+				local mark=$(echo "$line" | grep -o "mark=0x[0-9A-Fa-f]\+" | cut -d= -f2)
+				local proto=$(echo "$line" | awk '{print $1}')
+				local sport=$(echo "$line" | grep -o "sport=[0-9]\+" | cut -d= -f2)
+				local dport=$(echo "$line" | grep -o "dport=[0-9]\+" | cut -d= -f2)
+				
+				# 缩短 IPv6 地址以便显示
+				src_ip=$(echo "$src_ip" | sed 's/::/: :/g' | awk '{print $1}')
+				dst_ip=$(echo "$dst_ip" | sed 's/::/: :/g' | awk '{print $1}')
+				
+				printf "  %-7s %-30s:%-5s → %-30s:%-5s [标记: %s]\n" \
+					"$proto" "${src_ip:-N/A}" "${sport:-N/A}" "${dst_ip:-N/A}" "${dport:-N/A}" "${mark:-无}"
+			done
+		else
+			echo "  未找到带标记的 IPv6 连接"
+		fi
+	else
+		echo "  WAN IPv6 地址不可用"
+	fi
+
+	# 同时显示源地址为 WAN 的连接（上传方向）
+	echo -e "\n上传方向连接标记 (源地址为 WAN):"
+	if [ -n "$wan_ipv4" ]; then
+		local upload_marks=$(conntrack -L -s "$wan_ipv4" 2>/dev/null | grep -E "mark=0x[0-9A-Fa-f]+" | head -n 3)
+		if [ -n "$upload_marks" ]; then
+			echo "$upload_marks" | while read -r line; do
+				local mark=$(echo "$line" | grep -o "mark=0x[0-9A-Fa-f]\+" | cut -d= -f2)
+				printf "  %s [标记: %s]\n" "$(echo "$line" | cut -d' ' -f1-3)" "$mark"
+			done
+		else
+			echo "  未找到带标记的上传方向连接"
+		fi
+	fi
     
     # 显示网络接口统计
     echo -e "\n===== 网络接口统计 ====="

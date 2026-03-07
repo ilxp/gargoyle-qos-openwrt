@@ -849,7 +849,17 @@ health_check_cake() {
 
 # ========== 主初始化函数 ==========
 initialize_cake_qos() {
-    log_info "开始初始化CAKE QoS系统"
+    log_info "开始初始化CAKE QoS系统，并确保系统状态干净"
+    
+    # ---- 排他性检查 ----
+    # 停止所有可能干扰的TC队列，不仅仅是CAKE的
+    log_info "清理系统上所有可能与QoS冲突的TC队列..."
+    tc qdisc del dev "$qos_interface" root 2>/dev/null && log_info "清理根队列"
+    tc qdisc del dev "$qos_interface" ingress 2>/dev/null && log_info "清理ingress队列"
+    if ip link show dev "$IFB_DEVICE" >/dev/null 2>&1; then
+        tc qdisc del dev "$IFB_DEVICE" root 2>/dev/null && log_info "清理IFB队列"
+    fi
+    # ---------------------------------
     
     load_cake_config
     auto_tune_cake
@@ -910,9 +920,12 @@ initialize_cake_qos() {
 stop_cake_qos() {
     log_info "停止CAKE QoS"
 	
-	 # 先停止 cake_autorate
+	# ---- 无条件强制停止autorate，无论当前算法是什么 ----
+    log_info "强制停止可能残留的cake_autorate进程..."
     if [ -f "/usr/lib/qos_gargoyle/cake_autorate.sh" ]; then
-        /usr/lib/qos_gargoyle/cake_autorate.sh stop
+        # 直接调用停止函数，不依赖外部脚本
+        . /usr/lib/qos_gargoyle/cake_autorate.sh
+        stop_cake_autorate
     fi
     
 	# 清理共享文件

@@ -118,20 +118,26 @@ msgstr "优先级映射"
 msgid "DRR Quantum"
 msgstr "DRR量子"
 
-msgid "Target Delay (microseconds)"
+msgid "Target Delay(microseconds)"
 msgstr "目标延迟（微秒）"
 
 msgid "Queue Length Limit"
 msgstr "队列长度限制"
 
-msgid "Quantum (bytes)"
+msgid "Quantum(bytes)"
 msgstr "量子（字节）"
 
 msgid "Number of Flows"
 msgstr "流量数"
 
-msgid "Interval (microseconds)"
+msgid "Interval(microseconds)"
 msgstr "间隔（微秒）"
+
+msgid "Memory Llimit"
+msgstr "内存限制"
+
+msgid "CE Threshold"
+msgstr "CE阈值"
 
 msgid "Queue Length Limit"
 msgstr "最小往返延时"
