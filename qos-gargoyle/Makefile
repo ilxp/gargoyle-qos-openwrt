@@ -71,7 +71,7 @@ define Package/qos-gargoyle/install
 	$(INSTALL_BIN) $(CURDIR)/files/usr/lib/qos_gargoyle/hfsc_fqcodel.sh $(1)/usr/lib/qos_gargoyle/hfsc_fqcodel.sh
 	$(INSTALL_BIN) $(CURDIR)/files/usr/lib/qos_gargoyle/htb_fqcodel.sh $(1)/usr/lib/qos_gargoyle/htb_fqcodel.sh
 	$(INSTALL_BIN) $(CURDIR)/files/usr/lib/qos_gargoyle/cake.sh $(1)/usr/lib/qos_gargoyle/cake.sh
-	$(INSTALL_BIN) $(CURDIR)/files/usr/lib/qos_gargoyle/cake_autorate.sh $(1)/usr/lib/qos_gargoyle/cake_autorate.sh
+	#$(INSTALL_BIN) $(CURDIR)/files/usr/lib/qos_gargoyle/cake_autorate.sh $(1)/usr/lib/qos_gargoyle/cake_autorate.sh
 	$(INSTALL_BIN) $(CURDIR)/files/gargoyle_firewall.include $(1)/usr/share/qos_gargoyle/gargoyle_firewall.include
 
 	$(INSTALL_DIR) $(1)/usr/sbin
