@@ -104,7 +104,7 @@ stop_qos() {
     echo "Stopping QoS system..."
     
     # 停止监控进程
-    killall qosmon 2>/dev/null
+    killall -q qosmon 2>/dev/null
     sleep 1
     
     # 检查服务是否真的在运行
@@ -859,140 +859,8 @@ get_class_counts_from_file() {
 }
 
 
-# ========== 算法切换管理函数 ==========
-
-# 检测当前运行的算法
-detect_current_algorithm() {
-    # 将调试信息重定向到标准错误
-    echo "===== 算法检测调试信息 =====" >&2
-    
-    # 获取所有接口的TC队列信息
-    local tc_output=$(tc qdisc show 2>/dev/null)
-    echo "TC 队列完整输出:" >&2
-    echo "$tc_output" >&2
-    echo "" >&2
-    
-    # 检查是否有TC队列
-    if [ -z "$tc_output" ]; then
-        echo "未找到任何TC队列" >&2
-        echo "unknown"
-        return 1
-    fi
-    
-    # 检测CAKE
-    if echo "$tc_output" | grep -E "qdisc cake [0-9]+:" >/dev/null 2>&1; then
-        echo "检测到 CAKE 算法" >&2
-        echo "cake"
-        return 0
-    fi
-    
-    # 检测HFSC
-    if echo "$tc_output" | grep -E "qdisc hfsc [0-9]+:" >/dev/null 2>&1; then
-        echo "检测到 HFSC 算法" >&2
-        echo "hfsc_fqcodel"
-        return 0
-    fi
-    
-    # 检测HTB
-    if echo "$tc_output" | grep -E "qdisc htb [0-9]+:" >/dev/null 2>&1; then
-        echo "检测到 HTB 算法" >&2
-        echo "htb_fqcodel"
-        return 0
-    fi
-    
-    # 检测fq_codel
-    if echo "$tc_output" | grep -E "qdisc fq_codel [0-9]+:" >/dev/null 2>&1; then
-        echo "检测到默认的 fq_codel 队列（非QoS算法）" >&2
-        echo "fq_codel"
-        return 0
-    fi
-    
-    # 检测noqueue
-    if echo "$tc_output" | grep -E "qdisc noqueue [0-9]+:" >/dev/null 2>&1; then
-        echo "检测到默认的 noqueue 队列（非QoS算法）" >&2
-        echo "noqueue"
-        return 0
-    fi
-    
-    echo "未检测到任何QoS队列" >&2
-    echo "unknown"
-    return 1
-}
-
-# 停止当前运行的算法
-stop_current_algorithm() {
-    echo "===== 算法切换处理 ====="
-    
-    # 直接获取算法标识（调试信息输出到终端，但不被捕获）
-    local current_algo=$(detect_current_algorithm)
-    
-    # 清理可能的换行符
-    current_algo=$(echo "$current_algo" | tr -d '\n\r')
-    
-    echo "检测到当前运行的算法: $current_algo"
-    
-    # 根据算法类型执行不同的停止逻辑
-    case "$current_algo" in
-        cake)
-            echo "停止正在运行的CAKE算法..."
-            if [ -f "$CAKE_MODULE" ]; then
-                . "$CAKE_MODULE"
-                if type stop_cake_qos >/dev/null 2>&1; then
-                    stop_cake_qos
-                    echo "✅ CAKE算法已停止"
-                else
-                    echo "⚠️ 警告: 未找到 stop_cake_qos 函数"
-                fi
-            else
-                echo "❌ 错误: CAKE模块未找到"
-            fi
-            ;;
-            
-        hfsc_fqcodel)
-            echo "停止正在运行的HFSC算法..."
-            if [ -f "$HFSC_MODULE" ]; then
-                . "$HFSC_MODULE"
-                if type stop_hfsc_qos >/dev/null 2>&1; then
-                    stop_hfsc_qos
-                    echo "✅ HFSC算法已停止"
-                else
-                    echo "⚠️ 警告: 未找到 stop_hfsc_qos 函数"
-                fi
-            else
-                echo "❌ 错误: HFSC模块未找到"
-            fi
-            ;;
-            
-        htb_fqcodel)
-            echo "停止正在运行的HTB算法..."
-            if [ -f "$HTB_MODULE" ]; then
-                . "$HTB_MODULE"
-                if type stop_htb_qos >/dev/null 2>&1; then
-                    stop_htb_qos
-                    echo "✅ HTB算法已停止"
-                else
-                    echo "⚠️ 警告: 未找到 stop_htb_qos 函数"
-                fi
-            else
-                echo "❌ 错误: HTB模块未找到"
-            fi
-            ;;
-            
-        fq_codel|noqueue|unknown)
-            echo "当前运行的是默认队列 ($current_algo)，不是QoS算法"
-            echo "执行通用清理..."
-            ;;
-            
-        *)
-            echo "未知算法类型: $current_algo"
-            echo "跳过算法专属停止，执行通用清理..."
-            ;;
-    esac
-    
-    echo "===== 算法停止完成 ====="
-}
-
 # ========== 主初始化函数 ==========
+
 # 初始化 QoS
 initialize_qos() {
     echo "Initializing QoS system..."
@@ -1015,45 +883,15 @@ initialize_qos() {
     # 创建锁文件，防止并发执行
     touch "$LOCK_FILE"
     
-    # ========== 算法切换清理 ==========
-    echo "===== 算法切换处理 ====="
-    
-    # 1. 停止当前运行的算法（如果存在）
-    stop_current_algorithm
-    
-    # 2. 执行通用清理
-    echo "执行通用QoS清理..."
-    stop_qos
-    
-    # 3. 额外清理算法特定的残留进程
-    echo "清理算法特定的残留进程..."
-    
-    # 停止 cake_autorate 进程（无论当前算法是什么）
-    if [ -f "/usr/lib/qos_gargoyle/cake_autorate.sh" ]; then
-        . /usr/lib/qos_gargoyle/cake_autorate.sh
-        if type stop_cake_autorate >/dev/null 2>&1; then
-            stop_cake_autorate
-            echo "已停止 cake_autorate 进程"
-        fi
-    fi
-    
-    # 清理算法特定的状态文件
-    echo "清理算法特定的状态文件..."
-    rm -f /tmp/cake_autorate.status 2>/dev/null
-    rm -f /tmp/hfsc_status.json 2>/dev/null
-    rm -f /tmp/htb_status.json 2>/dev/null
-    
-    # 短暂等待确保清理完成
-    sleep 1
-    echo "===== 算法切换处理完成 ====="
-    # =========================================
-    
     # 加载对应算法模块
     if ! load_algorithm_module "$algorithm"; then
         echo "Failed to load algorithm module: $algorithm"
         rm -rf "$LOCK_FILE"
         return 1
     fi
+    
+    # 清理现有 QoS 设置
+    stop_qos
     
     # 初始化 NFT 表
     setup_nft_tables
@@ -1063,16 +901,16 @@ initialize_qos() {
     
     # 加载带宽配置
     load_bandwidth_config
-    
-    # 生成标记文件
-    if [ ! -f "/etc/qos_gargoyle/qos_class_marks" ]; then
+	
+	# 生成标记文件
+     if [ ! -f "/etc/qos_gargoyle/qos_class_marks" ]; then
         logger -t "qos_gargoyle" "生成类别标记文件..."
         generate_class_marks
     fi
     
     # 应用分类规则 - cake算法不应用
-    echo "调用分类规则应用..."
-    if [ "$algorithm" != "cake" ]; then
+    echo "调用分类规则应用..."	
+	if [ "$algorithm" != "cake" ]; then
         echo "调用分类规则应用..."
         apply_classification_rules
     else

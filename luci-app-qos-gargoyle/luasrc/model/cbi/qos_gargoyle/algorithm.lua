@@ -69,7 +69,7 @@ if current_algo == "hfsc_fqcodel" then
     s_fq_codel.anonymous = true
     s_fq_codel.addremove = false
     
-    local target = s_fq_codel:option(Value, "target", translate("Target Delay (microseconds)"))
+    local target = s_fq_codel:option(Value, "target", translate("Target Delay(microseconds)"))
     target.default = "5000"
     target.datatype = "uinteger"
     target.rmempty = false
@@ -94,12 +94,12 @@ if current_algo == "hfsc_fqcodel" then
     interval.datatype = "uinteger"
     interval.rmempty = false
 	
-	local interval = s_fq_codel:option(Value, "memory_limit", translate("Memory Llimit"))
+	local memory_limit = s_fq_codel:option(Value, "memory_limit", translate("Memory Llimit"))
     memory_limit.default = "auto"
     memory_limit.datatype = "uinteger"
     memory_limit.rmempty = false
 	
-	local interval = s_fq_codel:option(Value, "ce_threshold", translate("CE Threshold"))
+	local ce_threshold = s_fq_codel:option(Value, "ce_threshold", translate("CE Threshold"))
     ce_threshold.default = "0"
     ce_threshold.datatype = "uinteger"
     ce_threshold.rmempty = false
