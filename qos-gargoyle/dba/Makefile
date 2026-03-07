@@ -9,7 +9,7 @@ TCDIR:=$(shell if [ -e "${BUILD_DIR}/iproute2-tcfull" ] ; then echo "${BUILD_DIR
 # CFLAGS += -I$(STAGING_DIR)/usr/include
 # LDFLAGS += -L$(STAGING_DIR)/usr/lib
 
-LDLIBS += -luci -lpthread -lm
+LDLIBS += -lm
 
 # TC库对象文件
 TCOBJS := $(TCDIR)/tc/tc_util.o
