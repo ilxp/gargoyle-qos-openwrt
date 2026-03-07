@@ -3,11 +3,7 @@
  * 功能：监控各QoS分类的带宽使用率，实现分类间的动态带宽借用和归还
  * 支持同时监控下载(ifb0)和上传(pppoe-wan)两个设备
  * 统一配置文件：/etc/qosdba.conf
- * 版本：1.5.0（优化版本）
- * 优化特性：
- * 1. TC状态缓存 - 减少tc命令调用频率
- * 2. 批量命令执行 - 合并多个tc class change命令
- * 3. 异步监控 - 使用epoll监控TC统计文件
+ * 版本：1.4.0（修复版本）
  */
 
 #include <stdio.h>
@@ -27,11 +23,9 @@
 #include <dirent.h>
 #include <signal.h>
 #include <stdatomic.h>
-#include <sys/epoll.h>
-#include <sys/inotify.h>
 
 /* ==================== 宏定义 ==================== */
-#define QOSDBA_VERSION "1.5.0"
+#define QOSDBA_VERSION "1.4.0"
 #define MAX_CLASSES 32              // 最大分类数
 #define MAX_BORROW_RECORDS 64       // 最大借用记录数
 #define MAX_CONFIG_LINE 256         // 配置文件单行最大长度
@@ -115,30 +109,6 @@ typedef struct {
     int returned;                  // 是否已归还
 } borrow_record_t;
 
-/* ==================== TC统计缓存结构 ==================== */
-typedef struct {
-    char tc_stats_output[8192];     // 缓存的tc统计输出
-    int64_t last_query_time;        // 上次查询时间
-    int valid;                      // 缓存是否有效
-    int query_interval_ms;          // 查询间隔(毫秒)
-} tc_cache_t;
-
-/* ==================== 批量命令结构 ==================== */
-typedef struct {
-    char commands[10][512];  // 命令缓冲区
-    int command_count;       // 命令数量
-    int max_commands;        // 最大命令数
-} batch_commands_t;
-
-/* ==================== 异步监控上下文 ==================== */
-typedef struct {
-    int epoll_fd;                   // epoll文件描述符
-    int inotify_fd;                 // inotify文件描述符
-    int watch_fd;                   // 监控的文件描述符
-    int async_enabled;              // 异步监控是否启用
-    int64_t last_async_check;       // 上次异步检查时间
-} async_monitor_t;
-
 /* ==================== 设备上下文结构 ==================== */
 typedef struct {
     char device[16];               // 网络设备名
@@ -151,15 +121,6 @@ typedef struct {
     borrow_record_t records[MAX_BORROW_RECORDS];  // 借用记录
     int num_classes;               // 分类数量
     int num_records;               // 借用记录数量
-    
-    // TC统计缓存
-    tc_cache_t tc_cache;           // TC统计缓存
-    
-    // 异步监控
-    async_monitor_t async_monitor;  // 异步监控上下文
-    
-    // 批量命令
-    batch_commands_t batch_cmds;   // 批量命令缓冲区
     
     // 借还参数
     int high_util_threshold;       // 高使用率阈值(%)
@@ -255,14 +216,6 @@ static int is_valid_device_name(const char* name);
 static void trim_whitespace(char* str);
 static int parse_key_value(const char* line, char* key, int key_len, char* value, int value_len);
 static int validate_config_parameters(device_context_t* dev_ctx);
-
-/* ==================== 优化函数声明 ==================== */
-static qosdba_result_t update_tc_cache(device_context_t* dev_ctx);
-static int parse_class_stats_from_cache(device_context_t* dev_ctx, int classid, unsigned long long* bytes);
-static void add_to_batch_commands(batch_commands_t* batch, const char* cmd);
-static qosdba_result_t execute_batch_commands(batch_commands_t* batch, device_context_t* dev_ctx);
-static qosdba_result_t init_async_monitor(device_context_t* dev_ctx);
-static int check_async_events(device_context_t* dev_ctx);
 
 /* ==================== 辅助函数 ==================== */
 int64_t get_current_time_ms(void) {
@@ -615,10 +568,6 @@ static qosdba_result_t load_config_file(qosdba_context_t* ctx, const char* confi
                     current_dev->device[sizeof(current_dev->device)-1] = '\0';
                     current_dev->enabled = 1;  // 默认启用
                     
-                    // 初始化批量命令缓冲区
-                    current_dev->batch_cmds.max_commands = 10;
-                    current_dev->batch_cmds.command_count = 0;
-                    
                     // 设置默认优先级策略
                     current_dev->priority_policy.max_borrow_from_higher_priority = 0;
                     current_dev->priority_policy.allow_same_priority_borrow = 0;
@@ -648,10 +597,6 @@ static qosdba_result_t load_config_file(qosdba_context_t* ctx, const char* confi
                     strncpy(current_dev->device, device_name, sizeof(current_dev->device)-1);
                     current_dev->device[sizeof(current_dev->device)-1] = '\0';
                     current_dev->enabled = 1;
-                    
-                    // 初始化批量命令缓冲区
-                    current_dev->batch_cmds.max_commands = 10;
-                    current_dev->batch_cmds.command_count = 0;
                     
                     // 设置默认优先级策略
                     current_dev->priority_policy.max_borrow_from_higher_priority = 0;
@@ -705,11 +650,6 @@ static qosdba_result_t load_config_file(qosdba_context_t* ctx, const char* confi
                     ctx->safe_mode = atoi(value);
                 } else if (strcmp(key, "debug_mode") == 0) {
                     ctx->debug_mode = atoi(value);
-                } else if (strcmp(key, "cache_interval") == 0) {
-                    int interval = atoi(value);
-                    if (interval > 0) {
-                        current_dev->tc_cache.query_interval_ms = interval * 1000;
-                    }
                 }
             } 
             // 尝试解析为分类配置行
@@ -946,159 +886,63 @@ static int find_class_by_id(device_context_t* dev_ctx, int classid) {
     return -1;
 }
 
-/* ==================== 更新TC统计缓存 ==================== */
-static qosdba_result_t update_tc_cache(device_context_t* dev_ctx) {
-    if (!dev_ctx) return QOSDBA_ERR_MEMORY;
-    
-    int64_t now = get_current_time_ms();
-    
-    // 检查缓存是否过期（默认5秒）
-    if (dev_ctx->tc_cache.valid && 
-        (now - dev_ctx->tc_cache.last_query_time) < dev_ctx->tc_cache.query_interval_ms) {
-        return QOSDBA_OK;  // 缓存有效
-    }
-    
-    char cmd[256];
-    char output[8192];
-    
-    // 批量获取所有分类的统计信息
-    snprintf(cmd, sizeof(cmd), "tc -s -p -h class show dev %s 2>&1", dev_ctx->device);
-    
-    int ret = execute_command_with_timeout(cmd, output, sizeof(output), MAX_CMD_TIMEOUT_MS);
-    if (ret == 0) {
-        strncpy(dev_ctx->tc_cache.tc_stats_output, output, sizeof(dev_ctx->tc_cache.tc_stats_output)-1);
-        dev_ctx->tc_cache.tc_stats_output[sizeof(dev_ctx->tc_cache.tc_stats_output)-1] = '\0';
-        dev_ctx->tc_cache.last_query_time = now;
-        dev_ctx->tc_cache.valid = 1;
-        dev_ctx->tc_cache.query_interval_ms = 5000;  // 默认5秒更新一次
-        
-        log_message(NULL, "DEBUG", "TC统计缓存更新完成，设备: %s\n", dev_ctx->device);
-        return QOSDBA_OK;
-    } else {
-        dev_ctx->tc_cache.valid = 0;
-        return QOSDBA_ERR_TC;
-    }
-}
-
-/* ==================== 从缓存中解析分类统计 ==================== */
-static int parse_class_stats_from_cache(device_context_t* dev_ctx, int classid, unsigned long long* bytes) {
-    if (!dev_ctx || !bytes || !dev_ctx->tc_cache.valid) return 0;
-    
-    int major = (classid >> 16) & 0xFF;
-    int minor = classid & 0xFFFF;
-    
-    char search_pattern[32];
-    snprintf(search_pattern, sizeof(search_pattern), "class %s %d:%d", 
-             dev_ctx->qdisc_kind, major, minor);
-    
-    char* line_start = strstr(dev_ctx->tc_cache.tc_stats_output, search_pattern);
-    if (!line_start) return 0;
-    
-    // 找到该行的开始
-    char* line_end = strchr(line_start, '\n');
-    if (!line_end) line_end = line_start + strlen(line_start);
-    
-    // 复制一行进行分析
-    char line[256];
-    int line_len = line_end - line_start;
-    if (line_len >= sizeof(line)) line_len = sizeof(line) - 1;
-    strncpy(line, line_start, line_len);
-    line[line_len] = '\0';
-    
-    // 解析字节数
-    char* bytes_ptr = strstr(line, "bytes");
-    if (bytes_ptr) {
-        // 向后查找数字
-        for (char* p = bytes_ptr; p > line; p--) {
-            if (isdigit((unsigned char)*p) && (p == line || !isdigit((unsigned char)*(p-1)))) {
-                char* endptr;
-                *bytes = strtoull(p, &endptr, 10);
-                if (endptr != p) {
-                    return 1;
-                }
-            }
-        }
-    }
-    
-    return 0;
-}
-
-/* ==================== 检查带宽使用率（使用缓存） ==================== */
+/* ==================== 检查带宽使用率 ==================== */
 static qosdba_result_t check_bandwidth_usage(device_context_t* dev_ctx) {
     if (!dev_ctx || dev_ctx->num_classes == 0) return QOSDBA_ERR_MEMORY;
     
     int64_t now = get_current_time_ms();
     
-    // 更新TC统计缓存
-    qosdba_result_t cache_ret = update_tc_cache(dev_ctx);
-    if (cache_ret != QOSDBA_OK) {
-        log_message(NULL, "WARN", "TC统计缓存更新失败，设备: %s\n", dev_ctx->device);
-    }
-    
     for (int i = 0; i < dev_ctx->num_classes; i++) {
         class_state_t* state = &dev_ctx->states[i];
         class_config_t* config = &dev_ctx->configs[i];
         
-        unsigned long long bytes = 0;
-        int got_stats = 0;
+        int major = (state->classid >> 16) & 0xFF;
+        int minor = state->classid & 0xFFFF;
         
-        if (dev_ctx->tc_cache.valid) {
-            // 尝试从缓存中获取统计信息
-            got_stats = parse_class_stats_from_cache(dev_ctx, state->classid, &bytes);
-        }
+        char cmd[256];
+        char output[MAX_CMD_OUTPUT];
         
-        if (!got_stats) {
-            // 缓存失败，回退到原始方法
-            int major = (state->classid >> 16) & 0xFF;
-            int minor = state->classid & 0xFFFF;
-            
-            char cmd[256];
-            char output[MAX_CMD_OUTPUT];
-            
-            snprintf(cmd, sizeof(cmd),
-                     "tc -s class show dev %s classid %d:%d 2>&1 | "
-                     "grep -E 'bytes|Sent' | head -1",
-                     dev_ctx->device, major, minor);
-            
-            int ret = execute_command_with_timeout(cmd, output, sizeof(output), MAX_CMD_TIMEOUT_MS);
-            if (ret == 0) {
-                if (sscanf(output, "Sent %llu bytes", &bytes) == 1 ||
-                    sscanf(output, "%*s %llu bytes", &bytes) == 1) {
-                    got_stats = 1;
-                }
-            }
-        }
+        snprintf(cmd, sizeof(cmd),
+                 "tc -s class show dev %s classid %d:%d 2>&1 | "
+                 "grep -E 'bytes|Sent' | head -1",
+                 dev_ctx->device, major, minor);
         
-        if (got_stats) {
-            int64_t time_diff = now - state->last_check_time;
-            if (time_diff > 0) {
-                int64_t bytes_diff = bytes - state->last_total_bytes;
+        int ret = execute_command_with_timeout(cmd, output, sizeof(output), MAX_CMD_TIMEOUT_MS);
+        if (ret == 0) {
+            unsigned long long bytes = 0;
+            if (sscanf(output, "Sent %llu bytes", &bytes) == 1 ||
+                sscanf(output, "%*s %llu bytes", &bytes) == 1) {
                 
-                if (bytes_diff < 0) {
-                    bytes_diff = bytes;
-                }
-                
-                // 修复整数溢出风险：使用64位整数
-                int64_t bps = (bytes_diff * 8000LL) / time_diff;
-                int new_used_bw_kbps = (int)(bps / 1000);
-                
-                if (new_used_bw_kbps < 0) new_used_bw_kbps = 0;
-                if (new_used_bw_kbps > dev_ctx->total_bandwidth_kbps) {
-                    new_used_bw_kbps = dev_ctx->total_bandwidth_kbps;
-                }
-                
-                state->used_bw_kbps = new_used_bw_kbps;
-                state->total_bytes = bytes;
-                state->last_total_bytes = bytes;
-                
-                if (new_used_bw_kbps > state->peak_used_bw_kbps) {
-                    state->peak_used_bw_kbps = new_used_bw_kbps;
-                }
-                
-                if (state->avg_used_bw_kbps == 0) {
-                    state->avg_used_bw_kbps = new_used_bw_kbps;
-                } else {
-                    state->avg_used_bw_kbps = (state->avg_used_bw_kbps * 9 + new_used_bw_kbps) / 10;
+                int64_t time_diff = now - state->last_check_time;
+                if (time_diff > 0) {
+                    int64_t bytes_diff = bytes - state->last_total_bytes;
+                    
+                    if (bytes_diff < 0) {
+                        bytes_diff = bytes;
+                    }
+                    
+                    // 修复整数溢出风险：使用64位整数
+                    int64_t bps = (bytes_diff * 8000LL) / time_diff;
+                    int new_used_bw_kbps = (int)(bps / 1000);
+                    
+                    if (new_used_bw_kbps < 0) new_used_bw_kbps = 0;
+                    if (new_used_bw_kbps > dev_ctx->total_bandwidth_kbps) {
+                        new_used_bw_kbps = dev_ctx->total_bandwidth_kbps;
+                    }
+                    
+                    state->used_bw_kbps = new_used_bw_kbps;
+                    state->total_bytes = bytes;
+                    state->last_total_bytes = bytes;
+                    
+                    if (new_used_bw_kbps > state->peak_used_bw_kbps) {
+                        state->peak_used_bw_kbps = new_used_bw_kbps;
+                    }
+                    
+                    if (state->avg_used_bw_kbps == 0) {
+                        state->avg_used_bw_kbps = new_used_bw_kbps;
+                    } else {
+                        state->avg_used_bw_kbps = (state->avg_used_bw_kbps * 9 + new_used_bw_kbps) / 10;
+                    }
                 }
             }
         }
@@ -1198,67 +1042,6 @@ static void add_borrow_record(device_context_t* dev_ctx, int from_classid,
     dev_ctx->total_borrowed_kbps += borrowed_bw_kbps;
 }
 
-/* ==================== 添加到批量命令 ==================== */
-static void add_to_batch_commands(batch_commands_t* batch, const char* cmd) {
-    if (!batch || !cmd || batch->command_count >= batch->max_commands) {
-        return;
-    }
-    
-    strncpy(batch->commands[batch->command_count], cmd, sizeof(batch->commands[0])-1);
-    batch->commands[batch->command_count][sizeof(batch->commands[0])-1] = '\0';
-    batch->command_count++;
-}
-
-/* ==================== 执行批量命令 ==================== */
-static qosdba_result_t execute_batch_commands(batch_commands_t* batch, device_context_t* dev_ctx) {
-    if (!batch || batch->command_count == 0) return QOSDBA_OK;
-    
-    if (dev_ctx->safe_mode) {
-        // 安全模式，只记录不执行
-        for (int i = 0; i < batch->command_count; i++) {
-            log_message(NULL, "DEBUG", "[安全模式] 批量命令 %d: %s\n", i+1, batch->commands[i]);
-        }
-        batch->command_count = 0;
-        return QOSDBA_OK;
-    }
-    
-    // 构建批量命令
-    char batch_cmd[2048] = "";
-    int pos = 0;
-    
-    for (int i = 0; i < batch->command_count; i++) {
-        int remaining = sizeof(batch_cmd) - pos;
-        int cmd_len = snprintf(batch_cmd + pos, remaining, "%s; ", batch->commands[i]);
-        if (cmd_len >= remaining || cmd_len < 0) {
-            // 缓冲区不足，执行当前已构建的命令
-            if (pos > 0) {
-                batch_cmd[pos-1] = '\0';  // 移除最后一个分号
-                char output[MAX_CMD_OUTPUT];
-                int ret = execute_command_with_timeout(batch_cmd, output, sizeof(output), MAX_CMD_TIMEOUT_MS);
-                if (ret != 0) {
-                    log_message(NULL, "ERROR", "批量命令执行失败: %s\n", output);
-                }
-            }
-            pos = 0;
-        } else {
-            pos += cmd_len;
-        }
-    }
-    
-    // 执行剩余的命令
-    if (pos > 0) {
-        batch_cmd[pos-2] = '\0';  // 移除最后一个分号和空格
-        char output[MAX_CMD_OUTPUT];
-        int ret = execute_command_with_timeout(batch_cmd, output, sizeof(output), MAX_CMD_TIMEOUT_MS);
-        if (ret != 0) {
-            log_message(NULL, "ERROR", "批量命令执行失败: %s\n", output);
-        }
-    }
-    
-    batch->command_count = 0;
-    return QOSDBA_OK;
-}
-
 /* ==================== 调整分类带宽 ==================== */
 static qosdba_result_t adjust_class_bandwidth(device_context_t* dev_ctx, 
                                              int classid, int new_bw_kbps) {
@@ -1291,6 +1074,7 @@ static qosdba_result_t adjust_class_bandwidth(device_context_t* dev_ctx,
     int minor = classid & 0xFFFF;
     
     char cmd[512];
+    char output[MAX_CMD_OUTPUT];
     
     if (dev_ctx->safe_mode) {
         // 安全模式，不实际执行命令
@@ -1316,13 +1100,15 @@ static qosdba_result_t adjust_class_bandwidth(device_context_t* dev_ctx,
                  dev_ctx->device, major, minor, new_bw_kbps, new_bw_kbps, burst);
     }
     
-    // 添加到批量命令缓冲区
-    add_to_batch_commands(&dev_ctx->batch_cmds, cmd);
+    int ret = execute_command_with_timeout(cmd, output, sizeof(output), MAX_CMD_TIMEOUT_MS);
     
-    // 更新状态
-    state->current_bw_kbps = new_bw_kbps;
-    
-    return QOSDBA_OK;
+    if (ret == 0) {
+        state->current_bw_kbps = new_bw_kbps;
+        return QOSDBA_OK;
+    } else {
+        log_message(NULL, "ERROR", "调整分类 0x%x 带宽失败: %s\n", classid, output);
+        return QOSDBA_ERR_TC;
+    }
 }
 
 /* ==================== 运行借用逻辑 ==================== */
@@ -1390,52 +1176,10 @@ static void run_borrow_logic(device_context_t* dev_ctx) {
                             int old_bw_a = class_a->current_bw_kbps;
                             int old_bw_b = class_b->current_bw_kbps;
                             
-                            // 构建调整命令
-                            int major_a = (class_a->classid >> 16) & 0xFF;
-                            int minor_a = class_a->classid & 0xFFFF;
-                            int major_b = (class_b->classid >> 16) & 0xFF;
-                            int minor_b = class_b->classid & 0xFFFF;
-                            
-                            char cmd[512];
-                            
-                            if (strcmp(dev_ctx->qdisc_kind, "hfsc") == 0) {
-                                snprintf(cmd, sizeof(cmd),
-                                         "tc class change dev %s parent 1:0 classid %d:%d hfsc "
-                                         "ls m1 0b d 0us m2 %dkbit ul m1 0b d 0us m2 %dkbit",
-                                         dev_ctx->device, major_a, minor_a, 
-                                         old_bw_a + borrow_amount, old_bw_a + borrow_amount);
-                                add_to_batch_commands(&dev_ctx->batch_cmds, cmd);
-                                
-                                snprintf(cmd, sizeof(cmd),
-                                         "tc class change dev %s parent 1:0 classid %d:%d hfsc "
-                                         "ls m1 0b d 0us m2 %dkbit ul m1 0b d 0us m2 %dkbit",
-                                         dev_ctx->device, major_b, minor_b,
-                                         old_bw_b - borrow_amount, old_bw_b - borrow_amount);
-                                add_to_batch_commands(&dev_ctx->batch_cmds, cmd);
-                            } else {
-                                int burst_a = (old_bw_a + borrow_amount) / 8;
-                                if (burst_a < 2) burst_a = 2;
-                                int burst_b = (old_bw_b - borrow_amount) / 8;
-                                if (burst_b < 2) burst_b = 2;
-                                
-                                snprintf(cmd, sizeof(cmd),
-                                         "tc class change dev %s parent 1:0 classid %d:%d htb "
-                                         "rate %dkbit ceil %dkbit burst %dkbit",
-                                         dev_ctx->device, major_a, minor_a,
-                                         old_bw_a + borrow_amount, old_bw_a + borrow_amount, burst_a);
-                                add_to_batch_commands(&dev_ctx->batch_cmds, cmd);
-                                
-                                snprintf(cmd, sizeof(cmd),
-                                         "tc class change dev %s parent 1:0 classid %d:%d htb "
-                                         "rate %dkbit ceil %dkbit burst %dkbit",
-                                         dev_ctx->device, major_b, minor_b,
-                                         old_bw_b - borrow_amount, old_bw_b - borrow_amount, burst_b);
-                                add_to_batch_commands(&dev_ctx->batch_cmds, cmd);
-                            }
-                            
-                            // 更新状态
-                            class_a->current_bw_kbps = old_bw_a + borrow_amount;
-                            class_b->current_bw_kbps = old_bw_b - borrow_amount;
+                            adjust_class_bandwidth(dev_ctx, class_a->classid, 
+                                                 old_bw_a + borrow_amount);
+                            adjust_class_bandwidth(dev_ctx, class_b->classid, 
+                                                 old_bw_b - borrow_amount);
                             
                             class_a->borrowed_bw_kbps += borrow_amount;
                             class_b->lent_bw_kbps += borrow_amount;
@@ -1447,23 +1191,12 @@ static void run_borrow_logic(device_context_t* dev_ctx) {
                             
                             log_message(NULL, "INFO", "分类 %s 从 %s 借用 %d kbps 带宽\n",
                                        config_a->name, config_b->name, borrow_amount);
-                            
-                            // 如果批量命令已满，执行一次
-                            if (dev_ctx->batch_cmds.command_count >= dev_ctx->batch_cmds.max_commands) {
-                                execute_batch_commands(&dev_ctx->batch_cmds, dev_ctx);
-                            }
-                            
                             break;
                         }
                     }
                 }
             }
         }
-    }
-    
-    // 执行剩余的批量命令
-    if (dev_ctx->batch_cmds.command_count > 0) {
-        execute_batch_commands(&dev_ctx->batch_cmds, dev_ctx);
     }
 }
 
@@ -1511,52 +1244,10 @@ static void run_return_logic(device_context_t* dev_ctx) {
                             int old_bw_a = class_a->current_bw_kbps;
                             int old_bw_b = class_b->current_bw_kbps;
                             
-                            // 构建调整命令
-                            int major_a = (class_a->classid >> 16) & 0xFF;
-                            int minor_a = class_a->classid & 0xFFFF;
-                            int major_b = (class_b->classid >> 16) & 0xFF;
-                            int minor_b = class_b->classid & 0xFFFF;
-                            
-                            char cmd[512];
-                            
-                            if (strcmp(dev_ctx->qdisc_kind, "hfsc") == 0) {
-                                snprintf(cmd, sizeof(cmd),
-                                         "tc class change dev %s parent 1:0 classid %d:%d hfsc "
-                                         "ls m1 0b d 0us m2 %dkbit ul m1 0b d 0us m2 %dkbit",
-                                         dev_ctx->device, major_a, minor_a,
-                                         old_bw_a - return_amount, old_bw_a - return_amount);
-                                add_to_batch_commands(&dev_ctx->batch_cmds, cmd);
-                                
-                                snprintf(cmd, sizeof(cmd),
-                                         "tc class change dev %s parent 1:0 classid %d:%d hfsc "
-                                         "ls m1 0b d 0us m2 %dkbit ul m1 0b d 0us m2 %dkbit",
-                                         dev_ctx->device, major_b, minor_b,
-                                         old_bw_b + return_amount, old_bw_b + return_amount);
-                                add_to_batch_commands(&dev_ctx->batch_cmds, cmd);
-                            } else {
-                                int burst_a = (old_bw_a - return_amount) / 8;
-                                if (burst_a < 2) burst_a = 2;
-                                int burst_b = (old_bw_b + return_amount) / 8;
-                                if (burst_b < 2) burst_b = 2;
-                                
-                                snprintf(cmd, sizeof(cmd),
-                                         "tc class change dev %s parent 1:0 classid %d:%d htb "
-                                         "rate %dkbit ceil %dkbit burst %dkbit",
-                                         dev_ctx->device, major_a, minor_a,
-                                         old_bw_a - return_amount, old_bw_a - return_amount, burst_a);
-                                add_to_batch_commands(&dev_ctx->batch_cmds, cmd);
-                                
-                                snprintf(cmd, sizeof(cmd),
-                                         "tc class change dev %s parent 1:0 classid %d:%d htb "
-                                         "rate %dkbit ceil %dkbit burst %dkbit",
-                                         dev_ctx->device, major_b, minor_b,
-                                         old_bw_b + return_amount, old_bw_b + return_amount, burst_b);
-                                add_to_batch_commands(&dev_ctx->batch_cmds, cmd);
-                            }
-                            
-                            // 更新状态
-                            class_a->current_bw_kbps = old_bw_a - return_amount;
-                            class_b->current_bw_kbps = old_bw_b + return_amount;
+                            adjust_class_bandwidth(dev_ctx, class_a->classid, 
+                                                 old_bw_a - return_amount);
+                            adjust_class_bandwidth(dev_ctx, class_b->classid, 
+                                                 old_bw_b + return_amount);
                             
                             class_a->borrowed_bw_kbps -= return_amount;
                             class_b->lent_bw_kbps -= return_amount;
@@ -1572,12 +1263,6 @@ static void run_return_logic(device_context_t* dev_ctx) {
                             
                             log_message(NULL, "INFO", "分类 0x%x 归还 %d kbps 带宽给 0x%x\n",
                                        class_a->classid, return_amount, class_b->classid);
-                            
-                            // 如果批量命令已满，执行一次
-                            if (dev_ctx->batch_cmds.command_count >= dev_ctx->batch_cmds.max_commands) {
-                                execute_batch_commands(&dev_ctx->batch_cmds, dev_ctx);
-                            }
-                            
                             break;
                         }
                     }
@@ -1585,120 +1270,79 @@ static void run_return_logic(device_context_t* dev_ctx) {
             }
         }
     }
-    
-    // 执行剩余的批量命令
-    if (dev_ctx->batch_cmds.command_count > 0) {
-        execute_batch_commands(&dev_ctx->batch_cmds, dev_ctx);
-    }
 }
 
-/* ==================== 初始化异步监控 ==================== */
-static qosdba_result_t init_async_monitor(device_context_t* dev_ctx) {
-    if (!dev_ctx) return QOSDBA_ERR_MEMORY;
+/* ==================== 检查配置是否需要重新加载 ==================== */
+static int check_config_reload(qosdba_context_t* ctx, const char* config_file) {
+    if (!ctx || !config_file) return 0;
     
-    // 创建epoll实例
-    dev_ctx->async_monitor.epoll_fd = epoll_create1(0);
-    if (dev_ctx->async_monitor.epoll_fd < 0) {
-        log_message(NULL, "ERROR", "创建epoll失败: %s\n", strerror(errno));
-        return QOSDBA_ERR_SYSTEM;
+    int current_mtime = get_file_mtime(config_file);
+    if (current_mtime > ctx->config_mtime) {
+        ctx->config_mtime = current_mtime;
+        return 1;
     }
     
-    // 创建inotify实例
-    dev_ctx->async_monitor.inotify_fd = inotify_init1(IN_NONBLOCK);
-    if (dev_ctx->async_monitor.inotify_fd < 0) {
-        log_message(NULL, "WARN", "创建inotify失败，回退到轮询模式: %s\n", strerror(errno));
-        dev_ctx->async_monitor.async_enabled = 0;
-        return QOSDBA_OK;
-    }
-    
-    // 尝试监控TC统计文件
-    char stat_path[256];
-    snprintf(stat_path, sizeof(stat_path), "/sys/class/net/%s/statistics/tx_bytes", dev_ctx->device);
-    
-    dev_ctx->async_monitor.watch_fd = inotify_add_watch(dev_ctx->async_monitor.inotify_fd, 
-                                                       stat_path, IN_MODIFY);
-    
-    if (dev_ctx->async_monitor.watch_fd < 0) {
-        // 如果监控失败，可能是文件不存在或不支持，回退到轮询
-        log_message(NULL, "DEBUG", "无法监控 %s，回退到轮询模式\n", stat_path);
-        dev_ctx->async_monitor.async_enabled = 0;
-        close(dev_ctx->async_monitor.inotify_fd);
-        dev_ctx->async_monitor.inotify_fd = -1;
-        return QOSDBA_OK;
-    }
-    
-    // 添加inotify到epoll监控
-    struct epoll_event ev;
-    ev.events = EPOLLIN;
-    ev.data.fd = dev_ctx->async_monitor.inotify_fd;
-    
-    if (epoll_ctl(dev_ctx->async_monitor.epoll_fd, EPOLL_CTL_ADD, 
-                 dev_ctx->async_monitor.inotify_fd, &ev) < 0) {
-        log_message(NULL, "WARN", "epoll_ctl添加inotify失败: %s\n", strerror(errno));
-        dev_ctx->async_monitor.async_enabled = 0;
-        close(dev_ctx->async_monitor.inotify_fd);
-        dev_ctx->async_monitor.inotify_fd = -1;
-        return QOSDBA_OK;
-    }
-    
-    dev_ctx->async_monitor.async_enabled = 1;
-    dev_ctx->async_monitor.last_async_check = get_current_time_ms();
-    
-    log_message(NULL, "INFO", "异步监控已启用，设备: %s\n", dev_ctx->device);
-    return QOSDBA_OK;
+    return 0;
 }
 
-/* ==================== 异步检查事件 ==================== */
-static int check_async_events(device_context_t* dev_ctx) {
-    if (!dev_ctx || !dev_ctx->async_monitor.async_enabled) {
-        return 0;
+/* ==================== 重新加载配置 ==================== */
+static qosdba_result_t reload_config(qosdba_context_t* ctx, const char* config_file) {
+    if (!ctx || !config_file) return QOSDBA_ERR_MEMORY;
+    
+    log_message(ctx, "INFO", "重新加载配置文件: %s\n", config_file);
+    
+    // 深拷贝旧的设备状态
+    device_context_t old_devices[MAX_DEVICES];
+    for (int i = 0; i < ctx->num_devices; i++) {
+        memcpy(&old_devices[i], &ctx->devices[i], sizeof(device_context_t));
     }
     
-    struct epoll_event events[10];
-    int nfds = epoll_wait(dev_ctx->async_monitor.epoll_fd, events, 10, 0);
+    // 保存旧的分类状态
+    class_state_t old_states[MAX_DEVICES][MAX_CLASSES];
+    int old_num_classes[MAX_DEVICES];
     
-    if (nfds < 0) {
-        if (errno != EINTR) {
-            log_message(NULL, "ERROR", "epoll_wait失败: %s\n", strerror(errno));
+    for (int i = 0; i < ctx->num_devices; i++) {
+        old_num_classes[i] = ctx->devices[i].num_classes;
+        for (int j = 0; j < ctx->devices[i].num_classes; j++) {
+            old_states[i][j] = ctx->devices[i].states[j];
         }
-        return 0;
     }
     
-    int need_check = 0;
+    // 重新加载配置
+    qosdba_result_t ret = load_config_file(ctx, config_file);
+    if (ret != QOSDBA_OK) {
+        log_message(ctx, "ERROR", "重新加载配置失败，保留原有配置\n");
+        return ret;
+    }
     
-    for (int i = 0; i < nfds; i++) {
-        if (events[i].data.fd == dev_ctx->async_monitor.inotify_fd) {
-            char buf[4096] __attribute__ ((aligned(__alignof__(struct inotify_event))));
-            const struct inotify_event *event;
-            
-            ssize_t len = read(dev_ctx->async_monitor.inotify_fd, buf, sizeof(buf));
-            if (len <= 0) {
-                continue;
-            }
-            
-            // 处理inotify事件
-            for (char* ptr = buf; ptr < buf + len; 
-                 ptr += sizeof(struct inotify_event) + event->len) {
-                event = (const struct inotify_event*)ptr;
-                
-                if (event->mask & IN_MODIFY) {
-                    need_check = 1;
+    // 重新初始化设备
+    for (int i = 0; i < ctx->num_devices; i++) {
+        device_context_t* dev_ctx = &ctx->devices[i];
+        
+        if (!dev_ctx->enabled) continue;
+        
+        // 尝试恢复分类状态
+        for (int j = 0; j < dev_ctx->num_classes; j++) {
+            // 查找对应的旧状态
+            for (int k = 0; k < old_num_classes[i]; k++) {
+                if (old_states[i][k].classid == dev_ctx->configs[j].classid) {
+                    // 恢复状态
+                    dev_ctx->states[j] = old_states[i][k];
                     break;
                 }
             }
         }
-    }
-    
-    if (need_check) {
-        int64_t now = get_current_time_ms();
-        // 避免过于频繁的检查，至少间隔100ms
-        if (now - dev_ctx->async_monitor.last_async_check > 100) {
-            dev_ctx->async_monitor.last_async_check = now;
-            return 1;
+        
+        // 重新初始化TC分类
+        if (init_tc_classes(dev_ctx) != QOSDBA_OK) {
+            log_message(ctx, "ERROR", "设备 %s 的TC分类重新初始化失败\n", dev_ctx->device);
         }
+        
+        dev_ctx->last_check_time = get_current_time_ms();
     }
     
-    return 0;
+    log_message(ctx, "INFO", "配置文件重新加载完成\n");
+    return QOSDBA_OK;
 }
 
 /* ==================== 主接口函数 ==================== */
@@ -1770,19 +1414,6 @@ qosdba_result_t qosdba_init(qosdba_context_t* ctx) {
             continue;
         }
         
-        // 初始化TC统计缓存
-        dev_ctx->tc_cache.valid = 0;
-        dev_ctx->tc_cache.query_interval_ms = 5000;  // 默认5秒
-        
-        // 初始化批量命令缓冲区
-        dev_ctx->batch_cmds.max_commands = 10;
-        dev_ctx->batch_cmds.command_count = 0;
-        
-        // 初始化异步监控
-        if (init_async_monitor(dev_ctx) != QOSDBA_OK) {
-            log_message(ctx, "WARN", "设备 %s 异步监控初始化失败\n", dev_ctx->device);
-        }
-        
         // 发现TC分类
         if (discover_tc_classes(dev_ctx) != QOSDBA_OK) {
             log_message(ctx, "WARN", "设备 %s 的TC分类发现失败\n", dev_ctx->device);
@@ -1793,10 +1424,9 @@ qosdba_result_t qosdba_init(qosdba_context_t* ctx) {
             log_message(ctx, "ERROR", "设备 %s 的TC分类初始化失败\n", dev_ctx->device);
         } else {
             log_message(ctx, "INFO", 
-                       "设备 %s 初始化完成: 总带宽=%dkbps, 分类数=%d, 异步监控=%s\n"
+                       "设备 %s 初始化完成: 总带宽=%dkbps, 分类数=%d\n"
                        "  借还参数: 高阈值=%d%%, 低阈值=%d%%, 借用比例=%.1f%%, 最小借用=%dkbps\n",
                        dev_ctx->device, dev_ctx->total_bandwidth_kbps, dev_ctx->num_classes,
-                       dev_ctx->async_monitor.async_enabled ? "启用" : "禁用",
                        dev_ctx->high_util_threshold, dev_ctx->low_util_threshold,
                        dev_ctx->borrow_ratio * 100.0f, dev_ctx->min_borrow_kbps);
             
@@ -1816,7 +1446,7 @@ qosdba_result_t qosdba_init(qosdba_context_t* ctx) {
     ctx->last_check_time = get_current_time_ms();
     
     log_message(ctx, "INFO", 
-               "QoS动态带宽分配器初始化完成: 支持 %d 个设备, 检查间隔=%d秒, TC缓存=启用, 批量命令=启用\n",
+               "QoS动态带宽分配器初始化完成: 支持 %d 个设备, 检查间隔=%d秒\n",
                ctx->num_devices, ctx->check_interval);
     
     return QOSDBA_OK;
@@ -1826,6 +1456,12 @@ qosdba_result_t qosdba_run(qosdba_context_t* ctx) {
     if (!ctx || !ctx->enabled) return QOSDBA_ERR_MEMORY;
     
     int64_t now = get_current_time_ms();
+    
+    if (now - ctx->last_check_time < ctx->check_interval * 1000) {
+        return QOSDBA_OK;
+    }
+    
+    ctx->last_check_time = now;
     
     // 检查是否需要重新加载配置
     if (g_reload_config || (ctx->config_path[0] && check_config_reload(ctx, ctx->config_path))) {
@@ -1850,36 +1486,18 @@ qosdba_result_t qosdba_run(qosdba_context_t* ctx) {
             continue;
         }
         
-        int need_check = 0;
-        
-        // 检查定时器是否到期
-        if (now - dev_ctx->last_check_time >= ctx->check_interval * 1000) {
-            need_check = 1;
+        // 检查带宽使用率
+        if (check_bandwidth_usage(dev_ctx) != QOSDBA_OK) {
+            log_message(ctx, "ERROR", "设备 %s 带宽使用率检查失败\n", dev_ctx->device);
+            continue;
         }
         
-        // 检查异步事件
-        if (check_async_events(dev_ctx)) {
-            need_check = 1;
-        }
+        // 运行借用逻辑
+        run_borrow_logic(dev_ctx);
         
-        if (need_check) {
-            // 检查带宽使用率
-            if (check_bandwidth_usage(dev_ctx) != QOSDBA_OK) {
-                log_message(ctx, "ERROR", "设备 %s 带宽使用率检查失败\n", dev_ctx->device);
-                continue;
-            }
-            
-            // 运行借用逻辑
-            run_borrow_logic(dev_ctx);
-            
-            // 运行归还逻辑
-            run_return_logic(dev_ctx);
-            
-            dev_ctx->last_check_time = now;
-        }
+        // 运行归还逻辑
+        run_return_logic(dev_ctx);
     }
-    
-    ctx->last_check_time = now;
     
     return QOSDBA_OK;
 }
@@ -1941,10 +1559,6 @@ qosdba_result_t qosdba_update_status(qosdba_context_t* ctx, const char* status_f
                 (long)dev_ctx->total_returned_kbps);
         fprintf(ctx->status_file, "最后检查时间: %ld秒前\n", 
                 (long)((now - dev_ctx->last_check_time) / 1000));
-        fprintf(ctx->status_file, "TC缓存状态: %s\n", 
-                dev_ctx->tc_cache.valid ? "有效" : "无效");
-        fprintf(ctx->status_file, "异步监控: %s\n", 
-                dev_ctx->async_monitor.async_enabled ? "启用" : "禁用");
         fprintf(ctx->status_file, "\n");
         
         fprintf(ctx->status_file, "=== 分类状态 ===\n");
@@ -2016,20 +1630,6 @@ qosdba_result_t qosdba_cleanup(qosdba_context_t* ctx) {
         
         if (!dev_ctx->enabled) continue;
         
-        // 清理异步监控资源
-        if (dev_ctx->async_monitor.async_enabled) {
-            if (dev_ctx->async_monitor.watch_fd >= 0) {
-                inotify_rm_watch(dev_ctx->async_monitor.inotify_fd, 
-                                dev_ctx->async_monitor.watch_fd);
-            }
-            if (dev_ctx->async_monitor.inotify_fd >= 0) {
-                close(dev_ctx->async_monitor.inotify_fd);
-            }
-            if (dev_ctx->async_monitor.epoll_fd >= 0) {
-                close(dev_ctx->async_monitor.epoll_fd);
-            }
-        }
-        
         // 将所有分类带宽恢复到中间值（最小和最大中间）
         for (int j = 0; j < dev_ctx->num_classes; j++) {
             class_state_t* state = &dev_ctx->states[j];
@@ -2037,14 +1637,8 @@ qosdba_result_t qosdba_cleanup(qosdba_context_t* ctx) {
             
             int target_bw = (config->min_bw_kbps + config->max_bw_kbps) / 2;
             if (state->current_bw_kbps != target_bw) {
-                // 使用批量命令执行最后一次调整
                 adjust_class_bandwidth(dev_ctx, state->classid, target_bw);
             }
-        }
-        
-        // 执行最后一次批量命令
-        if (dev_ctx->batch_cmds.command_count > 0) {
-            execute_batch_commands(&dev_ctx->batch_cmds, dev_ctx);
         }
     }
     

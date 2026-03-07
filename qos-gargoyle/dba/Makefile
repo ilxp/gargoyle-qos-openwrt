@@ -37,7 +37,6 @@ install: all uninstall
 	cp qosdba $(BINDIR)
 	#cp files/qosdba.init /etc/init.d/qosdba
 	#chmod 755 /etc/init.d/qosdba
-	#cp files/qosdba.config /etc/config/qosdba
 	#cp files/qosdba.conf /etc/qosdba.conf
 	#cp files/qosdba.hotplug /etc/hotplug.d/iface/99-qosdba
 
