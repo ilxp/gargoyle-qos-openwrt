@@ -52,6 +52,22 @@
 #define HEARTBEAT_INTERVAL_MS 10000
 #define POLL_TIMEOUT_MS 10  // poll 超时时间
 
+// 配置范围宏定义
+#define MIN_PING_INTERVAL 50
+#define MAX_PING_INTERVAL 5000
+#define MIN_BANDWIDTH_KBPS 100
+#define MAX_BANDWIDTH_KBPS 1000000
+#define MIN_PING_LIMIT_MS 5
+#define MAX_PING_LIMIT_MS 1000
+#define MIN_BW_RATIO 0.01f
+#define MAX_BW_RATIO_MAX 1.0f
+#define MIN_BW_RATIO_MIN 0.5f
+#define SMOOTHING_FACTOR_MIN 0.0f
+#define SMOOTHING_FACTOR_MAX 1.0f
+#define MAX_BW_RATIO_MIN 0.5f
+#define MAX_BW_RATIO_MAX 1.0f
+#define SAFE_START_RATIO 0.5f
+
 /* ==================== 返回码 ==================== */
 typedef enum {
     QMON_OK = 0,
@@ -171,7 +187,7 @@ const char qosacc_usage[] =
 "  -c <文件>        从指定配置文件读取参数\n"
 "  -d <设备>        目标网络设备名称 (默认: ifb0)\n"
 "  -t <地址/域名>  ping目标地址 (默认: 8.8.8.8)\n"
-"  -s <文件>        状态文件路径 (默认: /var/run/qosacc.status)\n"
+"  -s <文件>        状态文件路径 (默认: /tmp/qosacc.status)\n"
 "  -l <文件>        调试日志文件路径 (默认: /var/log/qosacc.log)\n"
 "  -v               启用详细输出模式\n"
 "  -b               在后台（守护进程）模式运行\n"
@@ -402,7 +418,7 @@ static int qosacc_config_parse_file(qosacc_config_t* cfg, const char* config_fil
     
     FILE* fp = fopen(config_file, "r");
     if (!fp) {
-        fprintf(stderr, "无法打开配置文件: %s\n", config_file);
+        fprintf(stderr, "错误：指定的配置文件'%s'无法打开: %s\n", config_file, strerror(errno));
         return QMON_ERR_FILE;
     }
     
@@ -530,6 +546,7 @@ int qosacc_config_parse(qosacc_config_t* cfg, int argc, char* argv[]) {
             strncpy(cfg->config_file, config_file, sizeof(cfg->config_file) - 1);
             int ret = qosacc_config_parse_file(cfg, config_file);
             if (ret != QMON_OK) {
+                fprintf(stderr, "错误：配置文件解析失败。\n");
                 return ret; // 配置文件解析失败
             }
             config_file_provided = 1;
@@ -594,18 +611,21 @@ int qosacc_config_validate(qosacc_config_t* cfg, int argc, char* argv[], char* e
 	
 	if (!cfg || !error) return QMON_ERR_MEMORY;
 
-    if (cfg->ping_interval < 50 || cfg->ping_interval > 5000) {
-        snprintf(error, error_len, "ping间隔必须在50-5000ms之间");
+    if (cfg->ping_interval < MIN_PING_INTERVAL || cfg->ping_interval > MAX_PING_INTERVAL) {
+        snprintf(error, error_len, "ping间隔必须在%d-%dms之间", 
+                MIN_PING_INTERVAL, MAX_PING_INTERVAL);
         return QMON_ERR_CONFIG;
     }
     
-    if (cfg->max_bandwidth_kbps < 100 || cfg->max_bandwidth_kbps > 1000000) {
-        snprintf(error, error_len, "最大带宽必须在100-1000000kbps之间");
+    if (cfg->max_bandwidth_kbps < MIN_BANDWIDTH_KBPS || cfg->max_bandwidth_kbps > MAX_BANDWIDTH_KBPS) {
+        snprintf(error, error_len, "最大带宽必须在%d-%dkbps之间", 
+                MIN_BANDWIDTH_KBPS, MAX_BANDWIDTH_KBPS);
         return QMON_ERR_CONFIG;
     }
     
-    if (cfg->ping_limit_ms < 5 || cfg->ping_limit_ms > 1000) {
-        snprintf(error, error_len, "ping限制必须在5-1000ms之间");
+    if (cfg->ping_limit_ms < MIN_PING_LIMIT_MS || cfg->ping_limit_ms > MAX_PING_LIMIT_MS) {
+        snprintf(error, error_len, "ping限制必须在%d-%dms之间", 
+                MIN_PING_LIMIT_MS, MAX_PING_LIMIT_MS);
         return QMON_ERR_CONFIG;
     }
     
@@ -619,18 +639,21 @@ int qosacc_config_validate(qosacc_config_t* cfg, int argc, char* argv[], char* e
         return QMON_ERR_CONFIG;
     }
     
-    if (cfg->min_bw_ratio < 0.01f || cfg->min_bw_ratio > 0.5f) {
-        snprintf(error, error_len, "最小带宽比例必须在0.01-0.5之间");
+    if (cfg->min_bw_ratio < MIN_BW_RATIO || cfg->min_bw_ratio > MIN_BW_RATIO_MIN) {
+        snprintf(error, error_len, "最小带宽比例必须在%.2f-%.2f之间", 
+                MIN_BW_RATIO, MIN_BW_RATIO_MIN);
         return QMON_ERR_CONFIG;
     }
     
-    if (cfg->max_bw_ratio < 0.5f || cfg->max_bw_ratio > 1.0f) {
-        snprintf(error, error_len, "最大带宽比例必须在0.5-1.0之间");
+    if (cfg->max_bw_ratio < MAX_BW_RATIO_MIN || cfg->max_bw_ratio > MAX_BW_RATIO_MAX) {
+        snprintf(error, error_len, "最大带宽比例必须在%.2f-%.2f之间", 
+                MAX_BW_RATIO_MIN, MAX_BW_RATIO_MAX);
         return QMON_ERR_CONFIG;
     }
     
-    if (cfg->smoothing_factor <= 0.0f || cfg->smoothing_factor >= 1.0f) {
-        snprintf(error, error_len, "平滑因子必须在0.0-1.0之间");
+    if (cfg->smoothing_factor <= SMOOTHING_FACTOR_MIN || cfg->smoothing_factor >= SMOOTHING_FACTOR_MAX) {
+        snprintf(error, error_len, "平滑因子必须在%.1f-%.1f之间", 
+                SMOOTHING_FACTOR_MIN, SMOOTHING_FACTOR_MAX);
         return QMON_ERR_CONFIG;
     }
     
@@ -1778,7 +1801,8 @@ int status_file_update(qosacc_context_t* ctx) {
 
 /* ==================== 信号处理 ==================== */
 void signal_handler(int sig) {
-    // 空函数，通过全局变量控制退出
+    // 记录信号接收
+    syslog(LOG_INFO, "收到信号: %d", sig);
 }
 
 int setup_signal_handlers(qosacc_context_t* ctx) {
