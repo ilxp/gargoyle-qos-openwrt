@@ -1,7 +1,14 @@
-/* qosacc - 基于netlink的优化版QoS监控器
+/* qosacc - 基于netlink的优化版QoS主动拥塞控制
  * 功能：通过ping监控延迟，使用tc库直接调整ifb0根类的带宽
- * 基于Paul Bixel的原始代码优化,poll机制，完整支持HFSC\HTB\CAKE算法。
- * 重构：从popen方式改为直接使用TC库
+ * 使用poll机制，完整支持HFSC\HTB\CAKE算法。
+ * 状态文件目录：/tmp/qosacc.status
+ * 1、使用配置文件启动：qosacc -c /etc/qosacc.conf
+ * 2、混合使用：配置文件提供基础设置，命令行参数进行覆盖或补充：
+ *  命令：qosacc -c /etc/qosacc.conf -v -p 150 -t 1.1.1.1
+ * 3、传统的纯命令：
+ * qosacc 200 8.8.8.8 10000 20
+ * qosacc -d eth0 -t 8.8.8.8 -m 50000 -p 100 -P 30 -v -A
+ * 更多使用qosacc -h
  */
  
 #define _GNU_SOURCE 1
@@ -35,6 +42,7 @@
 #include <time.h>
 #include <dlfcn.h>
 #include <ctype.h>
+#include <atomic>
 
 // TC库头文件
 #include "utils.h"
@@ -55,11 +63,15 @@
 #define REALTIME_DETECT_MS 1000
 #define HEARTBEAT_INTERVAL_MS 10000
 #define HEARTBEAT_TIMEOUT_MS 30000  // 心跳超时重启机制
-#define POLL_TIMEOUT_MS 10
+#define POLL_TIMEOUT_MS 10   // poll 超时时间
 #define MIN_SLEEP_MS 1
-#define CONFIG_VERSION 1  // 配置文件版本
+#define CONFIG_VERSION 1
 #define MIN_CONFIG_VERSION 1
 #define MAX_CONFIG_VERSION 1
+#define DETECT_QDISC_RETRY_COUNT 3
+#define DETECT_QDISC_RETRY_DELAY_MS 100
+#define STATUS_FILE_RETRY_COUNT 3
+#define STATUS_FILE_RETRY_DELAY_MS 100
 
 // 配置范围宏定义
 #define MIN_PING_INTERVAL 50
@@ -76,14 +88,15 @@
 #define MAX_BW_RATIO_MIN 0.5f
 #define MAX_BW_RATIO_MAX 1.0f
 #define SAFE_START_RATIO 0.5f
-#define EPSILON 1e-6f
+#define EPSILON 1e-9   // 浮点数比较误差范围
 #define FLOAT_EPSILON 0.001f
+#define DOUBLE_EPSILON 1e-12
 
-// 算法参数宏
-#define BANDWIDTH_ADJUST_RATE_NEG 0.002f
-#define BANDWIDTH_ADJUST_RATE_POS 0.004f
-#define MIN_ADJUST_FACTOR 0.85f
-#define LOAD_THRESHOLD_FOR_DECREASE 0.85f
+// 算法参数宏（可从配置文件调整）
+#define BANDWIDTH_ADJUST_RATE_NEG 0.002f  // 负误差调整速率
+#define BANDWIDTH_ADJUST_RATE_POS 0.004f  // 正误差调整速率
+#define MIN_ADJUST_FACTOR 0.85f           // 最小调整因子
+#define LOAD_THRESHOLD_FOR_DECREASE 0.85f // 减少带宽的负载阈值
 
 // TC库兼容性宏
 #ifndef RTNL_FAMILY_MAX
@@ -114,34 +127,35 @@ typedef enum {
     QMON_ERR_CONFIG = -4,
     QMON_ERR_SYSTEM = -5,
     QMON_ERR_SIGNAL = -6,
-    QMON_HELP_REQUESTED = -99
+    QMON_ERR_TIMEOUT = -7,
+    QMON_HELP_REQUESTED = -99  // 表示用户请求查看帮助
 } qosacc_result_t;
 
 /* ==================== 配置结构 ==================== */
 typedef struct {
-    int enabled;
-    int ping_interval;
-    int max_bandwidth_kbps;
-    int ping_limit_ms;
-    int classid;
-    int safe_mode;
-    int verbose;
-    int auto_switch_mode;
-    int background_mode;
-    int skip_initial;
-    int min_bw_change_kbps;
-    float min_bw_ratio;
-    float max_bw_ratio;
-    float smoothing_factor;
-    float active_threshold;
-    float idle_threshold;
-    float safe_start_ratio;
-    char target[64];
-    char device[16];
-    char config_file[256];
-    char debug_log[256];
-    char status_file[256];
-    int check_interval;
+    int enabled;                // 是否启用此设备配置
+    int ping_interval;          // ping间隔(ms)
+    int max_bandwidth_kbps;     // 最大带宽(kbps)
+    int ping_limit_ms;          // ping限制(ms)
+    int classid;                // TC类ID
+    int safe_mode;              // 安全模式
+    int verbose;                // 详细输出
+    int auto_switch_mode;       // 自动切换模式
+    int background_mode;        // 后台模式
+    int skip_initial;           // 跳过初始测量
+    int min_bw_change_kbps;     // 最小带宽变化(kbps)
+    float min_bw_ratio;         // 最小带宽比例
+    float max_bw_ratio;         // 最大带宽比例
+    float smoothing_factor;     // 平滑因子
+    float active_threshold;     // 激活阈值
+    float idle_threshold;       // 空闲阈值
+    float safe_start_ratio;     // 安全启动比例
+    char target[64];            // 目标地址
+    char device[16];            // 网络设备
+    char config_file[256];      // 配置文件
+    char debug_log[256];        // 调试日志
+    char status_file[256];      // 状态文件
+    int check_interval;         // 主循环检查间隔（ms）
 } qosacc_config_t;
 
 /* ==================== 状态枚举 ==================== */
@@ -167,6 +181,8 @@ typedef struct runtime_stats_s {
     int64_t min_ping_time_recorded;
     int64_t total_bytes_processed;
     int64_t uptime_seconds;
+    int64_t total_heartbeat_checks;
+    int64_t total_heartbeat_timeouts;
 } runtime_stats_t;
 
 /* ==================== 数据结构 ==================== */
@@ -174,7 +190,7 @@ typedef struct ping_history_s {
     int64_t times[PING_HISTORY_SIZE];
     int index;
     int count;
-    float smoothed;
+    double smoothed;
 } ping_history_t;
 
 /* ==================== 类统计结构 ==================== */
@@ -248,11 +264,21 @@ typedef struct qosacc_context_s {
     
     // 运行时统计
     runtime_stats_t stats;
+    
+    // 原子操作计数器
+    std::atomic<int> signal_counter;
 } qosacc_context_t;
 
 /* ==================== 全局信号标志 ==================== */
 static volatile sig_atomic_t g_sigterm_received = 0;
 static volatile sig_atomic_t g_reset_bw = 0;
+
+/* ==================== 线程安全队列检测结果结构 ==================== */
+typedef struct {
+    char qdisc_kind[16];
+    int valid;
+    int error_code;
+} qdisc_detect_result_t;
 
 /* ==================== 帮助信息 ==================== */
 const char qosacc_usage[] =
@@ -282,6 +308,10 @@ const char qosacc_usage[] =
 "  -p <间隔>        设置ping间隔(ms)，覆盖位置参数\n"
 "  -m <带宽>        设置最大带宽(kbps)，覆盖位置参数\n"
 "  -P <限制>        设置ping限制(ms)，覆盖位置参数\n\n"
+"示例:\n"
+"  qosacc 200 8.8.8.8 10000 20\n"
+"  qosacc -b -v -A -d eth0 -p 100 -t 1.1.1.1 -m 50000 -P 15\n"
+"  qosacc -c /etc/qosacc.conf\n\n"
 "信号处理:\n"
 "  SIGTERM, SIGINT  安全终止程序，并尝试恢复TC配置\n"
 "  SIGUSR1          重置链路带宽到初始值\n";
@@ -376,25 +406,23 @@ int resolve_target(const char* target, struct sockaddr_in6* addr, char* error, i
 void qosacc_log(qosacc_context_t* ctx, int level, const char* format, ...) {
     if (!ctx) return;
     
-    // 优化：提前检查日志级别
     if (!ctx->config.verbose && level > QMON_LOG_INFO) {
         return;
     }
     
-    // 性能优化建议1：缓存时间戳
-    static int64_t last_log_time = 0;
+    static std::atomic<int64_t> last_log_time(0);
     static char cached_time_str[32] = {0};
     int64_t now_ms = qosacc_time_ms();
+    int64_t last_time = last_log_time.load(std::memory_order_relaxed);
     
     va_list args;
     char buffer[1024];
     
-    // 每100ms更新一次时间缓存
-    if (now_ms - last_log_time > 100 || last_log_time == 0) {
+    if (now_ms - last_time > 100 || last_time == 0) {
         time_t now = time(NULL);
         struct tm* tm_info = localtime(&now);
         strftime(cached_time_str, sizeof(cached_time_str), "%Y-%m-%d %H:%M:%S", tm_info);
-        last_log_time = now_ms;
+        last_log_time.store(now_ms, std::memory_order_relaxed);
     }
     
     va_start(args, format);
@@ -935,13 +963,13 @@ int ping_manager_receive(ping_manager_t* pm) {
     if (hist->count == 1) {
         hist->smoothed = ctx->raw_ping_time_us;
     } else {
-        hist->smoothed = hist->smoothed * (1.0f - ctx->config.smoothing_factor) +
+        hist->smoothed = hist->smoothed * (1.0 - ctx->config.smoothing_factor) +
                           ctx->raw_ping_time_us * ctx->config.smoothing_factor;
     }
     
-    ctx->filtered_ping_time_us = (int)hist->smoothed;
+    ctx->filtered_ping_time_us = (int64_t)hist->smoothed;
     
-    qosacc_log(ctx, QMON_LOG_DEBUG, "收到ping回复: seq=%d, 时间=%dms, 平滑=%dms\n",
+    qosacc_log(ctx, QMON_LOG_DEBUG, "收到ping回复: seq=%d, 时间=%dms, 平滑=%ldms\n",
                seq, triptime, ctx->filtered_ping_time_us / 1000);
     
     return 1;
@@ -1274,46 +1302,70 @@ int tc_class_modify(qosacc_context_t* ctx, __u32 rate) {
     return 0;
 }
 
-char* detect_qdisc_kind(qosacc_context_t* ctx) {
-    static char qdisc_kind[16] = "htb";
+qdisc_detect_result_t safe_detect_qdisc_kind(qosacc_context_t* ctx) {
+    qdisc_detect_result_t result = {0};
+    strcpy(result.qdisc_kind, "htb");
+    result.valid = 1;
     
-    FILE* fp = popen("tc -s qdisc show", "r");
-    if (!fp) {
-        qosacc_log(ctx, QMON_LOG_ERROR, "popen failed: %s\n", strerror(errno));
-        return qdisc_kind;
-    }
-
-    char line[512];
-    int success = 1;
-    
-    while (fgets(line, sizeof(line), fp)) {
-        char* newline = strchr(line, '\n');
-        if (newline) *newline = '\0';
+    for (int attempt = 0; attempt < DETECT_QDISC_RETRY_COUNT; attempt++) {
+        if (attempt > 0) {
+            usleep(DETECT_QDISC_RETRY_DELAY_MS * 1000);
+        }
         
-        if (strstr(line, ctx->config.device) != NULL) {
-            if (strstr(line, "htb") != NULL) {
-                strcpy(qdisc_kind, "htb");
-                break;
-            } else if (strstr(line, "hfsc") != NULL) {
-                strcpy(qdisc_kind, "hfsc");
-                break;
-            } else if (strstr(line, "cake") != NULL) {
-                strcpy(qdisc_kind, "cake");
-                break;
+        FILE* fp = popen("tc -s qdisc show", "r");
+        if (!fp) {
+            qosacc_log(ctx, QMON_LOG_ERROR, "popen failed: %s\n", strerror(errno));
+            result.error_code = errno;
+            result.valid = 0;
+            continue;
+        }
+        
+        char line[512];
+        int success = 1;
+        
+        while (fgets(line, sizeof(line), fp)) {
+            char* newline = strchr(line, '\n');
+            if (newline) *newline = '\0';
+            
+            if (strstr(line, ctx->config.device) != NULL) {
+                if (strstr(line, "htb") != NULL) {
+                    strcpy(result.qdisc_kind, "htb");
+                    success = 1;
+                    break;
+                } else if (strstr(line, "hfsc") != NULL) {
+                    strcpy(result.qdisc_kind, "hfsc");
+                    success = 1;
+                    break;
+                } else if (strstr(line, "cake") != NULL) {
+                    strcpy(result.qdisc_kind, "cake");
+                    success = 1;
+                    break;
+                }
             }
         }
-    }
-
-    int ret = pclose(fp);
-    if (ret != 0) {
-        qosacc_log(ctx, QMON_LOG_WARN, "pclose returned %d\n", ret);
-    }
-    if (!success) {
-        qosacc_log(ctx, QMON_LOG_ERROR, "Failed to parse tc output\n");
+        
+        int ret = pclose(fp);
+        if (WIFEXITED(ret)) {
+            ret = WEXITSTATUS(ret);
+        } else {
+            ret = -1;
+        }
+        
+        if (ret != 0) {
+            qosacc_log(ctx, QMON_LOG_WARN, "pclose returned %d\n", ret);
+            result.error_code = ret;
+            result.valid = 0;
+        } else if (!success) {
+            qosacc_log(ctx, QMON_LOG_ERROR, "Failed to parse tc output\n");
+            result.error_code = -1;
+            result.valid = 0;
+        } else {
+            qosacc_log(ctx, QMON_LOG_INFO, "检测到队列算法: %s\n", result.qdisc_kind);
+            break;
+        }
     }
     
-    qosacc_log(ctx, QMON_LOG_INFO, "检测到队列算法: %s\n", qdisc_kind);
-    return qdisc_kind;
+    return result;
 }
 
 int safe_popen_and_read(qosacc_context_t* ctx, const char* cmd, char* output, int output_size) {
@@ -1378,9 +1430,14 @@ int tc_set_bandwidth(qosacc_context_t* ctx, int bandwidth_bps) {
     }
     
     if (strlen(ctx->detected_qdisc) == 0) {
-        char* qdisc_kind = detect_qdisc_kind(ctx);
-        strncpy(ctx->detected_qdisc, qdisc_kind, sizeof(ctx->detected_qdisc) - 1);
-        ctx->detected_qdisc[sizeof(ctx->detected_qdisc) - 1] = '\0';
+        qdisc_detect_result_t result = safe_detect_qdisc_kind(ctx);
+        if (result.valid) {
+            strncpy(ctx->detected_qdisc, result.qdisc_kind, sizeof(ctx->detected_qdisc) - 1);
+            ctx->detected_qdisc[sizeof(ctx->detected_qdisc) - 1] = '\0';
+        } else {
+            qosacc_log(ctx, QMON_LOG_ERROR, "无法检测队列算法，使用默认htb\n");
+            strcpy(ctx->detected_qdisc, "htb");
+        }
     }
     
     int ret = 0;
@@ -1464,9 +1521,14 @@ int tc_controller_init(tc_controller_t* tc, qosacc_context_t* ctx) {
         return QMON_ERR_SYSTEM;
     }
     
-    char* qdisc_kind = detect_qdisc_kind(ctx);
-    strncpy(ctx->detected_qdisc, qdisc_kind, sizeof(ctx->detected_qdisc) - 1);
-    ctx->detected_qdisc[sizeof(ctx->detected_qdisc) - 1] = '\0';
+    qdisc_detect_result_t result = safe_detect_qdisc_kind(ctx);
+    if (result.valid) {
+        strncpy(ctx->detected_qdisc, result.qdisc_kind, sizeof(ctx->detected_qdisc) - 1);
+        ctx->detected_qdisc[sizeof(ctx->detected_qdisc) - 1] = '\0';
+    } else {
+        qosacc_log(ctx, QMON_LOG_ERROR, "队列算法检测失败，使用默认htb\n");
+        strcpy(ctx->detected_qdisc, "htb");
+    }
     
     qosacc_log(ctx, QMON_LOG_INFO, "TC控制器初始化完成 (算法: %s)\n", ctx->detected_qdisc);
     
@@ -1538,6 +1600,8 @@ void update_runtime_stats(qosacc_context_t* ctx) {
         qosacc_log(ctx, QMON_LOG_INFO, "  总错误数: %ld\n", ctx->stats.total_errors);
         qosacc_log(ctx, QMON_LOG_INFO, "  最大ping: %ldms\n", ctx->stats.max_ping_time_recorded / 1000);
         qosacc_log(ctx, QMON_LOG_INFO, "  最小ping: %ldms\n", ctx->stats.min_ping_time_recorded / 1000);
+        qosacc_log(ctx, QMON_LOG_INFO, "  心跳检查: %ld次\n", ctx->stats.total_heartbeat_checks);
+        qosacc_log(ctx, QMON_LOG_INFO, "  心跳超时: %ld次\n", ctx->stats.total_heartbeat_timeouts);
         
         last_stats_update = now;
     }
@@ -1581,6 +1645,9 @@ void state_machine_init(qosacc_context_t* ctx) {
     ctx->pingon = 0;
     ctx->dbw_fil = 0;
     ctx->dbw_ul = ctx->config.max_bandwidth_kbps * 1000;
+    
+    // 初始化原子计数器
+    ctx->signal_counter.store(0, std::memory_order_relaxed);
 }
 
 void state_machine_check(qosacc_context_t* ctx, ping_manager_t* pm, tc_controller_t* tc) {
@@ -1638,7 +1705,7 @@ void state_machine_idle(qosacc_context_t* ctx) {
         return;
     }
     
-    float utilization = (float)ctx->filtered_total_load_bps / max_bps;
+    double utilization = (double)ctx->filtered_total_load_bps / (double)max_bps;
     
     if (utilization > ctx->config.active_threshold) {
         if (ctx->realtime_classes == 0 && ctx->config.auto_switch_mode) {
@@ -1651,7 +1718,7 @@ void state_machine_idle(qosacc_context_t* ctx) {
         
         qosacc_log(ctx, QMON_LOG_INFO, "切换到%s状态: 利用率=%.1f%%\n",
                   (ctx->state == QMON_ACTIVE) ? "ACTIVE" : "REALTIME",
-                  utilization * 100.0f);
+                  utilization * 100.0);
     }
 }
 
@@ -1669,13 +1736,13 @@ void state_machine_active(qosacc_context_t* ctx) {
         return;
     }
     
-    float utilization = (float)ctx->filtered_total_load_bps / max_bps;
+    double utilization = (double)ctx->filtered_total_load_bps / (double)max_bps;
     
     // 使用双精度浮点数提高精度
-    if (utilization < ctx->config.idle_threshold - FLOAT_EPSILON) {
+    if (utilization < ctx->config.idle_threshold - DOUBLE_EPSILON) {
         ctx->state = QMON_IDLE;
         qosacc_log(ctx, QMON_LOG_INFO, "切换到IDLE状态: 利用率=%.1f%%\n", 
-                  utilization * 100.0f);
+                  utilization * 100.0);
         return;
     }
     
@@ -1688,19 +1755,19 @@ void state_machine_active(qosacc_context_t* ctx) {
     double error = (double)ctx->filtered_ping_time_us - (double)current_plimit_us;
     double error_ratio = error / (double)current_plimit_us;
     
-    float adjust_factor = 1.0f;
-    if (error_ratio < 0) {
+    double adjust_factor = 1.0;
+    if (error_ratio < 0.0) {
         if (ctx->filtered_total_load_bps < ctx->current_limit_bps * LOAD_THRESHOLD_FOR_DECREASE) {
             return;
         }
-        adjust_factor = 1.0f - BANDWIDTH_ADJUST_RATE_NEG * (float)error_ratio;
+        adjust_factor = 1.0 - BANDWIDTH_ADJUST_RATE_NEG * error_ratio;
     } else {
-        adjust_factor = 1.0f - BANDWIDTH_ADJUST_RATE_POS * ((float)error_ratio + 0.1f);
+        adjust_factor = 1.0 - BANDWIDTH_ADJUST_RATE_POS * (error_ratio + 0.1);
         if (adjust_factor < MIN_ADJUST_FACTOR) adjust_factor = MIN_ADJUST_FACTOR;
     }
     
     int old_limit = ctx->current_limit_bps;
-    int new_limit = (int)(ctx->current_limit_bps * adjust_factor + 0.5f);
+    int new_limit = (int)(ctx->current_limit_bps * adjust_factor + 0.5);
     
     int min_bw = (int)(ctx->config.max_bandwidth_kbps * 1000 * ctx->config.min_bw_ratio);
     int max_bw = (int)(ctx->config.max_bandwidth_kbps * 1000 * ctx->config.max_bw_ratio);
@@ -1728,6 +1795,8 @@ void heart_beat_check(qosacc_context_t* ctx) {
     int64_t now = qosacc_time_ms();
     
     if (now - last_heartbeat > HEARTBEAT_INTERVAL_MS) {
+        ctx->stats.total_heartbeat_checks++;
+        
         qosacc_log(ctx, QMON_LOG_DEBUG, "心跳检测: 系统运行正常\n");
         qosacc_log(ctx, QMON_LOG_DEBUG, "  - 状态: %d\n", ctx->state);
         qosacc_log(ctx, QMON_LOG_DEBUG, "  - 当前带宽: %d kbps\n", ctx->current_limit_bps / 1000);
@@ -1756,6 +1825,7 @@ void state_machine_run(qosacc_context_t* ctx, ping_manager_t* pm, tc_controller_
         ctx->state = QMON_CHK;
         ctx->last_heartbeat_ms = now;
         ctx->stats.total_errors++;
+        ctx->stats.total_heartbeat_timeouts++;
         ctx->stats.last_error_time = now;
         
         // 尝试重新初始化网络连接
@@ -1851,7 +1921,7 @@ int status_file_update(qosacc_context_t* ctx) {
         return QMON_ERR_FILE;
     }
     
-    // 添加运行时统计到状态文件
+    // 原子写入状态文件
     fprintf(temp_fp, "状态: %d\n", ctx->state);
     fprintf(temp_fp, "当前带宽: %d kbps\n", ctx->current_limit_bps / 1000);
     fprintf(temp_fp, "当前ping: %ld ms\n", ctx->filtered_ping_time_us / 1000);
@@ -1863,6 +1933,8 @@ int status_file_update(qosacc_context_t* ctx) {
     fprintf(temp_fp, "运行时间: %ld秒\n", ctx->stats.uptime_seconds);
     fprintf(temp_fp, "总带宽调整: %ld次\n", ctx->stats.total_bandwidth_adjustments);
     fprintf(temp_fp, "总错误数: %ld\n", ctx->stats.total_errors);
+    fprintf(temp_fp, "心跳检查: %ld次\n", ctx->stats.total_heartbeat_checks);
+    fprintf(temp_fp, "心跳超时: %ld次\n", ctx->stats.total_heartbeat_timeouts);
     fprintf(temp_fp, "最后更新: %ld\n", (long)now);
     
     fflush(temp_fp);
@@ -1871,12 +1943,12 @@ int status_file_update(qosacc_context_t* ctx) {
     // 原子重命名，添加重试机制
     int retry_count = 0;
     while (rename(temp_file, ctx->config.status_file) != 0) {
-        if (retry_count++ >= 3) {
+        if (retry_count++ >= STATUS_FILE_RETRY_COUNT) {
             qosacc_log(ctx, QMON_LOG_ERROR, "无法重命名状态文件: %s\n", strerror(errno));
             remove(temp_file);
             return QMON_ERR_FILE;
         }
-        usleep(100000);  // 等待100ms后重试
+        usleep(STATUS_FILE_RETRY_DELAY_MS * 1000);
     }
     
     last_update = now;
@@ -2128,6 +2200,7 @@ int main(int argc, char* argv[]) {
                 // 更新信号标志
                 context.sigterm = g_sigterm_received;
                 context.reset_bw = g_reset_bw;
+                context.signal_counter.fetch_add(1, std::memory_order_relaxed);
                 continue;  // 被信号中断，继续循环
             }
             qosacc_log(&context, QMON_LOG_ERROR, "poll失败: %s\n", strerror(errno));
@@ -2183,6 +2256,9 @@ cleanup:
     qosacc_log(&context, QMON_LOG_INFO, "  总错误数: %ld\n", context.stats.total_errors);
     qosacc_log(&context, QMON_LOG_INFO, "  最大ping: %ldms\n", context.stats.max_ping_time_recorded / 1000);
     qosacc_log(&context, QMON_LOG_INFO, "  最小ping: %ldms\n", context.stats.min_ping_time_recorded / 1000);
+    qosacc_log(&context, QMON_LOG_INFO, "  心跳检查: %ld次\n", context.stats.total_heartbeat_checks);
+    qosacc_log(&context, QMON_LOG_INFO, "  心跳超时: %ld次\n", context.stats.total_heartbeat_timeouts);
+    qosacc_log(&context, QMON_LOG_INFO, "  信号中断: %d次\n", context.signal_counter.load(std::memory_order_relaxed));
     
     qosacc_log(&context, QMON_LOG_INFO, "QoS监控器已退出\n");
     
