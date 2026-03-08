@@ -1,8 +1,13 @@
 /* qosacc - 基于netlink的优化版QoS监控器
  * 功能：通过ping监控延迟，使用netlink动态调整ifb0根类的带宽
  * 基于Paul Bixel的原始代码优化,poll机制，完整支持HFSC\HTB\CAKE算法。
- * # 使用配置文件启动：qosacc -c /etc/qosacc.conf
- *  命令行参数覆盖配置文件：qosacc -c /etc/qosacc.conf -v -p 100 -t 1.1.1.1
+ * 1、使用配置文件启动：qosacc -c /etc/qosacc.conf
+ * 2、混合使用：配置文件提供基础设置，命令行参数进行覆盖或补充：
+ *  命令：qosacc -c /etc/qosacc.conf -v -p 150 -t 1.1.1.1
+ * 3、传统的纯命令：
+ * qosacc 200 8.8.8.8 10000 20
+ * qosacc -d eth0 -t 8.8.8.8 -m 50000 -p 100 -P 30 -v -A
+ * 更多使用qosacc -h 或者qosacc -h 
  */
  
 #include <stdio.h>
@@ -10,7 +15,7 @@
 #include <string.h>
 #include <unistd.h>
 #include <stdint.h>
-#include <stdarg.h>  // 添加可变参数支持
+#include <stdarg.h>
 #include <signal.h>
 #include <syslog.h>
 #include <sys/time.h>
@@ -25,7 +30,7 @@
 #include <netinet/icmp6.h>
 #include <arpa/inet.h>
 #include <netdb.h>
-#include <poll.h>  // 修复poll.h包含
+#include <poll.h>
 #include <fcntl.h>
 #include <errno.h>
 #include <math.h>
@@ -33,6 +38,10 @@
 #include <sys/stat.h>
 
 /* ==================== 宏定义 ==================== */
+#define QMON_LOG_ERROR 0
+#define QMON_LOG_WARN  1
+#define QMON_LOG_INFO  2
+#define QMON_LOG_DEBUG 3
 #define MAX_PACKET_SIZE 4096
 #define PING_HISTORY_SIZE 10
 #define MIN_PING_TIME_MS 1
@@ -42,12 +51,6 @@
 #define REALTIME_DETECT_MS 1000
 #define HEARTBEAT_INTERVAL_MS 10000
 #define POLL_TIMEOUT_MS 10  // poll 超时时间
-
-// 修改日志宏定义，避免与系统定义冲突
-#define QMON_LOG_ERROR 0
-#define QMON_LOG_WARN  1
-#define QMON_LOG_INFO  2
-#define QMON_LOG_DEBUG 3
 
 /* ==================== 返回码 ==================== */
 typedef enum {
