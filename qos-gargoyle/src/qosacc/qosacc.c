@@ -7,7 +7,7 @@
  * 3、传统的纯命令：
  * qosacc 200 8.8.8.8 10000 20
  * qosacc -d eth0 -t 8.8.8.8 -m 50000 -p 100 -P 30 -v -A
- * 更多使用qosacc -h 或者qosacc -h 
+ * 更多使用qosacc -h
  */
  
 #include <stdio.h>
@@ -36,6 +36,7 @@
 #include <math.h>
 #include <pthread.h>
 #include <sys/stat.h>
+#include <float.h>
 
 /* ==================== 宏定义 ==================== */
 #define QMON_LOG_ERROR 0
@@ -67,6 +68,13 @@
 #define MAX_BW_RATIO_MIN 0.5f
 #define MAX_BW_RATIO_MAX 1.0f
 #define SAFE_START_RATIO 0.5f
+#define EPSILON 1e-6f  // 浮点数比较误差范围
+
+// 算法参数宏（可从配置文件调整）
+#define BANDWIDTH_ADJUST_RATE_NEG 0.002f  // 负误差调整速率
+#define BANDWIDTH_ADJUST_RATE_POS 0.004f  // 正误差调整速率
+#define MIN_ADJUST_FACTOR 0.85f           // 最小调整因子
+#define LOAD_THRESHOLD_FOR_DECREASE 0.85f // 减少带宽的负载阈值
 
 /* ==================== 返回码 ==================== */
 typedef enum {
@@ -77,12 +85,12 @@ typedef enum {
     QMON_ERR_CONFIG = -4,
     QMON_ERR_SYSTEM = -5,
     QMON_ERR_SIGNAL = -6,
-	QMON_HELP_REQUESTED = -99  // 表示用户请求查看帮助
+    QMON_HELP_REQUESTED = -99  // 表示用户请求查看帮助
 } qosacc_result_t;
 
 /* ==================== 配置结构 ==================== */
 typedef struct {
-	int enabled;                // 是否启用此设备配置
+    int enabled;                // 是否启用此设备配置
     int ping_interval;          // ping间隔(ms)
     int max_bandwidth_kbps;     // 最大带宽(kbps)
     int ping_limit_ms;          // ping限制(ms)
@@ -104,7 +112,7 @@ typedef struct {
     char config_file[256];      // 配置文件
     char debug_log[256];        // 调试日志
     char status_file[256];      // 状态文件
-	int check_interval;         // 主循环检查间隔（ms）
+    int check_interval;         // 主循环检查间隔（ms）
 } qosacc_config_t;
 
 /* ==================== 状态枚举 ==================== */
@@ -166,8 +174,11 @@ typedef struct qosacc_context_s {
     FILE* debug_log_file;
     
     // 控制标志
-    int sigterm;
+    volatile sig_atomic_t sigterm;  // 改为volatile sig_atomic_t
 } qosacc_context_t;
+
+/* ==================== 全局信号标志 ==================== */
+static volatile sig_atomic_t g_sigterm_received = 0;
 
 /* ==================== 帮助信息 ==================== */
 const char qosacc_usage[] =
@@ -388,7 +399,7 @@ void qosacc_config_init(qosacc_config_t* cfg) {
     if (!cfg) return;
     
     memset(cfg, 0, sizeof(qosacc_config_t));
-	cfg->enabled = 1; // 默认启用
+    cfg->enabled = 1; // 默认启用
     cfg->ping_interval = 200;
     cfg->max_bandwidth_kbps = 10000;
     cfg->ping_limit_ms = 20;
@@ -398,14 +409,14 @@ void qosacc_config_init(qosacc_config_t* cfg) {
     cfg->auto_switch_mode = 0;
     cfg->background_mode = 0;
     cfg->skip_initial = 0;
-    cfg->min_bw_change_kbps = 10;	// 最小带宽变化阈值
-    cfg->min_bw_ratio = 0.1f;	 // 最小带宽比例（最大带宽的10%）
-    cfg->max_bw_ratio = 1.0f;	 // 最大带宽比例
+    cfg->min_bw_change_kbps = 10;    // 最小带宽变化阈值
+    cfg->min_bw_ratio = 0.1f;     // 最小带宽比例（最大带宽的10%）
+    cfg->max_bw_ratio = 1.0f;     // 最大带宽比例
     cfg->smoothing_factor = 0.3f;   // ping延迟平滑因子
     cfg->active_threshold = 0.7f;   // 切换到活跃状态的利用率阈值
     cfg->idle_threshold = 0.3f;    // 切换到空闲状态的利用率阈值
     cfg->safe_start_ratio = 0.5f;
-	cfg->check_interval = 1000; // 默认1秒
+    cfg->check_interval = 1000; // 默认1秒
     strcpy(cfg->device, "ifb0");
     strcpy(cfg->target, "8.8.8.8");
     strcpy(cfg->status_file, "/tmp/qosacc.status");
@@ -608,8 +619,14 @@ int qosacc_config_validate(qosacc_config_t* cfg, int argc, char* argv[], char* e
         snprintf(error, error_len, "未提供任何参数");
         return QMON_ERR_CONFIG;
     }
-	
-	if (!cfg || !error) return QMON_ERR_MEMORY;
+    
+    if (!cfg || !error) return QMON_ERR_MEMORY;
+
+    // 检查enabled字段（优化点1）
+    if (!cfg->enabled) {
+        snprintf(error, error_len, "设备 '%s' 的配置未启用", cfg->device);
+        return QMON_ERR_CONFIG;
+    }
 
     if (cfg->ping_interval < MIN_PING_INTERVAL || cfg->ping_interval > MAX_PING_INTERVAL) {
         snprintf(error, error_len, "ping间隔必须在%d-%dms之间", 
@@ -639,19 +656,19 @@ int qosacc_config_validate(qosacc_config_t* cfg, int argc, char* argv[], char* e
         return QMON_ERR_CONFIG;
     }
     
-    if (cfg->min_bw_ratio < MIN_BW_RATIO || cfg->min_bw_ratio > MIN_BW_RATIO_MIN) {
+    if (cfg->min_bw_ratio < (MIN_BW_RATIO - EPSILON) || cfg->min_bw_ratio > (MIN_BW_RATIO_MIN + EPSILON)) {
         snprintf(error, error_len, "最小带宽比例必须在%.2f-%.2f之间", 
                 MIN_BW_RATIO, MIN_BW_RATIO_MIN);
         return QMON_ERR_CONFIG;
     }
     
-    if (cfg->max_bw_ratio < MAX_BW_RATIO_MIN || cfg->max_bw_ratio > MAX_BW_RATIO_MAX) {
+    if (cfg->max_bw_ratio < (MAX_BW_RATIO_MIN - EPSILON) || cfg->max_bw_ratio > (MAX_BW_RATIO_MAX + EPSILON)) {
         snprintf(error, error_len, "最大带宽比例必须在%.2f-%.2f之间", 
                 MAX_BW_RATIO_MIN, MAX_BW_RATIO_MAX);
         return QMON_ERR_CONFIG;
     }
     
-    if (cfg->smoothing_factor <= SMOOTHING_FACTOR_MIN || cfg->smoothing_factor >= SMOOTHING_FACTOR_MAX) {
+    if (cfg->smoothing_factor <= (SMOOTHING_FACTOR_MIN - EPSILON) || cfg->smoothing_factor >= (SMOOTHING_FACTOR_MAX + EPSILON)) {
         snprintf(error, error_len, "平滑因子必须在%.1f-%.1f之间", 
                 SMOOTHING_FACTOR_MIN, SMOOTHING_FACTOR_MAX);
         return QMON_ERR_CONFIG;
@@ -1026,7 +1043,7 @@ char* detect_qdisc_kind(qosacc_context_t* ctx) {
     return qdisc_kind;
 }
 
-// 获取根类ID
+// 改进的get_root_classid函数（优化点4）
 int get_root_classid(qosacc_context_t* ctx, int* root_classid) {
     if (!ctx || !root_classid) return QMON_ERR_MEMORY;
     
@@ -1051,16 +1068,36 @@ int get_root_classid(qosacc_context_t* ctx, int* root_classid) {
             strstr(line, "parent 1:0") != NULL ||
             (strstr(line, "parent") == NULL && strstr(line, "class") != NULL)) {
             
-            // 解析类ID
-            int major, minor;
-            if (sscanf(line, "class htb 1:%x", &minor) == 1) {
-                *root_classid = 0x10000 | minor;
-                found = 1;
-                break;
-            } else if (sscanf(line, "class hfsc 1:%x", &minor) == 1) {
-                *root_classid = 0x10000 | minor;
-                found = 1;
-                break;
+            // 改进的解析逻辑：使用更健壮的方法
+            char* class_pos = strstr(line, "class ");
+            if (class_pos) {
+                class_pos += 6; // 跳过"class "
+                
+                // 跳过可能的空格
+                while (*class_pos == ' ') class_pos++;
+                
+                // 检查是否是htb或hfsc
+                if (strncmp(class_pos, "htb ", 4) == 0) {
+                    char* id_pos = class_pos + 4;
+                    while (*id_pos == ' ') id_pos++;
+                    
+                    // 解析1:xxxx格式
+                    if (sscanf(id_pos, "1:%x", root_classid) == 1) {
+                        *root_classid = 0x10000 | (*root_classid & 0xFFFF);
+                        found = 1;
+                        break;
+                    }
+                } else if (strncmp(class_pos, "hfsc ", 5) == 0) {
+                    char* id_pos = class_pos + 5;
+                    while (*id_pos == ' ') id_pos++;
+                    
+                    // 解析1:xxxx格式
+                    if (sscanf(id_pos, "1:%x", root_classid) == 1) {
+                        *root_classid = 0x10000 | (*root_classid & 0xFFFF);
+                        found = 1;
+                        break;
+                    }
+                }
             }
         }
     }
@@ -1657,13 +1694,13 @@ void state_machine_active(qosacc_context_t* ctx) {
     
     float adjust_factor = 1.0f;
     if (error_ratio < 0) {
-        if (ctx->filtered_total_load_bps < ctx->current_limit_bps * 0.85f) {
+        if (ctx->filtered_total_load_bps < ctx->current_limit_bps * LOAD_THRESHOLD_FOR_DECREASE) {
             return;
         }
-        adjust_factor = 1.0f - 0.002f * error_ratio;
+        adjust_factor = 1.0f - BANDWIDTH_ADJUST_RATE_NEG * error_ratio;
     } else {
-        adjust_factor = 1.0f - 0.004f * (error_ratio + 0.1f);
-        if (adjust_factor < 0.85f) adjust_factor = 0.85f;
+        adjust_factor = 1.0f - BANDWIDTH_ADJUST_RATE_POS * (error_ratio + 0.1f);
+        if (adjust_factor < MIN_ADJUST_FACTOR) adjust_factor = MIN_ADJUST_FACTOR;
     }
     
     int old_limit = ctx->current_limit_bps;
@@ -1745,10 +1782,10 @@ void state_machine_run(qosacc_context_t* ctx, ping_manager_t* pm, tc_controller_
     
     switch (ctx->state) {
         case QMON_CHK:
-            state_machine_check(ctx, pm, tc);  // 添加 tc 参数
+            state_machine_check(ctx, pm, tc);
             break;
         case QMON_INIT:
-            state_machine_init_state(ctx, tc);  // 添加 tc 参数
+            state_machine_init_state(ctx, tc);
             break;
         case QMON_IDLE:
             state_machine_idle(ctx);
@@ -1773,27 +1810,36 @@ int status_file_update(qosacc_context_t* ctx) {
         return QMON_OK;
     }
     
-    if (!ctx->status_file) {
-        ctx->status_file = fopen(ctx->config.status_file, "w");
-        if (!ctx->status_file) {
-            qosacc_log(ctx, QMON_LOG_ERROR, "无法打开状态文件: %s\n", strerror(errno));
-            return QMON_ERR_FILE;
-        }
+    // 原子写入状态文件（优化点2）
+    char temp_file[512];
+    snprintf(temp_file, sizeof(temp_file), "%s.tmp", ctx->config.status_file);
+    
+    FILE* temp_fp = fopen(temp_file, "w");
+    if (!temp_fp) {
+        qosacc_log(ctx, QMON_LOG_ERROR, "无法打开临时状态文件: %s\n", strerror(errno));
+        return QMON_ERR_FILE;
     }
     
     // 使用%ld格式化int64_t
-    fprintf(ctx->status_file, "状态: %d\n", ctx->state);
-    fprintf(ctx->status_file, "当前带宽: %d kbps\n", ctx->current_limit_bps / 1000);
-    fprintf(ctx->status_file, "当前ping: %ld ms\n", ctx->filtered_ping_time_us / 1000);
-    fprintf(ctx->status_file, "最大ping: %ld ms\n", ctx->max_ping_time_us / 1000);
-    fprintf(ctx->status_file, "流量负载: %d kbps\n", ctx->filtered_total_load_bps / 1000);
-    fprintf(ctx->status_file, "已发送ping: %d\n", ctx->ntransmitted);
-    fprintf(ctx->status_file, "已接收ping: %d\n", ctx->nreceived);
-    fprintf(ctx->status_file, "队列算法: %s\n", ctx->detected_qdisc);
-    fprintf(ctx->status_file, "最后更新: %ld\n", (long)now);
+    fprintf(temp_fp, "状态: %d\n", ctx->state);
+    fprintf(temp_fp, "当前带宽: %d kbps\n", ctx->current_limit_bps / 1000);
+    fprintf(temp_fp, "当前ping: %ld ms\n", ctx->filtered_ping_time_us / 1000);
+    fprintf(temp_fp, "最大ping: %ld ms\n", ctx->max_ping_time_us / 1000);
+    fprintf(temp_fp, "流量负载: %d kbps\n", ctx->filtered_total_load_bps / 1000);
+    fprintf(temp_fp, "已发送ping: %d\n", ctx->ntransmitted);
+    fprintf(temp_fp, "已接收ping: %d\n", ctx->nreceived);
+    fprintf(temp_fp, "队列算法: %s\n", ctx->detected_qdisc);
+    fprintf(temp_fp, "最后更新: %ld\n", (long)now);
     
-    fflush(ctx->status_file);
-    fseek(ctx->status_file, 0, SEEK_SET);
+    fflush(temp_fp);
+    fclose(temp_fp);
+    
+    // 原子重命名
+    if (rename(temp_file, ctx->config.status_file) != 0) {
+        qosacc_log(ctx, QMON_LOG_ERROR, "无法重命名状态文件: %s\n", strerror(errno));
+        remove(temp_file);
+        return QMON_ERR_FILE;
+    }
     
     last_update = now;
     return QMON_OK;
@@ -1802,7 +1848,10 @@ int status_file_update(qosacc_context_t* ctx) {
 /* ==================== 信号处理 ==================== */
 void signal_handler(int sig) {
     // 记录信号接收
-    syslog(LOG_INFO, "收到信号: %d", sig);
+    syslog(LOG_INFO, "收到退出信号: %d", sig);
+    // 注意：在实际的信号处理函数中，应避免复杂操作。
+    // 此处仅设置全局标志，主循环会检测并退出。
+    g_sigterm_received = 1;
 }
 
 int setup_signal_handlers(qosacc_context_t* ctx) {
@@ -1876,7 +1925,7 @@ void qosacc_cleanup(qosacc_context_t* ctx, ping_manager_t* pm, tc_controller_t* 
 int main(int argc, char* argv[]) {
     int ret = EXIT_FAILURE;
     qosacc_context_t context = {0};
-	ping_manager_t ping_mgr = {0};
+    ping_manager_t ping_mgr = {0};
     tc_controller_t tc_mgr = {0};
     
     // 情况1：无任何参数，直接提示帮助
@@ -1990,6 +2039,9 @@ int main(int argc, char* argv[]) {
     fds[0].fd = context.ping_socket;
     fds[0].events = POLLIN;
     
+    // 将全局标志同步到上下文
+    context.sigterm = g_sigterm_received;
+    
     while (!context.sigterm) {
         int64_t now = qosacc_time_ms();
         
@@ -2006,6 +2058,13 @@ int main(int argc, char* argv[]) {
         
         // 找到最小的正超时时间
         int min_timeout = POLL_TIMEOUT_MS;
+        
+        // 考虑check_interval配置
+        int max_check_timeout = context.config.check_interval;
+        if (max_check_timeout < min_timeout) {
+            min_timeout = max_check_timeout;
+        }
+        
         if (next_ping > 0 && next_ping < min_timeout) min_timeout = next_ping;
         if (next_stats > 0 && next_stats < min_timeout) min_timeout = next_stats;
         if (next_tc_update > 0 && next_tc_update < min_timeout) min_timeout = next_tc_update;
@@ -2025,6 +2084,8 @@ int main(int argc, char* argv[]) {
         
         if (poll_ret < 0) {
             if (errno == EINTR) {
+                // 更新信号标志
+                context.sigterm = g_sigterm_received;
                 continue;  // 被信号中断，继续循环
             }
             qosacc_log(&context, QMON_LOG_ERROR, "poll失败: %s\n", strerror(errno));
@@ -2049,6 +2110,9 @@ int main(int argc, char* argv[]) {
         state_machine_run(&context, &ping_mgr, &tc_mgr);
         
         status_file_update(&context);
+        
+        // 更新信号标志
+        context.sigterm = g_sigterm_received;
         
         if (context.sigterm) {
             qosacc_log(&context, QMON_LOG_INFO, "收到退出信号\n");

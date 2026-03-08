@@ -19,7 +19,7 @@ define Package/qos-gargoyle
 	CATEGORY:=Network
 	TITLE:=A set of QoS scripts designed for use with Gargoyle Web Interface
 	DEPENDS:=+tc-full +ip +bc +kmod-ifb +kmod-sched +kmod-sched-connmark +kmod-sched-prio +nftables \
-							+kmod-nf-conntrack +kmod-nf-conntrack6 +kmod-nf-nat +kmod-nf-nat6 +kmod-nf-nathelper +kmod-nf-nathelper-extra
+		+kmod-nf-conntrack +kmod-nf-conntrack6 +kmod-nf-nat +kmod-nf-nat6 +kmod-nf-nathelper +kmod-nf-nathelper-extra
 	MAINTAINER:=Eric Bishop <eric@gargoyle-router.com>
 endef
 
@@ -35,28 +35,25 @@ define Build/Prepare
 	$(CP) ./src/qosdba/* $(PKG_BUILD_DIR)/qosdba/
 endef
 
-
 define Build/Configure
 endef
 
 define Build/Compile
 	-$(MAKE) -C $(PKG_BUILD_DIR)/qosacc clean
-    -$(MAKE) -C $(PKG_BUILD_DIR)/qosdba clean
+	-$(MAKE) -C $(PKG_BUILD_DIR)/qosdba clean
 	# 编译qosacc
-	$(MAKE) -C $(PKG_BUILD_DIR) \
+	$(MAKE) -C $(PKG_BUILD_DIR)/qosacc \
 		$(TARGET_CONFIGURE_OPTS) \
 		CFLAGS="$(TARGET_CFLAGS) -I $(STAGING_DIR)/usr/include" \
 		LDFLAGS="$(TARGET_LDFLAGS) -L $(STAGING_DIR)/usr/lib" \
-		BUILD_DIR="$(KERNEL_BUILD_DIR)" \
-		qosacc
+		BUILD_DIR="$(KERNEL_BUILD_DIR)"
 
 	# 编译qosdba
-	$(MAKE) -C $(PKG_BUILD_DIR) \
+	$(MAKE) -C $(PKG_BUILD_DIR)/qosdba \
 		$(TARGET_CONFIGURE_OPTS) \
 		CFLAGS="$(TARGET_CFLAGS) -I $(STAGING_DIR)/usr/include" \
 		LDFLAGS="$(TARGET_LDFLAGS) -L $(STAGING_DIR)/usr/lib" \
-		BUILD_DIR="$(KERNEL_BUILD_DIR)" \
-		qosdba
+		BUILD_DIR="$(KERNEL_BUILD_DIR)"
 endef
 
 # 重启防火墙时, 添加qos规则
@@ -91,7 +88,8 @@ define Package/qos-gargoyle/install
 endef
 
 define Package/qos-gargoyle/prerm
-	$${IPKG_INSTROOT}/etc/init.d/qos_gargoyle stop 2>/dev/null
+	$$
+{IPKG_INSTROOT}/etc/init.d/qos_gargoyle stop 2>/dev/null
 	$${IPKG_INSTROOT}/etc/init.d/qos_gargoyle disable 2>/dev/null
 	ls >/dev/null 2>&1
 endef

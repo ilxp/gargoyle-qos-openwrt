@@ -7,20 +7,22 @@ TCDIR:=$(shell if [ -e "${BUILD_DIR}/iproute2-tcfull" ] ; then echo "${BUILD_DIR
 
 LDLIBS += -lm
 
-
 TCOBJS := $(TCDIR)/tc/tc_util.o
 TCOBJS += $(TCDIR)/tc/tc_core.o
 TCOBJS += $(TCDIR)/tc/q_hfsc.o
+TCOBJS += $(TCDIR)/tc/q_hfsc.o
+TCOBJS += $(TCDIR)/tc/q_htb.o
+TCOBJS += $(TCDIR)/tc/q_cake.o
 TCOBJS += $(TCDIR)/lib/libnetlink.a
 TCOBJS += $(TCDIR)/lib/libutil.a
 LDFLAGS += -Wl,-export-dynamic 
 
 all: qosacc
 
-qosmon: qosacc.o
+qosacc: qosacc.o
 	$(CC) $(LDFLAGS) $^ $(TCOBJS) -o $@ $(LDLIBS)
 
-qosmon.o: qosacc.c
+qosacc.o: qosacc.c
 	$(CC) -D ONLYBG $(CFLAGS) -I $(TCDIR)/include -I $(TCDIR)/tc -c $^ -o $@
 
 install: all uninstall
