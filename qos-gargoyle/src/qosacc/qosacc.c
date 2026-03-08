@@ -159,12 +159,12 @@ typedef struct {
 
 /* ==================== 状态枚举 ==================== */
 typedef enum {
-    QMON_CHK,
-    QMON_INIT,
-    QMON_IDLE,
-    QMON_ACTIVE,
-    QMON_REALTIME,
-    QMON_EXIT
+    QMON_CHK,      // 0: 检查状态（初始状态）
+    QMON_INIT,     // 1: 初始化状态
+    QMON_IDLE,     // 2: 空闲状态
+    QMON_ACTIVE,   // 3: 活跃状态
+    QMON_REALTIME, // 4: 实时状态
+    QMON_EXIT      // 5: 退出状态
 } qosacc_state_t;
 
 /* ==================== 运行时统计结构 ==================== */
