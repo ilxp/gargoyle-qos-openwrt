@@ -1,6 +1,8 @@
 /* qosacc - 基于netlink的优化版QoS监控器
  * 功能：通过ping监控延迟，使用netlink动态调整ifb0根类的带宽
  * 基于Paul Bixel的原始代码优化,poll机制，完整支持HFSC\HTB\CAKE算法。
+ * # 使用配置文件启动：qosacc -c /etc/qosacc.conf
+ *  命令行参数覆盖配置文件：qosacc -c /etc/qosacc.conf -v -p 100 -t 1.1.1.1
  */
  
 #include <stdio.h>
@@ -61,6 +63,7 @@ typedef enum {
 
 /* ==================== 配置结构 ==================== */
 typedef struct {
+	int enabled;                // 是否启用此设备配置
     int ping_interval;          // ping间隔(ms)
     int max_bandwidth_kbps;     // 最大带宽(kbps)
     int ping_limit_ms;          // ping限制(ms)
@@ -82,6 +85,7 @@ typedef struct {
     char config_file[256];      // 配置文件
     char debug_log[256];        // 调试日志
     char status_file[256];      // 状态文件
+	int check_interval;         // 主循环检查间隔（ms）
 } qosacc_config_t;
 
 /* ==================== 状态枚举 ==================== */
@@ -326,11 +330,46 @@ void qosacc_log(qosacc_context_t* ctx, int level, const char* format, ...) {
     }
 }
 
+/* ==================== 配置文件解析辅助函数 ==================== */
+static void trim_whitespace(char* str) {
+    if (!str) return;
+    char* end;
+    // 去除头部空格
+    while (isspace((unsigned char)*str)) str++;
+    if (*str == 0) return; // 全是空格
+    // 去除尾部空格
+    end = str + strlen(str) - 1;
+    while (end > str && isspace((unsigned char)*end)) end--;
+    end[1] = '\0';
+}
+
+static int parse_key_value(const char* line, char* key, int key_len, char* value, int value_len) {
+    const char* equal_sign = strchr(line, '=');
+    if (!equal_sign) return 0;
+    
+    int key_len_to_copy = equal_sign - line;
+    if (key_len_to_copy >= key_len) key_len_to_copy = key_len - 1;
+    strncpy(key, line, key_len_to_copy);
+    key[key_len_to_copy] = '\0';
+    
+    const char* value_start = equal_sign + 1;
+    int value_len_to_copy = strlen(value_start);
+    if (value_len_to_copy >= value_len) value_len_to_copy = value_len - 1;
+    strncpy(value, value_start, value_len_to_copy);
+    value[value_len_to_copy] = '\0';
+    
+    // 去除两端空格
+    trim_whitespace(key);
+    trim_whitespace(value);
+    return 1;
+}
+
 /* ==================== 配置处理 ==================== */
 void qosacc_config_init(qosacc_config_t* cfg) {
     if (!cfg) return;
     
     memset(cfg, 0, sizeof(qosacc_config_t));
+	cfg->enabled = 1; // 默认启用
     cfg->ping_interval = 200;
     cfg->max_bandwidth_kbps = 10000;
     cfg->ping_limit_ms = 20;
@@ -347,13 +386,124 @@ void qosacc_config_init(qosacc_config_t* cfg) {
     cfg->active_threshold = 0.7f;   // 切换到活跃状态的利用率阈值
     cfg->idle_threshold = 0.3f;    // 切换到空闲状态的利用率阈值
     cfg->safe_start_ratio = 0.5f;
+	cfg->check_interval = 1000; // 默认1秒
     strcpy(cfg->device, "ifb0");
     strcpy(cfg->target, "8.8.8.8");
     strcpy(cfg->status_file, "/tmp/qosacc.status");
     strcpy(cfg->debug_log, "/var/log/qosacc.log");
 }
 
-/* ==================== 配置解析函数 ==================== */
+/* ==================== [配置文件]解析函数 ==================== */
+static int qosacc_config_parse_file(qosacc_config_t* cfg, const char* config_file) {
+    if (!cfg || !config_file) return QMON_ERR_MEMORY;
+    
+    FILE* fp = fopen(config_file, "r");
+    if (!fp) {
+        fprintf(stderr, "无法打开配置文件: %s\n", config_file);
+        return QMON_ERR_FILE;
+    }
+    
+    char line[256];
+    int in_device_section = 0;
+    
+    // 初始化为默认值
+    qosacc_config_init(cfg);
+    cfg->enabled = 0; // 默认不启用，直到在对应节中设置
+    
+    while (fgets(line, sizeof(line), fp)) {
+        // 移除换行符
+        char* newline = strchr(line, '\n');
+        if (newline) *newline = '\0';
+        newline = strchr(line, '\r');
+        if (newline) *newline = '\0';
+        
+        // 跳过注释和空行
+        if (line[0] == '#' || line[0] == ';' || line[0] == '\0') {
+            continue;
+        }
+        
+        // 检查节头 [device=DEVICE_NAME]
+        if (line[0] == '[' && strchr(line, ']')) {
+            char section[64];
+            if (sscanf(line, "[%63[^]]]", section) == 1) {
+                if (strncmp(section, "device=", 7) == 0) {
+                    const char* device_name = section + 7;
+                    if (strcmp(device_name, cfg->device) == 0) {
+                        in_device_section = 1;
+                        cfg->enabled = 1; // 找到对应设备的节，启用配置
+                        continue;
+                    } else {
+                        in_device_section = 0; // 进入其他设备节，不再解析
+                        continue;
+                    }
+                } else {
+                    in_device_section = 0; // 进入其他类型的节，不再解析
+                    continue;
+                }
+            }
+        }
+        
+        // 如果在目标设备节内，解析键值对
+        if (in_device_section) {
+            char key[64], value[64];
+            if (parse_key_value(line, key, sizeof(key), value, sizeof(value))) {
+                // 映射键到配置结构体字段
+                if (strcmp(key, "enabled") == 0) {
+                    cfg->enabled = atoi(value);
+                } else if (strcmp(key, "target") == 0) {
+                    strncpy(cfg->target, value, sizeof(cfg->target)-1);
+                } else if (strcmp(key, "ping_interval") == 0) {
+                    cfg->ping_interval = atoi(value);
+                } else if (strcmp(key, "max_bandwidth_kbps") == 0) {
+                    cfg->max_bandwidth_kbps = atoi(value);
+                } else if (strcmp(key, "ping_limit_ms") == 0) {
+                    cfg->ping_limit_ms = atoi(value);
+                } else if (strcmp(key, "safe_mode") == 0) {
+                    cfg->safe_mode = atoi(value);
+                } else if (strcmp(key, "verbose") == 0) {
+                    cfg->verbose = atoi(value);
+                } else if (strcmp(key, "auto_switch_mode") == 0) {
+                    cfg->auto_switch_mode = atoi(value);
+                } else if (strcmp(key, "background_mode") == 0) {
+                    cfg->background_mode = atoi(value);
+                } else if (strcmp(key, "skip_initial") == 0) {
+                    cfg->skip_initial = atoi(value);
+                } else if (strcmp(key, "min_bw_change_kbps") == 0) {
+                    cfg->min_bw_change_kbps = atoi(value);
+                } else if (strcmp(key, "min_bw_ratio") == 0) {
+                    cfg->min_bw_ratio = atof(value);
+                } else if (strcmp(key, "max_bw_ratio") == 0) {
+                    cfg->max_bw_ratio = atof(value);
+                } else if (strcmp(key, "smoothing_factor") == 0) {
+                    cfg->smoothing_factor = atof(value);
+                } else if (strcmp(key, "active_threshold") == 0) {
+                    cfg->active_threshold = atof(value);
+                } else if (strcmp(key, "idle_threshold") == 0) {
+                    cfg->idle_threshold = atof(value);
+                } else if (strcmp(key, "safe_start_ratio") == 0) {
+                    cfg->safe_start_ratio = atof(value);
+                } else if (strcmp(key, "debug_log") == 0) {
+                    strncpy(cfg->debug_log, value, sizeof(cfg->debug_log)-1);
+                } else if (strcmp(key, "status_file") == 0) {
+                    strncpy(cfg->status_file, value, sizeof(cfg->status_file)-1);
+                } else if (strcmp(key, "check_interval") == 0) {
+                    cfg->check_interval = atoi(value) * 1000; // 转换为ms
+                }
+                // 注意：`device` 字段通常由节名决定，此处不解析
+            }
+        }
+    }
+    
+    fclose(fp);
+    
+    if (!cfg->enabled) {
+        fprintf(stderr, "警告：配置文件中未找到设备 '%s' 的启用配置。\n", cfg->device);
+    }
+    
+    return QMON_OK;
+}
+
+/* ==================== [配置]解析函数 ==================== */
 int qosacc_config_parse(qosacc_config_t* cfg, int argc, char* argv[]) {
     if (!cfg) return QMON_ERR_MEMORY;
     
@@ -369,12 +519,33 @@ int qosacc_config_parse(qosacc_config_t* cfg, int argc, char* argv[]) {
     // 设置默认值
     qosacc_config_init(cfg);
     
-    // 简单参数解析
+    // 第一遍：检查是否有 -c 参数，并优先解析配置文件
+    int config_file_provided = 0;
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "-c") == 0 && i + 1 < argc) {
-            strncpy(cfg->config_file, argv[++i], sizeof(cfg->config_file) - 1);
+            char* config_file = argv[++i];
+            strncpy(cfg->config_file, config_file, sizeof(cfg->config_file) - 1);
+            int ret = qosacc_config_parse_file(cfg, config_file);
+            if (ret != QMON_OK) {
+                return ret; // 配置文件解析失败
+            }
+            config_file_provided = 1;
+            break; // 假设只有一个 -c 参数
+        }
+    }
+    
+    // 第二遍：解析命令行参数（覆盖配置文件设置）
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "-c") == 0) {
+            i++; // 跳过已处理的配置文件路径
+            continue;
         } else if (strcmp(argv[i], "-d") == 0 && i + 1 < argc) {
             strncpy(cfg->device, argv[++i], sizeof(cfg->device) - 1);
+            // 如果提供了 -d 但之前加载过配置文件，需要重新检查设备节
+            if (config_file_provided && strlen(cfg->config_file) > 0) {
+                // 重新解析配置文件，以匹配新的设备名
+                qosacc_config_parse_file(cfg, cfg->config_file);
+            }
         } else if (strcmp(argv[i], "-t") == 0 && i + 1 < argc) {
             strncpy(cfg->target, argv[++i], sizeof(cfg->target) - 1);
         } else if (strcmp(argv[i], "-s") == 0 && i + 1 < argc) {
@@ -391,7 +562,13 @@ int qosacc_config_parse(qosacc_config_t* cfg, int argc, char* argv[]) {
             cfg->auto_switch_mode = 1;
         } else if (strcmp(argv[i], "-I") == 0) {
             cfg->skip_initial = 1;
-        } else if (i == 1 && argc >= 4) {
+        } else if (strcmp(argv[i], "-p") == 0 && i + 1 < argc) {
+            cfg->ping_interval = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "-m") == 0 && i + 1 < argc) {
+            cfg->max_bandwidth_kbps = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "-P") == 0 && i + 1 < argc) {
+            cfg->ping_limit_ms = atoi(argv[++i]);
+        } else if (i == 1 && argc >= 4) { // 位置参数
             // 位置参数: ping_interval target max_bandwidth_kbps ping_limit_ms
             cfg->ping_interval = atoi(argv[1]);
             if (argc >= 2) strncpy(cfg->target, argv[2], sizeof(cfg->target) - 1);
