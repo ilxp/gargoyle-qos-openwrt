@@ -29,7 +29,7 @@ endef
 
 define Build/Prepare
 	mkdir -p $(PKG_BUILD_DIR)
-	mkdir -p $(PKG_BUILD_DIR)/qosaaa
+	mkdir -p $(PKG_BUILD_DIR)/qosacc
 	mkdir -p $(PKG_BUILD_DIR)/qosdba
 	$(CP) ./src/qosacc/* $(PKG_BUILD_DIR)/qosacc/ 2>/dev/null || true
 	$(CP) ./src/qosdba/* $(PKG_BUILD_DIR)/qosdba/
