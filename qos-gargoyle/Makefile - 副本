@@ -19,7 +19,7 @@ define Package/qos-gargoyle
 	CATEGORY:=Network
 	TITLE:=A set of QoS scripts designed for use with Gargoyle Web Interface
 	DEPENDS:=+tc-full +ip +bc +kmod-ifb +kmod-sched +kmod-sched-connmark +kmod-sched-prio +nftables \
-							+kmod-nf-conntrack +kmod-nf-conntrack6 +kmod-nf-nat +kmod-nf-nat6 +kmod-nf-nathelper +kmod-nf-nathelper-extra
+		+kmod-nf-conntrack +kmod-nf-conntrack6 +kmod-nf-nat +kmod-nf-nat6 +kmod-nf-nathelper +kmod-nf-nathelper-extra
 	MAINTAINER:=Eric Bishop <eric@gargoyle-router.com>
 endef
 
@@ -29,22 +29,31 @@ endef
 
 define Build/Prepare
 	mkdir -p $(PKG_BUILD_DIR)
-	$(CP) ./src/qosacc/* $(PKG_BUILD_DIR)/
-	#$(CP) ./dba/* $(PKG_BUILD_DIR)/
+	mkdir -p $(PKG_BUILD_DIR)/qosacc
+	mkdir -p $(PKG_BUILD_DIR)/qosdba
+	$(CP) ./src/qosacc/* $(PKG_BUILD_DIR)/qosacc/ 2>/dev/null || true
+	$(CP) ./src/qosdba/* $(PKG_BUILD_DIR)/qosdba/
 endef
-
 
 define Build/Configure
 endef
 
 define Build/Compile
-	-$(MAKE) -C $(PKG_BUILD_DIR) clean
-	$(MAKE) -C $(PKG_BUILD_DIR) \
+	-$(MAKE) -C $(PKG_BUILD_DIR)/qosacc clean
+	-$(MAKE) -C $(PKG_BUILD_DIR)/qosdba clean
+	# 编译qosacc
+	$(MAKE) -C $(PKG_BUILD_DIR)/qosacc \
 		$(TARGET_CONFIGURE_OPTS) \
 		CFLAGS="$(TARGET_CFLAGS) -I $(STAGING_DIR)/usr/include" \
 		LDFLAGS="$(TARGET_LDFLAGS) -L $(STAGING_DIR)/usr/lib" \
-		BUILD_DIR="$(KERNEL_BUILD_DIR)" \
-		all
+		BUILD_DIR="$(KERNEL_BUILD_DIR)"
+
+	# 编译qosdba
+	$(MAKE) -C $(PKG_BUILD_DIR)/qosdba \
+		$(TARGET_CONFIGURE_OPTS) \
+		CFLAGS="$(TARGET_CFLAGS) -I $(STAGING_DIR)/usr/include" \
+		LDFLAGS="$(TARGET_LDFLAGS) -L $(STAGING_DIR)/usr/lib" \
+		BUILD_DIR="$(KERNEL_BUILD_DIR)"
 endef
 
 # 重启防火墙时, 添加qos规则
@@ -69,16 +78,18 @@ define Package/qos-gargoyle/install
 	$(INSTALL_BIN) $(CURDIR)/files/usr/lib/qos_gargoyle/hfsc_fqcodel.sh $(1)/usr/lib/qos_gargoyle/hfsc_fqcodel.sh
 	$(INSTALL_BIN) $(CURDIR)/files/usr/lib/qos_gargoyle/htb_fqcodel.sh $(1)/usr/lib/qos_gargoyle/htb_fqcodel.sh
 	$(INSTALL_BIN) $(CURDIR)/files/usr/lib/qos_gargoyle/cake.sh $(1)/usr/lib/qos_gargoyle/cake.sh
-	#$(INSTALL_BIN) $(CURDIR)/files/usr/lib/qos_gargoyle/cake_autorate.sh $(1)/usr/lib/qos_gargoyle/cake_autorate.sh
+	$(INSTALL_BIN) $(CURDIR)/files/usr/lib/qos_gargoyle/acc_conf.sh $(1)/usr/lib/qos_gargoyle/acc_conf.sh
+	$(INSTALL_BIN) $(CURDIR)/files/usr/lib/qos_gargoyle/dba_conf.sh $(1)/usr/lib/qos_gargoyle/dba_conf.sh
 	$(INSTALL_BIN) $(CURDIR)/files/gargoyle_firewall.include $(1)/usr/share/qos_gargoyle/gargoyle_firewall.include
 
 	$(INSTALL_DIR) $(1)/usr/sbin
-	$(INSTALL_BIN) $(PKG_BUILD_DIR)/qosacc $(1)/usr/sbin/qosacc
-	#$(INSTALL_BIN) $(PKG_BUILD_DIR)/qosdba $(1)/usr/sbin/qosdba
+	$(INSTALL_BIN) $(PKG_BUILD_DIR)/qosacc/qosacc $(1)/usr/sbin/qosacc
+	$(INSTALL_BIN) $(PKG_BUILD_DIR)/qosdba/qosdba $(1)/usr/sbin/qosdba
 endef
 
 define Package/qos-gargoyle/prerm
-	$${IPKG_INSTROOT}/etc/init.d/qos_gargoyle stop 2>/dev/null
+	$$
+{IPKG_INSTROOT}/etc/init.d/qos_gargoyle stop 2>/dev/null
 	$${IPKG_INSTROOT}/etc/init.d/qos_gargoyle disable 2>/dev/null
 	ls >/dev/null 2>&1
 endef
