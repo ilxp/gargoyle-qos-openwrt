@@ -42,7 +42,6 @@
 #include <time.h>
 #include <dlfcn.h>
 #include <ctype.h>
-#include <atomic>
 
 // TC库头文件
 #include "utils.h"
@@ -160,12 +159,12 @@ typedef struct {
 
 /* ==================== 状态枚举 ==================== */
 typedef enum {
-    QMON_CHK,
-    QMON_INIT,
-    QMON_IDLE,
-    QMON_ACTIVE,
-    QMON_REALTIME,
-    QMON_EXIT
+    QMON_CHK,      // 0: 检查状态（初始状态）
+    QMON_INIT,     // 1: 初始化状态
+    QMON_IDLE,     // 2: 空闲状态
+    QMON_ACTIVE,   // 3: 活跃状态
+    QMON_REALTIME, // 4: 实时状态
+    QMON_EXIT      // 5: 退出状态
 } qosacc_state_t;
 
 /* ==================== 运行时统计结构 ==================== */
@@ -265,8 +264,8 @@ typedef struct qosacc_context_s {
     // 运行时统计
     runtime_stats_t stats;
     
-    // 原子操作计数器
-    std::atomic<int> signal_counter;
+    // 原子操作计数器 - 改用 volatile
+    volatile int signal_counter;
 } qosacc_context_t;
 
 /* ==================== 全局信号标志 ==================== */
@@ -410,19 +409,19 @@ void qosacc_log(qosacc_context_t* ctx, int level, const char* format, ...) {
         return;
     }
     
-    static std::atomic<int64_t> last_log_time(0);
+    /* 修改：使用普通的静态变量代替原子操作 */
+    static int64_t last_log_time = 0;
     static char cached_time_str[32] = {0};
     int64_t now_ms = qosacc_time_ms();
-    int64_t last_time = last_log_time.load(std::memory_order_relaxed);
     
     va_list args;
     char buffer[1024];
     
-    if (now_ms - last_time > 100 || last_time == 0) {
+    if (now_ms - last_log_time > 100 || last_log_time == 0) {
         time_t now = time(NULL);
         struct tm* tm_info = localtime(&now);
         strftime(cached_time_str, sizeof(cached_time_str), "%Y-%m-%d %H:%M:%S", tm_info);
-        last_log_time.store(now_ms, std::memory_order_relaxed);
+        last_log_time = now_ms;
     }
     
     va_start(args, format);
@@ -1647,7 +1646,7 @@ void state_machine_init(qosacc_context_t* ctx) {
     ctx->dbw_ul = ctx->config.max_bandwidth_kbps * 1000;
     
     // 初始化原子计数器
-    ctx->signal_counter.store(0, std::memory_order_relaxed);
+    ctx->signal_counter = 0;
 }
 
 void state_machine_check(qosacc_context_t* ctx, ping_manager_t* pm, tc_controller_t* tc) {
@@ -2200,7 +2199,7 @@ int main(int argc, char* argv[]) {
                 // 更新信号标志
                 context.sigterm = g_sigterm_received;
                 context.reset_bw = g_reset_bw;
-                context.signal_counter.fetch_add(1, std::memory_order_relaxed);
+                context.signal_counter++;  // 修改：使用普通递增
                 continue;  // 被信号中断，继续循环
             }
             qosacc_log(&context, QMON_LOG_ERROR, "poll失败: %s\n", strerror(errno));
@@ -2258,7 +2257,7 @@ cleanup:
     qosacc_log(&context, QMON_LOG_INFO, "  最小ping: %ldms\n", context.stats.min_ping_time_recorded / 1000);
     qosacc_log(&context, QMON_LOG_INFO, "  心跳检查: %ld次\n", context.stats.total_heartbeat_checks);
     qosacc_log(&context, QMON_LOG_INFO, "  心跳超时: %ld次\n", context.stats.total_heartbeat_timeouts);
-    qosacc_log(&context, QMON_LOG_INFO, "  信号中断: %d次\n", context.signal_counter.load(std::memory_order_relaxed));
+    qosacc_log(&context, QMON_LOG_INFO, "  信号中断: %d次\n", context.signal_counter);
     
     qosacc_log(&context, QMON_LOG_INFO, "QoS监控器已退出\n");
     

@@ -9,28 +9,14 @@ local nixio = require "nixio"
 local m, s, o
 
 -- 检查qosdba是否安装
-local qosdba_installed = fs.access("/usr/sbin/qosdba")
-
--- 检查dba_conf.sh是否存在
-local dba_conf_installed = fs.access("/usr/lib/qos_gargoyle/dba_conf.sh")
-
--- 获取当前QoS算法
-local function get_current_algorithm()
-    local algo = uci:get("qos_gargoyle", "global", "qos_algorithm")
-    if not algo or algo == "" then
-        -- 默认使用htb
-        algo = "htb"
-    end
-    return algo
-end
+local qosdba_installed = fs.access("/usr/sbin/qosdba") and fs.access("/etc/config/qosdba")
 
 -- 获取DBA服务状态
 local function get_dba_status()
     local status = {
         enabled = false,
         running = false,
-        pid = nil,
-        config_exists = false
+        pid = nil
     }
     
     -- 检查qosdba是否真的存在
@@ -42,11 +28,6 @@ local function get_dba_status()
     local enabled = uci:get("qos_gargoyle", "dba", "enabled")
     if enabled == "1" then
         status.enabled = true
-    end
-    
-    -- 检查配置文件是否存在
-    if fs.access("/etc/qosdba.conf") then
-        status.config_exists = true
     end
     
     -- 检查进程是否运行
@@ -79,9 +60,9 @@ end
 local function format_bandwidth(kbps)
     if not kbps or kbps == 0 then return "0" end
     if kbps >= 1000 then
-        return string.format("%.1f Mbps", kbps / 1000)
+        return string.format("%.1fM", kbps / 1000)
     else
-        return string.format("%d Kbps", kbps)
+        return string.format("%dK", kbps)
     end
 end
 
@@ -91,8 +72,8 @@ local function get_total_bandwidth()
     local download_bandwidth = uci:get("qos_gargoyle", "download", "total_bandwidth")
     
     -- 从配置中读取，单位是kbps
-    local up_kbps = parse_bandwidth(upload_bandwidth) or 40000
-    local down_kbps = parse_bandwidth(download_bandwidth) or 95000
+    local up_kbps = parse_bandwidth(upload_bandwidth) or 50000
+    local down_kbps = parse_bandwidth(download_bandwidth) or 100000
     
     return {
         upload = up_kbps,
@@ -100,6 +81,29 @@ local function get_total_bandwidth()
         upload_str = format_bandwidth(up_kbps),
         download_str = format_bandwidth(down_kbps)
     }
+end
+
+-- 从qos_gargoyle配置中读取分类
+local function get_classes(direction)
+    local classes = {}
+    
+    -- 遍历所有分类
+    uci:foreach("qos_gargoyle", direction .. "_class", function(section)
+        local class_name = section[".name"]
+        if class_name then
+            local class_data = uci:get_all("qos_gargoyle", class_name) or {}
+            
+            local class = {
+                name = class_name,
+                display_name = class_data.name or class_name:gsub("^[ud]class_", ""),
+                percent = tonumber(class_data.percent_bandwidth) or 0
+            }
+            
+            table.insert(classes, class)
+        end
+    end)
+    
+    return classes
 end
 
 -- 创建Map
@@ -114,19 +118,19 @@ if not dba_config then
     uci:set("qos_gargoyle", "dba", "interval", "5")
     uci:set("qos_gargoyle", "dba", "high_usage_threshold", "85")
     uci:set("qos_gargoyle", "dba", "high_usage_duration", "5")
-    uci:set("qos_gargoyle", "dba", "low_usage_threshold", "40")
-    uci:set("qos_gargoyle", "dba", "low_usage_duration", "5")
-    uci:set("qos_gargoyle", "dba", "borrow_ratio", "0.2")
-    uci:set("qos_gargoyle", "dba", "min_borrow_kbps", "128")
-    uci:set("qos_gargoyle", "dba", "min_change_kbps", "128")
-    uci:set("qos_gargoyle", "dba", "cooldown_time", "8")
+    uci:set("qos_gargoyle", "dba", "low_usage_threshold", "30")
+    uci:set("qos_gargoyle", "dba", "low_usage_duration", "10")
+    uci:set("qos_gargoyle", "dba", "borrow_ratio", "0.5")
+    uci:set("qos_gargoyle", "dba", "min_borrow_kbps", "64")
+    uci:set("qos_gargoyle", "dba", "min_change_kbps", "32")
+    uci:set("qos_gargoyle", "dba", "cooldown_time", "10")
     uci:set("qos_gargoyle", "dba", "auto_return_enable", "1")
-    uci:set("qos_gargoyle", "dba", "return_threshold", "50")
+    uci:set("qos_gargoyle", "dba", "return_threshold", "60")
     uci:set("qos_gargoyle", "dba", "return_speed", "0.1")
     uci:commit("qos_gargoyle")
 end
 
--- 状态显示
+-- 状态显示 - 放在最前面
 local dba_status = get_dba_status()
 local total_bw = get_total_bandwidth()
 
@@ -149,70 +153,10 @@ else
     status_dv.value = '<span style="color: red; font-weight: bold;">qosdba 未安装</span>'
 end
 
--- 配置文件状态
-local config_dv = s:option(DummyValue, "_config_status", translate("配置文件状态"))
-config_dv.rawhtml = true
-if dba_status.config_exists then
-    config_dv.value = '<span style="color: green;">✓ 配置文件存在</span>'
-else
-    config_dv.value = '<span style="color: orange;">⚠ 配置文件不存在</span>'
-end
-
 -- 总带宽
 local total_bw_dv = s:option(DummyValue, "_total_bw", translate("总带宽"))
 total_bw_dv.value = string.format("上传: %s, 下载: %s", 
     total_bw.upload_str, total_bw.download_str)
-
--- 当前算法
-local algo = get_current_algorithm()
-local algo_dv = s:option(DummyValue, "_algorithm", translate("当前算法"))
-algo_dv.value = string.upper(algo)
-
--- 服务控制按钮
-local ctl_btn = s:option(Button, "_control", translate("服务控制"))
-ctl_btn.inputtitle = translate("立即控制")
-ctl_btn.inputstyle = "apply"
-
-function ctl_btn.write(self, section, value)
-    if not qosdba_installed then
-        m.message = translate("qosdba 未安装，请先安装qosdba")
-        return
-    end
-    
-    local enabled = uci:get("qos_gargoyle", "dba", "enabled")
-    
-    if enabled == "1" then
-        -- 启动服务
-        sys.call("/etc/init.d/qosdba start 2>&1")
-        m.message = translate("qosdba 服务已启动")
-    else
-        -- 停止服务
-        sys.call("/etc/init.d/qosdba stop 2>&1")
-        m.message = translate("qosdba 服务已停止")
-    end
-end
-
--- 生成配置按钮
-if dba_conf_installed then
-    local gen_btn = s:option(Button, "_generate", translate("配置生成"))
-    gen_btn.inputtitle = translate("重新生成配置")
-    gen_btn.inputstyle = "apply"
-    
-    function gen_btn.write(self, section, value)
-        -- 获取当前算法
-        local current_algo = get_current_algorithm()
-        
-        -- 生成配置
-        local cmd = string.format("/usr/lib/qos_gargoyle/dba_conf.sh quick-generate %s", current_algo)
-        local result = sys.call(cmd)
-        
-        if result == 0 then
-            m.message = translate("配置生成成功")
-        else
-            m.message = translate("配置生成失败，请检查日志")
-        end
-    end
-end
 
 -- 基本设置
 s = m:section(TypedSection, "dba", translate("基本设置"))
@@ -227,55 +171,46 @@ o = s:option(Value, "interval", translate("检查间隔（秒）"),
     translate("检查带宽使用情况的间隔时间。"))
 o.datatype = "uinteger"
 o.default = "5"
-o:depends("enabled", "1")
 
 o = s:option(Value, "high_usage_threshold", translate("高使用阈值（%）"), 
     translate("当分类使用率达到此百分比时，被认为是高使用状态。"))
 o.datatype = "range(0,100)"
 o.default = "85"
-o:depends("enabled", "1")
 
 o = s:option(Value, "high_usage_duration", translate("高使用持续时间（秒）"), 
     translate("维持高使用状态多少秒后触发带宽调整。"))
 o.datatype = "uinteger"
 o.default = "5"
-o:depends("enabled", "1")
 
 o = s:option(Value, "low_usage_threshold", translate("低使用阈值（%）"), 
     translate("当分类使用率低于此百分比时，被认为是低使用状态。"))
 o.datatype = "range(0,100)"
-o.default = "40"
-o:depends("enabled", "1")
+o.default = "30"
 
 o = s:option(Value, "low_usage_duration", translate("低使用持续时间（秒）"), 
     translate("维持低使用状态多少秒后触发带宽调整。"))
 o.datatype = "uinteger"
-o.default = "5"
-o:depends("enabled", "1")
+o.default = "10"
 
 o = s:option(Value, "borrow_ratio", translate("借用比例"), 
     translate("从低使用分类借用的带宽比例（0.0-1.0）。"))
 o.datatype = "float"
-o.default = "0.2"
-o:depends("enabled", "1")
+o.default = "0.5"
 
-o = s:option(Value, "min_borrow_kbps", translate("最小借用带宽（Kbps）"), 
+o = s:option(Value, "min_borrow_kbps", translate("最小借用带宽（kbps）"), 
     translate("每次调整的最小带宽。"))
 o.datatype = "uinteger"
-o.default = "128"
-o:depends("enabled", "1")
+o.default = "64"
 
-o = s:option(Value, "min_change_kbps", translate("最小调整带宽（Kbps）"), 
+o = s:option(Value, "min_change_kbps", translate("最小调整带宽（kbps）"), 
     translate("带宽调整的最小变化量。"))
 o.datatype = "uinteger"
-o.default = "128"
-o:depends("enabled", "1")
+o.default = "32"
 
 o = s:option(Value, "cooldown_time", translate("冷却时间（秒）"), 
     translate("两次调整之间的最小间隔时间。"))
 o.datatype = "uinteger"
-o.default = "8"
-o:depends("enabled", "1")
+o.default = "10"
 
 -- 自动归还设置
 s = m:section(TypedSection, "dba", translate("自动归还设置"))
@@ -285,40 +220,122 @@ s.addremove = false
 o = s:option(Flag, "auto_return_enable", translate("启用自动归还"),
     translate("当分类使用率降低时，自动归还借用的带宽。"))
 o.default = "1"
-o:depends("enabled", "1")
 
 o = s:option(Value, "return_threshold", translate("归还阈值（%）"),
     translate("当分类使用率低于此百分比时，开始归还带宽。"))
 o.datatype = "range(0,100)"
-o.default = "50"
-o:depends({"enabled", "auto_return_enable"}, {"1", "1"})
+o.default = "60"
 
 o = s:option(Value, "return_speed", translate("归还速度"),
     translate("每次调整归还的带宽比例（0.0-1.0）。"))
 o.datatype = "float"
 o.default = "0.1"
-o:depends({"enabled", "auto_return_enable"}, {"1", "1"})
 
--- 高级设置
-s = m:section(TypedSection, "dba", translate("高级设置"))
-s.anonymous = true
-s.addremove = false
+-- 添加上传分类状态
+local upload_classes = get_classes("upload")
+if upload_classes and #upload_classes > 0 then
+    s = m:section(SimpleSection, nil, translate("上传分类状态"))
+    s.anonymous = true
+    
+    local html = [[
+    <table class="table" style="width: 100%; text-align: left; border-collapse: collapse; border: 1px solid #ddd;">
+    <thead>
+    <tr style="background-color: #f5f5f5;">
+        <th style="padding: 8px; border: 1px solid #ddd; text-align: left; width: 25%">分类名称</th>
+        <th style="padding: 8px; border: 1px solid #ddd; text-align: left; width: 25%">配置比例</th>
+        <th style="padding: 8px; border: 1px solid #ddd; text-align: left; width: 25%">使用率</th>
+        <th style="padding: 8px; border: 1px solid #ddd; text-align: left; width: 25%">实时带宽</th>
+    </tr>
+    </thead>
+    <tbody>
+    ]]
+    
+    for _, class in ipairs(upload_classes) do
+        html = html .. string.format([[
+    <tr>
+        <td style="padding: 8px; border: 1px solid #ddd; text-align: left;">%s</td>
+        <td style="padding: 8px; border: 1px solid #ddd; text-align: left;">%d%%</td>
+        <td style="padding: 8px; border: 1px solid #ddd; text-align: left; color: gray;">%s</td>
+        <td style="padding: 8px; border: 1px solid #ddd; text-align: left; color: gray;">%s</td>
+    </tr>
+    ]], 
+        class.display_name or class.name,
+        class.percent or 0,
+        "--",  -- 使用率，暂不显示
+        "--")  -- 实时带宽，暂不显示
+    end
+    
+    html = html .. "</tbody></table>"
+    
+    local note_html = [[
+    <div style="margin-top: 10px; padding: 10px; background-color: #f0f0f0; border: 1px solid #ccc; border-radius: 3px;">
+    <p style="color: #666; font-size: 12px; margin: 0;">
+    注：使用率和实时带宽需要安装并启动 qosdba 服务后才会显示实时数据。
+    </p>
+    </div>
+    ]]
+    
+    local upload_table = s:option(DummyValue, "_upload_table")
+    upload_table.rawhtml = true
+    upload_table.value = html .. note_html
+end
 
-o = s:option(Flag, "debug_mode", translate("调试模式"),
-    translate("启用调试模式，输出详细日志。"))
-o.default = "0"
-o:depends("enabled", "1")
+-- 添加下载分类状态
+local download_classes = get_classes("download")
+if download_classes and #download_classes > 0 then
+    s = m:section(SimpleSection, nil, translate("下载分类状态"))
+    s.anonymous = true
+    
+    local html = [[
+    <table class="table" style="width: 100%; text-align: left; border-collapse: collapse; border: 1px solid #ddd;">
+    <thead>
+    <tr style="background-color: #f5f5f5;">
+        <th style="padding: 8px; border: 1px solid #ddd; text-align: left; width: 25%">分类名称</th>
+        <th style="padding: 8px; border: 1px solid #ddd; text-align: left; width: 25%">配置比例</th>
+        <th style="padding: 8px; border: 1px solid #ddd; text-align: left; width: 25%">使用率</th>
+        <th style="padding: 8px; border: 1px solid #ddd; text-align: left; width: 25%">实时带宽</th>
+    </tr>
+    </thead>
+    <tbody>
+    ]]
+    
+    for _, class in ipairs(download_classes) do
+        html = html .. string.format([[
+    <tr>
+        <td style="padding: 8px; border: 1px solid #ddd; text-align: left;">%s</td>
+        <td style="padding: 8px; border: 1px solid #ddd; text-align: left;">%d%%</td>
+        <td style="padding: 8px; border: 1px solid #ddd; text-align: left; color: gray;">%s</td>
+        <td style="padding: 8px; border: 1px solid #ddd; text-align: left; color: gray;">%s</td>
+    </tr>
+    ]], 
+        class.display_name or class.name,
+        class.percent or 0,
+        "--",  -- 使用率，暂不显示
+        "--")  -- 实时带宽，暂不显示
+    end
+    
+    html = html .. "</tbody></table>"
+    
+    local note_html = [[
+    <div style="margin-top: 10px; padding: 10px; background-color: #f0f0f0; border: 1px solid #ccc; border-radius: 3px;">
+    <p style="color: #666; font-size: 12px; margin: 0;">
+    注：使用率和实时带宽需要安装并启动 qosdba 服务后才会显示实时数据。
+    </p>
+    </div>
+    ]]
+    
+    local download_table = s:option(DummyValue, "_download_table")
+    download_table.rawhtml = true
+    download_table.value = html .. note_html
+end
 
-o = s:option(Flag, "safe_mode", translate("安全模式"),
-    translate("安全模式下不实际修改TC配置，只记录操作。"))
-o.default = "0"
-o:depends("enabled", "1")
-
-o = s:option(Value, "cache_interval", translate("缓存间隔（秒）"),
-    translate("TC统计信息缓存时间。"))
-o.datatype = "uinteger"
-o.default = "5"
-o:depends("enabled", "1")
+-- 处理动作请求
+local action = luci.http.formvalue("action")
+if action then
+    if action == "install" then
+        m.message = translate("请通过SSH运行: opkg update && opkg install qosdba")
+    end
+end
 
 -- 安装提示
 if not qosdba_installed then
@@ -347,81 +364,33 @@ function m.on_after_apply(self)
     uci:save("qos_gargoyle")
     uci:commit("qos_gargoyle")
     
-    -- 获取DBA配置
-    local dba_enabled = uci:get("qos_gargoyle", "dba", "enabled")
+    -- 同步配置到qosdba
+    local enabled = uci:get("qos_gargoyle", "dba", "enabled")
     
-    if qosdba_installed then
-        if dba_enabled == "1" then
-            -- 启用DBA功能
-            
-            -- 1. 生成qosdba配置文件
-            if dba_conf_installed then
-                local current_algo = get_current_algorithm()
-                local cmd = string.format("/usr/lib/qos_gargoyle/dba_conf.sh quick-generate %s", current_algo)
-                sys.call(cmd)
-            else
-                -- 如果dba_conf.sh不存在，生成基本的qosdba.conf
-                local dba_opts = uci:get_all("qos_gargoyle", "dba") or {}
-                
-                -- 创建基本配置文件
-                local conf_content = [[# qosdba配置
-# 自动生成
-
-[global]
-enabled=1
-debug_mode=]] .. (dba_opts.debug_mode or "0") .. [[
-safe_mode=]] .. (dba_opts.safe_mode or "0") .. [[
-interval=]] .. (dba_opts.interval or "5") .. [[
-config_path=/etc/qosdba.conf
-status_file=/tmp/qosdba.status
-log_file=/var/log/qosdba.log
-
-[device=ifb0]
-enabled=1
-total_bandwidth_kbps=]] .. (total_bw.download or 95000) .. [[
-high_util_threshold=]] .. (dba_opts.high_usage_threshold or "85") .. [[
-high_util_duration=]] .. (dba_opts.high_usage_duration or "5") .. [[
-low_util_threshold=]] .. (dba_opts.low_usage_threshold or "40") .. [[
-low_util_duration=]] .. (dba_opts.low_usage_duration or "5") .. [[
-borrow_ratio=]] .. (dba_opts.borrow_ratio or "0.2") .. [[
-min_borrow_kbps=]] .. (dba_opts.min_borrow_kbps or "128") .. [[
-min_change_kbps=]] .. (dba_opts.min_change_kbps or "128") .. [[
-cooldown_time=]] .. (dba_opts.cooldown_time or "8") .. [[
-auto_return_enable=]] .. (dba_opts.auto_return_enable or "1") .. [[
-return_threshold=]] .. (dba_opts.return_threshold or "50") .. [[
-return_speed=]] .. (dba_opts.return_speed or "0.1") .. [[
-cache_interval=]] .. (dba_opts.cache_interval or "5")
-                
-                -- 写入配置文件
-                local file = io.open("/etc/qosdba.conf", "w")
-                if file then
-                    file:write(conf_content)
-                    file:close()
-                end
-            end
-            
-            -- 2. 启用并启动qosdba服务
-            sys.call("/etc/init.d/qosdba enable 2>/dev/null")
-            sys.call("/etc/init.d/qosdba restart 2>&1")
-            
-            -- 3. 记录日志
-            sys.call("logger -t 'qos_gargoyle' 'DBA已启用并启动'")
-        else
-            -- 禁用DBA功能
-            sys.call("/etc/init.d/qosdba stop 2>&1")
-            sys.call("/etc/init.d/qosdba disable 2>/dev/null")
-            sys.call("logger -t 'qos_gargoyle' 'DBA已禁用'")
+    if qosdba_installed and enabled == "1" then
+        -- 复制配置
+        local dba_opts = uci:get_all("qos_gargoyle", "dba") or {}
+        
+        -- 确保qosdba配置存在
+        if not uci:get("qosdba", "dba") then
+            uci:set("qosdba", "dba", "dba")
         end
-    else
-        m.message = translate("qosdba 未安装，请先安装 qosdba 包")
-    end
-end
-
--- 处理动作请求
-local action = luci.http.formvalue("action")
-if action then
-    if action == "install" then
-        m.message = translate("请通过SSH运行: opkg update && opkg install qosdba")
+        
+        for k, v in pairs(dba_opts) do
+            if k ~= ".name" and k ~= ".type" then
+                uci:set("qosdba", "dba", k, v)
+            end
+        end
+        
+        uci:save("qosdba")
+        uci:commit("qosdba")
+        
+        -- 启用并启动服务
+        sys.call("/etc/init.d/qosdba enable 2>/dev/null")
+        sys.call("/etc/init.d/qosdba restart 2>&1")
+    elseif qosdba_installed then
+        sys.call("/etc/init.d/qosdba stop 2>&1")
+        sys.call("/etc/init.d/qosdba disable 2>/dev/null")
     end
 end
 

@@ -18,23 +18,22 @@ DOWNLOAD_MASK="0x7F00"
 . /lib/functions/network.sh 2>/dev/null || true
 
 # ==================== 辅助函数 ====================
-
 # 从UCI配置加载类别配置
 load_class_config_from_uci() {
     local class_name="$1"
-    local config_section="$2"
-    
+    local config_section="$2"  # 此参数在脚本中可能用于其他逻辑，但配置读取将直接使用 $class_name
+
     # 清空变量
     unset percent_bandwidth per_min_bandwidth per_max_bandwidth priority name minRTT
-    
-    # 从UCI读取配置
-    config_get percent_bandwidth "$config_section" percent_bandwidth
-    config_get per_min_bandwidth "$config_section" per_min_bandwidth
-    config_get per_max_bandwidth "$config_section" per_max_bandwidth
-    config_get priority "$config_section" priority
-    config_get name "$config_section" name
-    config_get minRTT "$config_section" minRTT
-    
+
+    # 直接从UCI读取配置（使用uci get命令）
+    percent_bandwidth=$(uci -q get qos_gargoyle."$class_name".percent_bandwidth 2>/dev/null)
+    per_min_bandwidth=$(uci -q get qos_gargoyle."$class_name".per_min_bandwidth 2>/dev/null)
+    per_max_bandwidth=$(uci -q get qos_gargoyle."$class_name".per_max_bandwidth 2>/dev/null)
+    priority=$(uci -q get qos_gargoyle."$class_name".priority 2>/dev/null)
+    name=$(uci -q get qos_gargoyle."$class_name".name 2>/dev/null)
+    minRTT=$(uci -q get qos_gargoyle."$class_name".minRTT 2>/dev/null)
+
     return 0
 }
 
@@ -140,43 +139,9 @@ generate_tc_class_config() {
     local output=""
     local class_index=2
     
-    logger -t "dba_conf" "为$direction生成TC类别配置, 总带宽=${total_bandwidth}kbps, 类别列表: $class_list"
-    
     for class_name in $class_list; do
-        logger -t "dba_conf" "处理$direction类别: $class_name"
-        
         # 从UCI加载类别配置
-        local percent_bandwidth="" per_min_bandwidth="" per_max_bandwidth="" priority="" name="" minRTT=""
-        
-        # 尝试从UCI读取配置
-        config_load qos_gargoyle
-        
-        # 获取类别显示名称
-        name=$(uci -q get "qos_gargoyle.$class_name.name" 2>/dev/null)
-        [ -z "$name" ] && name="$class_name"
-        
-        # 获取带宽百分比
-        percent_bandwidth=$(uci -q get "qos_gargoyle.$class_name.percent_bandwidth" 2>/dev/null)
-        per_min_bandwidth=$(uci -q get "qos_gargoyle.$class_name.per_min_bandwidth" 2>/dev/null)
-        per_max_bandwidth=$(uci -q get "qos_gargoyle.$class_name.per_max_bandwidth" 2>/dev/null)
-        priority=$(uci -q get "qos_gargoyle.$class_name.priority" 2>/dev/null)
-        minRTT=$(uci -q get "qos_gargoyle.$class_name.minRTT" 2>/dev/null)
-        
-        # 使用默认值
-        [ -z "$priority" ] && priority="$class_index"
-        [ -z "$percent_bandwidth" ] && percent_bandwidth="0"  # 默认0%，表示不使用百分比
-        [ -z "$per_min_bandwidth" ] && per_min_bandwidth="0"  # 默认0%
-        [ -z "$per_max_bandwidth" ] && per_max_bandwidth="0"  # 默认0%
-        
-        # 如果百分比为0，则使用公平分配
-        if [ "$percent_bandwidth" = "0" ] || [ -z "$percent_bandwidth" ]; then
-            # 计算平均分配
-            local class_count=$(echo "$class_list" | wc -w)
-            if [ "$class_count" -gt 0 ]; then
-                percent_bandwidth=$((100 / class_count))
-                logger -t "dba_conf" "类别 $name 使用公平分配: ${percent_bandwidth}%"
-            fi
-        fi
+        load_class_config_from_uci "$class_name" "$config_section"
         
         # 计算实际带宽
         local bandwidth_values=$(calculate_actual_bandwidth "$class_name" "$direction" "$total_bandwidth" \
@@ -185,6 +150,10 @@ generate_tc_class_config() {
         local class_total_bw=$(echo "$bandwidth_values" | awk '{print $1}')
         local min_bw_kbps=$(echo "$bandwidth_values" | awk '{print $2}')
         local max_bw_kbps=$(echo "$bandwidth_values" | awk '{print $3}')
+        
+        # 获取类别名称和优先级
+        local class_display_name="${name:-$class_name}"
+        local class_priority="${priority:-$class_index}"
         
         # 计算classid
         local classid_hex=""
@@ -195,15 +164,12 @@ generate_tc_class_config() {
         fi
         
         # 添加到输出
-        output="${output}${classid_hex},${name},${priority},${class_total_bw},${min_bw_kbps},${max_bw_kbps}"$'\n'
+        output="$output$classid_hex,$class_display_name,$class_priority,$class_total_bw,$min_bw_kbps,$max_bw_kbps\n"
         
-        logger -t "dba_conf" "  $direction分类: $name (ID=$classid_hex) -> 总带宽=${class_total_bw}kbps, 最小=${min_bw_kbps}kbps, 最大=${max_bw_kbps}kbps, 优先级=$priority"
+        logger -t "dba_conf" "生成$direction分类: $class_display_name -> 总带宽=${class_total_bw}kbps, 最小=${min_bw_kbps}kbps, 最大=${max_bw_kbps}kbps"
         
         class_index=$((class_index + 1))
     done
-    
-    # 移除最后的换行符
-    output="${output%$'\n'}"
     
     echo "$output"
 }
@@ -262,19 +228,13 @@ cache_interval=5
 # 格式: classid,name,priority,total_bw_kbps,min_bw_kbps,max_bw_kbps
 EOF
     
-    # 【修复】生成下载分类配置
-    if [ -n "$download_classes" ]; then
-        local download_config=$(generate_tc_class_config "download" "$download_classes" "$total_download" "$download_device" "$config_section")
-        if [ -n "$download_config" ]; then
-            echo "$download_config" >> "$QOSDBA_CONFIG_FILE"
-        else
-            echo "# 错误: 无法生成下载分类配置" >> "$QOSDBA_CONFIG_FILE"
-        fi
-    else
-        # 【修复】不生成默认分类，只添加注释
-        echo "# 注意: 系统中未配置下载类别" >> "$QOSDBA_CONFIG_FILE"
-        echo "# 请先在qos_gargoyle配置中设置下载分类" >> "$QOSDBA_CONFIG_FILE"
-    fi
+    # 生成下载分类配置
+	if [ -n "$download_classes" ]; then
+		local download_config=$(generate_tc_class_config "download" "$download_classes" "$total_download" "$download_device" "$config_section")
+		echo -e "$download_config" >> "$QOSDBA_CONFIG_FILE"  # 添加 -e 参数换行
+	else
+		echo "# 错误: 无法生成下载分类配置" >> "$QOSDBA_CONFIG_FILE"
+	fi
     
     # 上传设备配置
     cat >> "$QOSDBA_CONFIG_FILE" << EOF
@@ -300,19 +260,13 @@ cache_interval=5
 # 格式: classid,name,priority,total_bw_kbps,min_bw_kbps,max_bw_kbps
 EOF
     
-    # 【修复】生成上传分类配置
-    if [ -n "$upload_classes" ]; then
-        local upload_config=$(generate_tc_class_config "upload" "$upload_classes" "$total_upload" "$upload_device" "$config_section")
-        if [ -n "$upload_config" ]; then
-            echo "$upload_config" >> "$QOSDBA_CONFIG_FILE"
-        else
-            echo "# 错误: 无法生成上传分类配置" >> "$QOSDBA_CONFIG_FILE"
-        fi
-    else
-        # 【修复】不生成默认分类，只添加注释
-        echo "# 注意: 系统中未配置上传类别" >> "$QOSDBA_CONFIG_FILE"
-        echo "# 请先在qos_gargoyle配置中设置上传分类" >> "$QOSDBA_CONFIG_FILE"
-    fi
+    # 生成上传分类配置
+	if [ -n "$upload_classes" ]; then
+		local upload_config=$(generate_tc_class_config "upload" "$upload_classes" "$total_upload" "$upload_device" "$config_section")
+		echo -e "$upload_config" >> "$QOSDBA_CONFIG_FILE"  # 添加 -e 参数换行
+	else
+		echo "# 错误: 无法生成上传分类配置" >> "$QOSDBA_CONFIG_FILE"
+	fi
     
     # 添加动态带宽分配参数
     cat >> "$QOSDBA_CONFIG_FILE" << EOF
@@ -460,11 +414,8 @@ check_qosdba_config() {
 }
 
 # 快速生成配置（简化接口）
-# 快速生成配置（简化接口）
 quick_generate_config() {
     local algorithm="$1"  # htb 或 hfsc
-    
-    logger -t "dba_conf" "正在为算法 $algorithm 生成qosdba配置..."
     
     # 获取网络接口
     local qos_interface=$(uci -q get qos_gargoyle.global.wan_interface 2>/dev/null)
@@ -477,59 +428,32 @@ quick_generate_config() {
     local total_download=$(uci -q get qos_gargoyle.download.total_bandwidth 2>/dev/null)
     total_download="${total_download:-95000}"
     
-    logger -t "dba_conf" "网络接口: WAN=$qos_interface, 上传=${total_upload}kbps, 下载=${total_download}kbps"
-    
-    # 根据算法类型获取分类列表
+    # 获取分类列表（算法无关的通用查找方式）
     local upload_classes=""
     local download_classes=""
     
-    if [ "$algorithm" = "htb" ]; then
-        logger -t "dba_conf" "使用HTB配置模式"
-        
-        # 从UCI获取上传类别
+    # 方法1：优先查找标准上传/下载分类 (type='upload_class' / 'download_class')
+    upload_classes=$(uci show qos_gargoyle 2>/dev/null | \
+        grep -E "^qos_gargoyle\.[a-zA-Z0-9_]+\.type='upload_class'$" | \
+        cut -d. -f2 | tr '\n' ' ')
+    download_classes=$(uci show qos_gargoyle 2>/dev/null | \
+        grep -E "^qos_gargoyle\.[a-zA-Z0-9_]+\.type='download_class'$" | \
+        cut -d. -f2 | tr '\n' ' ')
+    
+    # 方法2：如果仍然没找到，尝试旧的配置格式 (section类型直接是 upload_class/download_class)
+    if [ -z "$upload_classes" ]; then
+        logger -t "dba_conf" "尝试旧格式配置查找..."
         upload_classes=$(uci show qos_gargoyle 2>/dev/null | \
-            grep -E "qos_gargoyle\..+\.type=upload_class" | \
+            grep -E "^qos_gargoyle\.[a-zA-Z0-9_]+=upload_class$" | \
             cut -d. -f2 | cut -d= -f1 | tr '\n' ' ')
-        
-        # 从UCI获取下载类别
         download_classes=$(uci show qos_gargoyle 2>/dev/null | \
-            grep -E "qos_gargoyle\..+\.type=download_class" | \
+            grep -E "^qos_gargoyle\.[a-zA-Z0-9_]+=download_class$" | \
             cut -d. -f2 | cut -d= -f1 | tr '\n' ' ')
-        
-    elif [ "$algorithm" = "hfsc" ]; then
-        logger -t "dba_conf" "使用HFSC配置模式"
-        
-        # 从UCI获取HFSC上传类别
-        upload_classes=$(uci show qos_gargoyle 2>/dev/null | \
-            grep -E "qos_gargoyle\..+\.type=hfsc_upload_class" | \
-            cut -d. -f2 | cut -d= -f1 | tr '\n' ' ')
-        
-        # 从UCI获取HFSC下载类别
-        download_classes=$(uci show qos_gargoyle 2>/dev/null | \
-            grep -E "qos_gargoyle\..+\.type=hfsc_download_class" | \
-            cut -d. -f2 | cut -d= -f1 | tr '\n' ' ')
-    else
-        logger -t "dba_conf" "错误: 未知的算法类型: $algorithm"
-        return 1
     fi
     
-    # 【修复】删除自动添加默认分类的逻辑
-    # 只使用从系统读取的实际分类
-    if [ -n "$upload_classes" ]; then
-        logger -t "dba_conf" "从系统读取上传类别: $upload_classes"
-    else
-        logger -t "dba_conf" "警告: 未找到上传类别配置，将生成空的上传分类定义"
-    fi
-    
-    if [ -n "$download_classes" ]; then
-        logger -t "dba_conf" "从系统读取下载类别: $download_classes"
-    else
-        logger -t "dba_conf" "警告: 未找到下载类别配置，将生成空的下载分类定义"
-    fi
-    
-    # 清理空白字符
-    upload_classes=$(echo "$upload_classes" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' | tr -s ' ')
-    download_classes=$(echo "$download_classes" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' | tr -s ' ')
+    logger -t "dba_conf" "为算法 $algorithm 生成配置: 上传设备=$qos_interface, 下载设备=ifb0"
+    logger -t "dba_conf" "找到的上传分类: $upload_classes"
+    logger -t "dba_conf" "找到的下载分类: $download_classes"
     
     # 生成配置
     generate_qosdba_config "$qos_interface" "ifb0" "$total_upload" "$total_download" \

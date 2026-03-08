@@ -169,7 +169,7 @@ o.cfgvalue = function(self, section)
     return v and ("%d%%" % v) or "-"
 end
 
-o = s:option(DummyValue, "per_min_bandwidth", translate("Min bandwidth(%))"))
+o = s:option(DummyValue, "per_min_bandwidth", translate("Min bandwidth(%)"))
 o.cfgvalue = function(self, section)
     local v = tonumber(Value.cfgvalue(self, section))
     return v or "0"
