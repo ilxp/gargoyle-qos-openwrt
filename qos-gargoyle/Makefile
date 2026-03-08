@@ -30,7 +30,7 @@ endef
 define Build/Prepare
 	mkdir -p $(PKG_BUILD_DIR)
 	$(CP) ./src/qosmon/* $(PKG_BUILD_DIR)/
-	#$(CP) ./dba/* $(PKG_BUILD_DIR)/
+	$(CP) ./src/qosdba/* $(PKG_BUILD_DIR)/
 endef
 
 
@@ -76,7 +76,7 @@ define Package/qos-gargoyle/install
 
 	$(INSTALL_DIR) $(1)/usr/sbin
 	$(INSTALL_BIN) $(PKG_BUILD_DIR)/qosmon $(1)/usr/sbin/qosmon
-	#$(INSTALL_BIN) $(PKG_BUILD_DIR)/qosdba $(1)/usr/sbin/qosdba
+	$(INSTALL_BIN) $(PKG_BUILD_DIR)/qosdba $(1)/usr/sbin/qosdba
 endef
 
 define Package/qos-gargoyle/prerm
