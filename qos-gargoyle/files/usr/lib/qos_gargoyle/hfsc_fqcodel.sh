@@ -1606,72 +1606,84 @@ show_hfsc_status() {
 	fi
 
 	# IPv4 连接标记
-	echo -e "\nIPv4 连接标记 (目标地址为 WAN):"
-	if [ -n "$wan_ipv4" ]; then
-		echo "WAN IPv4: $wan_ipv4"
-		local ipv4_marks=$(conntrack -L -d "$wan_ipv4" 2>/dev/null | grep -E "mark=0x[0-9A-Fa-f]+" | head -n 5)
-		if [ -n "$ipv4_marks" ]; then
-			echo "$ipv4_marks" | while read -r line; do
-				# 提取并格式化显示
-				local src_ip=$(echo "$line" | grep -o "src=[0-9.]\+" | cut -d= -f2)
-				local dst_ip=$(echo "$line" | grep -o "dst=[0-9.]\+" | cut -d= -f2)
-				local mark=$(echo "$line" | grep -o "mark=0x[0-9A-Fa-f]\+" | cut -d= -f2)
-				local proto=$(echo "$line" | awk '{print $1}')
-				local sport=$(echo "$line" | grep -o "sport=[0-9]\+" | cut -d= -f2)
-				local dport=$(echo "$line" | grep -o "dport=[0-9]\+" | cut -d= -f2)
-				
-				printf "  %-7s %-15s:%-5s → %-15s:%-5s [标记: %s]\n" \
-					"$proto" "${src_ip:-N/A}" "${sport:-N/A}" "${dst_ip:-N/A}" "${dport:-N/A}" "${mark:-无}"
-			done
-		else
-			echo "  未找到带标记的 IPv4 连接"
-		fi
-	else
-		echo "  WAN IPv4 地址不可用"
-	fi
+echo -e "\nIPv4 连接标记 (目标地址为 WAN):"
+if [ -n "$wan_ipv4" ]; then
+    echo "WAN IPv4: $wan_ipv4"
+    local ipv4_marks=$(conntrack -L -d "$wan_ipv4" 2>/dev/null | grep -E "mark=[0-9]+" | head -n 5)
+    if [ -n "$ipv4_marks" ]; then
+        echo "$ipv4_marks" | while IFS= read -r line; do
+            # 使用 awk 精确提取原始方向（第一个方向）的字段
+            local src_ip=$(echo "$line" | awk '{for(i=1;i<=NF;i++) if ($i ~ /^src=/) {sub(/^src=/, "", $i); print $i; exit}}')
+            local dst_ip=$(echo "$line" | awk '{for(i=1;i<=NF;i++) if ($i ~ /^dst=/) {sub(/^dst=/, "", $i); print $i; exit}}')
+            local sport=$(echo "$line" | awk '{for(i=1;i<=NF;i++) if ($i ~ /^sport=/) {sub(/^sport=/, "", $i); print $i; exit}}')
+            local dport=$(echo "$line" | awk '{for(i=1;i<=NF;i++) if ($i ~ /^dport=/) {sub(/^dport=/, "", $i); print $i; exit}}')
+            local proto=$(echo "$line" | awk '{print $1}')
+            # 提取十进制标记并转换为十六进制
+            local dec_mark=$(echo "$line" | grep -o "mark=[0-9]\+" | cut -d= -f2 | head -1)
+            local mark_hex="0x$(printf '%x' "$dec_mark" 2>/dev/null || echo '0')"
+            
+            printf "  %-7s %-15s:%-5s → %-15s:%-5s [标记: %s]\n" \
+                "$proto" "${src_ip:-N/A}" "${sport:-N/A}" "${dst_ip:-N/A}" "${dport:-N/A}" "$mark_hex"
+        done
+    else
+        echo "  未找到带标记的 IPv4 连接"
+    fi
+else
+    echo "  WAN IPv4 地址不可用"
+fi
 
-	# IPv6 连接标记
-	echo -e "\nIPv6 连接标记 (目标地址为 WAN):"
-	if [ -n "$wan_ipv6" ]; then
-		echo "WAN IPv6: $wan_ipv6"
-		local ipv6_marks=$(conntrack -L -d "$wan_ipv6" 2>/dev/null | grep -E "mark=0x[0-9A-Fa-f]+" | head -n 5)
-		if [ -n "$ipv6_marks" ]; then
-			echo "$ipv6_marks" | while read -r line; do
-				# 提取并格式化显示
-				local src_ip=$(echo "$line" | grep -o "src=[0-9a-fA-F:]\+" | cut -d= -f2)
-				local dst_ip=$(echo "$line" | grep -o "dst=[0-9a-fA-F:]\+" | cut -d= -f2)
-				local mark=$(echo "$line" | grep -o "mark=0x[0-9A-Fa-f]\+" | cut -d= -f2)
-				local proto=$(echo "$line" | awk '{print $1}')
-				local sport=$(echo "$line" | grep -o "sport=[0-9]\+" | cut -d= -f2)
-				local dport=$(echo "$line" | grep -o "dport=[0-9]\+" | cut -d= -f2)
-				
-				# 缩短 IPv6 地址以便显示
-				src_ip=$(echo "$src_ip" | sed 's/::/: :/g' | awk '{print $1}')
-				dst_ip=$(echo "$dst_ip" | sed 's/::/: :/g' | awk '{print $1}')
-				
-				printf "  %-7s %-30s:%-5s → %-30s:%-5s [标记: %s]\n" \
-					"$proto" "${src_ip:-N/A}" "${sport:-N/A}" "${dst_ip:-N/A}" "${dport:-N/A}" "${mark:-无}"
-			done
-		else
-			echo "  未找到带标记的 IPv6 连接"
-		fi
-	else
-		echo "  WAN IPv6 地址不可用"
-	fi
+# IPv6 连接标记
+echo -e "\nIPv6 连接标记 (目标地址为 WAN):"
+if [ -n "$wan_ipv6" ]; then
+    echo "WAN IPv6: $wan_ipv6"
+    local ipv6_marks=$(conntrack -L -d "$wan_ipv6" 2>/dev/null | grep -E "mark=[0-9]+" | head -n 5)
+    if [ -n "$ipv6_marks" ]; then
+        echo "$ipv6_marks" | while IFS= read -r line; do
+            # 提取字段（针对 IPv6）
+            local src_ip=$(echo "$line" | awk '{for(i=1;i<=NF;i++) if ($i ~ /^src=/) {sub(/^src=/, "", $i); print $i; exit}}')
+            local dst_ip=$(echo "$line" | awk '{for(i=1;i<=NF;i++) if ($i ~ /^dst=/) {sub(/^dst=/, "", $i); print $i; exit}}')
+            local sport=$(echo "$line" | awk '{for(i=1;i<=NF;i++) if ($i ~ /^sport=/) {sub(/^sport=/, "", $i); print $i; exit}}')
+            local dport=$(echo "$line" | awk '{for(i=1;i<=NF;i++) if ($i ~ /^dport=/) {sub(/^dport=/, "", $i); print $i; exit}}')
+            local proto=$(echo "$line" | awk '{print $1}')
+            local dec_mark=$(echo "$line" | grep -o "mark=[0-9]\+" | cut -d= -f2 | head -1)
+            local mark_hex="0x$(printf '%x' "$dec_mark" 2>/dev/null || echo '0')"
+            
+            # 简化 IPv6 地址显示（压缩连续的零）
+            src_ip=$(echo "$src_ip" | sed 's/\(:\)[0:]*/\1/g')
+            dst_ip=$(echo "$dst_ip" | sed 's/\(:\)[0:]*/\1/g')
+            
+            printf "  %-7s %-30s:%-5s → %-30s:%-5s [标记: %s]\n" \
+                "$proto" "${src_ip:-N/A}" "${sport:-N/A}" "${dst_ip:-N/A}" "${dport:-N/A}" "$mark_hex"
+        done
+    else
+        echo "  未找到带标记的 IPv6 连接"
+    fi
+else
+    echo "  WAN IPv6 地址不可用"
+fi
 
-	# 同时显示源地址为 WAN 的连接（上传方向）
-	echo -e "\n上传方向连接标记 (源地址为 WAN):"
-	if [ -n "$wan_ipv4" ]; then
-		local upload_marks=$(conntrack -L -s "$wan_ipv4" 2>/dev/null | grep -E "mark=0x[0-9A-Fa-f]+" | head -n 3)
-		if [ -n "$upload_marks" ]; then
-			echo "$upload_marks" | while read -r line; do
-				local mark=$(echo "$line" | grep -o "mark=0x[0-9A-Fa-f]\+" | cut -d= -f2)
-				printf "  %s [标记: %s]\n" "$(echo "$line" | cut -d' ' -f1-3)" "$mark"
-			done
-		else
-			echo "  未找到带标记的上传方向连接"
-		fi
-	fi
+# 同时显示源地址为 WAN 的连接（上传方向）
+echo -e "\n上传方向连接标记 (源地址为 WAN):"
+if [ -n "$wan_ipv4" ]; then
+    local upload_marks=$(conntrack -L -s "$wan_ipv4" 2>/dev/null | grep -E "mark=[0-9]+" | head -n 3)
+    if [ -n "$upload_marks" ]; then
+        echo "$upload_marks" | while IFS= read -r line; do
+            # 提取原始方向字段（这是上传流量，原始方向的 src 是 WAN IP）
+            local src_ip=$(echo "$line" | awk '{for(i=1;i<=NF;i++) if ($i ~ /^src=/) {sub(/^src=/, "", $i); print $i; exit}}')
+            local dst_ip=$(echo "$line" | awk '{for(i=1;i<=NF;i++) if ($i ~ /^dst=/) {sub(/^dst=/, "", $i); print $i; exit}}')
+            local sport=$(echo "$line" | awk '{for(i=1;i<=NF;i++) if ($i ~ /^sport=/) {sub(/^sport=/, "", $i); print $i; exit}}')
+            local dport=$(echo "$line" | awk '{for(i=1;i<=NF;i++) if ($i ~ /^dport=/) {sub(/^dport=/, "", $i); print $i; exit}}')
+            local proto=$(echo "$line" | awk '{print $1}')
+            local dec_mark=$(echo "$line" | grep -o "mark=[0-9]\+" | cut -d= -f2 | head -1)
+            local mark_hex="0x$(printf '%x' "$dec_mark" 2>/dev/null || echo '0')"
+            
+            printf "  %-7s %-15s:%-5s → %-15s:%-5s [标记: %s]\n" \
+                "$proto" "${src_ip:-N/A}" "${sport:-N/A}" "${dst_ip:-N/A}" "${dport:-N/A}" "$mark_hex"
+        done
+    else
+        echo "  未找到带标记的上传方向连接"
+    fi
+fi
     
     # 显示网络接口统计
     echo -e "\n===== 网络接口统计 ====="
