@@ -1,0 +1,203 @@
+#!/bin/sh
+# qosmon 控制脚本
+
+QOSMON_BIN="/usr/sbin/qosmon"
+PID_FILE="/var/run/qosmon.pid"
+START_ARGS="%s"
+LOG_FILE="/tmp/qosmon_debug.log"
+
+# 检查qosmon程序是否存在
+check_binary() {
+    if [ ! -x "$QOSMON_BIN" ]; then
+        echo "错误: qosmon程序不存在: $QOSMON_BIN" >> "$LOG_FILE"
+        echo "请确保已正确安装qosmon程序" >> "$LOG_FILE"
+        return 1
+    fi
+    return 0
+}
+
+# 获取 qosmon 进程的 PID
+get_qosmon_pid() {
+    pidof qosmon 2>/dev/null | awk '{print $1}'
+}
+
+# 解析启动参数
+parse_args() {
+    local args="$START_ARGS"
+    echo "=== qosmon启动参数分析 ===" >> "$LOG_FILE"
+    echo "完整参数: $args" >> "$LOG_FILE"
+    
+    # 显示解析后的参数
+    echo "原始参数: $args" >> "$LOG_FILE"
+    
+    return 0
+}
+
+start() {
+    echo "启动 qosmon 服务..." > "$LOG_FILE"
+    echo "启动时间: $(date)" >> "$LOG_FILE"
+    echo "启动参数: $QOSMON_BIN $START_ARGS" >> "$LOG_FILE"
+    
+    # 检查二进制文件
+    if ! check_binary; then
+        echo "qosmon二进制文件检查失败" >&2
+        return 1
+    fi
+    
+    # 检查是否已在运行
+    local qosmon_pid=$(get_qosmon_pid)
+    if [ -n "$qosmon_pid" ]; then
+        echo "qosmon 已在运行 (PID: $qosmon_pid)" >> "$LOG_FILE"
+        echo "$qosmon_pid" > "$PID_FILE" 2>/dev/null
+        return 0
+    fi
+    
+    # 清理可能存在的旧 PID 文件
+    rm -f "$PID_FILE" 2>/dev/null
+    
+    # 显示启动参数详情
+    parse_args
+    
+    # 启动 qosmon - 使用直接调用，不加后台符号
+    echo "正在启动 qosmon..." >> "$LOG_FILE"
+    echo "执行命令: $QOSMON_BIN $START_ARGS" >> "$LOG_FILE"
+    
+    # 先测试命令是否能运行
+    echo "测试命令输出:" >> "$LOG_FILE"
+    $QOSMON_BIN --help 2>&1 | head -5 >> "$LOG_FILE"
+    
+    # 启动qosmon
+    $QOSMON_BIN $START_ARGS >> "$LOG_FILE" 2>&1 &
+    local pid=$!
+    
+    # 写入PID到文件
+    echo $pid > "$PID_FILE" 2>/dev/null
+    
+    # 等待进程启动
+    sleep 2
+    
+    # 检查是否启动成功
+    if kill -0 $pid 2>/dev/null; then
+        echo "✓ qosmon 启动成功 (PID: $pid)" >> "$LOG_FILE"
+        echo "PID: $pid 已写入 $PID_FILE" >> "$LOG_FILE"
+        echo "启动参数: $START_ARGS" >> "$LOG_FILE"
+        return 0
+    else
+        echo "✗ qosmon 启动失败" >> "$LOG_FILE"
+        echo "最后10行日志输出:" >> "$LOG_FILE"
+        tail -10 "$LOG_FILE" >> "$LOG_FILE"
+        echo "检查命令是否存在: $(ls -la $QOSMON_BIN 2>&1)" >> "$LOG_FILE"
+        return 1
+    fi
+}
+
+stop() {
+    echo "停止 qosmon 服务..." > "$LOG_FILE"
+    
+    # 停止所有qosmon进程
+    local all_pids=$(get_qosmon_pid)
+    if [ -n "$all_pids" ]; then
+        echo "找到进程: $all_pids" >> "$LOG_FILE"
+        for pid in $all_pids; do
+            if [ -n "$pid" ] && [ "$pid" -gt 1 ] 2>/dev/null; then
+                echo "停止进程 (PID: $pid)" >> "$LOG_FILE"
+                kill $pid 2>/dev/null
+                sleep 1
+                if kill -0 $pid 2>/dev/null; then
+                    echo "强制停止进程 (PID: $pid)" >> "$LOG_FILE"
+                    kill -9 $pid 2>/dev/null
+                fi
+            fi
+        done
+    fi
+    
+    # 从 PID 文件获取 PID
+    if [ -f "$PID_FILE" ]; then
+        local pid=$(cat "$PID_FILE" 2>/dev/null)
+        if [ -n "$pid" ] && [ "$pid" -gt 1 ] 2>/dev/null && kill -0 "$pid" 2>/dev/null; then
+            echo "停止进程 (PID: $pid)" >> "$LOG_FILE"
+            kill "$pid" 2>/dev/null
+            sleep 1
+            if kill -0 "$pid" 2>/dev/null; then
+                echo "强制停止进程 (PID: $pid)" >> "$LOG_FILE"
+                kill -9 "$pid" 2>/dev/null
+            fi
+        fi
+    fi
+    
+    # 清理 PID 文件
+    rm -f "$PID_FILE" 2>/dev/null
+    
+    # 最终检查
+    sleep 1
+    if [ -z "$(get_qosmon_pid)" ]; then
+        echo "✓ qosmon 已停止" >> "$LOG_FILE"
+        return 0
+    else
+        echo "⚠ 可能有残留进程" >> "$LOG_FILE"
+        return 1
+    fi
+}
+
+restart() {
+    echo "重启 qosmon 服务..." >> "$LOG_FILE"
+    stop
+    sleep 1
+    start
+}
+
+status() {
+    echo "qosmon 状态:"
+    
+    # 检查二进制文件
+    if ! check_binary; then
+        echo "✗ qosmon 程序不存在"
+        return 1
+    fi
+    
+    # 检查实际进程
+    local qosmon_pid=$(get_qosmon_pid)
+    if [ -n "$qosmon_pid" ]; then
+        echo "✓ 正在运行 (PID: $qosmon_pid)"
+        echo "  启动参数: $QOSMON_BIN $START_ARGS"
+        return 0
+    else
+        echo "✗ 未运行"
+        return 1
+    fi
+}
+
+enable() {
+    echo "启用开机自启动..."
+    ln -sf /etc/init.d/qosmon /etc/rc.d/S99qosmon 2>/dev/null
+    ln -sf /etc/init.d/qosmon /etc/rc.d/K10qosmon 2>/dev/null
+    echo "✓ 已启用开机自启动"
+    return 0
+}
+
+disable() {
+    echo "禁用开机自启动..."
+    rm -f /etc/rc.d/S??qosmon 2>/dev/null
+    rm -f /etc/rc.d/K??qosmon 2>/dev/null
+    echo "✓ 已禁用开机自启动"
+    return 0
+}
+
+case "$1" in
+    start)   start   ;;
+    stop)    stop    ;;
+    restart) restart ;;
+    status)  status  ;;
+    enable)  enable  ;;
+    disable) disable ;;
+    *)
+        echo "qosmon 服务控制脚本"
+        echo "版本: 1.0"
+        echo "当前启动参数: $START_ARGS"
+        echo ""
+        echo "用法: $0 {start|stop|restart|status|enable|disable}"
+        exit 1
+        ;;
+esac
+
+exit 0

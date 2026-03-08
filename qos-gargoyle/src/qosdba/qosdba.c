@@ -2343,10 +2343,10 @@ int main(int argc, char* argv[]) {
     // 设置信号处理
     setup_signal_handlers();
     
-    // 创建PID文件
-    if (create_pid_file("/var/run/qosdba.pid") < 0) {
-        fprintf(stderr, "警告: 无法创建PID文件\n");
-    }
+    // 创建PID文件,由etc/init.d/qosdbs接管
+    //if (create_pid_file("/var/run/qosdba.pid") < 0) {
+        //fprintf(stderr, "警告: 无法创建PID文件\n");
+    //}
     
     // 打开日志文件
     ctx.log_file = fopen(opts.log_file, "a");
@@ -2413,10 +2413,10 @@ int main(int argc, char* argv[]) {
     log_message(&ctx, "INFO", "收到终止信号，开始清理资源...\n");
     qosdba_cleanup(&ctx);
     
-    // 移除PID文件
-    remove_pid_file("/var/run/qosdba.pid");
+    // 移除PID文件,由etc/init.d/qosdbs接管
+    //remove_pid_file("/var/run/qosdba.pid");
     
-    // 关闭日志文件
+    // 关日志文件
     if (ctx.log_file && ctx.log_file != stderr) {
         fclose(ctx.log_file);
     }

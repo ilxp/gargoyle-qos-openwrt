@@ -29,8 +29,10 @@ endef
 
 define Build/Prepare
 	mkdir -p $(PKG_BUILD_DIR)
-	$(CP) ./src/qosmon/* $(PKG_BUILD_DIR)/
-	$(CP) ./src/qosdba/* $(PKG_BUILD_DIR)/
+	 mkdir -p $(PKG_BUILD_DIR)/qosmon
+    mkdir -p $(PKG_BUILD_DIR)/qosdba
+	$(CP) ./src/qosmon/* $(PKG_BUILD_DIR)/qosmon
+	$(CP) ./src/qosdba/* $(PKG_BUILD_DIR)/qosdba
 endef
 
 
@@ -38,15 +40,23 @@ define Build/Configure
 endef
 
 define Build/Compile
-	-$(MAKE) -C $(PKG_BUILD_DIR) clean
+	-$(MAKE) -C $(PKG_BUILD_DIR)/qosmon clean
+    -$(MAKE) -C $(PKG_BUILD_DIR)/qosdba clean
+	# 编译qosmon
 	$(MAKE) -C $(PKG_BUILD_DIR) \
 		$(TARGET_CONFIGURE_OPTS) \
 		CFLAGS="$(TARGET_CFLAGS) -I $(STAGING_DIR)/usr/include" \
 		LDFLAGS="$(TARGET_LDFLAGS) -L $(STAGING_DIR)/usr/lib" \
 		BUILD_DIR="$(KERNEL_BUILD_DIR)" \
-		all
+		qosmon
 
-
+	# 编译qosdba
+	$(MAKE) -C $(PKG_BUILD_DIR) \
+		$(TARGET_CONFIGURE_OPTS) \
+		CFLAGS="$(TARGET_CFLAGS) -I $(STAGING_DIR)/usr/include" \
+		LDFLAGS="$(TARGET_LDFLAGS) -L $(STAGING_DIR)/usr/lib" \
+		BUILD_DIR="$(KERNEL_BUILD_DIR)" \
+		qosdba
 endef
 
 # 重启防火墙时, 添加qos规则
@@ -75,8 +85,8 @@ define Package/qos-gargoyle/install
 	$(INSTALL_BIN) $(CURDIR)/files/gargoyle_firewall.include $(1)/usr/share/qos_gargoyle/gargoyle_firewall.include
 
 	$(INSTALL_DIR) $(1)/usr/sbin
-	$(INSTALL_BIN) $(PKG_BUILD_DIR)/qosmon $(1)/usr/sbin/qosmon
-	$(INSTALL_BIN) $(PKG_BUILD_DIR)/qosdba $(1)/usr/sbin/qosdba
+	$(INSTALL_BIN) $(PKG_BUILD_DIR)/qosmon/qosmon $(1)/usr/sbin/qosmon
+	$(INSTALL_BIN) $(PKG_BUILD_DIR)/qosdba/qosdba $(1)/usr/sbin/qosdba
 endef
 
 define Package/qos-gargoyle/prerm

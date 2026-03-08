@@ -30,21 +30,21 @@ qosdba.o: qosdba.c
 
 install: all uninstall
 	-mkdir -p $(BINDIR)
-	#-mkdir -p /etc/init.d
-	#-mkdir -p /etc/config
-	#-mkdir -p /etc
+	-mkdir -p /etc/init.d
+	-mkdir -p /etc/config
+	-mkdir -p /etc
 	#-mkdir -p /etc/hotplug.d/iface
 	cp qosdba $(BINDIR)
-	#cp files/qosdba.init /etc/init.d/qosdba
-	#chmod 755 /etc/init.d/qosdba
-	#cp files/qosdba.conf /etc/qosdba.conf
+	cp files/qosdba.init /etc/init.d/qosdba
+	chmod 755 /etc/init.d/qosdba
+	cp files/qosdba.conf /etc/qosdba.conf
 	#cp files/qosdba.hotplug /etc/hotplug.d/iface/99-qosdba
 
 uninstall:
 	rm -f $(BINDIR)/qosdba
-	#rm -f /etc/init.d/qosdba
-	#rm -f /etc/config/qosdba
-	#rm -f /etc/qosdba.conf
+	rm -f /etc/init.d/qosdba
+	rm -f /etc/config/qosdba
+	rm -f /etc/qosdba.conf
 	#rm -f /etc/hotplug.d/iface/99-qosdba
 
 clean:
