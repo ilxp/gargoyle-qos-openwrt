@@ -45,11 +45,11 @@ function index()
     entry({"admin", "qos", "qos_gargoyle", "acc"},
         cbi("qos_gargoyle/acc"), _("Active Congestion Control"), 50)
 	
-	-- entry({"admin", "qos", "qos_gargoyle", "dba"},
-        -- cbi("qos_gargoyle/dba"), _("Dynamic Bandwidth Adjustment"), 50)
+	entry({"admin", "qos", "qos_gargoyle", "dba"},
+        cbi("qos_gargoyle/dba"), _("Dynamic Bandwidth Adjustment"), 60)
 		
     entry({"admin", "qos", "qos_gargoyle", "troubleshooting"},
-        template("qos_gargoyle/troubleshooting"), _("Troubleshooting"), 60)
+        template("qos_gargoyle/troubleshooting"), _("Troubleshooting"), 70)
 
     entry({"admin", "qos", "qos_gargoyle", "troubleshooting", "data"},
         call("action_troubleshooting_data"))
@@ -82,8 +82,8 @@ function action_troubleshooting_data()
 
     local data = {}
 
-    --local monenabled = cursor:get("qos_gargoyle", "download", "qos_monenabled") or "false"
-    local monenabled = cursor:get("qos_gargoyle", "qosmon", "enabled") or "0"
+    --local monenabled = cursor:get("qos_gargoyle", "download", "acc_monenabled") or "false"
+    local monenabled = cursor:get("qos_gargoyle", "qosacc", "enabled") or "0"
 	
     local show_data = util.trim(util.exec("/etc/init.d/qos_gargoyle show 2>/dev/null"))
     if show_data == "" then
@@ -95,7 +95,7 @@ function action_troubleshooting_data()
     local mon_data
     --if monenabled == "true" then
 	if monenabled == "1" then
-        mon_data = util.trim(util.exec("cat /tmp/qosmon.status 2>/dev/null"))
+        mon_data = util.trim(util.exec("cat /tmp/qosacc.status 2>/dev/null"))
 
         if mon_data == "" then
             mon_data = i18n.translate("No data found")

@@ -104,7 +104,7 @@ stop_qos() {
     echo "Stopping QoS system..."
     
     # 停止监控进程
-    killall -q qosmon 2>/dev/null
+    killall -q qosacc 2>/dev/null
     sleep 1
     
     # 检查服务是否真的在运行
@@ -663,28 +663,28 @@ add_connmark_pass_rules() {
 }
 
 # 启动 QoS 监控
-start_qos_monitor() {
-    echo "Starting QoS monitor..."
+start_qos_acc() {
+    echo "Starting QoS acc..."
     
     # 检查监控是否启用
-    local monitor_enabled=$(uci -q get "$CONFIG_FILE.download.qos_monenabled")
+    local acc_enabled=$(uci -q get "$CONFIG_FILE.download.acc_monenabled")
     
-    if [ "$monitor_enabled" = "true" ] || [ "$monitor_enabled" = "1" ]; then
+    if [ "$acc_enabled" = "true" ] || [ "$acc_enabled" = "1" ]; then
         # 加载监控辅助模块
-        if [ -f "$MONITOR_HELPER" ]; then
-            . "$MONITOR_HELPER"
+        if [ -f "$ACC_HELPER" ]; then
+            . "$ACC_HELPER"
             
-            if type start_qos_monitoring >/dev/null 2>&1; then
-                start_qos_monitoring
-                echo "QoS monitor started"
+            if type start_qos_acc >/dev/null 2>&1; then
+                start_qos_acc
+                echo "QoS acc started"
             else
-                echo "Warning: start_qos_monitoring function not found"
+                echo "Warning: start_qos_accing function not found"
             fi
         else
-            echo "Warning: Monitor helper module not found"
+            echo "Warning: acc helper module not found"
         fi
     else
-        echo "QoS monitor is disabled in configuration"
+        echo "QoS acc is disabled in configuration"
     fi
 }
 
@@ -980,7 +980,7 @@ initialize_qos() {
     esac
     
     # 启动监控
-    start_qos_monitor
+    start_qos_acc
     
     # 清理锁文件
     rm -rf "$LOCK_FILE"
@@ -1089,11 +1089,11 @@ status() {
     echo ""
     
     # QoS 监控状态
-    echo "4. QoS Monitoring:"
-    if pgrep -x "qosmon" >/dev/null; then
-        echo "   QoS monitor is running (PID: $(pgrep -x qosmon))"
+    echo "4. QoS accing:"
+    if pgrep -x "qosacc" >/dev/null; then
+        echo "   QoS acc is running (PID: $(pgrep -x qosacc))"
     else
-        echo "   QoS monitor is not running"
+        echo "   QoS acc is not running"
     fi
 }
 

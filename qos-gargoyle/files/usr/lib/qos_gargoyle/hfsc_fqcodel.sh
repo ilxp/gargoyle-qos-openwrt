@@ -54,6 +54,14 @@ else
     logger -t "qos_gargoyle" "警告: 规则辅助模块未找到"
 fi
 
+# 加载dba_conf.sh模块
+if [ -f "/usr/lib/qos_gargoyle/dba_conf.sh" ]; then
+    . /usr/lib/qos_gargoyle/dba_conf.sh
+    logger -t "qos_gargoyle" "已加载dba_conf配置模块"
+else
+    logger -t "qos_gargoyle" "警告: 未找到dba_conf.sh模块"
+fi
+
 # ========= HFSC与fq_codel专属常量 ==========
 HFSC_LATENCY_MODE="normal"
 HFSC_MINRTT_ENABLED="0"
@@ -1318,8 +1326,46 @@ initialize_hfsc_qos() {
     
     # 5. 应用HFSC特定的nftables规则
     apply_hfsc_specific_rules
+	
+	# 6. 生成qosdba配置文件
+    generate_qosdba_for_hfsc
     
     logger -t "qos_gargoyle" "HFSC QoS初始化完成"
+}
+
+# ========== 为HFSC生成qosdba配置 ==========
+generate_qosdba_for_hfsc() {
+    logger -t "qos_gargoyle" "为HFSC生成qosdba配置文件"
+    
+    # 检查dba_conf.sh是否已加载
+    if type quick_generate_config >/dev/null 2>&1; then
+        # 获取必要的参数
+        local upload_device="${qos_interface:-pppoe-wan}"
+        local download_device="${IFB_DEVICE:-ifb0}"
+        
+        # 获取带宽配置
+        local upload_bw="${total_upload_bandwidth:-40000}"
+        local download_bw="${total_download_bandwidth:-95000}"
+        
+        # 获取HFSC特定的分类列表
+        local upload_classes=$(uci show qos_gargoyle 2>/dev/null | \
+            grep -E "^qos_gargoyle\.[a-zA-Z0-9_]+=hfsc_upload_class$" | \
+            cut -d. -f2 | cut -d= -f1 | tr '\n' ' ')
+        local download_classes=$(uci show qos_gargoyle 2>/dev/null | \
+            grep -E "^qos_gargoyle\.[a-zA-Z0-9_]+=hfsc_download_class$" | \
+            cut -d. -f2 | cut -d= -f1 | tr '\n' ' ')
+        
+        logger -t "qos_gargoyle" "调用dba_conf生成HFSC配置: 上传设备=$upload_device, 下载设备=$download_device"
+        
+        # 调用dba_conf.sh生成配置
+        if quick_generate_config "hfsc"; then
+            logger -t "qos_gargoyle" "HFSC的qosdba配置生成成功"
+        else
+            logger -t "qos_gargoyle" "警告: HFSC的qosdba配置生成失败"
+        fi
+    else
+        logger -t "qos_gargoyle" "错误: dba_conf.sh模块未正确加载，无法生成qosdba配置"
+    fi
 }
 
 # ========== 停止和清理函数 ==========
@@ -1666,8 +1712,29 @@ main_hfsc_qos() {
         "status")
             show_hfsc_status
             ;;
+        config)
+            # 新增命令：仅生成qosdba配置
+            logger -t "qos_gargoyle" "生成HFSC的qosdba配置"
+            generate_qosdba_for_hfsc
+            ;;
+        show-config)
+            # 显示qosdba配置
+            if type show_qosdba_config >/dev/null 2>&1; then
+                show_qosdba_config
+            else
+                echo "错误: dba_conf.sh模块未加载"
+            fi
+            ;;
         *)
-            echo "用法: $0 {start|stop|restart}"
+            echo "用法: $0 {start|stop|restart|status|config|show-config}"
+            echo ""
+            echo "命令:"
+            echo "  start        启动HFSC QoS"
+            echo "  stop         停止HFSC QoS"
+            echo "  restart      重启HFSC QoS"
+            echo "  status       显示状态"
+            echo "  config       生成qosdba配置文件"
+            echo "  show-config  显示qosdba配置"
             exit 1
             ;;
     esac

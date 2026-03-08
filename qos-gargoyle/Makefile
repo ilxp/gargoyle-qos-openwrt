@@ -29,10 +29,10 @@ endef
 
 define Build/Prepare
 	mkdir -p $(PKG_BUILD_DIR)
-	 mkdir -p $(PKG_BUILD_DIR)/qosmon
-    mkdir -p $(PKG_BUILD_DIR)/qosdba
-	$(CP) ./src/qosmon/* $(PKG_BUILD_DIR)/qosmon
-	$(CP) ./src/qosdba/* $(PKG_BUILD_DIR)/qosdba
+	mkdir -p $(PKG_BUILD_DIR)/qosaaa
+	mkdir -p $(PKG_BUILD_DIR)/qosdba
+	$(CP) ./src/qosacc/* $(PKG_BUILD_DIR)/qosacc/ 2>/dev/null || true
+	$(CP) ./src/qosdba/* $(PKG_BUILD_DIR)/qosdba/
 endef
 
 
@@ -40,15 +40,15 @@ define Build/Configure
 endef
 
 define Build/Compile
-	-$(MAKE) -C $(PKG_BUILD_DIR)/qosmon clean
+	-$(MAKE) -C $(PKG_BUILD_DIR)/qosacc clean
     -$(MAKE) -C $(PKG_BUILD_DIR)/qosdba clean
-	# 编译qosmon
+	# 编译qosacc
 	$(MAKE) -C $(PKG_BUILD_DIR) \
 		$(TARGET_CONFIGURE_OPTS) \
 		CFLAGS="$(TARGET_CFLAGS) -I $(STAGING_DIR)/usr/include" \
 		LDFLAGS="$(TARGET_LDFLAGS) -L $(STAGING_DIR)/usr/lib" \
 		BUILD_DIR="$(KERNEL_BUILD_DIR)" \
-		qosmon
+		qosacc
 
 	# 编译qosdba
 	$(MAKE) -C $(PKG_BUILD_DIR) \
@@ -81,11 +81,12 @@ define Package/qos-gargoyle/install
 	$(INSTALL_BIN) $(CURDIR)/files/usr/lib/qos_gargoyle/hfsc_fqcodel.sh $(1)/usr/lib/qos_gargoyle/hfsc_fqcodel.sh
 	$(INSTALL_BIN) $(CURDIR)/files/usr/lib/qos_gargoyle/htb_fqcodel.sh $(1)/usr/lib/qos_gargoyle/htb_fqcodel.sh
 	$(INSTALL_BIN) $(CURDIR)/files/usr/lib/qos_gargoyle/cake.sh $(1)/usr/lib/qos_gargoyle/cake.sh
-	#$(INSTALL_BIN) $(CURDIR)/files/usr/lib/qos_gargoyle/cake_autorate.sh $(1)/usr/lib/qos_gargoyle/cake_autorate.sh
+	$(INSTALL_BIN) $(CURDIR)/files/usr/lib/qos_gargoyle/acc_conf.sh $(1)/usr/lib/qos_gargoyle/acc_conf.sh
+	$(INSTALL_BIN) $(CURDIR)/files/usr/lib/qos_gargoyle/dba_conf.sh $(1)/usr/lib/qos_gargoyle/dba_conf.sh
 	$(INSTALL_BIN) $(CURDIR)/files/gargoyle_firewall.include $(1)/usr/share/qos_gargoyle/gargoyle_firewall.include
 
 	$(INSTALL_DIR) $(1)/usr/sbin
-	$(INSTALL_BIN) $(PKG_BUILD_DIR)/qosmon/qosmon $(1)/usr/sbin/qosmon
+	$(INSTALL_BIN) $(PKG_BUILD_DIR)/qosacc/qosacc $(1)/usr/sbin/qosacc
 	$(INSTALL_BIN) $(PKG_BUILD_DIR)/qosdba/qosdba $(1)/usr/sbin/qosdba
 endef
 

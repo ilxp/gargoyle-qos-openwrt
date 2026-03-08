@@ -15,20 +15,20 @@ TCOBJS += $(TCDIR)/lib/libnetlink.a
 TCOBJS += $(TCDIR)/lib/libutil.a
 LDFLAGS += -Wl,-export-dynamic 
 
-all: qosmon
+all: qosacc
 
-qosmon: qosmon.o
+qosmon: qosacc.o
 	$(CC) $(LDFLAGS) $^ $(TCOBJS) -o $@ $(LDLIBS)
 
-qosmon.o: qosmon.c
+qosmon.o: qosacc.c
 	$(CC) -D ONLYBG $(CFLAGS) -I $(TCDIR)/include -I $(TCDIR)/tc -c $^ -o $@
 
 install: all uninstall
 	-mkdir -p $(BINDIR)
-	cp qosmon  $(BINDIR)
+	cp qosacc  $(BINDIR)
 
 uninstall:
-	rm -f $(BINDIR)/qosmon
+	rm -f $(BINDIR)/qosacc
 
 clean:
-	rm -rf *.o *~ .*sw* qosmon
+	rm -rf *.o *~ .*sw* qosacc

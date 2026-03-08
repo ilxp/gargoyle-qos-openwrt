@@ -442,7 +442,7 @@ quick_generate_config() {
     local total_download=$(uci -q get qos_gargoyle.download.total_bandwidth 2>/dev/null)
     total_download="${total_download:-95000}"
     
-    # 获取分类列表
+    # 根据算法类型获取分类列表
     local upload_classes=""
     local download_classes=""
     
@@ -453,6 +453,14 @@ quick_generate_config() {
         download_classes=$(uci show qos_gargoyle 2>/dev/null | \
             grep -E "^qos_gargoyle\.[a-zA-Z0-9_]+=download_class$" | \
             cut -d. -f2 | cut -d= -f1 | tr '\n' ' ')
+        
+        # 如果没找到，尝试通用格式
+        if [ -z "$upload_classes" ]; then
+            upload_classes=$(uci show qos_gargoyle 2>/dev/null | \
+                grep -E "^qos_gargoyle\.[a-zA-Z0-9_]+=class$" | \
+                cut -d. -f2 | cut -d= -f1 | tr '\n' ' ')
+        fi
+        
     elif [ "$algorithm" = "hfsc" ]; then
         upload_classes=$(uci show qos_gargoyle 2>/dev/null | \
             grep -E "^qos_gargoyle\.[a-zA-Z0-9_]+=hfsc_upload_class$" | \
@@ -460,11 +468,20 @@ quick_generate_config() {
         download_classes=$(uci show qos_gargoyle 2>/dev/null | \
             grep -E "^qos_gargoyle\.[a-zA-Z0-9_]+=hfsc_download_class$" | \
             cut -d. -f2 | cut -d= -f1 | tr '\n' ' ')
+    else
+        logger -t "dba_conf" "错误: 未知的算法类型: $algorithm"
+        return 1
     fi
+    
+    logger -t "dba_conf" "为算法 $algorithm 生成配置: 上传设备=$qos_interface, 下载设备=ifb0"
+    logger -t "dba_conf" "上传分类: $upload_classes"
+    logger -t "dba_conf" "下载分类: $download_classes"
     
     # 生成配置
     generate_qosdba_config "$qos_interface" "ifb0" "$total_upload" "$total_download" \
         "$upload_classes" "$download_classes" "$algorithm"
+    
+    return $?
 }
 
 # ==================== 模块自检 ====================
