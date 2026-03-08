@@ -1446,12 +1446,17 @@ int tc_set_bandwidth(qosacc_context_t* ctx, int bandwidth_bps) {
         }
     }
     
+    // 在日志中添加当前使用的队列算法
+    qosacc_log(ctx, QMON_LOG_INFO, "设置带宽: %d kbps (当前使用队列算法: %s)\n", 
+              bandwidth_kbps, ctx->detected_qdisc);
+    
     if (ctx->last_tc_bw_kbps != 0) {
         int diff = bandwidth_kbps - ctx->last_tc_bw_kbps;
         if (diff < 0) diff = -diff;
         if (diff < ctx->config.min_bw_change_kbps) {
-            qosacc_log(ctx, QMON_LOG_DEBUG, "跳过TC更新: 变化太小(%d -> %d kbps, 阈值=%d)\n",
-                      ctx->last_tc_bw_kbps, bandwidth_kbps, ctx->config.min_bw_change_kbps);
+            qosacc_log(ctx, QMON_LOG_DEBUG, "跳过TC更新: 变化太小(%d -> %d kbps, 阈值=%d, 队列算法: %s)\n",
+                      ctx->last_tc_bw_kbps, bandwidth_kbps, ctx->config.min_bw_change_kbps, 
+                      ctx->detected_qdisc);
             return QMON_OK;
         }
     }
@@ -1572,8 +1577,8 @@ int tc_set_bandwidth(qosacc_context_t* ctx, int bandwidth_bps) {
     }
     
     if (ret != 0) {
-        // 更详细的错误信息
-        qosacc_log(ctx, QMON_LOG_ERROR, "TC命令执行失败: 返回码=%d (设备: %s, 带宽: %d kbps, 队列类型: %s)\n", 
+        // 在错误信息中添加队列算法
+        qosacc_log(ctx, QMON_LOG_ERROR, "TC命令执行失败: 返回码=%d (设备: %s, 带宽: %d kbps, 队列算法: %s)\n", 
                   ret, ctx->config.device, bandwidth_kbps, ctx->detected_qdisc);
         
         // 检查TC工具是否存在
@@ -1581,7 +1586,7 @@ int tc_set_bandwidth(qosacc_context_t* ctx, int bandwidth_bps) {
         if (tc_check != 0) {
             qosacc_log(ctx, QMON_LOG_ERROR, "警告: tc命令不存在或不可执行\n");
         } else {
-            qosacc_log(ctx, QMON_LOG_ERROR, "tc命令存在，但执行失败\n");
+            qosacc_log(ctx, QMON_LOG_ERROR, "tc命令存在，但执行失败 (当前队列算法: %s)\n", ctx->detected_qdisc);
         }
         
         ctx->stats.total_errors++;
@@ -1591,7 +1596,7 @@ int tc_set_bandwidth(qosacc_context_t* ctx, int bandwidth_bps) {
     
     ctx->last_tc_bw_kbps = bandwidth_kbps;
     ctx->stats.total_bandwidth_adjustments++;
-    qosacc_log(ctx, QMON_LOG_INFO, "总带宽设置成功: %d kbps (算法: %s)\n", 
+    qosacc_log(ctx, QMON_LOG_INFO, "总带宽设置成功: %d kbps (使用队列算法: %s)\n", 
               bandwidth_kbps, ctx->detected_qdisc);
     
     return QMON_OK;
@@ -1608,10 +1613,12 @@ int tc_controller_init(tc_controller_t* tc, qosacc_context_t* ctx) {
         return QMON_ERR_SYSTEM;
     }
     
+    // 检测队列算法
     qdisc_detect_result_t result = safe_detect_qdisc_kind(ctx);
     if (result.valid) {
         strncpy(ctx->detected_qdisc, result.qdisc_kind, sizeof(ctx->detected_qdisc) - 1);
         ctx->detected_qdisc[sizeof(ctx->detected_qdisc) - 1] = '\0';
+        qosacc_log(ctx, QMON_LOG_INFO, "检测到队列算法: %s\n", ctx->detected_qdisc);
     } else {
         qosacc_log(ctx, QMON_LOG_ERROR, "队列算法检测失败，使用默认htb\n");
         strcpy(ctx->detected_qdisc, "htb");
@@ -1892,7 +1899,7 @@ void heart_beat_check(qosacc_context_t* ctx) {
         qosacc_log(ctx, QMON_LOG_DEBUG, "  - 已发送ping: %d\n", ctx->ntransmitted);
         qosacc_log(ctx, QMON_LOG_DEBUG, "  - 已接收ping: %d\n", ctx->nreceived);
         qosacc_log(ctx, QMON_LOG_DEBUG, "  - 流量负载: %d kbps\n", ctx->filtered_total_load_bps / 1000);
-        qosacc_log(ctx, QMON_LOG_DEBUG, "  - 检测队列算法: %s\n", ctx->detected_qdisc);
+        qosacc_log(ctx, QMON_LOG_DEBUG, "  - 当前队列算法: %s\n", ctx->detected_qdisc);
         
         last_heartbeat = now;
     }
@@ -2205,14 +2212,15 @@ int main(int argc, char* argv[]) {
     if (setpriority(PRIO_PROCESS, 0, -10) < 0) {
         qosacc_log(&context, QMON_LOG_WARN, "无法设置进程优先级: %s\n", strerror(errno));
     }
-    
-    qosacc_log(&context, QMON_LOG_INFO, "========================================\n");
+	
+	qosacc_log(&context, QMON_LOG_INFO, "========================================\n");
     qosacc_log(&context, QMON_LOG_INFO, "QoS监控器启动（使用poll机制）\n");
     qosacc_log(&context, QMON_LOG_INFO, "目标地址: %s\n", context.config.target);
     qosacc_log(&context, QMON_LOG_INFO, "网络接口: %s\n", context.config.device);
     qosacc_log(&context, QMON_LOG_INFO, "最大带宽: %d kbps\n", context.config.max_bandwidth_kbps);
     qosacc_log(&context, QMON_LOG_INFO, "ping间隔: %d ms\n", context.config.ping_interval);
     qosacc_log(&context, QMON_LOG_INFO, "ping限制: %d ms\n", context.config.ping_limit_ms);
+    qosacc_log(&context, QMON_LOG_INFO, "队列算法: %s\n", context.detected_qdisc);  // 添加这行
     qosacc_log(&context, QMON_LOG_INFO, "TC类ID: 0x%x\n", context.config.classid);
     qosacc_log(&context, QMON_LOG_INFO, "安全模式: %s\n", context.config.safe_mode ? "是" : "否");
     qosacc_log(&context, QMON_LOG_INFO, "自动切换: %s\n", context.config.auto_switch_mode ? "是" : "否");
