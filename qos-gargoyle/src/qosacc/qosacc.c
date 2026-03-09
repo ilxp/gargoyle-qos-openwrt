@@ -2155,7 +2155,13 @@ int status_file_update(qosacc_context_t* ctx) {
     fprintf(temp_fp, "总错误数: %ld\n", ctx->stats.total_errors);
     fprintf(temp_fp, "心跳检查: %ld次\n", ctx->stats.total_heartbeat_checks);
     fprintf(temp_fp, "心跳超时: %ld次\n", ctx->stats.total_heartbeat_timeouts);
-    fprintf(temp_fp, "最后更新: %ld\n", (long)now);
+    //fprintf(temp_fp, "最后更新: %ld\n", (long)now); // 秒级时间戳：1773057886
+	// 修改为：2026-03-09 20:04:46.870这样格式
+	time_t t_now = (time_t)(now / 1000);
+	struct tm *tm_info = localtime(&t_now);
+	char time_buf[26];
+	strftime(time_buf, sizeof(time_buf), "%Y-%m-%d %H:%M:%S", tm_info);
+	fprintf(temp_fp, "最后更新: %s.%03ld\n", time_buf, (long)(now % 1000));
     
     fflush(temp_fp);
     fclose(temp_fp);
