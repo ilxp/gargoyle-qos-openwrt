@@ -341,6 +341,8 @@ void update_runtime_stats(qosacc_context_t* ctx);
 
 void qosacc_cleanup(qosacc_context_t* ctx, ping_manager_t* pm, tc_controller_t* tc);
 
+char* get_tc_path(void);
+
 /* ==================== 辅助函数 ==================== */
 int64_t qosacc_time_ms(void) {
     struct timeval tv;
@@ -1306,15 +1308,18 @@ qdisc_detect_result_t safe_detect_qdisc_kind(qosacc_context_t* ctx) {
     strcpy(result.qdisc_kind, "htb");
     result.valid = 1;
     
+    qosacc_log(ctx, QMON_LOG_INFO, "开始检测 %s 的队列类型...\n", ctx->config.device);
+    
     for (int attempt = 0; attempt < DETECT_QDISC_RETRY_COUNT; attempt++) {
         if (attempt > 0) {
             usleep(DETECT_QDISC_RETRY_DELAY_MS * 1000);
+            qosacc_log(ctx, QMON_LOG_INFO, "第 %d 次重试检测队列类型...\n", attempt + 1);
         }
         
-        // 修复：指定具体设备
+        // 使用详细输出模式获取更多信息
         char cmd[256];
-        snprintf(cmd, sizeof(cmd), "tc qdisc show dev %s 2>&1", ctx->config.device);
-        qosacc_log(ctx, QMON_LOG_DEBUG, "执行队列检测命令: %s\n", cmd);
+        snprintf(cmd, sizeof(cmd), "tc -d qdisc show dev %s 2>&1", ctx->config.device);
+        qosacc_log(ctx, QMON_LOG_DEBUG, "执行检测命令: %s\n", cmd);
         
         FILE* fp = popen(cmd, "r");
         if (!fp) {
@@ -1325,27 +1330,56 @@ qdisc_detect_result_t safe_detect_qdisc_kind(qosacc_context_t* ctx) {
         }
         
         char line[512];
-        int found_qdisc = 0;
+        int found_root_qdisc = 0;
+        int found_any_qdisc = 0;
+        int line_num = 0;
         
         while (fgets(line, sizeof(line), fp)) {
+            line_num++;
             char* newline = strchr(line, '\n');
             if (newline) *newline = '\0';
             
-            qosacc_log(ctx, QMON_LOG_DEBUG, "TC输出: %s\n", line);
+            qosacc_log(ctx, QMON_LOG_DEBUG, "TC输出[%d]: %s\n", line_num, line);
             
-            // 检测队列类型
+            // 首先检查是否是根队列行
+            if (strstr(line, "root") != NULL) {
+                qosacc_log(ctx, QMON_LOG_DEBUG, "找到根队列行: %s\n", line);
+                
+                // 在根队列行中检测队列类型
+                if (strstr(line, "hfsc") != NULL) {
+                    strcpy(result.qdisc_kind, "hfsc");
+                    found_root_qdisc = 1;
+                    qosacc_log(ctx, QMON_LOG_DEBUG, "在根队列行检测到HFSC\n");
+                    break;
+                } else if (strstr(line, "htb") != NULL) {
+                    strcpy(result.qdisc_kind, "htb");
+                    found_root_qdisc = 1;
+                    qosacc_log(ctx, QMON_LOG_DEBUG, "在根队列行检测到HTB\n");
+                    break;
+                } else if (strstr(line, "cake") != NULL) {
+                    strcpy(result.qdisc_kind, "cake");
+                    found_root_qdisc = 1;
+                    qosacc_log(ctx, QMON_LOG_DEBUG, "在根队列行检测到CAKE\n");
+                    break;
+                } else if (strstr(line, "fq_codel") != NULL) {
+                    // 这可能是子队列，不是根队列
+                    qosacc_log(ctx, QMON_LOG_DEBUG, "注意: 找到fq_codel子队列，继续查找\n");
+                }
+            }
+            
+            // 如果没有在根队列行找到，但任意行中有队列类型，记录下来
             if (strstr(line, "hfsc") != NULL) {
                 strcpy(result.qdisc_kind, "hfsc");
-                found_qdisc = 1;
-                break;
+                found_any_qdisc = 1;
+                qosacc_log(ctx, QMON_LOG_DEBUG, "在行%d检测到HFSC\n", line_num);
             } else if (strstr(line, "htb") != NULL) {
                 strcpy(result.qdisc_kind, "htb");
-                found_qdisc = 1;
-                break;
+                found_any_qdisc = 1;
+                qosacc_log(ctx, QMON_LOG_DEBUG, "在行%d检测到HTB\n", line_num);
             } else if (strstr(line, "cake") != NULL) {
                 strcpy(result.qdisc_kind, "cake");
-                found_qdisc = 1;
-                break;
+                found_any_qdisc = 1;
+                qosacc_log(ctx, QMON_LOG_DEBUG, "在行%d检测到CAKE\n", line_num);
             }
         }
         
@@ -1360,16 +1394,83 @@ qdisc_detect_result_t safe_detect_qdisc_kind(qosacc_context_t* ctx) {
             qosacc_log(ctx, QMON_LOG_WARN, "tc命令返回 %d\n", ret);
             result.error_code = ret;
             result.valid = 0;
-        } else if (!found_qdisc) {
-            qosacc_log(ctx, QMON_LOG_WARN, "未找到%s的队列配置\n", ctx->config.device);
-            result.valid = 1; // 即使没找到，也返回默认值
-        } else {
-            qosacc_log(ctx, QMON_LOG_INFO, "检测到队列算法: %s\n", result.qdisc_kind);
+            
+            // 即使命令失败，也尝试获取更多信息
+            qosacc_log(ctx, QMON_LOG_INFO, "尝试使用更简单的命令检测队列...\n");
+            char simple_cmd[256];
+            snprintf(simple_cmd, sizeof(simple_cmd), "tc qdisc show 2>&1 | grep -A1 'dev %s'", ctx->config.device);
+            
+            FILE* simple_fp = popen(simple_cmd, "r");
+            if (simple_fp) {
+                char simple_output[512];
+                while (fgets(simple_output, sizeof(simple_output), simple_fp)) {
+                    qosacc_log(ctx, QMON_LOG_DEBUG, "简单检测输出: %s\n", simple_output);
+                }
+                pclose(simple_fp);
+            }
+        } else if (found_root_qdisc) {
+            qosacc_log(ctx, QMON_LOG_INFO, "队列算法检测成功: %s (找到根队列, 尝试 %d)\n", 
+                      result.qdisc_kind, attempt + 1);
             break;
+        } else if (found_any_qdisc) {
+            qosacc_log(ctx, QMON_LOG_INFO, "队列算法检测成功: %s (找到任意队列, 尝试 %d)\n", 
+                      result.qdisc_kind, attempt + 1);
+            break;
+        } else {
+            qosacc_log(ctx, QMON_LOG_WARN, "在%s的输出中未找到队列类型\n", ctx->config.device);
+            result.valid = 0;
         }
     }
     
+    if (!result.valid) {
+        qosacc_log(ctx, QMON_LOG_ERROR, "队列算法检测失败，使用默认htb\n");
+        strcpy(result.qdisc_kind, "htb");
+        result.valid = 1;  // 强制有效，使用默认值
+    }
+    
     return result;
+}
+
+/* ==================== 辅助函数：获取TC路径 ==================== */
+char* get_tc_path(void) {
+    static char tc_path[256] = {0};
+    
+    if (tc_path[0] != '\0') {
+        return tc_path;
+    }
+    
+    // 尝试常见的tc路径
+    const char* possible_paths[] = {
+        "/sbin/tc",
+        "/usr/sbin/tc", 
+        "/usr/local/sbin/tc",
+        "/bin/tc",
+        "/usr/bin/tc"
+    };
+    
+    for (int i = 0; i < sizeof(possible_paths)/sizeof(possible_paths[0]); i++) {
+        if (access(possible_paths[i], X_OK) == 0) {
+            strncpy(tc_path, possible_paths[i], sizeof(tc_path)-1);
+            tc_path[sizeof(tc_path)-1] = '\0';
+            return tc_path;
+        }
+    }
+    
+    // 如果都没找到，尝试在PATH中查找
+    FILE* fp = popen("which tc 2>/dev/null", "r");
+    if (fp) {
+        if (fgets(tc_path, sizeof(tc_path), fp)) {
+            char* newline = strchr(tc_path, '\n');
+            if (newline) *newline = '\0';
+        }
+        pclose(fp);
+    }
+    
+    if (tc_path[0] == '\0') {
+        strcpy(tc_path, "tc");  // 最后尝试直接调用
+    }
+    
+    return tc_path;
 }
 
 int safe_popen_and_read(qosacc_context_t* ctx, const char* cmd, char* output, int output_size) {
@@ -1377,7 +1478,7 @@ int safe_popen_and_read(qosacc_context_t* ctx, const char* cmd, char* output, in
         return -1;
     }
     
-    output[0] = '\0'; // 确保输出为空
+    output[0] = '\0';
     
     qosacc_log(ctx, QMON_LOG_DEBUG, "执行命令: %s\n", cmd);
     
@@ -1390,35 +1491,50 @@ int safe_popen_and_read(qosacc_context_t* ctx, const char* cmd, char* output, in
     int total_read = 0;
     int read_success = 1;
     
-    while (fgets(output + total_read, output_size - total_read, fp)) {
-        int len = strlen(output + total_read);
-        total_read += len;
-        
-        if (total_read >= output_size - 1) {
-            qosacc_log(ctx, QMON_LOG_WARN, "输出缓冲区已满 (大小: %d)\n", output_size);
+    // 逐行读取，避免缓冲区溢出
+    char buffer[256];
+    while (fgets(buffer, sizeof(buffer), fp)) {
+        int len = strlen(buffer);
+        if (total_read + len < output_size - 1) {
+            strcpy(output + total_read, buffer);
+            total_read += len;
+        } else {
+            read_success = 0;
             break;
         }
     }
     
     output[total_read] = '\0';
     
+    // 改进退出状态处理
     int ret = pclose(fp);
     if (WIFEXITED(ret)) {
         ret = WEXITSTATUS(ret);
+        if (ret != 0) {
+            qosacc_log(ctx, QMON_LOG_DEBUG, "命令退出，返回码: %d\n", ret);
+        }
     } else if (WIFSIGNALED(ret)) {
         int sig = WTERMSIG(ret);
-        qosacc_log(ctx, QMON_LOG_ERROR, "命令被信号终止: %d\n", sig);
-        ret = 128 + sig; // 返回信号退出码
+        qosacc_log(ctx, QMON_LOG_ERROR, "命令被信号 %d 终止 (%s)\n", sig, strsignal(sig));
+        ret = 128 + sig;
     } else {
-        qosacc_log(ctx, QMON_LOG_ERROR, "命令异常终止\n");
+        qosacc_log(ctx, QMON_LOG_ERROR, "命令异常终止 (状态: %d)\n", ret);
         ret = -1;
     }
     
     if (!read_success) {
-        qosacc_log(ctx, QMON_LOG_WARN, "读取命令输出时发生错误\n");
+        qosacc_log(ctx, QMON_LOG_WARN, "输出缓冲区已满 (限制: %d字节)\n", output_size);
     }
     
-    qosacc_log(ctx, QMON_LOG_DEBUG, "命令返回码: %d, 输出长度: %d\n", ret, total_read);
+    if (total_read > 0) {
+        // 移除末尾的换行符
+        char* newline = strchr(output, '\n');
+        if (newline) *newline = '\0';
+        
+        if (strlen(output) > 0) {
+            qosacc_log(ctx, QMON_LOG_DEBUG, "命令输出: %s\n", output);
+        }
+    }
     
     return ret;
 }
@@ -1434,55 +1550,46 @@ int tc_set_bandwidth(qosacc_context_t* ctx, int bandwidth_bps) {
         bandwidth_kbps = max_bandwidth_kbps;
     }
     
+    // 获取 TC 路径
+    char* tc_path = get_tc_path();
+    qosacc_log(ctx, QMON_LOG_INFO, "使用TC路径: %s\n", tc_path);
+    
     // 检查是否需要重新检测队列类型
-    if (strlen(ctx->detected_qdisc) == 0 || 
-        (strcmp(ctx->detected_qdisc, "htb") == 0 && strstr(ctx->config.device, "ifb") != NULL)) {
-        // 如果是ifb设备且检测为htb，重新检测
-        qdisc_detect_result_t result = safe_detect_qdisc_kind(ctx);
-        if (result.valid) {
-            strncpy(ctx->detected_qdisc, result.qdisc_kind, sizeof(ctx->detected_qdisc) - 1);
-            ctx->detected_qdisc[sizeof(ctx->detected_qdisc) - 1] = '\0';
-            qosacc_log(ctx, QMON_LOG_INFO, "重新检测队列算法: %s\n", ctx->detected_qdisc);
-        }
-    }
-    
-    // 在日志中添加当前使用的队列算法
-    qosacc_log(ctx, QMON_LOG_INFO, "设置带宽: %d kbps (当前使用队列算法: %s)\n", 
-              bandwidth_kbps, ctx->detected_qdisc);
-    
-    if (ctx->last_tc_bw_kbps != 0) {
-        int diff = bandwidth_kbps - ctx->last_tc_bw_kbps;
-        if (diff < 0) diff = -diff;
-        if (diff < ctx->config.min_bw_change_kbps) {
-            qosacc_log(ctx, QMON_LOG_DEBUG, "跳过TC更新: 变化太小(%d -> %d kbps, 阈值=%d, 队列算法: %s)\n",
-                      ctx->last_tc_bw_kbps, bandwidth_kbps, ctx->config.min_bw_change_kbps, 
-                      ctx->detected_qdisc);
-            return QMON_OK;
-        }
-    }
-    
     if (strlen(ctx->detected_qdisc) == 0) {
         qdisc_detect_result_t result = safe_detect_qdisc_kind(ctx);
         if (result.valid) {
             strncpy(ctx->detected_qdisc, result.qdisc_kind, sizeof(ctx->detected_qdisc) - 1);
             ctx->detected_qdisc[sizeof(ctx->detected_qdisc) - 1] = '\0';
+            qosacc_log(ctx, QMON_LOG_INFO, "检测到队列算法: %s\n", ctx->detected_qdisc);
         } else {
             qosacc_log(ctx, QMON_LOG_ERROR, "无法检测队列算法，使用默认htb\n");
             strcpy(ctx->detected_qdisc, "htb");
         }
     }
     
-    qosacc_log(ctx, QMON_LOG_INFO, "设置带宽: %d kbps (检测队列类型: %s)\n", 
+    if (ctx->last_tc_bw_kbps != 0) {
+        int diff = bandwidth_kbps - ctx->last_tc_bw_kbps;
+        if (diff < 0) diff = -diff;
+        if (diff < ctx->config.min_bw_change_kbps) {
+            qosacc_log(ctx, QMON_LOG_DEBUG, "跳过TC更新: 变化太小(%d -> %d kbps, 阈值=%d)\n",
+                      ctx->last_tc_bw_kbps, bandwidth_kbps, ctx->config.min_bw_change_kbps);
+            return QMON_OK;
+        }
+    }
+    
+    qosacc_log(ctx, QMON_LOG_INFO, "设置带宽: %d kbps (队列算法: %s)\n", 
               bandwidth_kbps, ctx->detected_qdisc);
     
     int ret = 0;
+    char output[2048];
     
     if (strcmp(ctx->detected_qdisc, "hfsc") == 0) {
-        // 修复: 使用正确的HFSC命令格式
+        // HFSC 命令格式
         char cmd[512];
         int cmd_len = snprintf(cmd, sizeof(cmd), 
-                 "tc class change dev %s parent 1:0 classid 1:1 hfsc sc rate %dkbit ul rate %dkbit 2>&1",
-                 ctx->config.device, bandwidth_kbps, bandwidth_kbps);
+                 "%s class change dev %s parent 1:0 classid 1:1 hfsc sc rate %dkbit ul rate %dkbit 2>&1",
+                 tc_path, ctx->config.device, bandwidth_kbps, bandwidth_kbps);
+        
         if (cmd_len >= (int)sizeof(cmd)) {
             qosacc_log(ctx, QMON_LOG_ERROR, "HFSC命令字符串过长\n");
             return QMON_ERR_SYSTEM;
@@ -1490,35 +1597,8 @@ int tc_set_bandwidth(qosacc_context_t* ctx, int bandwidth_bps) {
         
         qosacc_log(ctx, QMON_LOG_INFO, "执行HFSC命令: %s\n", cmd);
         
-        char output[2048];
         ret = safe_popen_and_read(ctx, cmd, output, sizeof(output));
-        if (ret == 0) {
-            if (strlen(output) > 0) {
-                qosacc_log(ctx, QMON_LOG_DEBUG, "TC输出: %s\n", output);
-            }
-        } else {
-            qosacc_log(ctx, QMON_LOG_ERROR, "HFSC命令执行失败: 返回码=%d\n", ret);
-            qosacc_log(ctx, QMON_LOG_ERROR, "命令输出: %s\n", output);
-            
-            // 尝试替代的HFSC命令格式
-            qosacc_log(ctx, QMON_LOG_INFO, "尝试替代HFSC命令格式...\n");
-            cmd_len = snprintf(cmd, sizeof(cmd), 
-                     "tc class change dev %s parent 1:0 classid 1:1 hfsc ls m2 %dkbit ul m2 %dkbit 2>&1",
-                     ctx->config.device, bandwidth_kbps, bandwidth_kbps);
-            if (cmd_len < (int)sizeof(cmd)) {
-                qosacc_log(ctx, QMON_LOG_INFO, "执行替代HFSC命令: %s\n", cmd);
-                ret = safe_popen_and_read(ctx, cmd, output, sizeof(output));
-                if (ret == 0) {
-                    qosacc_log(ctx, QMON_LOG_INFO, "替代HFSC命令成功\n");
-                } else {
-                    qosacc_log(ctx, QMON_LOG_ERROR, "替代HFSC命令也失败: 返回码=%d\n", ret);
-                    qosacc_log(ctx, QMON_LOG_ERROR, "命令输出: %s\n", output);
-                }
-            }
-        }
         
-        // 注释掉原始的tc_class_modify调用，因为可能存在兼容性问题
-        // ret = tc_class_modify(ctx, bandwidth_bps);
     } else if (strcmp(ctx->detected_qdisc, "cake") == 0) {
         char bandwidth_str[32];
         if (bandwidth_kbps >= 1000000) {
@@ -1533,60 +1613,117 @@ int tc_set_bandwidth(qosacc_context_t* ctx, int bandwidth_bps) {
         
         char cmd[512];
         int cmd_len = snprintf(cmd, sizeof(cmd), 
-                 "tc qdisc change dev %s root cake bandwidth %s 2>&1",
-                 ctx->config.device, bandwidth_str);
+                 "%s qdisc change dev %s root cake bandwidth %s 2>&1",
+                 tc_path, ctx->config.device, bandwidth_str);
+        
         if (cmd_len >= (int)sizeof(cmd)) {
             qosacc_log(ctx, QMON_LOG_ERROR, "CAKE命令字符串过长\n");
             return QMON_ERR_SYSTEM;
         }
         
         qosacc_log(ctx, QMON_LOG_INFO, "执行CAKE命令: %s\n", cmd);
-        
-        char output[2048];
         ret = safe_popen_and_read(ctx, cmd, output, sizeof(output));
-        if (ret == 0) {
-            if (strlen(output) > 0) {
-                qosacc_log(ctx, QMON_LOG_DEBUG, "TC输出: %s\n", output);
-            }
-        } else {
-            qosacc_log(ctx, QMON_LOG_ERROR, "CAKE命令执行失败: 返回码=%d\n", ret);
-            qosacc_log(ctx, QMON_LOG_ERROR, "命令输出: %s\n", output);
-        }
+        
     } else {
+        // HTB 命令 - 修复的关键部分
         char cmd[512];
-        int cmd_len = snprintf(cmd, sizeof(cmd), 
-                 "tc class change dev %s parent 1:0 classid 1:1 htb rate %dkbit ceil %dkbit 2>&1",
-                 ctx->config.device, bandwidth_kbps, bandwidth_kbps);
-        if (cmd_len >= (int)sizeof(cmd)) {
-            qosacc_log(ctx, QMON_LOG_ERROR, "HTB命令字符串过长\n");
-            return QMON_ERR_SYSTEM;
+        
+        // 首先检查 HTB 类 1:1 是否存在
+        char check_cmd[256];
+        snprintf(check_cmd, sizeof(check_cmd), "%s class show dev %s 2>&1", tc_path, ctx->config.device);
+        
+        char check_output[1024];
+        int check_ret = safe_popen_and_read(ctx, check_cmd, check_output, sizeof(check_output));
+        
+        int class_exists = 0;
+        if (check_ret == 0) {
+            // 检查类 1:1 是否存在
+            if (strstr(check_output, "1:1") != NULL) {
+                class_exists = 1;
+                qosacc_log(ctx, QMON_LOG_INFO, "检测到 HTB 类 1:1 已存在\n");
+            } else {
+                qosacc_log(ctx, QMON_LOG_WARN, "HTB 类 1:1 不存在\n");
+            }
         }
         
-        qosacc_log(ctx, QMON_LOG_INFO, "执行HTB命令: %s\n", cmd);
-        
-        char output[2048];
-        ret = safe_popen_and_read(ctx, cmd, output, sizeof(output));
-        if (ret == 0) {
-            if (strlen(output) > 0) {
-                qosacc_log(ctx, QMON_LOG_DEBUG, "TC输出: %s\n", output);
+        if (class_exists) {
+            // 尝试不同的父类格式
+            const char* parent_formats[] = {"1:0", "1:"};
+            int success = 0;
+            
+            for (int i = 0; i < 2; i++) {
+                int cmd_len = snprintf(cmd, sizeof(cmd), 
+                         "%s class change dev %s parent %s classid 1:1 htb rate %dkbit ceil %dkbit 2>&1",
+                         tc_path, ctx->config.device, parent_formats[i], bandwidth_kbps, bandwidth_kbps);
+                
+                if (cmd_len >= (int)sizeof(cmd)) {
+                    qosacc_log(ctx, QMON_LOG_ERROR, "HTB命令字符串过长\n");
+                    continue;
+                }
+                
+                qosacc_log(ctx, QMON_LOG_INFO, "执行HTB命令(父类:%s): %s\n", parent_formats[i], cmd);
+                
+                ret = safe_popen_and_read(ctx, cmd, output, sizeof(output));
+                
+                if (ret == 0) {
+                    success = 1;
+                    qosacc_log(ctx, QMON_LOG_INFO, "HTB命令成功(父类:%s)\n", parent_formats[i]);
+                    break;
+                } else {
+                    qosacc_log(ctx, QMON_LOG_WARN, "父类 %s 失败: 返回码=%d\n", parent_formats[i], ret);
+                }
+            }
+            
+            if (!success) {
+                ret = -1;
             }
         } else {
-            qosacc_log(ctx, QMON_LOG_ERROR, "HTB命令执行失败: 返回码=%d\n", ret);
-            qosacc_log(ctx, QMON_LOG_ERROR, "命令输出: %s\n", output);
+            // 类不存在，需要先创建
+            qosacc_log(ctx, QMON_LOG_INFO, "尝试创建 HTB 类 1:1\n");
+            
+            int cmd_len = snprintf(cmd, sizeof(cmd), 
+                     "%s class add dev %s parent 1:0 classid 1:1 htb rate %dkbit ceil %dkbit 2>&1",
+                     tc_path, ctx->config.device, bandwidth_kbps, bandwidth_kbps);
+            
+            if (cmd_len < (int)sizeof(cmd)) {
+                qosacc_log(ctx, QMON_LOG_INFO, "执行创建HTB类命令: %s\n", cmd);
+                ret = safe_popen_and_read(ctx, cmd, output, sizeof(output));
+                
+                if (ret != 0) {
+                    qosacc_log(ctx, QMON_LOG_WARN, "创建HTB类失败，尝试使用父类1:\n");
+                    
+                    cmd_len = snprintf(cmd, sizeof(cmd), 
+                             "%s class add dev %s parent 1: classid 1:1 htb rate %dkbit ceil %dkbit 2>&1",
+                             tc_path, ctx->config.device, bandwidth_kbps, bandwidth_kbps);
+                    
+                    if (cmd_len < (int)sizeof(cmd)) {
+                        ret = safe_popen_and_read(ctx, cmd, output, sizeof(output));
+                    }
+                }
+            }
         }
     }
     
     if (ret != 0) {
-        // 在错误信息中添加队列算法
-        qosacc_log(ctx, QMON_LOG_ERROR, "TC命令执行失败: 返回码=%d (设备: %s, 带宽: %d kbps, 队列算法: %s)\n", 
-                  ret, ctx->config.device, bandwidth_kbps, ctx->detected_qdisc);
+        // 更详细的错误信息
+        qosacc_log(ctx, QMON_LOG_ERROR, "TC命令执行失败: 返回码=%d\n", ret);
+        qosacc_log(ctx, QMON_LOG_ERROR, "设备: %s, 带宽: %d kbps, 队列算法: %s\n", 
+                  ctx->config.device, bandwidth_kbps, ctx->detected_qdisc);
         
-        // 检查TC工具是否存在
-        int tc_check = system("which tc > /dev/null 2>&1");
-        if (tc_check != 0) {
-            qosacc_log(ctx, QMON_LOG_ERROR, "警告: tc命令不存在或不可执行\n");
+        if (strlen(output) > 0) {
+            qosacc_log(ctx, QMON_LOG_ERROR, "TC错误输出: %s\n", output);
+        }
+        
+        // 测试 TC 命令是否可用
+        char test_cmd[256];
+        snprintf(test_cmd, sizeof(test_cmd), "%s -V 2>&1", tc_path);
+        char test_output[512];
+        int test_ret = safe_popen_and_read(ctx, test_cmd, test_output, sizeof(test_output));
+        
+        if (test_ret != 0) {
+            qosacc_log(ctx, QMON_LOG_ERROR, "TC命令测试失败: %s\n", test_output);
         } else {
-            qosacc_log(ctx, QMON_LOG_ERROR, "tc命令存在，但执行失败 (当前队列算法: %s)\n", ctx->detected_qdisc);
+            qosacc_log(ctx, QMON_LOG_INFO, "TC命令可用: %s\n", test_output);
         }
         
         ctx->stats.total_errors++;
@@ -1596,7 +1733,7 @@ int tc_set_bandwidth(qosacc_context_t* ctx, int bandwidth_bps) {
     
     ctx->last_tc_bw_kbps = bandwidth_kbps;
     ctx->stats.total_bandwidth_adjustments++;
-    qosacc_log(ctx, QMON_LOG_INFO, "总带宽设置成功: %d kbps (使用队列算法: %s)\n", 
+    qosacc_log(ctx, QMON_LOG_INFO, "带宽设置成功: %d kbps (算法: %s)\n", 
               bandwidth_kbps, ctx->detected_qdisc);
     
     return QMON_OK;
@@ -1613,18 +1750,54 @@ int tc_controller_init(tc_controller_t* tc, qosacc_context_t* ctx) {
         return QMON_ERR_SYSTEM;
     }
     
-    // 检测队列算法
+    // 初始检测队列类型
     qdisc_detect_result_t result = safe_detect_qdisc_kind(ctx);
     if (result.valid) {
         strncpy(ctx->detected_qdisc, result.qdisc_kind, sizeof(ctx->detected_qdisc) - 1);
         ctx->detected_qdisc[sizeof(ctx->detected_qdisc) - 1] = '\0';
-        qosacc_log(ctx, QMON_LOG_INFO, "检测到队列算法: %s\n", ctx->detected_qdisc);
     } else {
         qosacc_log(ctx, QMON_LOG_ERROR, "队列算法检测失败，使用默认htb\n");
         strcpy(ctx->detected_qdisc, "htb");
     }
     
-    qosacc_log(ctx, QMON_LOG_INFO, "TC控制器初始化完成 (算法: %s)\n", ctx->detected_qdisc);
+    // 手动验证TC配置
+    qosacc_log(ctx, QMON_LOG_INFO, "手动验证TC配置...\n");
+    char cmd[256];
+    char output[2048];
+    
+    // 验证1: 查看设备的所有队列
+    snprintf(cmd, sizeof(cmd), "tc qdisc show dev %s 2>&1", ctx->config.device);
+    int ret = safe_popen_and_read(ctx, cmd, output, sizeof(output));
+    if (ret == 0) {
+        qosacc_log(ctx, QMON_LOG_INFO, "TC队列配置: %s\n", output);
+        
+        // 检查是否包含hfsc
+        if (strstr(output, "hfsc") != NULL) {
+            qosacc_log(ctx, QMON_LOG_INFO, "✓ 设备 %s 使用HFSC队列\n", ctx->config.device);
+            if (strcmp(ctx->detected_qdisc, "hfsc") != 0) {
+                qosacc_log(ctx, QMON_LOG_WARN, "⚠ 检测结果(%s)与实际队列(hfsc)不匹配，强制修正\n", 
+                          ctx->detected_qdisc);
+                strcpy(ctx->detected_qdisc, "hfsc");
+            }
+        } else if (strstr(output, "htb") != NULL) {
+            qosacc_log(ctx, QMON_LOG_INFO, "✓ 设备 %s 使用HTB队列\n", ctx->config.device);
+        } else if (strstr(output, "cake") != NULL) {
+            qosacc_log(ctx, QMON_LOG_INFO, "✓ 设备 %s 使用CAKE队列\n", ctx->config.device);
+        } else {
+            qosacc_log(ctx, QMON_LOG_WARN, "⚠ 设备 %s 的队列类型未知\n", ctx->config.device);
+        }
+    } else {
+        qosacc_log(ctx, QMON_LOG_WARN, "无法获取TC配置: 返回码=%d\n", ret);
+    }
+    
+    // 验证2: 查看类别配置
+    snprintf(cmd, sizeof(cmd), "tc class show dev %s 2>&1 | head -5", ctx->config.device);
+    ret = safe_popen_and_read(ctx, cmd, output, sizeof(output));
+    if (ret == 0) {
+        qosacc_log(ctx, QMON_LOG_INFO, "TC类别配置(前5行):\n%s\n", output);
+    }
+    
+    qosacc_log(ctx, QMON_LOG_INFO, "TC控制器初始化完成 (最终队列算法: %s)\n", ctx->detected_qdisc);
     
     return QMON_OK;
 }
