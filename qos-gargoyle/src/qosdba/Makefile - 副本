@@ -9,12 +9,10 @@ ifdef BUILD_DIR
     LDFLAGS += -L$(STAGING_DIR)/usr/lib
     # TC库对象文件
     TCOBJS := $(TCDIR)/tc/tc_util.o
-	TCOBJS += $(TCDIR)/tc/tc_core.o
-	TCOBJS += $(TCDIR)/tc/q_hfsc.o
-	TCOBJS += $(TCDIR)/tc/q_htb.o
-	TCOBJS += $(TCDIR)/tc/q_cake.o
-	TCOBJS += $(TCDIR)/lib/libnetlink.a
-	TCOBJS += $(TCDIR)/lib/libutil.a
+    TCOBJS += $(TCDIR)/tc/tc_core.o
+    TCOBJS += $(TCDIR)/tc/q_hfsc.o
+    TCOBJS += $(TCDIR)/lib/libnetlink.a
+    TCOBJS += $(TCDIR)/lib/libutil.a
     LDLIBS += -lm
     LDFLAGS += -Wl,-export-dynamic
     TC_CFLAGS = -I $(TCDIR)/include -I $(TCDIR)/tc
@@ -67,23 +65,23 @@ qosdba.o: qosdba.c
 # 安装目标
 install: all uninstall
 	-mkdir -p $(BINDIR)
-	#-mkdir -p /etc/init.d
-	#-mkdir -p /etc/config
-	#-mkdir -p /etc
+	-mkdir -p /etc/init.d
+	-mkdir -p /etc/config
+	-mkdir -p /etc
 	cp qosdba $(BINDIR)
 	chmod 755 $(BINDIR)/qosdba
-	#cp files/qosdba.init /etc/init.d/qosdba
-	#chmod 755 /etc/init.d/qosdba
-	#cp files/qosdba.conf /etc/qosdba.conf
-	#chmod 644 /etc/qosdba.conf
+	cp files/qosdba.init /etc/init.d/qosdba
+	chmod 755 /etc/init.d/qosdba
+	cp files/qosdba.conf /etc/qosdba.conf
+	chmod 644 /etc/qosdba.conf
 	# 创建状态文件目录
-	#-mkdir -p /var/log
-	#touch /var/log/qosdba.log
-	#chmod 644 /var/log/qosdba.log
+	-mkdir -p /var/log
+	touch /var/log/qosdba.log
+	chmod 644 /var/log/qosdba.log
 	# 如果存在，启用init脚本
-	#if [ -f /etc/init.d/qosdba ]; then \
-		#/etc/init.d/qosdba enable; \
-	#fi
+	if [ -f /etc/init.d/qosdba ]; then \
+		/etc/init.d/qosdba enable; \
+	fi
 
 # 卸载目标
 uninstall:
@@ -100,5 +98,21 @@ uninstall:
 # 清理目标
 clean:
 	rm -rf *.o *~ .*sw* qosdba
+
+# 测试目标
+test: qosdba
+	./qosdba --test
+
+# 运行一次检查
+once: qosdba
+	./qosdba --once
+
+# 调试版本
+debug:
+	$(MAKE) DEBUG=1
+
+# 发布版本
+release:
+	$(MAKE) DEBUG=0
 
 .PHONY: all install uninstall clean test once debug release
