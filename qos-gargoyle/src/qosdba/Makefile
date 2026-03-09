@@ -17,7 +17,15 @@ ifdef BUILD_DIR
 	TCOBJS += $(TCDIR)/lib/libutil.a
     LDLIBS += -lm
     LDFLAGS += -Wl,-export-dynamic
-    TC_CFLAGS = -I $(TCDIR)/include -I $(TCDIR)/tc
+	# 添加内核头文件路径
+	TC_CFLAGS = -I $(TCDIR)/include -I $(TCDIR)/tc -I $(LINUX_DIR)/include/uapi
+    # 添加内核头文件路径
+	#LINUX_HEADERS := $(shell find $(STAGING_DIR) -name "linux" -type d | grep -E "usr/include/linux$$" | head -1)
+	#ifneq ($(LINUX_HEADERS),)
+		#TC_CFLAGS = -I $(TCDIR)/include -I $(TCDIR)/tc -I $(dir $(LINUX_HEADERS))
+	#else
+		#TC_CFLAGS = -I $(TCDIR)/include -I $(TCDIR)/tc
+	#endif
 else
     # 标准Linux系统构建
     LDLIBS += -lnl-3 -lnl-route-3 -lpthread -lm
