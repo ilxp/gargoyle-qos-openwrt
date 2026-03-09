@@ -2,7 +2,7 @@
 # ============================================================================
 # dba_conf.sh - QoS动态带宽分配器配置模块
 # 功能：为qosdba生成配置文件，支持不同QoS算法
-# 版本: 1.0
+# 版本: 1.1 (支持dba_enabled参数)
 # 作者: ilxp
 # ============================================================================
 
@@ -24,7 +24,7 @@ load_class_config_from_uci() {
     local config_section="$2"  # 此参数在脚本中可能用于其他逻辑，但配置读取将直接使用 $class_name
 
     # 清空变量
-    unset percent_bandwidth per_min_bandwidth per_max_bandwidth priority name minRTT
+    unset percent_bandwidth per_min_bandwidth per_max_bandwidth priority name minRTT dba_enabled
 
     # 直接从UCI读取配置（使用uci get命令）
     percent_bandwidth=$(uci -q get qos_gargoyle."$class_name".percent_bandwidth 2>/dev/null)
@@ -33,6 +33,12 @@ load_class_config_from_uci() {
     priority=$(uci -q get qos_gargoyle."$class_name".priority 2>/dev/null)
     name=$(uci -q get qos_gargoyle."$class_name".name 2>/dev/null)
     minRTT=$(uci -q get qos_gargoyle."$class_name".minRTT 2>/dev/null)
+    dba_enabled=$(uci -q get qos_gargoyle."$class_name".dba_enabled 2>/dev/null)
+    
+    # 如果dba_enabled未设置，默认为1（启用）
+    if [ -z "$dba_enabled" ]; then
+        dba_enabled=1
+    fi
 
     return 0
 }
@@ -151,9 +157,10 @@ generate_tc_class_config() {
         local min_bw_kbps=$(echo "$bandwidth_values" | awk '{print $2}')
         local max_bw_kbps=$(echo "$bandwidth_values" | awk '{print $3}')
         
-        # 获取类别名称和优先级
+        # 获取类别名称、优先级和DBA启用状态
         local class_display_name="${name:-$class_name}"
         local class_priority="${priority:-$class_index}"
+        local class_dba_enabled="${dba_enabled:-1}"
         
         # 计算classid
         local classid_hex=""
@@ -163,15 +170,43 @@ generate_tc_class_config() {
             classid_hex=$(printf "0x%x" $((0x200 + class_index)))
         fi
         
-        # 添加到输出
-        output="$output$classid_hex,$class_display_name,$class_priority,$class_total_bw,$min_bw_kbps,$max_bw_kbps\n"
+        # 验证dba_enabled值
+        if [ "$class_dba_enabled" != "0" ] && [ "$class_dba_enabled" != "1" ]; then
+            logger -t "dba_conf" "警告: 分类 $class_display_name 的dba_enabled值无效 ($class_dba_enabled)，将设为默认值1"
+            class_dba_enabled=1
+        fi
         
-        logger -t "dba_conf" "生成$direction分类: $class_display_name -> 总带宽=${class_total_bw}kbps, 最小=${min_bw_kbps}kbps, 最大=${max_bw_kbps}kbps"
+        # 添加到输出
+        output="$output$classid_hex,$class_display_name,$class_priority,$class_total_bw,$min_bw_kbps,$max_bw_kbps,$class_dba_enabled\n"
+        
+        logger -t "dba_conf" "生成$direction分类: $class_display_name -> 总带宽=${class_total_bw}kbps, 最小=${min_bw_kbps}kbps, 最大=${max_bw_kbps}kbps, DBA=${class_dba_enabled}"
         
         class_index=$((class_index + 1))
     done
     
     echo "$output"
+}
+
+# 检查DBA启用分类数量
+check_dba_enabled_count() {
+    local direction="$1"           # upload 或 download
+    local class_list="$2"          # 类别名称列表
+    local config_section="$3"      # 配置节类型
+    
+    local dba_enabled_count=0
+    local total_classes=0
+    
+    for class_name in $class_list; do
+        load_class_config_from_uci "$class_name" "$config_section"
+        local class_dba_enabled="${dba_enabled:-1}"
+        
+        if [ "$class_dba_enabled" = "1" ]; then
+            dba_enabled_count=$((dba_enabled_count + 1))
+        fi
+        total_classes=$((total_classes + 1))
+    done
+    
+    echo "$dba_enabled_count $total_classes"
 }
 
 # ==================== 主配置生成函数 ====================
@@ -188,6 +223,31 @@ generate_qosdba_config() {
     
     logger -t "dba_conf" "正在生成qosdba配置文件..."
     
+    # 检查DBA启用分类数量
+    if [ -n "$upload_classes" ]; then
+        local upload_dba_check=$(check_dba_enabled_count "upload" "$upload_classes" "$config_section")
+        local upload_dba_enabled=$(echo "$upload_dba_check" | awk '{print $1}')
+        local upload_total_classes=$(echo "$upload_dba_check" | awk '{print $2}')
+        
+        if [ "$upload_dba_enabled" -lt 2 ]; then
+            logger -t "dba_conf" "警告: 上传设备 $upload_device 只有 $upload_dba_enabled 个分类启用DBA，至少需要2个才能运行动态调整"
+        else
+            logger -t "dba_conf" "上传设备 $upload_device: $upload_dba_enabled/$upload_total_classes 个分类启用DBA"
+        fi
+    fi
+    
+    if [ -n "$download_classes" ]; then
+        local download_dba_check=$(check_dba_enabled_count "download" "$download_classes" "$config_section")
+        local download_dba_enabled=$(echo "$download_dba_check" | awk '{print $1}')
+        local download_total_classes=$(echo "$download_dba_check" | awk '{print $2}')
+        
+        if [ "$download_dba_enabled" -lt 2 ]; then
+            logger -t "dba_conf" "警告: 下载设备 $download_device 只有 $download_dba_enabled 个分类启用DBA，至少需要2个才能运行动态调整"
+        else
+            logger -t "dba_conf" "下载设备 $download_device: $download_dba_enabled/$download_total_classes 个分类启用DBA"
+        fi
+    fi
+    
     # 开始生成配置文件
     cat > "$QOSDBA_CONFIG_FILE" << EOF
 # ============================================================================
@@ -195,6 +255,7 @@ generate_qosdba_config() {
 # 自动生成于: $(date)
 # 生成模块: dba_conf.sh
 # 算法类型: ${config_section:-htb}
+# 版本: 1.1 (支持dba_enabled参数)
 # ============================================================================
 
 # 全局配置
@@ -223,18 +284,21 @@ auto_return_enable=1
 return_threshold=50
 return_speed=0.1
 cache_interval=5
+adaptive_cache=1
+adaptive_batch=1
+max_retries=3
 
 # 下载分类定义
-# 格式: classid,name,priority,total_bw_kbps,min_bw_kbps,max_bw_kbps
+# 格式: classid,name,priority,total_bw_kbps,min_bw_kbps,max_bw_kbps,dba_enabled
 EOF
     
     # 生成下载分类配置
-	if [ -n "$download_classes" ]; then
-		local download_config=$(generate_tc_class_config "download" "$download_classes" "$total_download" "$download_device" "$config_section")
-		echo -e "$download_config" >> "$QOSDBA_CONFIG_FILE"  # 添加 -e 参数换行
-	else
-		echo "# 错误: 无法生成下载分类配置" >> "$QOSDBA_CONFIG_FILE"
-	fi
+    if [ -n "$download_classes" ]; then
+        local download_config=$(generate_tc_class_config "download" "$download_classes" "$total_download" "$download_device" "$config_section")
+        echo -e "$download_config" >> "$QOSDBA_CONFIG_FILE"  # 添加 -e 参数换行
+    else
+        echo "# 错误: 无法生成下载分类配置" >> "$QOSDBA_CONFIG_FILE"
+    fi
     
     # 上传设备配置
     cat >> "$QOSDBA_CONFIG_FILE" << EOF
@@ -255,18 +319,21 @@ auto_return_enable=1
 return_threshold=50
 return_speed=0.1
 cache_interval=5
+adaptive_cache=1
+adaptive_batch=1
+max_retries=3
 
 # 上传分类定义
-# 格式: classid,name,priority,total_bw_kbps,min_bw_kbps,max_bw_kbps
+# 格式: classid,name,priority,total_bw_kbps,min_bw_kbps,max_bw_kbps,dba_enabled
 EOF
     
     # 生成上传分类配置
-	if [ -n "$upload_classes" ]; then
-		local upload_config=$(generate_tc_class_config "upload" "$upload_classes" "$total_upload" "$upload_device" "$config_section")
-		echo -e "$upload_config" >> "$QOSDBA_CONFIG_FILE"  # 添加 -e 参数换行
-	else
-		echo "# 错误: 无法生成上传分类配置" >> "$QOSDBA_CONFIG_FILE"
-	fi
+    if [ -n "$upload_classes" ]; then
+        local upload_config=$(generate_tc_class_config "upload" "$upload_classes" "$total_upload" "$upload_device" "$config_section")
+        echo -e "$upload_config" >> "$QOSDBA_CONFIG_FILE"  # 添加 -e 参数换行
+    else
+        echo "# 错误: 无法生成上传分类配置" >> "$QOSDBA_CONFIG_FILE"
+    fi
     
     # 添加动态带宽分配参数
     cat >> "$QOSDBA_CONFIG_FILE" << EOF
@@ -297,6 +364,8 @@ auto_return_enable=1
 return_threshold=50
 # 归还速度 (每秒归还比例)
 return_speed=0.1
+# 启用分类验证
+require_dba_enabled=2
 EOF
     
     logger -t "dba_conf" "qosdba配置文件已生成: $QOSDBA_CONFIG_FILE"
@@ -322,6 +391,7 @@ show_config_summary() {
     echo "=== qosdba配置生成完成 ==="
     echo "配置文件: $QOSDBA_CONFIG_FILE"
     echo "算法类型: ${config_section:-htb}"
+    echo "版本: 1.1 (支持dba_enabled参数)"
     echo "下载设备: $download_device (带宽: ${total_download}kbps)"
     echo "上传设备: $upload_device (带宽: ${total_upload}kbps)"
     echo ""
@@ -339,9 +409,10 @@ show_config_summary() {
             
             local class_display_name="${name:-$class_name}"
             local class_priority="${priority:-$class_index}"
+            local class_dba_enabled="${dba_enabled:-1}"
             local classid_hex=$(printf "0x%x" $((0x200 + class_index)))
             
-            echo "  $classid_hex,$class_display_name,$class_priority,$class_total_bw,$min_bw_kbps,$max_bw_kbps"
+            echo "  $classid_hex,$class_display_name,$class_priority,$class_total_bw,$min_bw_kbps,$max_bw_kbps,$class_dba_enabled"
             
             class_index=$((class_index + 1))
         done
@@ -361,9 +432,10 @@ show_config_summary() {
             
             local class_display_name="${name:-$class_name}"
             local class_priority="${priority:-$class_index}"
+            local class_dba_enabled="${dba_enabled:-1}"
             local classid_hex=$(printf "0x%x" $((0x100 + class_index)))
             
-            echo "  $classid_hex,$class_display_name,$class_priority,$class_total_bw,$min_bw_kbps,$max_bw_kbps"
+            echo "  $classid_hex,$class_display_name,$class_priority,$class_total_bw,$min_bw_kbps,$max_bw_kbps,$class_dba_enabled"
             
             class_index=$((class_index + 1))
         done
@@ -381,6 +453,21 @@ show_qosdba_config() {
         grep -E "^0x[0-9A-Fa-f]+," "$QOSDBA_CONFIG_FILE" | while read -r line; do
             echo "  $line"
         done
+        
+        # 统计DBA启用状态
+        local total_classes=$(grep -cE "^0x[0-9A-Fa-f]+," "$QOSDBA_CONFIG_FILE")
+        local dba_enabled_classes=$(grep -E "^0x[0-9A-Fa-f]+," "$QOSDBA_CONFIG_FILE" | grep -c ",1$")
+        local dba_disabled_classes=$((total_classes - dba_enabled_classes))
+        
+        echo ""
+        echo "DBA启用统计:"
+        echo "  总分类数: $total_classes"
+        echo "  启用DBA: $dba_enabled_classes"
+        echo "  禁用DBA: $dba_disabled_classes"
+        
+        if [ "$dba_enabled_classes" -lt 2 ]; then
+            echo "  警告: 启用DBA的分类少于2个，动态调整功能可能受限"
+        fi
     else
         echo "配置文件不存在: $QOSDBA_CONFIG_FILE"
     fi
@@ -397,10 +484,23 @@ check_qosdba_config() {
     local class_count=$(grep -cE "^0x[0-9A-Fa-f]+," "$QOSDBA_CONFIG_FILE")
     local device_count=$(grep -c "^\[device=" "$QOSDBA_CONFIG_FILE")
     
+    # 检查字段数量
+    local bad_lines=0
+    while IFS= read -r line; do
+        if echo "$line" | grep -qE "^0x[0-9A-Fa-f]+,"; then
+            local field_count=$(echo "$line" | awk -F, '{print NF}')
+            if [ "$field_count" -ne 7 ]; then
+                echo "警告: 分类配置行字段数量不正确: $line"
+                bad_lines=$((bad_lines + 1))
+            fi
+        fi
+    done < "$QOSDBA_CONFIG_FILE"
+    
     echo "配置文件检查:"
     echo "  - 配置文件: $QOSDBA_CONFIG_FILE (存在)"
     echo "  - 分类数量: $class_count"
     echo "  - 设备数量: $device_count"
+    echo "  - 格式错误行数: $bad_lines"
     
     if [ $class_count -eq 0 ]; then
         echo "警告: 配置文件中没有分类定义"
@@ -408,6 +508,10 @@ check_qosdba_config() {
     
     if [ $device_count -eq 0 ]; then
         echo "警告: 配置文件中没有设备定义"
+    fi
+    
+    if [ $bad_lines -gt 0 ]; then
+        echo "警告: 有 $bad_lines 行分类配置格式不正确"
     fi
     
     return 0
@@ -462,12 +566,61 @@ quick_generate_config() {
     return $?
 }
 
+# 转换旧配置文件到新格式
+convert_old_config() {
+    local old_file="$1"
+    local new_file="$2"
+    
+    if [ -z "$old_file" ]; then
+        old_file="$QOSDBA_CONFIG_FILE"
+    fi
+    
+    if [ -z "$new_file" ]; then
+        new_file="$QOSDBA_CONFIG_FILE.new"
+    fi
+    
+    if [ ! -f "$old_file" ]; then
+        echo "错误: 旧配置文件不存在: $old_file"
+        return 1
+    fi
+    
+    echo "正在转换配置文件从旧格式到新格式..."
+    echo "输入文件: $old_file"
+    echo "输出文件: $new_file"
+    
+    # 创建新文件
+    cp "$old_file" "$new_file.tmp"
+    
+    # 更新配置文件头
+    sed -i 's/格式: classid,name,priority,total_bw_kbps,min_bw_kbps,max_bw_kbps/格式: classid,name,priority,total_bw_kbps,min_bw_kbps,max_bw_kbps,dba_enabled/g' "$new_file.tmp"
+    
+    # 处理分类配置行
+    local converted_lines=0
+    while IFS= read -r line; do
+        if echo "$line" | grep -qE "^0x[0-9A-Fa-f]+,[^,]+,[0-9]+,[0-9]+,[0-9]+,[0-9]+$"; then
+            # 旧格式行（6个字段），添加dba_enabled=1
+            echo "${line},1" >> "$new_file"
+            converted_lines=$((converted_lines + 1))
+        else
+            # 其他行，保持原样
+            echo "$line" >> "$new_file"
+        fi
+    done < "$new_file.tmp"
+    
+    rm -f "$new_file.tmp"
+    
+    echo "转换完成: 共处理 $converted_lines 个分类行"
+    echo "新配置文件已保存为: $new_file"
+    
+    return 0
+}
+
 # ==================== 模块自检 ====================
 
 # 模块自检函数
 module_self_test() {
     echo "=== dba_conf.sh 模块自检 ==="
-    echo "模块版本: 1.0"
+    echo "模块版本: 1.1 (支持dba_enabled参数)"
     echo "配置文件: $QOSDBA_CONFIG_FILE"
     echo ""
     
@@ -480,6 +633,16 @@ module_self_test() {
     
     echo "  输入: 总带宽=100000kbps, 类别占比=50%, 最小=30%, 最大=80%"
     echo "  输出: 总带宽=${total_bw}kbps, 最小=${min_bw}kbps, 最大=${max_bw}kbps"
+    
+    # 测试DBA启用检查
+    echo ""
+    echo "测试DBA启用检查:"
+    local test_classes="test_class1 test_class2 test_class3"
+    local dba_check=$(check_dba_enabled_count "upload" "$test_classes" "htb")
+    local dba_enabled=$(echo "$dba_check" | awk '{print $1}')
+    local total_classes=$(echo "$dba_check" | awk '{print $2}')
+    echo "  模拟分类: $test_classes"
+    echo "  启用DBA: $dba_enabled, 总分类: $total_classes"
     
     # 检查依赖
     echo ""
@@ -528,27 +691,33 @@ if [ "$(basename "$0")" = "dba_conf.sh" ]; then
         check)
             check_qosdba_config
             ;;
+        convert)
+            shift
+            convert_old_config "$1" "$2"
+            ;;
         test)
             module_self_test
             ;;
         help|*)
             echo "dba_conf.sh - qosdba配置生成模块"
             echo ""
-            echo "用法: $0 {generate|quick-generate|show|check|test|help}"
+            echo "用法: $0 {generate|quick-generate|show|check|convert|test|help}"
             echo ""
             echo "命令:"
             echo "  generate          生成完整配置（需提供所有参数）"
             echo "  quick-generate    快速生成配置（自动从UCI读取）"
             echo "  show              显示当前配置"
             echo "  check             检查配置文件"
+            echo "  convert           转换旧配置文件到新格式"
             echo "  test              模块自检"
             echo "  help              显示此帮助"
             echo ""
             echo "示例:"
             echo "  $0 quick-generate htb    # 快速生成HTB配置"
             echo "  $0 quick-generate hfsc   # 快速生成HFSC配置"
-            echo "  $0 show                   # 显示当前配置"
-            echo "  $0 test                   # 运行模块自检"
+            echo "  $0 convert               # 转换旧配置文件"
+            echo "  $0 show                  # 显示当前配置"
+            echo "  $0 test                  # 运行模块自检"
             ;;
     esac
 fi

@@ -1,35 +1,118 @@
+# qosdba Makefile - 优化版本1.7.1
 BINDIR = /usr/sbin
-#TCDIR:=$(BUILD_DIR)/iproute2-tc*/ip*
-TCDIR:=$(shell if [ -e "${BUILD_DIR}/iproute2-tcfull" ] ; then echo "${BUILD_DIR}/iproute2-tcfull"/ip* ; else echo "${BUILD_DIR}/iproute2-tctiny"/ip* ; fi ; )
-#The ncurses library only needed if we remove the ONLYBG switch
-#below.  Mostly for debug
-#LDLIBS += -lncurses
 
-LDLIBS += -lm
+# 检测构建环境
+ifdef BUILD_DIR
+    # OpenWrt构建系统
+    TCDIR:=$(shell if [ -e "${BUILD_DIR}/iproute2-tcfull" ] ; then echo "${BUILD_DIR}/iproute2-tcfull"/ip* ; else echo "${BUILD_DIR}/iproute2-tctiny"/ip* ; fi ; )
+    CFLAGS += -I$(STAGING_DIR)/usr/include
+    LDFLAGS += -L$(STAGING_DIR)/usr/lib
+    # TC库对象文件
+    TCOBJS := $(TCDIR)/tc/tc_util.o
+    TCOBJS += $(TCDIR)/tc/tc_core.o
+    TCOBJS += $(TCDIR)/tc/q_hfsc.o
+    TCOBJS += $(TCDIR)/lib/libnetlink.a
+    TCOBJS += $(TCDIR)/lib/libutil.a
+    LDLIBS += -lm
+    LDFLAGS += -Wl,-export-dynamic
+    TC_CFLAGS = -I $(TCDIR)/include -I $(TCDIR)/tc
+else
+    # 标准Linux系统构建
+    LDLIBS += -lnl-3 -lnl-route-3 -lpthread -lm
+    CFLAGS += -D_GNU_SOURCE
+    TC_CFLAGS = 
+endif
 
-TCOBJS := $(TCDIR)/tc/tc_util.o
-TCOBJS += $(TCDIR)/tc/tc_core.o
-TCOBJS += $(TCDIR)/tc/q_hfsc.o
-TCOBJS += $(TCDIR)/tc/q_htb.o
-TCOBJS += $(TCDIR)/tc/q_cake.o
-TCOBJS += $(TCDIR)/lib/libnetlink.a
-TCOBJS += $(TCDIR)/lib/libutil.a
-LDFLAGS += -Wl,-export-dynamic 
+# qosdba版本信息
+VERSION = 1.7.1
+CFLAGS += -DQOSDBA_VERSION=\"$(VERSION)\"
 
-all: qosacc
+# 调试选项
+DEBUG ?= 0
+ifeq ($(DEBUG),1)
+    CFLAGS += -g -O0 -DQOSDBA_DEBUG
+else
+    CFLAGS += -O2
+endif
 
-qosacc: qosacc.o
+# 测试选项
+TEST ?= 0
+ifeq ($(TEST),1)
+    CFLAGS += -DQOSDBA_TEST
+endif
+
+# 内存调试选项
+MEMDEBUG ?= 0
+ifeq ($(MEMDEBUG),1)
+    CFLAGS += -DQOSDBA_DEBUG_MEMORY
+endif
+
+# qosdba构建目标
+all: qosdba
+
+# 构建可执行文件
+qosdba: qosdba.o
+ifdef BUILD_DIR
 	$(CC) $(LDFLAGS) $^ $(TCOBJS) -o $@ $(LDLIBS)
+else
+	$(CC) $(LDFLAGS) $^ -o $@ $(LDLIBS)
+endif
 
-qosacc.o: qosacc.c
-	$(CC) -D ONLYBG $(CFLAGS) -I $(TCDIR)/include -I $(TCDIR)/tc -c $^ -o $@
+# 编译源文件
+qosdba.o: qosdba.c
+	$(CC) -D ONLYBG $(CFLAGS) $(TC_CFLAGS) -c $< -o $@
 
+# 安装目标
 install: all uninstall
 	-mkdir -p $(BINDIR)
-	cp qosacc  $(BINDIR)
+	#-mkdir -p /etc/init.d
+	#-mkdir -p /etc/config
+	#-mkdir -p /etc
+	cp qosdba $(BINDIR)
+	chmod 755 $(BINDIR)/qosdba
+	#cp files/qosdba.init /etc/init.d/qosdba
+	#chmod 755 /etc/init.d/qosdba
+	#cp files/qosdba.conf /etc/qosdba.conf
+	#chmod 644 /etc/qosdba.conf
+	# 创建状态文件目录
+	#-mkdir -p /var/log
+	#touch /var/log/qosdba.log
+	#chmod 644 /var/log/qosdba.log
+	# 如果存在，启用init脚本
+	#if [ -f /etc/init.d/qosdba ]; then \
+		#/etc/init.d/qosdba enable; \
+	#fi
 
+# 卸载目标
 uninstall:
-	rm -f $(BINDIR)/qosacc
+	rm -f $(BINDIR)/qosdba
+	rm -f /etc/init.d/qosdba
+	rm -f /etc/config/qosdba
+	rm -f /etc/qosdba.conf
+	# 停止并禁用服务
+	if [ -f /etc/init.d/qosdba ]; then \
+		/etc/init.d/qosdba stop; \
+		/etc/init.d/qosdba disable; \
+	fi
 
+# 清理目标
 clean:
-	rm -rf *.o *~ .*sw* qosacc
+	rm -rf *.o *~ .*sw* qosdba
+
+# 测试目标
+test: qosdba
+	./qosdba --test
+
+# 运行一次检查
+once: qosdba
+	./qosdba --once
+
+# 调试版本
+debug:
+	$(MAKE) DEBUG=1
+
+# 发布版本
+release:
+	$(MAKE) DEBUG=0
+
+.PHONY: all install uninstall clean test once debug release
