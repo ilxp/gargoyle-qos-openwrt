@@ -1,6 +1,4 @@
 BINDIR = /usr/sbin
-CONFDIR = /etc
-INITDIR = /etc/init.d
 #TCDIR:=$(BUILD_DIR)/iproute2-tc*/ip*
 TCDIR:=$(shell if [ -e "${BUILD_DIR}/iproute2-tcfull" ] ; then echo "${BUILD_DIR}/iproute2-tcfull"/ip* ; else echo "${BUILD_DIR}/iproute2-tctiny"/ip* ; fi ; )
 #The ncurses library only needed if we remove the ONLYBG switch
@@ -26,20 +24,12 @@ qosacc: qosacc.o
 qosacc.o: qosacc.c
 	$(CC) -D ONLYBG $(CFLAGS) -I $(TCDIR)/include -I $(TCDIR)/tc -c $^ -o $@
 
-install: all
-	-mkdir -p $(DESTDIR)$(BINDIR)
-	-mkdir -p $(DESTDIR)$(CONFDIR)
-	-mkdir -p $(DESTDIR)$(INITDIR)
-	cp qosacc $(DESTDIR)$(BINDIR)/
-	chmod 755 $(DESTDIR)$(BINDIR)/qosacc
-	cp flies/qosacc.conf $(DESTDIR)$(CONFDIR)/
-	chmod 644 $(DESTDIR)$(CONFDIR)/qosacc.conf
-	cp files/qosacc.init $(DESTDIR)$(INITDIR)/qosacc
-	chmod 755 $(DESTDIR)$(INITDIR)/qosacc
+install: all uninstall
+	-mkdir -p $(BINDIR)
+	cp qosacc  $(BINDIR)
 
 uninstall:
-	rm -f $(DESTDIR)$(BINDIR)/qosacc
-	rm -f $(DESTDIR)$(CONFDIR)/qosacc.conf
-	rm -f $(DESTDIR)$(INITDIR)/qosacc
+	rm -f $(BINDIR)/qosacc
+
 clean:
 	rm -rf *.o *~ .*sw* qosacc
