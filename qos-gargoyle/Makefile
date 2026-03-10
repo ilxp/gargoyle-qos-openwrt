@@ -29,8 +29,8 @@ endef
 
 define Build/Prepare
 	mkdir -p $(PKG_BUILD_DIR)
-	$(CP) ./src/qosacc/* $(PKG_BUILD_DIR)/
-	#$(CP) ./src/qosdba/* $(PKG_BUILD_DIR)/
+	#$(CP) ./src/qosacc/* $(PKG_BUILD_DIR)/
+	$(CP) ./src/qosdba/* $(PKG_BUILD_DIR)/
 endef
 
 
@@ -74,8 +74,8 @@ define Package/qos-gargoyle/install
 	$(INSTALL_BIN) $(CURDIR)/files/gargoyle_firewall.include $(1)/usr/share/qos_gargoyle/gargoyle_firewall.include
 
 	$(INSTALL_DIR) $(1)/usr/sbin
-	$(INSTALL_BIN) $(PKG_BUILD_DIR)/qosacc $(1)/usr/sbin/qosacc
-	#$(INSTALL_BIN) $(PKG_BUILD_DIR)/qosdba $(1)/usr/sbin/qosdba
+	#$(INSTALL_BIN) $(PKG_BUILD_DIR)/qosacc $(1)/usr/sbin/qosacc
+	$(INSTALL_BIN) $(PKG_BUILD_DIR)/qosdba $(1)/usr/sbin/qosdba
 endef
 
 define Package/qos-gargoyle/prerm
