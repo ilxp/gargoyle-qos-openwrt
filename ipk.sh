@@ -1,4 +1,4 @@
-#!/bin/bash
+8#!/bin/bash
 mkdir package/new
 function merge_package() {
 	# 参数1是分支名,参数2是库地址,参数3是所有文件下载到指定路径。
@@ -41,4 +41,4 @@ sed -i '$asrc-git telephony https://github.com/openwrt/telephony.git;openwrt-24.
 #merge_package main https://github.com/ilxp/gargoyle-qos-openwrt.git  package/new qos-gargoyle
 #merge_package main https://github.com/ilxp/gargoyle-qos-openwrt.git  package/new luci-app-qos-gargoyle
 
-git clone -b main --single-branch https://github.com/ilxp/gargoyle-qos-openwrt.git  package/gargolye-qos-openwrt
+git clone -b main --single-branch --depth 1 https://github.com/ilxp/gargoyle-qos-openwrt.git  package/gargolye-qos-openwrt
