@@ -47,10 +47,82 @@ define Build/Compile
 		all
 endef
 
-# 重启防火墙时, 添加qos规则
-define Package/gargoyle-firewall-util/postinst
-	included=$$(cat $${IPKG_INSTROOT}/etc/config/firewall | grep 'gargoyle_firewall.include'  )
-	if [ -z "$$included" ] ; then printf "config include 'qos_gargoyle'\n\toption type script\n\toption path /usr/share/qos_gargoyle/gargoyle_firewall.include\n\toption family any\n\toption reload 1\n\n" >> $${IPKG_INSTROOT}/etc/config/firewall ; fi
+# 安装前的预处理
+define Package/qos-gargoyle/preinst
+#!/bin/sh
+# 检查服务是否在运行，停止它
+if [ -f "$$
+{IPKG_INSTROOT}/etc/init.d/qos_gargoyle" ]; then
+	$${IPKG_INSTROOT}/etc/init.d/qos_gargoyle stop 2>/dev/null || true
+	$${IPKG_INSTROOT}/etc/init.d/qos_gargoyle disable 2>/dev/null || true
+fi
+exit 0
+endef
+
+# 安装后的配置
+define Package/qos-gargoyle/postinst
+#!/bin/sh
+# 添加防火墙规则包含
+if [ -z "$$(grep 'gargoyle_firewall.include' $${IPKG_INSTROOT}/etc/config/firewall 2>/dev/null)" ]; then
+	echo "config include 'qos_gargoyle'" >> $${IPKG_INSTROOT}/etc/config/firewall
+	echo "	option type script" >> $${IPKG_INSTROOT}/etc/config/firewall
+	echo "	option path /usr/share/qos_gargoyle/gargoyle_firewall.include" >> $${IPKG_INSTROOT}/etc/config/firewall
+	echo "	option family any" >> $${IPKG_INSTROOT}/etc/config/firewall
+	echo "	option reload 1" >> $${IPKG_INSTROOT}/etc/config/firewall
+fi
+# 启用服务
+[ -n "$${IPKG_INSTROOT}" ] || {
+	/etc/init.d/qos_gargoyle enable
+	/etc/init.d/ifb0 enable
+}
+exit 0
+endef
+
+# 卸载前的处理
+define Package/qos-gargoyle/prerm
+#!/bin/sh
+# 停止服务
+if [ -f "$${IPKG_INSTROOT}/etc/init.d/qos_gargoyle" ]; then
+	$$
+{IPKG_INSTROOT}/etc/init.d/qos_gargoyle stop 2>/dev/null || true
+	$${IPKG_INSTROOT}/etc/init.d/qos_gargoyle disable 2>/dev/null || true
+fi
+if [ -f "$$
+{IPKG_INSTROOT}/etc/init.d/ifb0" ]; then
+	$${IPKG_INSTROOT}/etc/init.d/ifb0 disable 2>/dev/null || true
+fi
+exit 0
+endef
+
+# 卸载后的清理
+define Package/qos-gargoyle/postrm
+#!/bin/sh
+# 从防火墙配置中删除qos_gargoyle的include规则
+if [ -f "$${IPKG_INSTROOT}/etc/config/firewall" ]; then
+	sed -i '/config include.*qos_gargoyle/,/^[[:space:]]*$/d' "$${IPKG_INSTROOT}/etc/config/firewall" 2>/dev/null || true
+fi
+# 清理残留的空目录
+[ -n "$${IPKG_INSTROOT}" ] || {
+	# 只在真实系统上删除配置文件（询问用户）
+	if [ "$${1}" = "remove" ]; then
+		echo "Do you want to remove the configuration files? [y/N]: "
+		read answer
+		case "$$answer" in
+			[Yy]*)
+				rm -rf /etc/config/qos_gargoyle 2>/dev/null || true
+				rm -rf /etc/qos_gargoyle/ 2>/dev/null || true
+				;;
+			*)
+				echo "Configuration files preserved."
+				;;
+		esac
+	fi
+	# 删除空目录
+	rmdir /usr/lib/qos_gargoyle/ 2>/dev/null || true
+	rmdir /usr/share/qos_gargoyle/ 2>/dev/null || true
+	rmdir /etc/qos_gargoyle/ 2>/dev/null || true
+}
+exit 0
 endef
 
 define Package/qos-gargoyle/install
@@ -76,12 +148,6 @@ define Package/qos-gargoyle/install
 	$(INSTALL_DIR) $(1)/usr/sbin
 	#$(INSTALL_BIN) $(PKG_BUILD_DIR)/qosacc $(1)/usr/sbin/qosacc
 	$(INSTALL_BIN) $(PKG_BUILD_DIR)/qosdba $(1)/usr/sbin/qosdba
-endef
-
-define Package/qos-gargoyle/prerm
-	$${IPKG_INSTROOT}/etc/init.d/qos_gargoyle stop 2>/dev/null
-	$${IPKG_INSTROOT}/etc/init.d/qos_gargoyle disable 2>/dev/null
-	ls >/dev/null 2>&1
 endef
 
 $(eval $(call BuildPackage,qos-gargoyle))
