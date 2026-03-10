@@ -38,5 +38,7 @@ sed -i '$asrc-git telephony https://github.com/openwrt/telephony.git;openwrt-24.
 #./scripts/feeds install -a
 
 #
-merge_package main https://github.com/ilxp/gargoyle-qos-openwrt.git  package/new qos-gargoyle
-merge_package main https://github.com/ilxp/gargoyle-qos-openwrt.git  package/new luci-app-qos-gargoyle
+#merge_package main https://github.com/ilxp/gargoyle-qos-openwrt.git  package/new qos-gargoyle
+#merge_package main https://github.com/ilxp/gargoyle-qos-openwrt.git  package/new luci-app-qos-gargoyle
+
+git clone -b main --single-branch https://github.com/ilxp/gargoyle-qos-openwrt.git  package/gargolye-qos-openwrt
