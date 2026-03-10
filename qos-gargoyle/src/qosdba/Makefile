@@ -20,7 +20,7 @@ CFLAGS += -DQOSDBA_PATCH_VERSION=1
 CFLAGS += -D_FILE_OFFSET_BITS=64
 
 # 构建模式
-BUILD_MODE ?= linux
+BUILD_MODE ?= openwrt
 ifeq ($(BUILD_MODE),openwrt)
     CFLAGS += -DQOSDBA_OPENWRT
     LDLIBS += -ldl
