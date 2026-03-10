@@ -44,24 +44,6 @@ else
     TC_CFLAGS = 
 endif
 
-# 调试选项
-DEBUG ?= 0
-ifeq ($(DEBUG),1)
-    CFLAGS += -g -O0 -DQOSDBA_DEBUG
-endif
-
-# 测试选项
-TEST ?= 0
-ifeq ($(TEST),1)
-    CFLAGS += -DQOSDBA_TEST
-endif
-
-# 内存调试选项
-MEMDEBUG ?= 0
-ifeq ($(MEMDEBUG),1)
-    CFLAGS += -DQOSDBA_DEBUG_MEMORY
-endif
-
 # 目录结构
 SRC_DIR = src
 INC_DIR = include
@@ -88,7 +70,7 @@ OBJS = $(patsubst $(SRC_DIR)/%.c,$(OBJ_DIR)/%.o,$(SRCS))
 DEPS = $(patsubst $(SRC_DIR)/%.c,$(OBJ_DIR)/%.d,$(SRCS))
 
 # 包含路径
-CFLAGS += -I$(INC_DIR)
+CFLAGS += -I$(CURDIR)/$(INC_DIR)
 
 # 默认目标
 all: directories $(BIN_DIR)/$(TARGET)
