@@ -58,7 +58,7 @@
 #else
     /* 标准Linux构建模式 - 使用系统libnetlink */
     #include <libnetlink.h>
-    #include <rtnetlink.h>
+    #include <linux/rtnetlink.h>
     #include <linux/pkt_sched.h>
     #include <linux/if_link.h>
 #endif
