@@ -1,4 +1,5 @@
 /* qosacc - 基于netlink的优化版QoS主动拥塞控制
+ * version=1.2.1
  * 功能：通过ping监控延迟，使用tc库直接调整ifb0根类的带宽
  * 使用poll机制，完整支持HFSC\HTB\CAKE算法。
  * 状态文件目录：/tmp/qosacc.status
@@ -9,7 +10,6 @@
  * qosacc 200 8.8.8.8 10000 20
  * qosacc -d eth0 -t 8.8.8.8 -m 50000 -p 100 -P 30 -v -A
  * 更多使用qosacc -h
- * version=1.0
  */
  
 #define _GNU_SOURCE 1
@@ -44,6 +44,11 @@
 #include <dlfcn.h>
 #include <ctype.h>
 #include <stdatomic.h>
+
+// 修复：添加缺失的头文件
+#ifdef __linux__
+  #include <sys/file.h>  // 用于flock
+#endif
 
 // TC库头文件
 #include "utils.h"
@@ -114,6 +119,14 @@
 
 #define MIN(a,b) (((a)<(b))?(a):(b))
 #define MAX(a,b) (((a)>(b))?(a):(b))
+
+// 修复：如果没有定义flock相关的宏，使用fcntl替代
+#ifndef LOCK_EX
+  #define LOCK_EX 2
+#endif
+#ifndef LOCK_UN
+  #define LOCK_UN 8
+#endif
 
 /* ==================== TC库全局变量 ==================== */
 bool use_names = false;
@@ -382,8 +395,8 @@ uint16_t icmp_checksum(void* data, int len) {
 struct icmpv6_pseudo_header {
     struct in6_addr src;
     struct in6_addr dst;
-    uint32_t length;
-    uint8_t zeros[3];
+    uint16_t length;
+    uint8_t zero[3];
     uint8_t next_header;
 };
 
@@ -394,8 +407,8 @@ uint16_t icmpv6_checksum(struct in6_addr* src, struct in6_addr* dst,
     
     memcpy(&ph.src, src, sizeof(struct in6_addr));
     memcpy(&ph.dst, dst, sizeof(struct in6_addr));
-    ph.length = htonl(len);
-    memset(ph.zeros, 0, 3);
+    ph.length = htons(len);
+    memset(ph.zero, 0, 3);
     ph.next_header = IPPROTO_ICMPV6;
     
     uint32_t sum = 0;
@@ -2283,8 +2296,14 @@ int status_file_update(qosacc_context_t* ctx) {
         return QMON_ERR_FILE;
     }
     
-    // 加锁
-    if (flock(fd, LOCK_EX) < 0) {
+    // 修复：使用fcntl替代flock，提高跨平台兼容性
+    struct flock lock = {0};
+    lock.l_type = F_WRLCK;  // 写锁
+    lock.l_whence = SEEK_SET;
+    lock.l_start = 0;
+    lock.l_len = 0;  // 锁定整个文件
+    
+    if (fcntl(fd, F_SETLK, &lock) < 0) {
         qosacc_log(ctx, QMON_LOG_ERROR, "无法锁定状态文件: %s\n", strerror(errno));
         close(fd);
         return QMON_ERR_FILE;
@@ -2293,7 +2312,9 @@ int status_file_update(qosacc_context_t* ctx) {
     FILE* temp_fp = fdopen(fd, "w");
     if (!temp_fp) {
         qosacc_log(ctx, QMON_LOG_ERROR, "无法打开临时状态文件流: %s\n", strerror(errno));
-        flock(fd, LOCK_UN);
+        // 解锁
+        lock.l_type = F_UNLCK;
+        fcntl(fd, F_SETLK, &lock);
         close(fd);
         return QMON_ERR_FILE;
     }
@@ -2322,7 +2343,8 @@ int status_file_update(qosacc_context_t* ctx) {
     fflush(temp_fp);
     
     // 解锁
-    flock(fd, LOCK_UN);
+    lock.l_type = F_UNLCK;
+    fcntl(fd, F_SETLK, &lock);
     fclose(temp_fp);
     
     // 修复：状态文件原子性写入问题
