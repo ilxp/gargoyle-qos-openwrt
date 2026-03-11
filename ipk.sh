@@ -1,4 +1,4 @@
-8#!/bin/bash
+#!/bin/sh
 mkdir package/new
 function merge_package() {
 	# 参数1是分支名,参数2是库地址,参数3是所有文件下载到指定路径。
