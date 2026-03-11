@@ -179,6 +179,35 @@ validate_bandwidth_config() {
     return 0
 }
 
+# 验证百分比
+validate_percentage() {
+    local value="$1"
+    local param_name="$2"
+    local min="${3:-0}"
+    local max="${4:-100}"
+    
+    if [ -z "$value" ]; then
+        return 0
+    fi
+    
+    if ! echo "$value" | grep -qE '^[0-9]+$'; then
+        qos_log "ERROR" "参数 $param_name 必须是整数: $value"
+        return 1
+    fi
+    
+    if [ "$value" -lt "$min" ] 2>/dev/null; then
+        qos_log "ERROR" "参数 $param_name 必须大于等于 $min: $value"
+        return 1
+    fi
+    
+    if [ "$value" -gt "$max" ] 2>/dev/null; then
+        qos_log "ERROR" "参数 $param_name 必须小于等于 $max: $value"
+        return 1
+    fi
+    
+    return 0
+}
+
 # 加载带宽配置
 load_bandwidth_from_config() {
     qos_log "INFO" "加载带宽配置"

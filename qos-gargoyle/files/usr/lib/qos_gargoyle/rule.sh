@@ -1,17 +1,12 @@
 #!/bin/sh
 # 规则辅助模块 (rule.sh)
 # 支持多样化端口、协议、IPv6双栈和连接字节数过滤
-# version=1.5.0 修复和优化版本
-# 修复和优化内容：
-# 1. 修复端口范围分割漏洞，确保分割后的两部分均为非空数字
-# 2. 修复IPv6正则表达式，支持更全面的IPv6地址格式
-# 3. 引入哈希算法生成唯一索引，避免类别标记冲突
-# 4. 增强临时文件安全性，使用mktemp -u并注册清理钩子
-# 5. 优化日志去重，提高可读性
-# 6. 优化配置加载，批量读取配置减少uci调用
-# 7. 性能提升，使用内存缓冲减少IO操作
-# 8. 新增安全措施，输入验证增强和资源限制
-# 9. 修复资源限制，在关键函数添加超时控制
+# version=1.5.2 修复sh语法兼容性版本
+# 修复内容：
+# 1. 修复第93行正则表达式语法错误，符合sh语法
+# 2. 修复数组语法，使用位置参数替代bash数组
+# 3. 修复字符串连接语法
+# 4. 修复变量替换语法
 
 CONFIG_FILE="qos_gargoyle"
 
@@ -35,9 +30,10 @@ log() {
     local message="$2"
     
     # 如果有换行符，则拆分成多行记录
-    if echo "$message" | grep -q $'\n'; then
+    if echo "$message" | grep -q '
+'; then
         local first_line=1
-        while IFS= read -r line; do
+        echo "$message" | while IFS= read -r line; do
             if [ $first_line -eq 1 ]; then
                 first_line=0
                 continue
@@ -59,9 +55,7 @@ log() {
                     logger -t "qos_gargoyle" "$line"
                     ;;
             esac
-        done <<EOF
-$message
-EOF
+        done
     fi
     
     # 记录主消息
@@ -90,11 +84,14 @@ safe_exec() {
     local timeout=30
     local command="$1"
     shift
-    local args=("$@")
+    # 在sh中使用位置参数代替数组
+    local args="$@"
     
     (
-        eval "$command \"\${args[@]}\""
-    ) & pid=$!
+        # 使用eval执行命令
+        eval "$command $args"
+    ) & 
+    pid=$!
     
     (
         sleep $timeout
@@ -155,19 +152,18 @@ validate_port() {
     
     # 检查是否是逗号分隔的列表
     if echo "$clean_value" | grep -q ','; then
-        local IFS=','
+        local IFS=,
         for port in $clean_value; do
             if echo "$port" | grep -q '-'; then
                 # 端口范围 - 使用数组分割确保格式正确
-                local parts=(${port//-/ })
+                local min_port max_port
+                min_port=$(echo "$port" | cut -d'-' -f1)
+                max_port=$(echo "$port" | cut -d'-' -f2)
                 # 修复：确保分割后的两部分均为非空数字
-                if [ ${#parts[@]} -ne 2 ] || [ -z "${parts[0]}" ] || [ -z "${parts[1]}" ]; then
+                if [ -z "$min_port" ] || [ -z "$max_port" ]; then
                     log "ERROR" "无效的端口范围格式 '$port'，必须为'最小端口-最大端口'"
                     return 1
                 fi
-                
-                local min_port=${parts[0]}
-                local max_port=${parts[1]}
                 
                 # 验证最小端口
                 if ! validate_number "$min_port" "$param_name" 1 65535; then
@@ -198,16 +194,15 @@ validate_port() {
             fi
         done
     elif echo "$clean_value" | grep -q '-'; then
-        # 单个端口范围 - 使用数组分割确保格式正确
-        local parts=(${clean_value//-/ })
+        # 单个端口范围
+        local min_port max_port
+        min_port=$(echo "$clean_value" | cut -d'-' -f1)
+        max_port=$(echo "$clean_value" | cut -d'-' -f2)
         # 修复：确保分割后的两部分均为非空数字
-        if [ ${#parts[@]} -ne 2 ] || [ -z "${parts[0]}" ] || [ -z "${parts[1]}" ]; then
+        if [ -z "$min_port" ] || [ -z "$max_port" ]; then
             log "ERROR" "无效的端口范围格式 '$clean_value'，必须为'最小端口-最大端口'"
             return 1
         fi
-        
-        local min_port=${parts[0]}
-        local max_port=${parts[1]}
         
         if ! validate_number "$min_port" "$param_name" 1 65535; then
             return 1
@@ -309,10 +304,12 @@ load_all_config_sections() {
             grep -E "^${config_name}\\.@${section_type}\\[[0-9]+\\]=" | \
             cut -d= -f1 | sed "s/${config_name}\.@${section_type}\[//g; s/\]//g")
         
-        # 格式2：命名配置节
+        # 格式2：命名配置节 - 修复：使用sh兼容的正则表达式
+        # 原始行：grep -E "^${config_name}\.[a-zA-Z0-9_]+=${section_type}(['\"])?$" |
+        # 修复为：使用更简单的正则表达式
         local named_sections=$(echo "$config_output" | \
-            grep -E "^${config_name}\\.[a-zA-Z0-9_]+=${section_type}(['\"])?$" | \
-            cut -d. -f2 | cut -d= -f1)
+            grep -E "^${config_name}\\.[a-zA-Z0-9_]+=${section_type}"'$' | \
+            cut -d= -f1 | cut -d. -f2)
         
         # 格式3：旧格式
         local old_format_sections=$(echo "$config_output" | \
@@ -321,7 +318,9 @@ load_all_config_sections() {
         
         # 合并所有结果
         local all_sections=$(echo "$anonymous_sections" "$named_sections" "$old_format_sections" | \
-            tr ' ' '\n' | grep -v "^$" | sort -u | tr '\n' ' ')
+            tr ' ' '
+' | grep -v "^$" | sort -u | tr '
+' ' ')
         
         # 输出结果，移除多余空格
         echo "$all_sections" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//'
@@ -614,10 +613,10 @@ sort_rules_by_priority() {
     
     # 使用内存缓冲减少IO操作
     local buffer=""
-    local buffer_size=0
     
     # 使用while read处理每个规则
-    echo "$rule_list" | tr ' ' '\n' | while read -r rule; do
+    echo "$rule_list" | tr ' ' '
+' | while read -r rule; do
         [ -z "$rule" ] && continue
         
         # 使用calculate_composite_priority计算分数
@@ -625,29 +624,22 @@ sort_rules_by_priority() {
         score=$(calculate_composite_priority "$rule" "$direction")
         
         # 添加到缓冲区
-        buffer="$buffer${score}:${rule}\n"
-        buffer_size=$((buffer_size + 1))
-        
-        # 缓冲区达到一定大小后写入文件
-        if [ $buffer_size -ge 100 ]; then
-            printf "%b" "$buffer" >> "$temp_file"
-            buffer=""
-            buffer_size=0
-        fi
+        buffer="$buffer${score}:${rule}
+"
     done
     
-    # 写入剩余的缓冲区内容
-    if [ -n "$buffer" ]; then
-        printf "%b" "$buffer" >> "$temp_file"
-    fi
+    # 写入文件
+    printf "%s" "$buffer" >> "$temp_file"
     
     # 排序 - 使用新的字符串排序方法
     if [ "$sort_direction" = "ascending" ]; then
         # 使用sort命令处理"类优先级_规则序号"格式
-        sort -t '_' -k1,1n -k2,2n "$temp_file" 2>/dev/null | cut -d: -f2- 2>/dev/null | tr '\n' ' ' | sed 's/ $//'
+        sort -t '_' -k1,1n -k2,2n "$temp_file" 2>/dev/null | cut -d: -f2- 2>/dev/null | tr '
+' ' ' | sed 's/ $//'
     else
         # 降序排序
-        sort -t '_' -k1,1nr -k2,2nr "$temp_file" 2>/dev/null | cut -d: -f2- 2>/dev/null | tr '\n' ' ' | sed 's/ $//'
+        sort -t '_' -k1,1nr -k2,2nr "$temp_file" 2>/dev/null | cut -d: -f2- 2>/dev/null | tr '
+' ' ' | sed 's/ $//'
     fi
 }
 
@@ -688,7 +680,8 @@ apply_enhanced_direction_rules() {
     fi
     
     # 优化日志：合并详细信息
-    local priority_info="=== 规则优先级详情 ===\n"
+    local priority_info="=== 规则优先级详情 ===
+"
     for rule_name in $sorted_rule_list; do
         local score=$(calculate_composite_priority "$rule_name" "$direction")
         local class="" order=""
@@ -698,12 +691,14 @@ apply_enhanced_direction_rules() {
         if config_line=$(load_all_config_options "$CONFIG_FILE" "$rule_name"); then
             parse_config_line "$config_line" "rule"
             local class_priority=$(uci -q get "${CONFIG_FILE}.${rule_class}.priority" 2>/dev/null || echo "999")
-            priority_info="${priority_info}  $rule_name -> 类[$rule_class:prio$class_priority] + 规则[order:${rule_order:-100}] = 总分:$score\n"
+            priority_info="${priority_info}  $rule_name -> 类[$rule_class:prio$class_priority] + 规则[order:${rule_order:-100}] = 总分:$score
+"
         fi
     done
     priority_info="${priority_info}====================="
     
-    log "INFO" "按优先级排序后的规则: $sorted_rule_list\n$(log_indent "$priority_info")"
+    log "INFO" "按优先级排序后的规则: $sorted_rule_list
+$(log_indent "$priority_info")"
     
     # 按优先级顺序应用规则
     for rule_name in $sorted_rule_list; do
@@ -861,22 +856,27 @@ build_enhanced_nft_rule() {
     # 优化日志：合并记录
     local log_msg="✅ 规则创建成功: $rule_name"
     if [ -n "$proto" ]; then
-        log_msg="$log_msg\n$(log_indent "协议: $proto")"
+        log_msg="$log_msg
+$(log_indent "协议: $proto")"
     fi
     if [ -n "$srcport" ]; then
-        log_msg="$log_msg\n$(log_indent "源端口: $srcport")"
+        log_msg="$log_msg
+$(log_indent "源端口: $srcport")"
     fi
     if [ -n "$dstport" ]; then
-        log_msg="$log_msg\n$(log_indent "目的端口: $dstport")"
+        log_msg="$log_msg
+$(log_indent "目的端口: $dstport")"
     fi
-    log_msg="$log_msg\n$(log_indent "NFT命令: $nft_cmd")"
+    log_msg="$log_msg
+$(log_indent "NFT命令: $nft_cmd")"
     
     # 执行命令
     if eval "$nft_cmd" 2>/dev/null; then
         log "INFO" "$log_msg"
         return 0
     else
-        log "ERROR" "❌ 规则创建失败: $rule_name (退出码: $?)\n$(log_indent "NFT命令: $nft_cmd")"
+        log "ERROR" "❌ 规则创建失败: $rule_name (退出码: $?)
+$(log_indent "NFT命令: $nft_cmd")"
         return 1
     fi
 }
@@ -945,7 +945,8 @@ process_single_rule() {
     local dstport=$(uci -q get "$CONFIG_FILE.$rule_id.dstport")
     
     # 调试信息
-    log "DEBUG" "规则 $rule_id: class=$class, proto=$proto\n$(log_indent "srcport='$srcport', dstport='$dstport'")"
+    log "DEBUG" "规则 $rule_id: class=$class, proto=$proto
+$(log_indent "srcport='$srcport', dstport='$dstport'")"
     
     # 检查必要参数
     if [ -z "$class" ]; then
@@ -1004,10 +1005,12 @@ process_single_rule() {
     
     # 实际执行
     if nft "$nft_cmd" 2>&1; then
-        log "INFO" "✅ NFT 规则添加成功\n$(log_indent "NFT命令: $nft_cmd")"
+        log "INFO" "✅ NFT 规则添加成功
+$(log_indent "NFT命令: $nft_cmd")"
         return 0
     else
-        log "ERROR" "❌ NFT 规则添加失败\n$(log_indent "NFT命令: $nft_cmd")"
+        log "ERROR" "❌ NFT 规则添加失败
+$(log_indent "NFT命令: $nft_cmd")"
         return 1
     fi
 }
@@ -1028,7 +1031,8 @@ apply_all_protocol_rule() {
         if [ -n "$ports" ]; then
             tcp_cmd="add rule inet gargoyle-qos-priority $chain meta l4proto tcp th sport { $ports } meta mark set $mark counter"
             if nft -c "$tcp_cmd" 2>&1; then
-                nft "$tcp_cmd" 2>&1 && log "INFO" "✅ TCP 规则添加成功\n$(log_indent "NFT命令: $tcp_cmd")" || { log "ERROR" "❌ TCP 规则添加失败"; success=1; }
+                nft "$tcp_cmd" 2>&1 && log "INFO" "✅ TCP 规则添加成功
+$(log_indent "NFT命令: $tcp_cmd")" || { log "ERROR" "❌ TCP 规则添加失败"; success=1; }
             else
                 log "ERROR" "❌ TCP 规则语法错误"
                 success=1
@@ -1039,7 +1043,8 @@ apply_all_protocol_rule() {
         if [ -n "$ports" ]; then
             tcp_cmd="add rule inet gargoyle-qos-priority $chain meta l4proto tcp th dport { $ports } meta mark set $mark counter"
             if nft -c "$tcp_cmd" 2>&1; then
-                nft "$tcp_cmd" 2>&1 && log "INFO" "✅ TCP 规则添加成功\n$(log_indent "NFT命令: $tcp_cmd")" || { log "ERROR" "❌ TCP 规则添加失败"; success=1; }
+                nft "$tcp_cmd" 2>&1 && log "INFO" "✅ TCP 规则添加成功
+$(log_indent "NFT命令: $tcp_cmd")" || { log "ERROR" "❌ TCP 规则添加失败"; success=1; }
             else
                 log "ERROR" "❌ TCP 规则语法错误"
                 success=1
@@ -1048,7 +1053,8 @@ apply_all_protocol_rule() {
     else
         tcp_cmd="add rule inet gargoyle-qos-priority $chain meta l4proto tcp meta mark set $mark counter"
         if nft -c "$tcp_cmd" 2>&1; then
-            nft "$tcp_cmd" 2>&1 && log "INFO" "✅ TCP 规则添加成功\n$(log_indent "NFT命令: $tcp_cmd")" || { log "ERROR" "❌ TCP 规则添加失败"; success=1; }
+            nft "$tcp_cmd" 2>&1 && log "INFO" "✅ TCP 规则添加成功
+$(log_indent "NFT命令: $tcp_cmd")" || { log "ERROR" "❌ TCP 规则添加失败"; success=1; }
         else
             log "ERROR" "❌ TCP 规则语法错误"
             success=1
@@ -1061,7 +1067,8 @@ apply_all_protocol_rule() {
         if [ -n "$ports" ]; then
             udp_cmd="add rule inet gargoyle-qos-priority $chain meta l4proto udp th sport { $ports } meta mark set $mark counter"
             if nft -c "$udp_cmd" 2>&1; then
-                nft "$udp_cmd" 2>&1 && log "INFO" "✅ UDP 规则添加成功\n$(log_indent "NFT命令: $udp_cmd")" || { log "ERROR" "❌ UDP 规则添加失败"; success=1; }
+                nft "$udp_cmd" 2>&1 && log "INFO" "✅ UDP 规则添加成功
+$(log_indent "NFT命令: $udp_cmd")" || { log "ERROR" "❌ UDP 规则添加失败"; success=1; }
             else
                 log "ERROR" "❌ UDP 规则语法错误"
                 success=1
@@ -1072,7 +1079,8 @@ apply_all_protocol_rule() {
         if [ -n "$ports" ]; then
             udp_cmd="add rule inet gargoyle-qos-priority $chain meta l4proto udp th dport { $ports } meta mark set $mark counter"
             if nft -c "$udp_cmd" 2>&1; then
-                nft "$udp_cmd" 2>&1 && log "INFO" "✅ UDP 规则添加成功\n$(log_indent "NFT命令: $udp_cmd")" || { log "ERROR" "❌ UDP 规则添加失败"; success=1; }
+                nft "$udp_cmd" 2>&1 && log "INFO" "✅ UDP 规则添加成功
+$(log_indent "NFT命令: $udp_cmd")" || { log "ERROR" "❌ UDP 规则添加失败"; success=1; }
             else
                 log "ERROR" "❌ UDP 规则语法错误"
                 success=1
@@ -1081,7 +1089,8 @@ apply_all_protocol_rule() {
     else
         udp_cmd="add rule inet gargoyle-qos-priority $chain meta l4proto udp meta mark set $mark counter"
         if nft -c "$udp_cmd" 2>&1; then
-            nft "$udp_cmd" 2>&1 && log "INFO" "✅ UDP 规则添加成功\n$(log_indent "NFT命令: $udp_cmd")" || { log "ERROR" "❌ UDP 规则添加失败"; success=1; }
+            nft "$udp_cmd" 2>&1 && log "INFO" "✅ UDP 规则添加成功
+$(log_indent "NFT命令: $udp_cmd")" || { log "ERROR" "❌ UDP 规则添加失败"; success=1; }
         else
             log "ERROR" "❌ UDP 规则语法错误"
             success=1

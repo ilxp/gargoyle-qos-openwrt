@@ -54,14 +54,6 @@ else
     logger -t "qos_gargoyle" "警告: 规则辅助模块未找到"
 fi
 
-# 加载dba_conf.sh模块
-if [ -f "/usr/lib/qos_gargoyle/dba_conf.sh" ]; then
-    . /usr/lib/qos_gargoyle/dba_conf.sh
-    logger -t "qos_gargoyle" "已加载dba_conf配置模块"
-else
-    logger -t "qos_gargoyle" "警告: 未找到dba_conf.sh模块"
-fi
-
 # ========= HFSC与fq_codel专属常量 ==========
 HFSC_LATENCY_MODE="normal"
 HFSC_MINRTT_ENABLED="0"
@@ -1326,9 +1318,6 @@ initialize_hfsc_qos() {
     
     # 5. 应用HFSC特定的nftables规则
     apply_hfsc_specific_rules
-	
-	# 6. 生成qosdba配置文件
-    generate_qosdba_for_hfsc
     
     logger -t "qos_gargoyle" "HFSC QoS初始化完成"
 }

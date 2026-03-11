@@ -1,5 +1,5 @@
 /* qosacc - 基于netlink的优化版QoS主动拥塞控制
- * version=1.2.1
+ * version=1.2.2
  * 功能：通过ping监控延迟，使用tc库直接调整ifb0根类的带宽
  * 使用poll机制，完整支持HFSC\HTB\CAKE算法。
  * 状态文件目录：/tmp/qosacc.status
@@ -1171,18 +1171,7 @@ struct tc_controller_s {
     qosacc_context_t* ctx;
 };
 
-// 补充缺失的get_tc_classid函数实现
-int get_tc_classid(__u32* classid, const char* str) {
-    if (!classid || !str) return -1;
-    
-    unsigned int major, minor;
-    if (sscanf(str, "%x:%x", &major, &minor) != 2) {
-        return -1;
-    }
-    
-    *classid = (major << 16) | minor;
-    return 0;
-}
+// 注意：删除了自定义的get_tc_classid函数，因为tc_util库中已经提供了
 
 int get_root_classid(qosacc_context_t* ctx, __u32* root_classid) {
     if (!ctx || !root_classid) return QMON_ERR_MEMORY;
