@@ -44,12 +44,9 @@ function index()
 
     entry({"admin", "qos", "qos_gargoyle", "acc"},
         cbi("qos_gargoyle/acc"), _("Active Congestion Control"), 50)
-	
-	-- entry({"admin", "qos", "qos_gargoyle", "dba"},
-        -- cbi("qos_gargoyle/dba"), _("Dynamic Bandwidth Adjustment"), 60)
 		
     entry({"admin", "qos", "qos_gargoyle", "troubleshooting"},
-        template("qos_gargoyle/troubleshooting"), _("Troubleshooting"), 70)
+        template("qos_gargoyle/troubleshooting"), _("Troubleshooting"), 60)
 
     entry({"admin", "qos", "qos_gargoyle", "troubleshooting", "data"},
         call("action_troubleshooting_data"))
