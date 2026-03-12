@@ -1271,8 +1271,15 @@ static int modify_class_bandwidth(qosacc_context_t* ctx, __u32 rate_bps) {
             struct tc_service_curve sc;
             memset(&sc, 0, sizeof(sc));
             sc.m2 = rate_bps / 8;
+
+#ifdef TCA_HFSC_SC
+            /* 新版 iproute2 使用独立的 SC 和 UL 属性 */
             addattr_l(&req.n, sizeof(req), TCA_HFSC_SC, &sc, sizeof(sc));
             addattr_l(&req.n, sizeof(req), TCA_HFSC_UL, &sc, sizeof(sc));
+#else
+            /* 老版本仅支持 USC（上行曲线），效果等同于同时设置 SC 和 UL */
+            addattr_l(&req.n, sizeof(req), TCA_HFSC_USC, &sc, sizeof(sc));
+#endif
             tail->rta_len = (void*)NLMSG_TAIL(&req.n) - (void*)tail;
         } else if (strcmp(ctx->detected_qdisc, "htb") == 0) {
             addattr_l(&req.n, sizeof(req), TCA_KIND, "htb", strlen("htb")+1);

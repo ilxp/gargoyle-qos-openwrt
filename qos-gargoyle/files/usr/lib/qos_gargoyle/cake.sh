@@ -1,6 +1,7 @@
 #!/bin/sh
-# CAKE算法实现模块 - 优化版 v4.9
-# 基于v4.8，修正：状态显示精简、IPv6地址匹配语法优化、锁竞争处理、添加tc依赖检查
+# CAKE算法实现模块 - 最终优化版 v4.12
+# 基于v4.11，优化：状态显示使用运行时参数、带宽单位转换增强警告
+# 修正：带宽转换函数中警告使用未初始化变量的问题
 
 # ========== 变量初始化 ==========
 : ${total_upload_bandwidth:=40000}
@@ -8,6 +9,7 @@
 : ${IFB_DEVICE:=ifb0}
 LOCK_DIR="/var/run/cake_qos.lock"
 LOCK_PID_FILE="$LOCK_DIR/pid"
+RUNTIME_PARAMS_FILE="/tmp/cake_runtime_params"
 
 # 如果 qos_interface 未设置，尝试获取
 if [ -z "$qos_interface" ]; then
@@ -15,7 +17,7 @@ if [ -z "$qos_interface" ]; then
     qos_interface="${qos_interface:-pppoe-wan}"
 fi
 
-echo "CAKE 模块初始化完成 (v4.9)"
+echo "CAKE 模块初始化完成 (v4.12)"
 echo "  网络接口: $qos_interface"
 echo "  IFB 设备: $IFB_DEVICE"
 echo "  上传带宽: ${total_upload_bandwidth}kbit/s"
@@ -30,7 +32,7 @@ CAKE_ACK_FILTER="0"
 CAKE_NAT="0"
 CAKE_WASH="0"
 CAKE_SPLIT_GSO="0"
-CAKE_INGRESS="0"
+CAKE_INGRESS="0"          # 用户配置，决定是否附加 ingress 参数
 CAKE_AUTORATE_INGRESS="0"
 CAKE_MEMORY_LIMIT="32mb"
 ENABLE_AUTO_TUNE="1"
@@ -80,7 +82,7 @@ check_dependencies() {
     return 0
 }
 
-# ========== 带宽单位转换 ==========
+# ========== 带宽单位转换（增强警告，修正版）==========
 convert_bandwidth_to_kbit() {
     local bw="$1"
     local num unit result
@@ -94,6 +96,11 @@ convert_bandwidth_to_kbit() {
             "") result=$num ;;
             *) log_error "未知带宽单位: $unit"; return 1 ;;
         esac
+        # 检查单位后是否有额外字符（如 "MB" -> 单位 "M"，但原字符串非纯单位）
+        local raw_unit=$(echo "$bw" | sed 's/[0-9]//g' | tr '[:lower:]' '[:upper:]')
+        if [ "$raw_unit" != "$unit" ] && [ -n "$raw_unit" ]; then
+            log_warn "带宽单位 '$raw_unit' 可能不标准，已按 '${unit}' 处理（${num}${unit}=${result}kbit）"
+        fi
         echo "$result"
         return 0
     else
@@ -279,7 +286,7 @@ validate_cake_config() {
     return 0
 }
 
-# ========== 入口重定向（修正IPv6地址匹配）==========
+# ========== 入口重定向（IPv4必须成功，IPv6可选）==========
 setup_ingress_redirect() {
     log_info "设置入口重定向: $qos_interface -> $IFB_DEVICE"
 
@@ -293,17 +300,19 @@ setup_ingress_redirect() {
     local ipv4_success=false
     local ipv6_success=false
 
-    # IPv4重定向
+    # IPv4重定向（必须成功）
     if tc filter add dev "$qos_interface" parent ffff: protocol ip \
         u32 match u32 0 0 \
         action mirred egress redirect dev "$IFB_DEVICE" 2>/dev/null; then
         ipv4_success=true
     else
         log_error "IPv4入口重定向规则添加失败"
+        # 清理已创建的队列
+        tc qdisc del dev "$qos_interface" ingress 2>/dev/null
+        return 1
     fi
 
-    # IPv6重定向：限制全球单播地址 2000::/3
-    # 使用标准 match ip6 dst 语法
+    # IPv6重定向：限制全球单播地址 2000::/3（可选）
     if tc filter add dev "$qos_interface" parent ffff: protocol ipv6 \
         match ip6 dst 2000::/3 \
         action mirred egress redirect dev "$IFB_DEVICE" 2>/dev/null; then
@@ -315,17 +324,11 @@ setup_ingress_redirect() {
             action mirred egress redirect dev "$IFB_DEVICE" 2>/dev/null; then
             ipv6_success=true
         else
-            log_error "IPv6入口重定向规则添加失败"
+            log_warn "IPv6入口重定向规则添加失败，IPv6流量将不会通过IFB"
         fi
     fi
 
-    if [ "$ipv4_success" = false ] || [ "$ipv6_success" = false ]; then
-        log_warn "部分入口重定向规则添加失败，清理已创建的队列"
-        tc qdisc del dev "$qos_interface" ingress 2>/dev/null
-        return 1
-    fi
-
-    log_info "入口重定向设置完成"
+    log_info "入口重定向设置完成 (IPv4: ${ipv4_success}, IPv6: ${ipv6_success})"
     return 0
 }
 
@@ -352,7 +355,7 @@ check_ingress_redirect() {
         echo "❌ IPv6入口重定向: 未生效"
     fi
 
-    [ "$has_ipv4" = true ] && [ "$has_ipv6" = true ] && return 0
+    [ "$has_ipv4" = true ] && return 0
     return 1
 }
 
@@ -360,7 +363,6 @@ check_ingress_redirect() {
 cleanup_existing_queues() {
     local device="$1"
     local direction="$2"
-    local ingress_mode="${3:-$CAKE_INGRESS}"
 
     log_info "清理$device上的现有$direction队列"
 
@@ -368,14 +370,9 @@ cleanup_existing_queues() {
         tc qdisc del dev "$device" root 2>/dev/null && \
             echo "  清理上传队列完成" || echo "  无上传队列可清理"
     elif [ "$direction" = "download" ]; then
-        if [ "$ingress_mode" = "1" ]; then
-            tc qdisc del dev "$device" ingress 2>/dev/null && \
-                echo "  清理ingress队列完成" || echo "  无ingress队列可清理"
-        else
-            if [ "$device" = "$IFB_DEVICE" ]; then
-                tc qdisc del dev "$device" root 2>/dev/null && \
-                    echo "  清理IFB队列完成" || echo "  无IFB队列可清理"
-            fi
+        if [ "$device" = "$IFB_DEVICE" ]; then
+            tc qdisc del dev "$device" root 2>/dev/null && \
+                echo "  清理IFB队列完成" || echo "  无IFB队列可清理"
         fi
     fi
 }
@@ -412,22 +409,16 @@ create_cake_root_qdisc() {
             return 1
         fi
     elif [ "$direction" = "download" ]; then
+        # 为下载队列附加 ingress 相关参数（如果启用）
         if [ "$CAKE_INGRESS" = "1" ]; then
-            echo "正在为 $device 创建下载CAKE入口队列..."
             cake_params="$cake_params ingress"
             [ "$CAKE_AUTORATE_INGRESS" = "1" ] && cake_params="$cake_params autorate-ingress"
-            echo "  参数: $cake_params"
-            if ! tc qdisc add dev "$device" ingress cake $cake_params; then
-                log_error "无法在$device上创建下载CAKE入口队列"
-                return 1
-            fi
-        else
-            echo "正在为 $device 创建下载CAKE根队列..."
-            echo "  参数: $cake_params"
-            if ! tc qdisc add dev "$device" root cake $cake_params; then
-                log_error "无法在$device上创建下载CAKE队列"
-                return 1
-            fi
+        fi
+        echo "正在为 $device 创建下载CAKE根队列..."
+        echo "  参数: $cake_params"
+        if ! tc qdisc add dev "$device" root cake $cake_params; then
+            log_error "无法在$device上创建下载CAKE队列"
+            return 1
         fi
     fi
 
@@ -458,28 +449,23 @@ initialize_cake_download() {
         return 0
     fi
 
-    if [ "$CAKE_INGRESS" = "1" ]; then
-        echo "为 $qos_interface 创建下载CAKE入口队列 (带宽: ${total_download_bandwidth}kbit/s)"
-        create_cake_root_qdisc "$qos_interface" "download" "$total_download_bandwidth"
-    else
-        echo "为 $IFB_DEVICE 创建下载CAKE队列 (带宽: ${total_download_bandwidth}kbit/s)"
+    echo "为 $IFB_DEVICE 创建下载CAKE队列 (带宽: ${total_download_bandwidth}kbit/s)"
 
-        if ! ip link show dev "$IFB_DEVICE" >/dev/null 2>&1; then
-            log_info "IFB设备 $IFB_DEVICE 不存在，尝试创建"
-            ip link add "$IFB_DEVICE" type ifb || {
-                log_error "无法创建IFB设备 $IFB_DEVICE"
-                return 1
-            }
-        fi
-
-        ip link set dev "$IFB_DEVICE" up || {
-            log_error "无法启动IFB设备 $IFB_DEVICE"
+    if ! ip link show dev "$IFB_DEVICE" >/dev/null 2>&1; then
+        log_info "IFB设备 $IFB_DEVICE 不存在，尝试创建"
+        ip link add "$IFB_DEVICE" type ifb || {
+            log_error "无法创建IFB设备 $IFB_DEVICE"
             return 1
         }
-
-        setup_ingress_redirect || return 1
-        create_cake_root_qdisc "$IFB_DEVICE" "download" "$total_download_bandwidth"
     fi
+
+    ip link set dev "$IFB_DEVICE" up || {
+        log_error "无法启动IFB设备 $IFB_DEVICE"
+        return 1
+    }
+
+    setup_ingress_redirect || return 1
+    create_cake_root_qdisc "$IFB_DEVICE" "download" "$total_download_bandwidth"
 }
 
 # ========== 健康检查 ==========
@@ -499,24 +485,17 @@ health_check_cake() {
         issues="${issues}上传CAKE队列未启用\n"
     fi
 
-    if [ "$CAKE_INGRESS" = "1" ]; then
-        if ! tc qdisc show dev "$qos_interface" ingress 2>/dev/null | grep -q "cake"; then
-            health_score=$((health_score - 20))
-            issues="${issues}下载CAKE队列未启用\n"
-        fi
-    else
-        if ! ip link show dev "$IFB_DEVICE" >/dev/null 2>&1; then
-            health_score=$((health_score - 10))
-            issues="${issues}IFB设备不存在\n"
-        elif ! tc qdisc show dev "$IFB_DEVICE" root 2>/dev/null | grep -q "cake"; then
-            health_score=$((health_score - 20))
-            issues="${issues}下载CAKE队列未启用\n"
-        fi
+    if ! ip link show dev "$IFB_DEVICE" >/dev/null 2>&1; then
+        health_score=$((health_score - 10))
+        issues="${issues}IFB设备不存在\n"
+    elif ! tc qdisc show dev "$IFB_DEVICE" root 2>/dev/null | grep -q "cake"; then
+        health_score=$((health_score - 20))
+        issues="${issues}下载CAKE队列未启用\n"
+    fi
 
-        if ! tc qdisc show dev "$qos_interface" ingress 2>/dev/null; then
-            health_score=$((health_score - 10))
-            issues="${issues}入口重定向未配置\n"
-        fi
+    if ! tc qdisc show dev "$qos_interface" ingress 2>/dev/null; then
+        health_score=$((health_score - 10))
+        issues="${issues}入口重定向未配置\n"
     fi
 
     echo -e "\n健康检查结果:"
@@ -534,13 +513,22 @@ health_check_cake() {
     return $((health_score >= 70 ? 0 : 1))
 }
 
-# ========== 状态显示（精简版）==========
+# ========== 状态显示（使用运行时参数）==========
 show_cake_status() {
-    echo "===== CAKE QoS状态报告 (v4.9) ====="
+    echo "===== CAKE QoS状态报告 (v4.12) ====="
     echo "时间: $(date)"
     echo "网络接口: ${qos_interface:-未知}"
 
+    # 加载UCI配置（用于显示默认配置，但运行时参数优先）
     load_cake_config
+
+    # 如果运行时参数文件存在，则读取实际运行的RTT和内存限制
+    if [ -f "$RUNTIME_PARAMS_FILE" ]; then
+        . "$RUNTIME_PARAMS_FILE"
+        log_debug "使用运行时参数: RTT=$CAKE_RTT, MEM=$CAKE_MEMORY_LIMIT"
+    else
+        log_debug "无运行时参数文件，使用UCI配置"
+    fi
 
     if ! tc qdisc show dev "${qos_interface}" 2>/dev/null | grep -q "qdisc cake"; then
         echo "警告: QoS未在接口 ${qos_interface} 上激活"
@@ -584,8 +572,8 @@ show_cake_status() {
         echo "入口队列状态: 未配置"
     fi
 
-    # CAKE配置参数
-    echo -e "\n===== CAKE配置参数 ====="
+    # CAKE配置参数（显示实际运行值）
+    echo -e "\n===== CAKE配置参数 (运行时) ====="
     echo "DiffServ模式: $CAKE_DIFFSERV_MODE"
     echo "RTT: $CAKE_RTT"
     echo "Overhead: $CAKE_OVERHEAD"
@@ -612,26 +600,21 @@ stop_cake_qos() {
         log_info "清理上传方向CAKE队列"
     fi
 
-    if [ "$CAKE_INGRESS" = "1" ]; then
-        if tc qdisc show dev "$qos_interface" ingress 2>/dev/null | grep -q "cake"; then
-            tc qdisc del dev "$qos_interface" ingress 2>/dev/null
-            log_info "清理下载方向CAKE入口队列"
+    if ip link show dev "$IFB_DEVICE" >/dev/null 2>&1; then
+        if tc qdisc show dev "$IFB_DEVICE" root 2>/dev/null | grep -q "cake"; then
+            tc qdisc del dev "$IFB_DEVICE" root 2>/dev/null
+            log_info "清理下载方向CAKE队列 (IFB)"
         fi
-    else
-        if ip link show dev "$IFB_DEVICE" >/dev/null 2>&1; then
-            if tc qdisc show dev "$IFB_DEVICE" root 2>/dev/null | grep -q "cake"; then
-                tc qdisc del dev "$IFB_DEVICE" root 2>/dev/null
-                log_info "清理下载方向CAKE队列 (IFB)"
-            fi
-        fi
-        tc qdisc del dev "$qos_interface" ingress 2>/dev/null && log_info "清理入口重定向队列"
     fi
+    tc qdisc del dev "$qos_interface" ingress 2>/dev/null && log_info "清理入口重定向队列"
 
     if ip link show dev "$IFB_DEVICE" >/dev/null 2>&1; then
         ip link set dev "$IFB_DEVICE" down
         log_info "停用IFB设备: $IFB_DEVICE"
     fi
 
+    # 清理运行时参数文件
+    rm -f "$RUNTIME_PARAMS_FILE"
     log_info "CAKE QoS停止完成"
 }
 
@@ -695,9 +678,13 @@ main_cake_qos() {
             initialize_cake_upload || { release_lock; exit 1; }
             initialize_cake_download || { release_lock; exit 1; }
 
-            if [ "$CAKE_INGRESS" = "0" ] && [ "$total_download_bandwidth" -gt 0 ]; then
+            if [ "$total_download_bandwidth" -gt 0 ]; then
                 check_ingress_redirect
             fi
+
+            # 保存最终运行时参数
+            echo "CAKE_RTT='$CAKE_RTT'" > "$RUNTIME_PARAMS_FILE"
+            echo "CAKE_MEMORY_LIMIT='$CAKE_MEMORY_LIMIT'" >> "$RUNTIME_PARAMS_FILE"
 
             health_check_cake
             release_lock

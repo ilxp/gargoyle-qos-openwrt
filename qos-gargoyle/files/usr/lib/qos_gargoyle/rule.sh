@@ -1,7 +1,9 @@
 #!/bin/sh
 # 规则辅助模块 (rule.sh)
 # 支持多样化端口、协议、IPv6双栈和连接字节数过滤
-# version=1.6.5 安全加固版本（修复临时文件清理、端口验证、mktemp兼容性等）
+# version=1.6.6 增加类数量超限警告
+# 优化内容（基于1.6.5）：
+# 19. 增加类数量检查：当某个方向的启用类数量超过8个时，记录警告日志
 
 CONFIG_FILE="qos_gargoyle"
 # 全局临时文件列表，用于trap清理
@@ -621,6 +623,28 @@ apply_enhanced_direction_rules() {
     priority_info="${priority_info}\n====================="
     
     log "INFO" "按优先级排序后的规则: $sorted_rule_list\n$priority_info"
+    
+    # === 新增：检查该方向启用类数量是否超过8个（可能引起标记冲突）===
+    local class_list=""
+    local class_count=0
+    for rule_name in $sorted_rule_list; do
+        load_all_config_options "$CONFIG_FILE" "$rule_name" "rule_"
+        # 只统计启用的规则
+        if [ "$rule_enabled" = "1" ] && [ -n "$rule_class" ]; then
+            # 去重
+            case " $class_list " in
+                *" $rule_class "*) ;;
+                *) class_list="$class_list $rule_class"; class_count=$((class_count + 1));;
+            esac
+        fi
+    done
+    if [ $class_count -gt 8 ]; then
+        if [ -n "$direction" ]; then
+            log "WARN" "方向 $direction 的启用类数量为 $class_count，超过8个，可能会导致标记冲突！请减少类数量或调整标记分配策略。"
+        else
+            log "WARN" "当前链 $chain 的启用类数量为 $class_count，超过8个，可能会导致标记冲突！请减少类数量或调整标记分配策略。"
+        fi
+    fi
     
     # 按优先级顺序应用规则
     for rule_name in $sorted_rule_list; do
