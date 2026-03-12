@@ -64,11 +64,7 @@ define Package/qos-gargoyle/install
 	$(INSTALL_BIN) $(CURDIR)/files/qos_gargoyle.init $(1)/etc/init.d/qos_gargoyle
 	$(INSTALL_BIN) $(CURDIR)/files/qos_gargoyle.hotplug $(1)/etc/hotplug.d/iface/99-qos_gargoyle
 	$(INSTALL_CONF) $(CURDIR)/files/qos_gargoyle.conf $(1)/etc/config/qos_gargoyle
-	$(INSTALL_BIN) $(CURDIR)/files/usr/lib/qos_gargoyle/rule.sh $(1)/usr/lib/qos_gargoyle/rule.sh
-	$(INSTALL_BIN) $(CURDIR)/files/usr/lib/qos_gargoyle/hfsc_fqcodel.sh $(1)/usr/lib/qos_gargoyle/hfsc_fqcodel.sh
-	$(INSTALL_BIN) $(CURDIR)/files/usr/lib/qos_gargoyle/htb_fqcodel.sh $(1)/usr/lib/qos_gargoyle/htb_fqcodel.sh
-	$(INSTALL_BIN) $(CURDIR)/files/usr/lib/qos_gargoyle/cake.sh $(1)/usr/lib/qos_gargoyle/cake.sh
-	$(INSTALL_BIN) $(CURDIR)/files/usr/lib/qos_gargoyle/acc_conf.sh $(1)/usr/lib/qos_gargoyle/acc_conf.sh
+	$(INSTALL_BIN) $(CURDIR)/files/usr/lib/qos_gargoyle/* $(1)/usr/lib/qos_gargoyle/
 	$(INSTALL_BIN) $(CURDIR)/files/gargoyle_firewall.include $(1)/usr/share/qos_gargoyle/gargoyle_firewall.include
 
 	$(INSTALL_DIR) $(1)/usr/sbin
