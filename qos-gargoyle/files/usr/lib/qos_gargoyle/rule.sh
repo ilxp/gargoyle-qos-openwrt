@@ -1,112 +1,55 @@
 #!/bin/sh
 # 规则辅助模块 (rule.sh)
 # 支持多样化端口、协议、IPv6双栈和连接字节数过滤
-# version=1.5.2 修复sh语法兼容性版本
-# 修复内容：
-# 1. 修复第93行正则表达式语法错误，符合sh语法
-# 2. 修复数组语法，使用位置参数替代bash数组
-# 3. 修复字符串连接语法
-# 4. 修复变量替换语法
+# version=1.6.5 安全加固版本（修复临时文件清理、端口验证、mktemp兼容性等）
 
 CONFIG_FILE="qos_gargoyle"
+# 全局临时文件列表，用于trap清理
+TEMP_FILES=""
+# 设置退出时清理临时文件
+trap 'rm -f $TEMP_FILES 2>/dev/null' EXIT INT TERM HUP
+
+# ========== 辅助函数 ==========
+# 转义字符串，使其可安全用于 eval 赋值
+escape_for_eval() {
+    echo "$1" | sed 's/\\/\\\\/g; s/"/\\"/g; s/\$/\\$/g; s/`/\\`/g'
+}
 
 # ========== 输入验证和清理函数 ==========
-# 清理输入，防止命令注入
+# 清理输入，防止命令注入（优化字符类，避免方括号歧义）
 sanitize_input() {
     local input="$1"
-    # 只允许字母、数字、下划线、连字符、冒号、斜杠、点
-    echo "$input" | sed 's/[^a-zA-Z0-9_\-:\/\.]//g'
+    # 只允许字母、数字、下划线、连字符、冒号、斜杠、点、逗号、方括号、空格
+    # 将字符类中的方括号移到首位并转义内部方括号（部分sed需要双重转义）
+    echo "$input" | sed 's/[^][a-zA-Z0-9_\-:\/\.\, ]//g'
 }
 
 # ========== 统一日志函数 ==========
-# 日志缩进辅助函数
-log_indent() {
-    local message="$1"
-    echo "  $message"
-}
-
 log() {
     local level="$1"
     local message="$2"
+    local tag="qos_gargoyle"
+    local prefix=""
     
-    # 如果有换行符，则拆分成多行记录
-    if echo "$message" | grep -q '
-'; then
-        local first_line=1
-        echo "$message" | while IFS= read -r line; do
-            if [ $first_line -eq 1 ]; then
-                first_line=0
-                continue
-            fi
-            case "$level" in
-                "ERROR"|"error")
-                    logger -t "qos_gargoyle" "错误: $line"
-                    ;;
-                "WARN"|"warn"|"WARNING"|"warning")
-                    logger -t "qos_gargoyle" "警告: $line"
-                    ;;
-                "INFO"|"info")
-                    logger -t "qos_gargoyle" "信息: $line"
-                    ;;
-                "DEBUG"|"debug")
-                    logger -t "qos_gargoyle" "调试: $line"
-                    ;;
-                *)
-                    logger -t "qos_gargoyle" "$line"
-                    ;;
-            esac
-        done
-    fi
+    [ -z "$message" ] && return  # 空消息不记录
     
-    # 记录主消息
     case "$level" in
-        "ERROR"|"error")
-            logger -t "qos_gargoyle" "错误: $(echo "$message" | head -1)"
-            ;;
-        "WARN"|"warn"|"WARNING"|"warning")
-            logger -t "qos_gargoyle" "警告: $(echo "$message" | head -1)"
-            ;;
-        "INFO"|"info")
-            logger -t "qos_gargoyle" "信息: $(echo "$message" | head -1)"
-            ;;
-        "DEBUG"|"debug")
-            logger -t "qos_gargoyle" "调试: $(echo "$message" | head -1)"
-            ;;
-        *)
-            logger -t "qos_gargoyle" "$(echo "$message" | head -1)"
-            ;;
+        ERROR|error)   prefix="错误:" ;;
+        WARN|warn|WARNING|warning) prefix="警告:" ;;
+        INFO|info)     prefix="信息:" ;;
+        DEBUG|debug)   prefix="调试:" ;;
+        *)             prefix="$level:" ;;
     esac
-}
-
-# ========== 安全执行函数 ==========
-# 在关键函数添加超时控制
-safe_exec() {
-    local timeout=30
-    local command="$1"
-    shift
-    # 在sh中使用位置参数代替数组
-    local args="$@"
     
-    (
-        # 使用eval执行命令
-        eval "$command $args"
-    ) & 
-    pid=$!
+    # 记录到系统日志（logger自动添加时间戳和标签）
+    echo "$message" | while IFS= read -r line; do
+        logger -t "$tag" "$prefix $line"
+    done
     
-    (
-        sleep $timeout
-        kill -9 $pid 2>/dev/null
-    ) 2>/dev/null &
-    
-    local killer_pid=$!
-    
-    wait $pid
-    local exit_code=$?
-    
-    # 清理杀手进程
-    kill $killer_pid 2>/dev/null
-    
-    return $exit_code
+    # 控制台输出：每行加时间戳
+    echo "$message" | while IFS= read -r line; do
+        echo "[$(date '+%H:%M:%S')] $tag $prefix $line" >&2
+    done
 }
 
 # ========== 验证函数 ==========
@@ -134,10 +77,11 @@ validate_number() {
     return 0
 }
 
-# 验证端口参数 - 修复端口范围分割漏洞
+# 验证端口参数 - 修复：处理空字段、多连字符，使用严格范围格式
 validate_port() {
     local value="$1"
     local param_name="$2"
+    local old_ifs="$IFS"
     
     # 检查是否为空
     if [ -z "$value" ]; then
@@ -152,74 +96,60 @@ validate_port() {
     
     # 检查是否是逗号分隔的列表
     if echo "$clean_value" | grep -q ','; then
-        local IFS=,
+        IFS=,
         for port in $clean_value; do
+            # 跳过空字段（如连续逗号）
+            [ -z "$port" ] && continue
+            
             if echo "$port" | grep -q '-'; then
-                # 端口范围 - 使用数组分割确保格式正确
+                # 验证是否为有效的范围格式：数字-数字，不允许额外字符
+                if ! echo "$port" | grep -qE '^[0-9]+-[0-9]+$'; then
+                    log "ERROR" "无效的端口范围格式 '$port'，必须为'最小端口-最大端口'"
+                    IFS="$old_ifs"
+                    return 1
+                fi
                 local min_port max_port
                 min_port=$(echo "$port" | cut -d'-' -f1)
                 max_port=$(echo "$port" | cut -d'-' -f2)
-                # 修复：确保分割后的两部分均为非空数字
-                if [ -z "$min_port" ] || [ -z "$max_port" ]; then
-                    log "ERROR" "无效的端口范围格式 '$port'，必须为'最小端口-最大端口'"
-                    return 1
-                fi
-                
-                # 验证最小端口
                 if ! validate_number "$min_port" "$param_name" 1 65535; then
+                    IFS="$old_ifs"
                     return 1
                 fi
-                
-                # 验证最大端口
                 if ! validate_number "$max_port" "$param_name" 1 65535; then
+                    IFS="$old_ifs"
                     return 1
                 fi
-                
-                # 检查端口范围顺序
                 if [ "$min_port" -gt "$max_port" ]; then
                     log "ERROR" "端口范围 $param_name 起始端口 $min_port 大于结束端口 $max_port"
-                    return 1
-                fi
-                
-                # 修复：确保最大端口不超过65535
-                if [ "$max_port" -gt 65535 ]; then
-                    log "ERROR" "端口范围 $param_name 结束端口 $max_port 超过最大允许值65535"
+                    IFS="$old_ifs"
                     return 1
                 fi
             else
                 # 单个端口
                 if ! validate_number "$port" "$param_name" 1 65535; then
+                    IFS="$old_ifs"
                     return 1
                 fi
             fi
         done
+        IFS="$old_ifs"
     elif echo "$clean_value" | grep -q '-'; then
         # 单个端口范围
-        local min_port max_port
-        min_port=$(echo "$clean_value" | cut -d'-' -f1)
-        max_port=$(echo "$clean_value" | cut -d'-' -f2)
-        # 修复：确保分割后的两部分均为非空数字
-        if [ -z "$min_port" ] || [ -z "$max_port" ]; then
+        if ! echo "$clean_value" | grep -qE '^[0-9]+-[0-9]+$'; then
             log "ERROR" "无效的端口范围格式 '$clean_value'，必须为'最小端口-最大端口'"
             return 1
         fi
-        
+        local min_port max_port
+        min_port=$(echo "$clean_value" | cut -d'-' -f1)
+        max_port=$(echo "$clean_value" | cut -d'-' -f2)
         if ! validate_number "$min_port" "$param_name" 1 65535; then
             return 1
         fi
-        
         if ! validate_number "$max_port" "$param_name" 1 65535; then
             return 1
         fi
-        
         if [ "$min_port" -gt "$max_port" ]; then
             log "ERROR" "端口范围 $param_name 起始端口 $min_port 大于结束端口 $max_port"
-            return 1
-        fi
-        
-        # 修复：确保最大端口不超过65535
-        if [ "$max_port" -gt 65535 ]; then
-            log "ERROR" "端口范围 $param_name 结束端口 $max_port 超过最大允许值65535"
             return 1
         fi
     else
@@ -232,7 +162,7 @@ validate_port() {
     return 0
 }
 
-# 验证IP地址 - 修复IPv6正则表达式
+# 验证IP地址 - 修复IPv6正则表达式，支持IPv4-mapped格式
 validate_ip_address() {
     local ip="$1"
     local param_name="$2"
@@ -244,13 +174,14 @@ validate_ip_address() {
     # 清理输入
     ip=$(sanitize_input "$ip")
     
-    # IPv4验证 - 禁止前导零
-    if echo "$ip" | grep -qE '^(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)$'; then
+    # IPv4验证 - 禁止前导零（除了单个0）
+    if echo "$ip" | grep -qE '^(25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])\.(25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])\.(25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])\.(25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])$'; then
         return 0
     fi
     
-    # IPv6验证 - 修复：支持压缩格式和接口标识符
-    if echo "$ip" | grep -qE '^(?:[a-fA-F0-9]{1,4}:){7}[a-fA-F0-9]{1,4}$|^(?:[a-fA-F0-9]{1,4}:){0,7}::(?:[a-fA-F0-9]{1,4}:){0,6}[a-fA-F0-9]{1,4}$|^[a-fA-F0-9]{1,4}:[a-fA-F0-9]{1,4}:[a-fA-F0-9]{1,4}:[a-fA-F0-9]{1,4}:[a-fA-F0-9]{1,4}:[a-fA-F0-9]{1,4}:[a-fA-F0-9]{1,4}:[a-fA-F0-9]{1,4}$|^::(?:[a-fA-F0-9]{1,4}:){0,6}[a-fA-F0-9]{1,4}$|^[a-fA-F0-9]{1,4}::(?:[a-fA-F0-9]{1,4}:){0,5}[a-fA-F0-9]{1,4}$|^(?:[a-fA-F0-9]{1,4}:){2}:(?:[a-fA-F0-9]{1,4}:){0,4}[a-fA-F0-9]{1,4}$|^(?:[a-fA-F0-9]{1,4}:){3}:(?:[a-fA-F0-9]{1,4}:){0,3}[a-fA-F0-9]{1,4}$|^(?:[a-fA-F0-9]{1,4}:){4}:(?:[a-fA-F0-9]{1,4}:){0,2}[a-fA-F0-9]{1,4}$|^(?:[a-fA-F0-9]{1,4}:){5}:(?:[a-fA-F0-9]{1,4}:)?[a-fA-F0-9]{1,4}$|^(?:[a-fA-F0-9]{1,4}:){6}:[a-fA-F0-9]{1,4}$|^[a-fA-F0-9]{1,4}:[a-fA-F0-9]{1,4}:[a-fA-F0-9]{1,4}::[a-fA-F0-9]{1,4}$|^[a-fA-F0-9]{1,4}:[a-fA-F0-9]{1,4}::[a-fA-F0-9]{1,4}:[a-fA-F0-9]{1,4}$|^[a-fA-F0-9]{1,4}::[a-fA-F0-9]{1,4}:[a-fA-F0-9]{1,4}:[a-fA-F0-9]{1,4}$|^::[a-fA-F0-9]{1,4}:[a-fA-F0-9]{1,4}:[a-fA-F0-9]{1,4}:[a-fA-F0-9]{1,4}$'; then
+    # IPv6验证 - 支持标准格式、压缩格式和IPv4-mapped格式
+    # 格式: 标准IPv6，允许::压缩一次，以及::ffff:x.x.x.x
+    if echo "$ip" | grep -qiE '^([0-9a-f]{1,4}:){7}[0-9a-f]{1,4}$|^([0-9a-f]{1,4}:){1,7}:$|^([0-9a-f]{1,4}:){1,6}:[0-9a-f]{1,4}$|^([0-9a-f]{1,4}:){1,5}(:[0-9a-f]{1,4}){1,2}$|^([0-9a-f]{1,4}:){1,4}(:[0-9a-f]{1,4}){1,3}$|^([0-9a-f]{1,4}:){1,3}(:[0-9a-f]{1,4}){1,4}$|^([0-9a-f]{1,4}:){1,2}(:[0-9a-f]{1,4}){1,5}$|^[0-9a-f]{1,4}:((:[0-9a-f]{1,4}){1,6})$|^:((:[0-9a-f]{1,4}){1,7})$|^::$|^::ffff:(25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])(\.(25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])){3}$'; then
         return 0
     fi
     
@@ -283,7 +214,7 @@ validate_protocol() {
 }
 
 # ========== 配置加载函数 ==========
-# 加载所有配置段
+# 加载所有配置段（修复匿名节提取）
 load_all_config_sections() {
     local config_name="$1"
     local section_type="$2"
@@ -297,30 +228,24 @@ load_all_config_sections() {
     fi
     
     if [ -n "$section_type" ]; then
-        # 修复：同时支持两种配置格式
-        
-        # 格式1：匿名配置节
+        # 格式1：匿名配置节，提取完整节名如 '@upload_rule[0]'
         local anonymous_sections=$(echo "$config_output" | \
             grep -E "^${config_name}\\.@${section_type}\\[[0-9]+\\]=" | \
-            cut -d= -f1 | sed "s/${config_name}\.@${section_type}\[//g; s/\]//g")
+            cut -d= -f1 | sed "s/^${config_name}\\.//")
         
-        # 格式2：命名配置节 - 修复：使用sh兼容的正则表达式
-        # 原始行：grep -E "^${config_name}\.[a-zA-Z0-9_]+=${section_type}(['\"])?$" |
-        # 修复为：使用更简单的正则表达式
+        # 格式2：命名配置节，提取节名（如 'myrule'）
         local named_sections=$(echo "$config_output" | \
             grep -E "^${config_name}\\.[a-zA-Z0-9_]+=${section_type}"'$' | \
             cut -d= -f1 | cut -d. -f2)
         
-        # 格式3：旧格式
+        # 格式3：旧格式（如 upload_rule_1）
         local old_format_sections=$(echo "$config_output" | \
             grep -E "^${config_name}\\.${section_type}_[0-9]+=" | \
             cut -d= -f1 | cut -d. -f2)
         
         # 合并所有结果
         local all_sections=$(echo "$anonymous_sections" "$named_sections" "$old_format_sections" | \
-            tr ' ' '
-' | grep -v "^$" | sort -u | tr '
-' ' ')
+            tr ' ' '\n' | grep -v "^$" | sort -u | tr '\n' ' ')
         
         # 输出结果，移除多余空格
         echo "$all_sections" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//'
@@ -331,7 +256,7 @@ load_all_config_sections() {
     fi
 }
 
-# 加载并排序所有配置段
+# 加载并排序所有配置段（修复：使用普通循环避免子shell，改进mktemp兼容性）
 load_and_sort_all_config_sections() {
     local config_name="$1"
     local section_type="$2"
@@ -347,18 +272,20 @@ load_and_sort_all_config_sections() {
     
     # 如果有排序变量，按排序值排序
     if [ -n "$sort_variable" ]; then
-        # 创建临时文件 - 增强安全性
-        local temp_file=$(mktemp -u /tmp/qos_rule_XXXXXX 2>/dev/null)
-        if [ -z "$temp_file" ] || ! mktemp "$temp_file" >/dev/null 2>&1; then
+        # 创建临时文件（使用通用路径，避免 -t 选项）
+        local temp_file=$(mktemp /tmp/qos_rule_XXXXXX 2>/dev/null)
+        if [ -z "$temp_file" ]; then
             log "ERROR" "无法创建临时文件"
             echo "$sections"
             return 1
         fi
+        TEMP_FILES="$TEMP_FILES $temp_file"
         
-        # 注册清理钩子
-        trap "rm -f '$temp_file' 2>/dev/null" EXIT INT TERM HUP
-        
-        for section in $sections; do
+        # 使用 for 循环（避免子shell）处理每个配置段
+        local IFS=' '
+        set -- $sections
+        for section; do
+            [ -n "$section" ] || continue
             local order=$(uci -q get "${config_name}.${section}.${sort_variable}")
             order=${order:-100}  # 更合理的默认值
             echo "${order}:${section}" >> "$temp_file"
@@ -371,89 +298,117 @@ load_and_sort_all_config_sections() {
     fi
 }
 
-# 加载所有配置选项 - 优化：批量读取配置
+# 加载所有配置选项 - 优化：直接赋值给带前缀的变量，避免解析行
+# 增加对 val 中反斜杠、双引号、美元符、反引号的转义，确保 eval 安全
+# 增加对 section_id 的正则转义，防止特殊字符破坏 grep 模式
 load_all_config_options() {
     local config_name="$1"
     local section_id="$2"
+    local prefix="$3"   # 变量前缀，如 "rule_"
     
-    # 清空之前可能存在的变量
-    unset class order enabled proto srcport dstport connbytes_kb family
+    # 转义 section_id 中的正则元字符，用于 grep 模式
+    local escaped_section_id
+    escaped_section_id=$(printf "%s" "$section_id" | sed 's/[][\.*?^$()+{}|]/\\&/g')
     
-    # 优化：批量读取配置
+    # 清空之前可能存在的变量（通过动态变量名）
+    for var in class order enabled proto srcport dstport connbytes_kb family; do
+        eval "${prefix}${var}=''"
+    done
+    
+    # 从UCI获取所有配置
     local config_data=$(uci show "${config_name}.${section_id}" 2>/dev/null)
     
-    # 从批量数据中提取配置
-    local class_val=$(echo "$config_data" | grep ^"${config_name}.${section_id}\.class=" | cut -d= -f2)
-    local order_val=$(echo "$config_data" | grep ^"${config_name}.${section_id}\.order=" | cut -d= -f2)
-    local enabled_val=$(echo "$config_data" | grep ^"${config_name}.${section_id}\.enabled=" | cut -d= -f2)
-    local proto_val=$(echo "$config_data" | grep ^"${config_name}.${section_id}\.proto=" | cut -d= -f2)
-    local srcport_val=$(echo "$config_data" | grep ^"${config_name}.${section_id}\.srcport=" | cut -d= -f2)
-    local dstport_val=$(echo "$config_data" | grep ^"${config_name}.${section_id}\.dstport=" | cut -d= -f2)
-    local connbytes_kb_val=$(echo "$config_data" | grep ^"${config_name}.${section_id}\.connbytes_kb=" | cut -d= -f2)
-    local family_val=$(echo "$config_data" | grep ^"${config_name}.${section_id}\.family=" | cut -d= -f2)
+    # 提取各个字段，并赋值给带前缀的变量
+    local val
     
-    # 验证关键参数
-    if [ -n "$srcport_val" ]; then
-        if ! validate_port "$srcport_val" "${section_id}.srcport"; then
-            log "WARN" "源端口参数验证失败: $srcport_val，将使用空值"
-            srcport_val=""
+    val=$(echo "$config_data" | grep "^${config_name}\\.${escaped_section_id}\\.class=" | cut -d= -f2-)
+    if [ -n "$val" ]; then
+        # 清理值中的引号（uci可能返回带引号的值）
+        val=$(echo "$val" | sed "s/^'//; s/'$//; s/^\"//; s/\"$//")
+        # 转义特殊字符
+        val=$(escape_for_eval "$val")
+        eval "${prefix}class=\"$val\""
+    fi
+    
+    val=$(echo "$config_data" | grep "^${config_name}\\.${escaped_section_id}\\.order=" | cut -d= -f2-)
+    if [ -n "$val" ]; then
+        val=$(echo "$val" | sed "s/^'//; s/'$//; s/^\"//; s/\"$//")
+        val=$(escape_for_eval "$val")
+        eval "${prefix}order=\"$val\""
+    fi
+    
+    val=$(echo "$config_data" | grep "^${config_name}\\.${escaped_section_id}\\.enabled=" | cut -d= -f2-)
+    if [ -n "$val" ]; then
+        val=$(echo "$val" | sed "s/^'//; s/'$//; s/^\"//; s/\"$//")
+        val=$(escape_for_eval "$val")
+        eval "${prefix}enabled=\"$val\""
+    fi
+    
+    val=$(echo "$config_data" | grep "^${config_name}\\.${escaped_section_id}\\.proto=" | cut -d= -f2-)
+    if [ -n "$val" ]; then
+        val=$(echo "$val" | sed "s/^'//; s/'$//; s/^\"//; s/\"$//")
+        val=$(escape_for_eval "$val")
+        eval "${prefix}proto=\"$val\""
+    fi
+    
+    val=$(echo "$config_data" | grep "^${config_name}\\.${escaped_section_id}\\.srcport=" | cut -d= -f2-)
+    if [ -n "$val" ]; then
+        val=$(echo "$val" | sed "s/^'//; s/'$//; s/^\"//; s/\"$//")
+        # 验证端口
+        if validate_port "$val" "${section_id}.srcport"; then
+            val=$(escape_for_eval "$val")
+            eval "${prefix}srcport=\"$val\""
+        else
+            log "WARN" "源端口参数验证失败: $val，将使用空值"
+            eval "${prefix}srcport=''"
         fi
     fi
     
-    if [ -n "$dstport_val" ]; then
-        if ! validate_port "$dstport_val" "${section_id}.dstport"; then
-            log "WARN" "目的端口参数验证失败: $dstport_val，将使用空值"
-            dstport_val=""
+    val=$(echo "$config_data" | grep "^${config_name}\\.${escaped_section_id}\\.dstport=" | cut -d= -f2-)
+    if [ -n "$val" ]; then
+        val=$(echo "$val" | sed "s/^'//; s/'$//; s/^\"//; s/\"$//")
+        if validate_port "$val" "${section_id}.dstport"; then
+            val=$(escape_for_eval "$val")
+            eval "${prefix}dstport=\"$val\""
+        else
+            log "WARN" "目的端口参数验证失败: $val，将使用空值"
+            eval "${prefix}dstport=''"
         fi
     fi
     
-    if [ -n "$proto_val" ]; then
-        if ! validate_protocol "$proto_val" "${section_id}.proto"; then
-            log "WARN" "协议参数验证失败: $proto_val，将继续处理"
-        fi
+    val=$(echo "$config_data" | grep "^${config_name}\\.${escaped_section_id}\\.connbytes_kb=" | cut -d= -f2-)
+    if [ -n "$val" ]; then
+        val=$(echo "$val" | sed "s/^'//; s/'$//; s/^\"//; s/\"$//")
+        val=$(escape_for_eval "$val")
+        eval "${prefix}connbytes_kb=\"$val\""
     fi
     
-    # 输出格式化的配置行
-    echo "${class_val}:${order_val}:${enabled_val}:${proto_val}:${srcport_val}:${dstport_val}:${connbytes_kb_val}:${family_val}"
-}
-
-# 解析配置行
-parse_config_line() {
-    local config_line="$1"
-    local var_prefix="$2"
-    
-    IFS=':' read -r class_val order_val enabled_val proto_val srcport_val dstport_val connbytes_kb_val family_val <<EOF
-$config_line
-EOF
-    
-    # 导出到调用者变量
-    eval "${var_prefix}_class=\"$class_val\""
-    eval "${var_prefix}_order=\"$order_val\""
-    eval "${var_prefix}_enabled=\"$enabled_val\""
-    eval "${var_prefix}_proto=\"$proto_val\""
-    eval "${var_prefix}_srcport=\"$srcport_val\""
-    eval "${var_prefix}_dstport=\"$dstport_val\""
-    eval "${var_prefix}_connbytes_kb=\"$connbytes_kb_val\""
-    eval "${var_prefix}_family=\"$family_val\""
+    val=$(echo "$config_data" | grep "^${config_name}\\.${escaped_section_id}\\.family=" | cut -d= -f2-)
+    if [ -n "$val" ]; then
+        val=$(echo "$val" | sed "s/^'//; s/'$//; s/^\"//; s/\"$//")
+        val=$(escape_for_eval "$val")
+        eval "${prefix}family=\"$val\""
+    fi
 }
 
 # ========== 类别标记计算函数 ==========
-# 计算哈希索引
+# 计算哈希索引 - 修复echo -n兼容性，使用printf
 calculate_hash_index() {
     local class="$1"
     # 使用SHA1哈希取前8位作为索引
     if command -v sha1sum >/dev/null 2>&1; then
-        local hash=$(echo -n "$class" | sha1sum | cut -c1-8)
+        local hash=$(printf "%s" "$class" | sha1sum | cut -c1-8)
         # 将十六进制转换为十进制
         printf "%d" "0x$hash"
     elif command -v sha1 >/dev/null 2>&1; then
-        local hash=$(echo -n "$class" | sha1 | cut -c1-8)
+        local hash=$(printf "%s" "$class" | sha1 | cut -c1-8)
         printf "%d" "0x$hash"
     else
         # 回退到简单的CRC32计算
         local sum=0
         local i=0
         while [ $i -lt ${#class} ]; do
+            # 注意：${class:$i:1} 在 POSIX sh 中可能不可用，但这里假设 busybox ash 支持
             local char=$(printf "%d" "'${class:$i:1}")
             sum=$(( (sum << 5) - sum + char ))
             i=$((i + 1))
@@ -462,7 +417,7 @@ calculate_hash_index() {
     fi
 }
 
-# 获取类别标记 - 修复：引入哈希算法生成唯一索引
+# 获取类别标记 - 引入哈希算法生成唯一索引
 get_class_mark_for_rule() {
     local class="$1"
     local direction="$2"  # upload 或 download
@@ -504,7 +459,7 @@ get_class_mark_for_rule() {
     return 1
 }
 
-# 计算类别标记 - 修复：使用哈希算法生成唯一索引
+# 计算类别标记 - 使用哈希算法生成唯一索引，但限制在方向内1-8之间
 calculate_class_mark() {
     local class="$1"
     local mask="$2"
@@ -512,12 +467,10 @@ calculate_class_mark() {
     
     # 从类别名称提取索引 - 使用哈希算法生成唯一索引
     local index=1
-    
-    # 修复：使用哈希算法生成唯一索引
     index=$(calculate_hash_index "$class")
     
-    # 确保索引在合理范围内 (1-255)
-    index=$(( (index % 255) + 1 ))
+    # 确保索引在合理范围内 (1-8)，因为每个方向只有8位可用
+    index=$(( (index % 8) + 1 ))
     
     # 根据链类型计算基础值
     local base_value=0
@@ -546,24 +499,17 @@ calculate_composite_priority() {
     local rule_name="$1"
     local direction="$2"  # upload 或 download，可选
     
-    # 加载规则配置
-    local config_line
-    if config_line=$(load_all_config_options "$CONFIG_FILE" "$rule_name"); then
-        parse_config_line "$config_line" "rule"
-    else
-        echo "999999_999999"  # 返回一个高优先级字符串
-        return
-    fi
+    # 加载规则配置到带前缀的变量
+    load_all_config_options "$CONFIG_FILE" "$rule_name" "rule_"
     
     # 检查规则是否启用
     if [ "$rule_enabled" != "1" ]; then
-        # 不输出日志，只返回分数
-        echo "999999_999999"
+        echo "999:999"
         return
     fi
     
     if [ -z "$rule_class" ]; then
-        echo "999999_999999"
+        echo "999:999"
         return
     fi
     
@@ -584,14 +530,11 @@ calculate_composite_priority() {
         class_priority=$(uci -q get "${CONFIG_FILE}.${rule_class}.priority" 2>/dev/null || echo "999")
     fi
     
-    # 计算综合优先级分数 - 使用字符串拼接避免整数溢出
-    # 格式: "类优先级_规则序号"，通过下划线分隔
-    local composite_score="${class_priority}_${rule_order}"
-    
-    echo "$composite_score"
+    # 计算综合优先级分数 - 格式: "类优先级:规则序号"
+    echo "${class_priority}:${rule_order}"
 }
 
-# 按优先级分数排序 - 优化：使用内存缓冲
+# 按优先级分数排序 - 修复：使用普通循环避免子shell，确保临时文件可清理
 sort_rules_by_priority() {
     local rule_list="$1"
     local direction="$2"
@@ -600,46 +543,34 @@ sort_rules_by_priority() {
     # 如果输入为空，返回空
     [ -z "$rule_list" ] && { echo ""; return 0; }
     
-    # 创建临时文件 - 增强安全性
-    local temp_file=$(mktemp -u /tmp/qos_rule_XXXXXX 2>/dev/null)
-    if [ -z "$temp_file" ] || ! mktemp "$temp_file" >/dev/null 2>&1; then
+    # 创建临时文件（使用通用路径）
+    local temp_file=$(mktemp /tmp/qos_rule_XXXXXX 2>/dev/null)
+    if [ -z "$temp_file" ]; then
         log "ERROR" "无法创建临时文件"
         echo "$rule_list"
         return 1
     fi
+    TEMP_FILES="$TEMP_FILES $temp_file"
     
-    # 注册清理钩子
-    trap "rm -f '$temp_file' 2>/dev/null" EXIT INT TERM HUP
-    
-    # 使用内存缓冲减少IO操作
-    local buffer=""
-    
-    # 使用while read处理每个规则
-    echo "$rule_list" | tr ' ' '
-' | while read -r rule; do
-        [ -z "$rule" ] && continue
+    # 使用 for 循环（避免子shell）处理每个规则
+    local IFS=' '
+    set -- $rule_list
+    for rule; do
+        [ -n "$rule" ] || continue
         
-        # 使用calculate_composite_priority计算分数
+        # 计算分数
         local score
         score=$(calculate_composite_priority "$rule" "$direction")
         
-        # 添加到缓冲区
-        buffer="$buffer${score}:${rule}
-"
+        # 写入文件：类优先级:规则序号:规则名
+        echo "${score}:${rule}" >> "$temp_file"
     done
     
-    # 写入文件
-    printf "%s" "$buffer" >> "$temp_file"
-    
-    # 排序 - 使用新的字符串排序方法
+    # 排序
     if [ "$sort_direction" = "ascending" ]; then
-        # 使用sort命令处理"类优先级_规则序号"格式
-        sort -t '_' -k1,1n -k2,2n "$temp_file" 2>/dev/null | cut -d: -f2- 2>/dev/null | tr '
-' ' ' | sed 's/ $//'
+        sort -t ':' -k1,1n -k2,2n "$temp_file" 2>/dev/null | cut -d: -f3- 2>/dev/null | tr '\n' ' ' | sed 's/ $//'
     else
-        # 降序排序
-        sort -t '_' -k1,1nr -k2,2nr "$temp_file" 2>/dev/null | cut -d: -f2- 2>/dev/null | tr '
-' ' ' | sed 's/ $//'
+        sort -t ':' -k1,1nr -k2,2nr "$temp_file" 2>/dev/null | cut -d: -f3- 2>/dev/null | tr '\n' ' ' | sed 's/ $//'
     fi
 }
 
@@ -679,26 +610,17 @@ apply_enhanced_direction_rules() {
         return
     fi
     
-    # 优化日志：合并详细信息
-    local priority_info="=== 规则优先级详情 ===
-"
+    # 构建优先级详情日志
+    local priority_info="=== 规则优先级详情 ==="
     for rule_name in $sorted_rule_list; do
-        local score=$(calculate_composite_priority "$rule_name" "$direction")
-        local class="" order=""
-        
-        # 加载规则配置
-        local config_line
-        if config_line=$(load_all_config_options "$CONFIG_FILE" "$rule_name"); then
-            parse_config_line "$config_line" "rule"
-            local class_priority=$(uci -q get "${CONFIG_FILE}.${rule_class}.priority" 2>/dev/null || echo "999")
-            priority_info="${priority_info}  $rule_name -> 类[$rule_class:prio$class_priority] + 规则[order:${rule_order:-100}] = 总分:$score
-"
-        fi
+        load_all_config_options "$CONFIG_FILE" "$rule_name" "rule_"
+        local class_priority=$(uci -q get "${CONFIG_FILE}.${rule_class}.priority" 2>/dev/null || echo "999")
+        local score="${class_priority}:${rule_order:-100}"
+        priority_info="${priority_info}\n  $rule_name -> 类[${rule_class}:prio${class_priority}] + 规则[order:${rule_order:-100}] = 总分:${score}"
     done
-    priority_info="${priority_info}====================="
+    priority_info="${priority_info}\n====================="
     
-    log "INFO" "按优先级排序后的规则: $sorted_rule_list
-$(log_indent "$priority_info")"
+    log "INFO" "按优先级排序后的规则: $sorted_rule_list\n$priority_info"
     
     # 按优先级顺序应用规则
     for rule_name in $sorted_rule_list; do
@@ -709,7 +631,7 @@ $(log_indent "$priority_info")"
     done
 }
 
-# 应用单条增强规则
+# 应用单条增强规则 - 移除 [[ ，改用 case
 apply_single_enhanced_rule() {
     local rule_name="$1"
     local chain="$2"
@@ -717,14 +639,8 @@ apply_single_enhanced_rule() {
     
     log "INFO" "处理增强规则: $rule_name"
     
-    # 加载规则配置
-    local config_line
-    if config_line=$(load_all_config_options "$CONFIG_FILE" "$rule_name"); then
-        parse_config_line "$config_line" "rule"
-    else
-        log "ERROR" "加载规则配置失败: $rule_name"
-        return 1
-    fi
+    # 加载规则配置到带前缀的变量
+    load_all_config_options "$CONFIG_FILE" "$rule_name" "rule_"
     
     if [ -z "$rule_class" ]; then
         log "ERROR" "规则 $rule_name 缺少class参数，跳过"
@@ -756,21 +672,26 @@ apply_single_enhanced_rule() {
         rule_family="inet"
     fi
     
-    # 修复协议处理逻辑 - 使用协议合并优化
+    # 修复协议处理逻辑 - 使用 case 替代 [[
     if [ "$rule_proto" = "all" ] || [ -z "$rule_proto" ]; then
         # 检查是否有端口条件
         local has_port_condition="false"
-        if [[ "$chain" == *"ingress"* ]] && [ -n "$rule_srcport" ] && [ "$rule_srcport" != "0" ] && [ "$rule_srcport" != "0x0" ]; then
-            has_port_condition="true"
-        elif [[ "$chain" == *"egress"* ]] && [ -n "$rule_dstport" ] && [ "$rule_dstport" != "0" ] && [ "$rule_dstport" != "0x0" ]; then
-            has_port_condition="true"
-        fi
+        case "$chain" in
+            *"ingress"*)
+                if [ -n "$rule_srcport" ] && [ "$rule_srcport" != "0" ] && [ "$rule_srcport" != "0x0" ]; then
+                    has_port_condition="true"
+                fi
+                ;;
+            *"egress"*)
+                if [ -n "$rule_dstport" ] && [ "$rule_dstport" != "0" ] && [ "$rule_dstport" != "0x0" ]; then
+                    has_port_condition="true"
+                fi
+                ;;
+        esac
         
         if [ "$has_port_condition" = "true" ]; then
-            # 优化：使用集合语法合并TCP和UDP规则
+            # 使用集合语法合并TCP和UDP规则
             log "INFO" "为规则 $rule_name 创建合并的TCP/UDP规则（协议: all）"
-            
-            # 使用特殊的协议标记表示合并的TCP/UDP
             if ! build_enhanced_nft_rule "$rule_name" "$chain" "$class_mark" "$mask" "$rule_family" "tcp_udp" "$rule_srcport" "$rule_dstport" "$rule_connbytes_kb"; then
                 log "ERROR" "创建合并的TCP/UDP规则失败: $rule_name"
                 return 1
@@ -793,7 +714,7 @@ apply_single_enhanced_rule() {
     return 0
 }
 
-# 构建增强 NFT 规则 - 优化日志记录
+# 构建增强 NFT 规则 - 修复命令注入漏洞，验证family，移除[[
 build_enhanced_nft_rule() {
     local rule_name="$1"
     local chain="$2"
@@ -811,11 +732,23 @@ build_enhanced_nft_rule() {
         return 1
     fi
     
-    # 设置默认family
-    [ -z "$family" ] && family="inet"
+    # 验证family，防止命令注入
+    case "$family" in
+        inet|ip|ip6) ;;
+        *)
+            log "ERROR" "无效的地址族: $family，必须为inet/ip/ip6"
+            return 1
+            ;;
+    esac
+    
+    # 验证class_mark是否为十六进制格式
+    if ! echo "$class_mark" | grep -qE '^0x[0-9A-Fa-f]+$'; then
+        log "ERROR" "无效的类别标记格式: $class_mark"
+        return 1
+    fi
     
     # 开始构建命令
-    local nft_cmd="nft add rule $family gargoyle-qos-priority $chain"
+    local nft_cmd="add rule $family gargoyle-qos-priority $chain"
     
     # 协议条件
     if [ "$proto" = "tcp" ]; then
@@ -828,14 +761,21 @@ build_enhanced_nft_rule() {
         nft_cmd="$nft_cmd meta l4proto $proto"
     fi
     
-    # 端口条件
-    if [[ "$chain" == *"ingress"* ]] && [ -n "$srcport" ]; then
-        local clean_srcport=$(echo "$srcport" | tr -d ' ')
-        nft_cmd="$nft_cmd th sport { $clean_srcport }"
-    elif [ -n "$dstport" ]; then
-        local clean_dstport=$(echo "$dstport" | tr -d ' ')
-        nft_cmd="$nft_cmd th dport { $clean_dstport }"
-    fi
+    # 端口条件 - 使用 case 替代 [[
+    case "$chain" in
+        *"ingress"*)
+            if [ -n "$srcport" ]; then
+                local clean_srcport=$(echo "$srcport" | tr -d ' ')
+                nft_cmd="$nft_cmd th sport { $clean_srcport }"
+            fi
+            ;;
+        *)
+            if [ -n "$dstport" ]; then
+                local clean_dstport=$(echo "$dstport" | tr -d ' ')
+                nft_cmd="$nft_cmd th dport { $clean_dstport }"
+            fi
+            ;;
+    esac
     
     # 连接字节数条件
     if [ -n "$connbytes_kb" ] && [ "$connbytes_kb" != "0" ]; then
@@ -853,30 +793,25 @@ build_enhanced_nft_rule() {
     # 标记设置
     nft_cmd="$nft_cmd meta mark set $class_mark counter"
     
-    # 优化日志：合并记录
-    local log_msg="✅ 规则创建成功: $rule_name"
+    # 准备日志
+    local log_msg="规则创建: $rule_name"
     if [ -n "$proto" ]; then
-        log_msg="$log_msg
-$(log_indent "协议: $proto")"
+        log_msg="$log_msg\n  协议: $proto"
     fi
     if [ -n "$srcport" ]; then
-        log_msg="$log_msg
-$(log_indent "源端口: $srcport")"
+        log_msg="$log_msg\n  源端口: $srcport"
     fi
     if [ -n "$dstport" ]; then
-        log_msg="$log_msg
-$(log_indent "目的端口: $dstport")"
+        log_msg="$log_msg\n  目的端口: $dstport"
     fi
-    log_msg="$log_msg
-$(log_indent "NFT命令: $nft_cmd")"
+    log_msg="$log_msg\n  NFT命令: nft $nft_cmd"
     
-    # 执行命令
-    if eval "$nft_cmd" 2>/dev/null; then
-        log "INFO" "$log_msg"
+    # 执行命令（直接执行，避免eval）
+    if nft $nft_cmd 2>/dev/null; then
+        log "INFO" "✅ $log_msg"
         return 0
     else
-        log "ERROR" "❌ 规则创建失败: $rule_name (退出码: $?)
-$(log_indent "NFT命令: $nft_cmd")"
+        log "ERROR" "❌ 规则创建失败: $rule_name (退出码: $?)\n  NFT命令: nft $nft_cmd"
         return 1
     fi
 }
@@ -931,7 +866,7 @@ apply_all_rules() {
     apply_enhanced_direction_rules "$rule_type" "$chain" "$mask"
 }
 
-# 处理单个规则
+# 处理单个规则（兼容旧版本）
 process_single_rule() {
     local rule_id="$1"
     local chain="$2"
@@ -945,8 +880,7 @@ process_single_rule() {
     local dstport=$(uci -q get "$CONFIG_FILE.$rule_id.dstport")
     
     # 调试信息
-    log "DEBUG" "规则 $rule_id: class=$class, proto=$proto
-$(log_indent "srcport='$srcport', dstport='$dstport'")"
+    log "DEBUG" "规则 $rule_id: class=$class, proto=$proto\n  srcport='$srcport', dstport='$dstport'"
     
     # 检查必要参数
     if [ -z "$class" ]; then
@@ -984,15 +918,20 @@ $(log_indent "srcport='$srcport', dstport='$dstport'")"
     fi
     
     # 添加端口条件
-    if [ -n "$srcport" ] && [ "$chain" = "filter_qos_ingress" ]; then
-        local ports=$(echo "$srcport" | tr -d ' ')
-        nft_cmd="$nft_cmd th sport { $ports }"
-    fi
-    
-    if [ -n "$dstport" ] && [ "$chain" = "filter_qos_egress" ]; then
-        local ports=$(echo "$dstport" | tr -d ' ')
-        nft_cmd="$nft_cmd th dport { $ports }"
-    fi
+    case "$chain" in
+        *"ingress"*)
+            if [ -n "$srcport" ]; then
+                local ports=$(echo "$srcport" | tr -d ' ')
+                nft_cmd="$nft_cmd th sport { $ports }"
+            fi
+            ;;
+        *"egress"*)
+            if [ -n "$dstport" ]; then
+                local ports=$(echo "$dstport" | tr -d ' ')
+                nft_cmd="$nft_cmd th dport { $ports }"
+            fi
+            ;;
+    esac
     
     # 添加标记设置
     nft_cmd="$nft_cmd meta mark set $mark counter"
@@ -1004,18 +943,16 @@ $(log_indent "srcport='$srcport', dstport='$dstport'")"
     fi
     
     # 实际执行
-    if nft "$nft_cmd" 2>&1; then
-        log "INFO" "✅ NFT 规则添加成功
-$(log_indent "NFT命令: $nft_cmd")"
+    if nft $nft_cmd 2>&1; then
+        log "INFO" "✅ NFT 规则添加成功\n  NFT命令: nft $nft_cmd"
         return 0
     else
-        log "ERROR" "❌ NFT 规则添加失败
-$(log_indent "NFT命令: $nft_cmd")"
+        log "ERROR" "❌ NFT 规则添加失败\n  NFT命令: nft $nft_cmd"
         return 1
     fi
 }
 
-# 处理所有协议的规则
+# 处理所有协议的规则（兼容旧版本）
 apply_all_protocol_rule() {
     local chain="$1"
     local mark="$2"
@@ -1026,76 +963,100 @@ apply_all_protocol_rule() {
     local tcp_cmd udp_cmd
     
     # 处理 TCP 规则
-    if [ -n "$srcport" ] && [ "$chain" = "filter_qos_ingress" ]; then
-        local ports=$(echo "$srcport" | tr -d ' ')
-        if [ -n "$ports" ]; then
-            tcp_cmd="add rule inet gargoyle-qos-priority $chain meta l4proto tcp th sport { $ports } meta mark set $mark counter"
-            if nft -c "$tcp_cmd" 2>&1; then
-                nft "$tcp_cmd" 2>&1 && log "INFO" "✅ TCP 规则添加成功
-$(log_indent "NFT命令: $tcp_cmd")" || { log "ERROR" "❌ TCP 规则添加失败"; success=1; }
+    case "$chain" in
+        *"ingress"*)
+            if [ -n "$srcport" ]; then
+                local ports=$(echo "$srcport" | tr -d ' ')
+                if [ -n "$ports" ]; then
+                    tcp_cmd="add rule inet gargoyle-qos-priority $chain meta l4proto tcp th sport { $ports } meta mark set $mark counter"
+                    if nft -c "$tcp_cmd" 2>&1; then
+                        nft $tcp_cmd 2>&1 && log "INFO" "✅ TCP 规则添加成功\n  NFT命令: nft $tcp_cmd" || { log "ERROR" "❌ TCP 规则添加失败"; success=1; }
+                    else
+                        log "ERROR" "❌ TCP 规则语法错误"
+                        success=1
+                    fi
+                fi
             else
-                log "ERROR" "❌ TCP 规则语法错误"
-                success=1
+                tcp_cmd="add rule inet gargoyle-qos-priority $chain meta l4proto tcp meta mark set $mark counter"
+                if nft -c "$tcp_cmd" 2>&1; then
+                    nft $tcp_cmd 2>&1 && log "INFO" "✅ TCP 规则添加成功\n  NFT命令: nft $tcp_cmd" || { log "ERROR" "❌ TCP 规则添加失败"; success=1; }
+                else
+                    log "ERROR" "❌ TCP 规则语法错误"
+                    success=1
+                fi
             fi
-        fi
-    elif [ -n "$dstport" ] && [ "$chain" = "filter_qos_egress" ]; then
-        local ports=$(echo "$dstport" | tr -d ' ')
-        if [ -n "$ports" ]; then
-            tcp_cmd="add rule inet gargoyle-qos-priority $chain meta l4proto tcp th dport { $ports } meta mark set $mark counter"
-            if nft -c "$tcp_cmd" 2>&1; then
-                nft "$tcp_cmd" 2>&1 && log "INFO" "✅ TCP 规则添加成功
-$(log_indent "NFT命令: $tcp_cmd")" || { log "ERROR" "❌ TCP 规则添加失败"; success=1; }
+            ;;
+        *"egress"*)
+            if [ -n "$dstport" ]; then
+                local ports=$(echo "$dstport" | tr -d ' ')
+                if [ -n "$ports" ]; then
+                    tcp_cmd="add rule inet gargoyle-qos-priority $chain meta l4proto tcp th dport { $ports } meta mark set $mark counter"
+                    if nft -c "$tcp_cmd" 2>&1; then
+                        nft $tcp_cmd 2>&1 && log "INFO" "✅ TCP 规则添加成功\n  NFT命令: nft $tcp_cmd" || { log "ERROR" "❌ TCP 规则添加失败"; success=1; }
+                    else
+                        log "ERROR" "❌ TCP 规则语法错误"
+                        success=1
+                    fi
+                fi
             else
-                log "ERROR" "❌ TCP 规则语法错误"
-                success=1
+                tcp_cmd="add rule inet gargoyle-qos-priority $chain meta l4proto tcp meta mark set $mark counter"
+                if nft -c "$tcp_cmd" 2>&1; then
+                    nft $tcp_cmd 2>&1 && log "INFO" "✅ TCP 规则添加成功\n  NFT命令: nft $tcp_cmd" || { log "ERROR" "❌ TCP 规则添加失败"; success=1; }
+                else
+                    log "ERROR" "❌ TCP 规则语法错误"
+                    success=1
+                fi
             fi
-        fi
-    else
-        tcp_cmd="add rule inet gargoyle-qos-priority $chain meta l4proto tcp meta mark set $mark counter"
-        if nft -c "$tcp_cmd" 2>&1; then
-            nft "$tcp_cmd" 2>&1 && log "INFO" "✅ TCP 规则添加成功
-$(log_indent "NFT命令: $tcp_cmd")" || { log "ERROR" "❌ TCP 规则添加失败"; success=1; }
-        else
-            log "ERROR" "❌ TCP 规则语法错误"
-            success=1
-        fi
-    fi
+            ;;
+    esac
     
     # 处理 UDP 规则
-    if [ -n "$srcport" ] && [ "$chain" = "filter_qos_ingress" ]; then
-        local ports=$(echo "$srcport" | tr -d ' ')
-        if [ -n "$ports" ]; then
-            udp_cmd="add rule inet gargoyle-qos-priority $chain meta l4proto udp th sport { $ports } meta mark set $mark counter"
-            if nft -c "$udp_cmd" 2>&1; then
-                nft "$udp_cmd" 2>&1 && log "INFO" "✅ UDP 规则添加成功
-$(log_indent "NFT命令: $udp_cmd")" || { log "ERROR" "❌ UDP 规则添加失败"; success=1; }
+    case "$chain" in
+        *"ingress"*)
+            if [ -n "$srcport" ]; then
+                local ports=$(echo "$srcport" | tr -d ' ')
+                if [ -n "$ports" ]; then
+                    udp_cmd="add rule inet gargoyle-qos-priority $chain meta l4proto udp th sport { $ports } meta mark set $mark counter"
+                    if nft -c "$udp_cmd" 2>&1; then
+                        nft $udp_cmd 2>&1 && log "INFO" "✅ UDP 规则添加成功\n  NFT命令: nft $udp_cmd" || { log "ERROR" "❌ UDP 规则添加失败"; success=1; }
+                    else
+                        log "ERROR" "❌ UDP 规则语法错误"
+                        success=1
+                    fi
+                fi
             else
-                log "ERROR" "❌ UDP 规则语法错误"
-                success=1
+                udp_cmd="add rule inet gargoyle-qos-priority $chain meta l4proto udp meta mark set $mark counter"
+                if nft -c "$udp_cmd" 2>&1; then
+                    nft $udp_cmd 2>&1 && log "INFO" "✅ UDP 规则添加成功\n  NFT命令: nft $udp_cmd" || { log "ERROR" "❌ UDP 规则添加失败"; success=1; }
+                else
+                    log "ERROR" "❌ UDP 规则语法错误"
+                    success=1
+                fi
             fi
-        fi
-    elif [ -n "$dstport" ] && [ "$chain" = "filter_qos_egress" ]; then
-        local ports=$(echo "$dstport" | tr -d ' ')
-        if [ -n "$ports" ]; then
-            udp_cmd="add rule inet gargoyle-qos-priority $chain meta l4proto udp th dport { $ports } meta mark set $mark counter"
-            if nft -c "$udp_cmd" 2>&1; then
-                nft "$udp_cmd" 2>&1 && log "INFO" "✅ UDP 规则添加成功
-$(log_indent "NFT命令: $udp_cmd")" || { log "ERROR" "❌ UDP 规则添加失败"; success=1; }
+            ;;
+        *"egress"*)
+            if [ -n "$dstport" ]; then
+                local ports=$(echo "$dstport" | tr -d ' ')
+                if [ -n "$ports" ]; then
+                    udp_cmd="add rule inet gargoyle-qos-priority $chain meta l4proto udp th dport { $ports } meta mark set $mark counter"
+                    if nft -c "$udp_cmd" 2>&1; then
+                        nft $udp_cmd 2>&1 && log "INFO" "✅ UDP 规则添加成功\n  NFT命令: nft $udp_cmd" || { log "ERROR" "❌ UDP 规则添加失败"; success=1; }
+                    else
+                        log "ERROR" "❌ UDP 规则语法错误"
+                        success=1
+                    fi
+                fi
             else
-                log "ERROR" "❌ UDP 规则语法错误"
-                success=1
+                udp_cmd="add rule inet gargoyle-qos-priority $chain meta l4proto udp meta mark set $mark counter"
+                if nft -c "$udp_cmd" 2>&1; then
+                    nft $udp_cmd 2>&1 && log "INFO" "✅ UDP 规则添加成功\n  NFT命令: nft $udp_cmd" || { log "ERROR" "❌ UDP 规则添加失败"; success=1; }
+                else
+                    log "ERROR" "❌ UDP 规则语法错误"
+                    success=1
+                fi
             fi
-        fi
-    else
-        udp_cmd="add rule inet gargoyle-qos-priority $chain meta l4proto udp meta mark set $mark counter"
-        if nft -c "$udp_cmd" 2>&1; then
-            nft "$udp_cmd" 2>&1 && log "INFO" "✅ UDP 规则添加成功
-$(log_indent "NFT命令: $udp_cmd")" || { log "ERROR" "❌ UDP 规则添加失败"; success=1; }
-        else
-            log "ERROR" "❌ UDP 规则语法错误"
-            success=1
-        fi
-    fi
+            ;;
+    esac
     
     return $success
 }
