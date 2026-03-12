@@ -446,8 +446,8 @@ load_download_class_configurations() {
 setup_ipv6_specific_rules() {
     qos_log "INFO" "设置IPv6特定规则（优化版）"
     
-    # 确保filter_prerouting链存在
-    nft add chain inet gargoyle-qos-priority filter_prerouting { type filter hook prerouting priority 0; policy accept; } 2>/dev/null || true
+    # 确保filter_prerouting链存在（注意花括号需引号）
+    nft add chain inet gargoyle-qos-priority filter_prerouting '{ type filter hook prerouting priority 0; policy accept; }' 2>/dev/null || true
     
     # ICMPv6关键类型（邻居发现、路由通告等）
     local ICMPV6_CRITICAL_TYPES="133,134,135,136,137"

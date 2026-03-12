@@ -1,15 +1,22 @@
 #!/bin/sh
 # 规则辅助模块 (rule.sh)
 # 支持多样化端口、协议、IPv6双栈和连接字节数过滤
-# version=1.6.6 增加类数量超限警告
-# 优化内容（基于1.6.5）：
-# 19. 增加类数量检查：当某个方向的启用类数量超过8个时，记录警告日志
+# version=1.6.7 增加CAKE算法检测，修复sed字符类语法
 
 CONFIG_FILE="qos_gargoyle"
 # 全局临时文件列表，用于trap清理
 TEMP_FILES=""
 # 设置退出时清理临时文件
 trap 'rm -f $TEMP_FILES 2>/dev/null' EXIT INT TERM HUP
+
+# ========== 新增：检测算法，若为CAKE则直接退出 ==========
+ALGORITHM=$(uci -q get ${CONFIG_FILE}.global.algorithm 2>/dev/null || echo "hfsc_fqcodel")
+if [ "$ALGORITHM" = "cake" ]; then
+    # 由于此时可能尚未加载日志函数，直接输出到控制台和系统日志
+    echo "[$(date '+%H:%M:%S')] qos_gargoyle 信息: 当前算法为 CAKE，无需生成分类规则，退出" >&2
+    logger -t "qos_gargoyle" "信息: 当前算法为 CAKE，无需生成分类规则，退出"
+    return 0
+fi
 
 # ========== 辅助函数 ==========
 # 转义字符串，使其可安全用于 eval 赋值
@@ -18,12 +25,12 @@ escape_for_eval() {
 }
 
 # ========== 输入验证和清理函数 ==========
-# 清理输入，防止命令注入（优化字符类，避免方括号歧义）
+# 清理输入，防止命令注入（修复：将连字符移到字符类末尾）
 sanitize_input() {
     local input="$1"
     # 只允许字母、数字、下划线、连字符、冒号、斜杠、点、逗号、方括号、空格
-    # 将字符类中的方括号移到首位并转义内部方括号（部分sed需要双重转义）
-    echo "$input" | sed 's/[^][a-zA-Z0-9_\-:\/\.\, ]//g'
+    # 注意：连字符必须放在字符类末尾，避免被误认为范围
+    echo "$input" | sed 's/[^][a-zA-Z0-9_:/., -]//g'
 }
 
 # ========== 统一日志函数 ==========
@@ -431,19 +438,19 @@ get_class_mark_for_rule() {
         return 0
     fi
     
-    # 如果没有配置，尝试从文件中获取
+    # 如果没有配置，尝试从文件中获取（并去除空格）
     if [ "$direction" = "upload" ]; then
         if [ -f "/etc/qos_gargoyle/upload_class_marks" ]; then
-            local file_mark=$(grep "^upload:${class}:" "/etc/qos_gargoyle/upload_class_marks" 2>/dev/null | awk -F: '{print $3}')
-            if [ -n "$file_mark" ]; then
+            local file_mark=$(grep "^upload:${class}:" "/etc/qos_gargoyle/upload_class_marks" 2>/dev/null | awk -F: '{print $3}' | tr -d '[:space:]')
+            if [ -n "$file_mark" ] && echo "$file_mark" | grep -qE '^0x[0-9A-Fa-f]+$'; then
                 echo "$file_mark"
                 return 0
             fi
         fi
     elif [ "$direction" = "download" ]; then
         if [ -f "/etc/qos_gargoyle/download_class_marks" ]; then
-            local file_mark=$(grep "^download:${class}:" "/etc/qos_gargoyle/download_class_marks" 2>/dev/null | awk -F: '{print $3}')
-            if [ -n "$file_mark" ]; then
+            local file_mark=$(grep "^download:${class}:" "/etc/qos_gargoyle/download_class_marks" 2>/dev/null | awk -F: '{print $3}' | tr -d '[:space:]')
+            if [ -n "$file_mark" ] && echo "$file_mark" | grep -qE '^0x[0-9A-Fa-f]+$'; then
                 echo "$file_mark"
                 return 0
             fi
@@ -453,7 +460,7 @@ get_class_mark_for_rule() {
     # 最后尝试通过计算获取
     local calculated_mark
     calculated_mark=$(calculate_class_mark "$class" "0x0" "$direction")
-    if [ -n "$calculated_mark" ]; then
+    if [ -n "$calculated_mark" ] && echo "$calculated_mark" | grep -qE '^0x[0-9A-Fa-f]+$'; then
         echo "$calculated_mark"
         return 0
     fi

@@ -49,7 +49,7 @@ endef
 # 重启防火墙时, 添加qos规则
 define Package/gargoyle-firewall-util/postinst
 	included=$$(cat $${IPKG_INSTROOT}/etc/config/firewall | grep 'gargoyle_firewall.include'  )
-	if [ -z "$$included" ] ; then printf "config include 'qos_gargoyle'\n\toption type script\n\toption path /usr/share/qos_gargoyle/gargoyle_firewall.include\n\toption family any\n\toption reload 1\n\n" >> $${IPKG_INSTROOT}/etc/config/firewall ; fi
+	if [ -z "$$included" ] ; then printf "config include 'qos_gargoyle'\n\toption type script\n\toption path /etc/gargoyle_firewall.include\n\toption family any\n\toption reload 1\n\n" >> $${IPKG_INSTROOT}/etc/config/firewall ; fi
 endef
 
 define Package/qos-gargoyle/install
@@ -65,7 +65,6 @@ define Package/qos-gargoyle/install
 	$(INSTALL_BIN) $(CURDIR)/files/qos_gargoyle.hotplug $(1)/etc/hotplug.d/iface/99-qos_gargoyle
 	$(INSTALL_CONF) $(CURDIR)/files/qos_gargoyle.conf $(1)/etc/config/qos_gargoyle
 	$(INSTALL_BIN) $(CURDIR)/files/usr/lib/qos_gargoyle/* $(1)/usr/lib/qos_gargoyle/
-	$(INSTALL_BIN) $(CURDIR)/files/gargoyle_firewall.include $(1)/usr/share/qos_gargoyle/gargoyle_firewall.include
 
 	$(INSTALL_DIR) $(1)/usr/sbin
 	$(INSTALL_BIN) $(PKG_BUILD_DIR)/qosacc $(1)/usr/sbin/qosacc

@@ -185,15 +185,19 @@ start() {
         return 0
     fi
     
-    # 调用主初始化
-    if initialize_qos; then
+    # 调用主初始化并捕获返回值
+    initialize_qos
+    ret=$?
+    echo "initialize_qos returned: $ret"
+    
+    if [ $ret -eq 0 ]; then
         echo "QoS Gargoyle started successfully"
         save_service_status "running"
-        return 0
+        exit 0
     else
         echo "QoS Gargoyle failed to start"
         save_service_status "error"
-        return 1
+        exit 1
     fi
 }
 
@@ -462,10 +466,14 @@ setup_nft_tables() {
     nft add chain inet gargoyle-qos-priority filter_forward '{ type filter hook forward priority 0; }'
     nft add chain inet gargoyle-qos-priority filter_prerouting '{ type filter hook prerouting priority -150; }'
     
-    # 添加跳转规则
-    nft add rule inet gargoyle-qos-priority filter_postrouting oifname "$qos_interface" counter jump filter_qos_egress
-    nft add rule inet gargoyle-qos-priority filter_input iifname "$qos_interface" counter jump filter_qos_ingress
-    nft add rule inet gargoyle-qos-priority filter_forward iifname "$qos_interface" counter jump filter_qos_ingress
+    # 添加跳转规则前检查接口变量是否非空
+    if [ -n "$qos_interface" ]; then
+        nft add rule inet gargoyle-qos-priority filter_postrouting oifname "$qos_interface" counter jump filter_qos_egress
+        nft add rule inet gargoyle-qos-priority filter_input iifname "$qos_interface" counter jump filter_qos_ingress
+        nft add rule inet gargoyle-qos-priority filter_forward iifname "$qos_interface" counter jump filter_qos_ingress
+    else
+        echo "警告: qos_interface 为空，无法添加跳转规则" >&2
+    fi
     
     echo "NFT tables initialized"
 }
@@ -858,6 +866,51 @@ get_class_counts_from_file() {
     echo "$upload_count $download_count"
 }
 
+# 设置防火墙跳转规则
+setup_firewall_jumps() {
+    local wan_iface="$qos_interface"
+    # 如果为空，尝试从 UCI 重新获取
+    if [ -z "$wan_iface" ]; then
+        wan_iface=$(uci -q get network.wan.ifname 2>/dev/null)
+        # 如果仍然为空，尝试检测 PPPoE 接口
+        if [ -z "$wan_iface" ]; then
+            wan_iface=$(ip link show | grep -o 'pppoe-[^:]*' | head -1)
+        fi
+    fi
+    
+    if [ -z "$wan_iface" ]; then
+        qos_log "ERROR" "无法确定 WAN 接口，防火墙跳转规则未生成"
+        return 1
+    fi
+    
+    local include_file="/etc/gargoyle_firewall.include"
+    
+    cat > "$include_file" <<EOF
+#!/bin/sh
+# 自动生成，用于将 QoS 流量跳转到自定义表
+nft add rule inet fw4 filter_postrouting oifname "$wan_iface" counter jump gargoyle-qos-priority filter_qos_egress
+nft add rule inet fw4 filter_input iifname "$wan_iface" counter jump gargoyle-qos-priority filter_qos_ingress
+nft add rule inet fw4 filter_forward iifname "$wan_iface" counter jump gargoyle-qos-priority filter_qos_ingress
+EOF
+    chmod +x "$include_file"
+    
+    # 配置防火墙加载该文件（通过 UCI include）
+    local include_index=$(uci show firewall | grep -E 'firewall\..*\.path' | grep -E '=.*gargoyle_firewall.include' | cut -d. -f2 | cut -d= -f1)
+    if [ -n "$include_index" ]; then
+        # 更新现有 include 段的路径
+        uci set firewall.$include_index.path="$include_file"
+        uci set firewall.$include_index.type='script'
+    else
+        # 添加新的 include 段
+        local new_index=$(uci add firewall include)
+        uci set firewall.$new_index.path="$include_file"
+        uci set firewall.$new_index.type='script'
+    fi
+    uci commit firewall
+    
+    # 重新加载防火墙使 include 生效
+    /etc/init.d/firewall reload 2>/dev/null || true
+}
 
 # ========== 主初始化函数 ==========
 
@@ -910,17 +963,19 @@ initialize_qos() {
     
     # 应用分类规则 - cake算法不应用
     echo "调用分类规则应用..."	
-	if [ "$algorithm" != "cake" ]; then
-        echo "调用分类规则应用..."
-        apply_classification_rules
-    else
-        echo "CAKE算法，跳过外部分类规则加载"
-        echo "CAKE使用内置DiffServ分类机制，无需NFTables分类规则"
-        
-        # 清空规则链，确保没有残留规则
-        nft flush chain inet gargoyle-qos-priority filter_qos_egress
-        nft flush chain inet gargoyle-qos-priority filter_qos_ingress
-    fi
+	if [ "$algorithm" = "cake" ]; then
+		echo "CAKE算法，跳过外部分类规则加载"
+		echo "CAKE使用内置DiffServ分类机制，无需NFTables分类规则"
+		# 清空规则链，确保没有残留规则
+		nft flush chain inet gargoyle-qos-priority filter_qos_egress
+		nft flush chain inet gargoyle-qos-priority filter_qos_ingress
+	else
+		echo "调用分类规则应用..."
+		apply_classification_rules
+	fi
+	
+	# === 新增：设置防火墙跳转规则 ===
+	setup_firewall_jumps
     
     # 调用算法特定的初始化
     case "$algorithm" in
@@ -941,7 +996,7 @@ initialize_qos() {
                 echo "正在初始化 HFSC QoS..."
                 # 修改：设置一个标志，告诉算法模块不要重复应用规则
                 export RULES_ALREADY_APPLIED=1
-                initialize_hfsc_qos
+                initialize_hfsc_qos start
             else
                 echo "错误: HFSC 初始化函数未找到"
                 echo "请检查 /usr/lib/qos_gargoyle/hfsc-helper.sh 中的函数名"
@@ -954,7 +1009,7 @@ initialize_qos() {
             if type initialize_cake_qos >/dev/null 2>&1; then
                 # 设置标志，告诉算法模块不要重复应用规则
                 export RULES_ALREADY_APPLIED=1
-                initialize_cake_qos
+                initialize_cake_qos start
             else
                 echo "CAKE initialization function not found"
                 rm -rf "$LOCK_FILE"
@@ -965,7 +1020,7 @@ initialize_qos() {
             if type initialize_htb_qos >/dev/null 2>&1; then
                 # 设置标志，告诉算法模块不要重复应用规则
                 export RULES_ALREADY_APPLIED=1
-                initialize_htb_qos
+                initialize_htb_qos start
             else
                 echo "HTB initialization function not found"
                 rm -rf "$LOCK_FILE"

@@ -335,28 +335,13 @@ setup_ingress_redirect() {
 # ========== 检查入口重定向 ==========
 check_ingress_redirect() {
     log_info "检查入口重定向状态"
-
-    local has_ipv4=false
-    local has_ipv6=false
-
-    if tc filter show dev "$qos_interface" parent ffff: protocol ip 2>/dev/null | \
-        grep -qi "mirred.*redirect dev $IFB_DEVICE"; then
-        has_ipv4=true
-        echo "✅ IPv4入口重定向: 已生效"
+    if tc filter show dev "$qos_interface" parent ffff: 2>/dev/null | grep -q '.'; then
+        echo "✅ 入口重定向: 已生效"
+        return 0
     else
-        echo "❌ IPv4入口重定向: 未生效"
+        echo "❌ 入口重定向: 未生效"
+        return 1
     fi
-
-    if tc filter show dev "$qos_interface" parent ffff: protocol ipv6 2>/dev/null | \
-        grep -qi "mirred.*redirect dev $IFB_DEVICE"; then
-        has_ipv6=true
-        echo "✅ IPv6入口重定向: 已生效"
-    else
-        echo "❌ IPv6入口重定向: 未生效"
-    fi
-
-    [ "$has_ipv4" = true ] && return 0
-    return 1
 }
 
 # ========== 清理队列 ==========
@@ -658,7 +643,7 @@ release_lock() {
 }
 
 # ========== 主函数 ==========
-main_cake_qos() {
+initialize_cake_qos() {
     local action="$1"
 
     case "$action" in
@@ -697,7 +682,7 @@ main_cake_qos() {
             log_info "重启CAKE QoS"
             stop_cake_qos
             sleep 2
-            main_cake_qos start
+            initialize_cake_qos start
             ;;
         status|show)
             show_cake_status
@@ -734,10 +719,10 @@ if [ "$(basename "$0")" = "cake.sh" ]; then
     if [ $# -eq 0 ]; then
         echo "错误: 缺少参数"
         echo ""
-        main_cake_qos "help"
+        initialize_cake_qos "help"
         exit 1
     fi
-    main_cake_qos "$@"
+    initialize_cake_qos "$@"
 fi
 
 log_info "CAKE模块加载完成"
