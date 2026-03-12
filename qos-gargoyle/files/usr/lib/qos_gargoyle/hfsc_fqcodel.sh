@@ -1,5 +1,5 @@
 #!/bin/sh
-# version=1.9.3 最终优化（修复根类语法，统一掩码使用）
+# version=1.9.4 修复下载方向参数冲突，增强IPv6链可靠性
 # HFSC_FQCODEL算法实现模块
 # 基于HFSC与FQ_CODEL组合算法实现QoS流量控制。
 # 必要工具：tc, nft, conntrack, ethtool, sysctl
@@ -24,7 +24,7 @@ qos_interface=""
 # 加载规则辅助模块（必须）
 if [ -f "/usr/lib/qos_gargoyle/rule.sh" ]; then
     . /usr/lib/qos_gargoyle/rule.sh
-    # 修复1：将别名改为函数定义
+    # 将别名改为函数定义
     qos_log() { log "$@"; }
 else
     echo "错误: 规则辅助模块 /usr/lib/qos_gargoyle/rule.sh 未找到" >&2
@@ -399,6 +399,9 @@ load_download_class_configurations() {
 setup_ipv6_specific_rules() {
     qos_log "INFO" "设置IPv6特定规则（优化版）"
     
+    # 确保filter_prerouting链存在
+    nft add chain inet gargoyle-qos-priority filter_prerouting { type filter hook prerouting priority 0; policy accept; } 2>/dev/null || true
+    
     # ICMPv6关键类型（邻居发现、路由通告等）
     local ICMPV6_CRITICAL_TYPES="133,134,135,136,137"
     
@@ -526,7 +529,7 @@ create_hfsc_upload_class() {
         qos_log "ERROR" "加载HFSC配置失败: $class_name"
         return 1
     fi
-    # 修复3：在eval前声明所有可能出现的变量为局部
+    # 在eval前声明所有可能出现的变量为局部
     local percent_bandwidth per_min_bandwidth per_max_bandwidth minRTT priority name
     eval "$class_config"
     
@@ -658,12 +661,13 @@ create_hfsc_upload_class() {
     return 0
 }
 
+# 创建HFSC下载类别（修复：第三个参数更名为filter_prio，避免与类别配置冲突）
 create_hfsc_download_class() {
     local class_name="$1"
     local class_index="$2"
-    local priority="$3"
+    local filter_prio="$3"   # 用于TC过滤器的优先级（避免与类别配置的priority冲突）
     
-    qos_log "INFO" "创建下载类别: $class_name, ID: 1:$class_index, 优先级: $priority"
+    qos_log "INFO" "创建下载类别: $class_name, ID: 1:$class_index, 过滤器优先级: $filter_prio"
     
     # IFB设备热插拔支持
     local retries=5
@@ -682,7 +686,7 @@ create_hfsc_download_class() {
         qos_log "ERROR" "加载HFSC配置失败: $class_name"
         return 1
     fi
-    # 修复3：在eval前声明所有可能出现的变量为局部
+    # 在eval前声明所有可能出现的变量为局部
     local percent_bandwidth per_min_bandwidth per_max_bandwidth minRTT priority name
     eval "$class_config"
     
@@ -787,20 +791,20 @@ create_hfsc_download_class() {
         return 1
     fi
     
-    # 添加IPv4过滤器（使用掩码）
+    # 添加IPv4过滤器（使用 filter_prio 和掩码）
     if [ "$class_mark" != "0x0" ]; then
         if ! tc filter add dev "$IFB_DEVICE" parent 1:0 protocol ip \
-            prio $priority handle ${class_mark}/$DOWNLOAD_MASK fw classid 1:$class_index 2>/dev/null; then
+            prio $filter_prio handle ${class_mark}/$DOWNLOAD_MASK fw classid 1:$class_index 2>/dev/null; then
             qos_log "WARN" "添加下载IPv4过滤器失败 (标记:$class_mark -> 类别:1:$class_index)"
         else
-            qos_log "INFO" "添加下载IPv4过滤器: 标记:$class_mark -> 类别:1:$class_index"
+            qos_log "INFO" "添加下载IPv4过滤器: 标记:$class_mark -> 类别:1:$class_index (优先级:$filter_prio)"
         fi
     fi
     
-    # 添加IPv6过滤器（使用掩码）
+    # 添加IPv6过滤器（使用 filter_prio + 100 和掩码）
     if [ "$class_mark" != "0x0" ]; then
         local base_prio=100
-        local ipv6_priority=$((base_prio + priority))
+        local ipv6_priority=$((base_prio + filter_prio))
         
         if ! tc filter add dev "$IFB_DEVICE" parent 1:0 protocol ipv6 \
             prio $ipv6_priority handle ${class_mark}/$DOWNLOAD_MASK fw classid 1:$class_index 2>/dev/null; then
@@ -1141,16 +1145,16 @@ initialize_hfsc_download() {
     
     # 创建各个类别
     local class_index=2
-    local priority=3
+    local filter_prio=3  # 初始过滤器优先级
     download_class_mark_list=""
     
     for class_name in $download_class_list; do
-        if create_hfsc_download_class "$class_name" "$class_index" "$priority"; then
+        if create_hfsc_download_class "$class_name" "$class_index" "$filter_prio"; then
             local class_mark_hex=$(get_class_mark_for_rule "$class_name" "download")
             download_class_mark_list="$download_class_mark_list$class_name:$class_mark_hex "
         fi
         class_index=$((class_index + 1))
-        priority=$((priority + 2))
+        filter_prio=$((filter_prio + 2))
     done
     
     # 设置默认类别

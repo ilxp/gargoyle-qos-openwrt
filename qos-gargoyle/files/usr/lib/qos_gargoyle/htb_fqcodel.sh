@@ -3,7 +3,7 @@
 # 基于HTB与FQ_CODEL组合算法实现QoS流量控制。
 # 必要工具：tc, nft, conntrack, ethtool, sysctl
 # 内核模块：ifb, sch_htb, sch_fq_codel
-# version=1.9.2 最终优化（确保rate≥1，恢复连接标记显示）
+# version=1.9.3 最终优化（确保rate≥1，恢复连接标记显示，添加IPv6链创建）
 
 # ========== 全局配置常量 ==========
 : ${CONFIG_FILE:=qos_gargoyle}
@@ -445,6 +445,9 @@ load_download_class_configurations() {
 # ========== IPv6增强支持 ==========
 setup_ipv6_specific_rules() {
     qos_log "INFO" "设置IPv6特定规则（优化版）"
+    
+    # 确保filter_prerouting链存在
+    nft add chain inet gargoyle-qos-priority filter_prerouting { type filter hook prerouting priority 0; policy accept; } 2>/dev/null || true
     
     # ICMPv6关键类型（邻居发现、路由通告等）
     local ICMPV6_CRITICAL_TYPES="133,134,135,136,137"
