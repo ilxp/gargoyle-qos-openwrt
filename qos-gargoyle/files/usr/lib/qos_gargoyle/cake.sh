@@ -1,4 +1,5 @@
 #!/bin/sh
+# version=4.12
 # CAKE算法实现模块 - 最终优化版 v4.12
 # 基于v4.11，优化：状态显示使用运行时参数、带宽单位转换增强警告
 # 修正：带宽转换函数中警告使用未初始化变量的问题
@@ -335,7 +336,7 @@ setup_ingress_redirect() {
 # ========== 检查入口重定向 ==========
 check_ingress_redirect() {
     log_info "检查入口重定向状态"
-    if tc filter show dev "$qos_interface" parent ffff: 2>/dev/null | grep -q '.'; then
+    if tc filter show dev "$qos_interface" parent ffff: 2>/dev/null | grep -q "ifb0"; then
         echo "✅ 入口重定向: 已生效"
         return 0
     else

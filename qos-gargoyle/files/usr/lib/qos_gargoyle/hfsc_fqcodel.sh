@@ -1,5 +1,5 @@
 #!/bin/sh
-# version=1.9.4 修复下载方向参数冲突，增强IPv6链可靠性
+# version=2.1 修复内存计算向上取整，增加默认类设置前的根队列检查
 # HFSC_FQCODEL算法实现模块
 # 基于HFSC与FQ_CODEL组合算法实现QoS流量控制。
 # 必要工具：tc, nft, conntrack, ethtool, sysctl
@@ -36,13 +36,26 @@ fi
 . /lib/functions/network.sh
 include /lib/network
 
-# ========== 并发安全锁机制 ==========
+# ========== 并发安全锁机制（增强版） ==========
 acquire_lock() {
     local lock_file="$LOCK_FILE"
     local timeout=10
     local count=0
     
     while [ $count -lt $timeout ]; do
+        if [ -f "$lock_file" ]; then
+            local pid=$(cat "$lock_file" 2>/dev/null)
+            if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+                # 锁文件有效且进程存在
+                sleep 1
+                count=$((count + 1))
+                continue
+            else
+                # 锁文件无效，删除后重试
+                rm -f "$lock_file" 2>/dev/null
+            fi
+        fi
+        
         if ( set -o noclobber; echo "$$" > "$lock_file" ) 2>/dev/null; then
             trap 'release_lock; exit 0' EXIT SIGINT SIGTERM SIGHUP
             return 0
@@ -102,7 +115,7 @@ get_physical_interface_max_bandwidth() {
     echo "$max_bandwidth"
 }
 
-# 加载带宽配置（使用rule.sh的validate_number进行验证）
+# 加载带宽配置（增强：未配置时明确提示）
 load_bandwidth_from_config() {
     qos_log "INFO" "加载带宽配置"
     
@@ -111,8 +124,11 @@ load_bandwidth_from_config() {
     
     # 读取上传总带宽
     local config_upload_bw=$(uci -q get qos_gargoyle.upload.total_bandwidth 2>/dev/null)
+    if [ -z "$config_upload_bw" ]; then
+        qos_log "ERROR" "上传总带宽未配置，请检查UCI"
+        return 1
+    fi
     if ! validate_number "$config_upload_bw" "upload.total_bandwidth" 1 "$max_physical_bw"; then
-        qos_log "ERROR" "上传总带宽配置无效: $config_upload_bw"
         return 1
     fi
     total_upload_bandwidth="$config_upload_bw"
@@ -120,8 +136,11 @@ load_bandwidth_from_config() {
 
     # 读取下载总带宽
     local config_download_bw=$(uci -q get qos_gargoyle.download.total_bandwidth 2>/dev/null)
+    if [ -z "$config_download_bw" ]; then
+        qos_log "ERROR" "下载总带宽未配置，请检查UCI"
+        return 1
+    fi
     if ! validate_number "$config_download_bw" "download.total_bandwidth" 1 "$max_physical_bw"; then
-        qos_log "ERROR" "下载总带宽配置无效: $config_download_bw"
         return 1
     fi
     total_download_bandwidth="$config_download_bw"
@@ -130,7 +149,7 @@ load_bandwidth_from_config() {
     return 0
 }
 
-# 计算内存限制 - 修复2：正确计算 memory_limit（单位Mb），并验证用户自定义值
+# 计算内存限制 - 修复1：使用向上取整避免除法结果为0
 calculate_memory_limit() {
     local config_value="$1"
     local result
@@ -162,8 +181,8 @@ calculate_memory_limit() {
         fi
         
         if [ -n "$total_mem_mb" ] && [ "$total_mem_mb" -gt 0 ] 2>/dev/null; then
-            # 每256MB内存分配1MB给FQCoDel
-            result="$((total_mem_mb / 256))Mb"
+            # 每256MB内存分配1MB给FQCoDel，向上取整确保至少1MB基数
+            result="$(((total_mem_mb + 255) / 256))Mb"
             
             # 设置最小和最大限制
             local min_limit=4
@@ -317,8 +336,6 @@ load_hfsc_config() {
 # 加载HFSC类别配置（简化版，直接使用uci读取并验证）
 load_hfsc_class_config() {
     local class_name="$1"
-    # 定义变量名（在调用函数中通过eval设置局部变量）
-    # 此函数不直接设置全局变量，而是通过eval输出给调用者
     local percent_bandwidth per_min_bandwidth per_max_bandwidth minRTT priority name
     
     qos_log "INFO" "加载HFSC类别配置: $class_name"
@@ -331,7 +348,7 @@ load_hfsc_class_config() {
     priority=$(uci -q get qos_gargoyle.$class_name.priority 2>/dev/null)
     name=$(uci -q get qos_gargoyle.$class_name.name 2>/dev/null)
     
-    # 验证百分比参数（使用rule.sh的validate_percentage，如果存在）
+    # 验证百分比参数
     if [ -n "$percent_bandwidth" ] && ! validate_number "$percent_bandwidth" "$class_name.percent_bandwidth" 0 100; then
         percent_bandwidth=""
     fi
@@ -363,7 +380,7 @@ load_hfsc_class_config() {
     return 0
 }
 
-# 加载上传类别配置（使用rule.sh的load_all_config_sections）
+# 加载上传类别配置
 load_upload_class_configurations() {
     qos_log "INFO" "正在加载上传类别配置..."
     
@@ -395,82 +412,58 @@ load_download_class_configurations() {
     return 0
 }
 
-# ========== IPv6增强支持 ==========
+# ========== IPv6增强支持（优化版） ==========
 setup_ipv6_specific_rules() {
     qos_log "INFO" "设置IPv6特定规则（优化版）"
     
-    # 确保filter_prerouting链存在（注意花括号需引号）
+    # 确保filter_prerouting链存在
     nft add chain inet gargoyle-qos-priority filter_prerouting '{ type filter hook prerouting priority 0; policy accept; }' 2>/dev/null || true
+    
+    # 清空链中所有规则，确保每次添加都是全新的，避免重复
+    nft flush chain inet gargoyle-qos-priority filter_prerouting 2>/dev/null || true
     
     # ICMPv6关键类型（邻居发现、路由通告等）
     local ICMPV6_CRITICAL_TYPES="133,134,135,136,137"
     
-    # 使用地址聚合
+    # 多播组（单独规则，避免集合类型混合）
     nft add rule inet gargoyle-qos-priority filter_prerouting \
-        meta nfproto ipv6 ip6 daddr { ff02::1:2, ff02::1:3, ::1/128 } \
+        meta nfproto ipv6 ip6 daddr { ff02::1:2, ff02::1:3 } \
         meta mark set 0x3F counter 2>/dev/null || true
     
-    # 使用nftables设置IPv6关键流量标记
-    if nft add rule inet gargoyle-qos-priority filter_prerouting \
+    # 本地回环地址（单独规则）
+    nft add rule inet gargoyle-qos-priority filter_prerouting \
+        meta nfproto ipv6 ip6 daddr ::1 \
+        meta mark set 0x3F counter 2>/dev/null || true
+    
+    # IPv6 ICMPv6关键类型
+    nft add rule inet gargoyle-qos-priority filter_prerouting \
         meta nfproto ipv6 icmpv6 type { $ICMPV6_CRITICAL_TYPES } \
-        meta mark set 0x7F counter 2>/dev/null; then
-        qos_log "DEBUG" "IPv6 ICMPv6关键类型规则添加成功"
-    else
-        qos_log "WARN" "IPv6 ICMPv6关键类型规则添加失败"
-    fi
+        meta mark set 0x7F counter 2>/dev/null || true
     
     # DHCPv6流量（UDP 546/547）
-    if nft add rule inet gargoyle-qos-priority filter_prerouting \
+    nft add rule inet gargoyle-qos-priority filter_prerouting \
         meta nfproto ipv6 udp dport { 546, 547 } \
-        meta mark set 0x7F counter 2>/dev/null; then
-        qos_log "DEBUG" "IPv6 DHCPv6流量规则添加成功"
-    else
-        qos_log "WARN" "IPv6 DHCPv6流量规则添加失败"
-    fi
+        meta mark set 0x7F counter 2>/dev/null || true
     
-    # 仅匹配LLMNR/MDNS等关键多播组
-    if nft add rule inet gargoyle-qos-priority filter_prerouting \
-        meta nfproto ipv6 ip6 daddr { ff02::1:2, ff02::1:3 } \
-        meta mark set 0x3F counter 2>/dev/null; then
-        qos_log "DEBUG" "IPv6多播流量规则添加成功"
-    else
-        qos_log "WARN" "IPv6多播流量规则添加失败"
-    fi
-    
-    # DNS over IPv6 (TCP/UDP 53)
-    if nft add rule inet gargoyle-qos-priority filter_prerouting \
+    # DNS over IPv6 (UDP 53)
+    nft add rule inet gargoyle-qos-priority filter_prerouting \
         meta nfproto ipv6 udp dport 53 \
-        meta mark set 0x7F counter 2>/dev/null; then
-        qos_log "DEBUG" "IPv6 DNS (UDP)流量规则添加成功"
-    else
-        qos_log "WARN" "IPv6 DNS (UDP)流量规则添加失败"
-    fi
+        meta mark set 0x7F counter 2>/dev/null || true
     
-    if nft add rule inet gargoyle-qos-priority filter_prerouting \
+    # DNS over IPv6 (TCP 53)
+    nft add rule inet gargoyle-qos-priority filter_prerouting \
         meta nfproto ipv6 tcp dport 53 \
-        meta mark set 0x7F counter 2>/dev/null; then
-        qos_log "DEBUG" "IPv6 DNS (TCP)流量规则添加成功"
-    else
-        qos_log "WARN" "IPv6 DNS (TCP)流量规则添加失败"
-    fi
+        meta mark set 0x7F counter 2>/dev/null || true
     
     # HTTP/HTTPS over IPv6
-    if nft add rule inet gargoyle-qos-priority filter_prerouting \
+    nft add rule inet gargoyle-qos-priority filter_prerouting \
         meta nfproto ipv6 tcp dport { 80, 443 } \
-        meta mark set 0x7F counter 2>/dev/null; then
-        qos_log "DEBUG" "IPv6 HTTP/HTTPS流量规则添加成功"
-    else
-        qos_log "WARN" "IPv6 HTTP/HTTPS流量规则添加失败"
-    fi
+        meta mark set 0x7F counter 2>/dev/null || true
     
     # NTP over IPv6
-    if nft add rule inet gargoyle-qos-priority filter_prerouting \
+    nft add rule inet gargoyle-qos-priority filter_prerouting \
         meta nfproto ipv6 udp dport 123 \
-        meta mark set 0x7F counter 2>/dev/null; then
-        qos_log "DEBUG" "IPv6 NTP流量规则添加成功"
-    else
-        qos_log "WARN" "IPv6 NTP流量规则添加失败"
-    fi
+        meta mark set 0x7F counter 2>/dev/null || true
     
     qos_log "INFO" "IPv6关键流量规则设置完成"
 }
@@ -506,7 +499,7 @@ create_hfsc_root_qdisc() {
         return 1
     fi
     
-    # 创建根类（修复语法：使用 rate 快捷方式）
+    # 创建根类（使用 rate 快捷方式）
     qos_log "INFO" "正在为 $device 创建 HFSC 根类..."
     if ! tc class add dev "$device" parent $root_handle classid $root_classid hfsc ls rate ${bandwidth}kbit ul rate ${bandwidth}kbit; then
         qos_log "ERROR" "无法在$device上创建HFSC根类"
@@ -661,18 +654,21 @@ create_hfsc_upload_class() {
     return 0
 }
 
-# 创建HFSC下载类别（修复：第三个参数更名为filter_prio，避免与类别配置冲突）
+# 创建HFSC下载类别（统一使用局部IFB变量，ul参数简化）
 create_hfsc_download_class() {
     local class_name="$1"
     local class_index="$2"
     local filter_prio="$3"   # 用于TC过滤器的优先级（避免与类别配置的priority冲突）
     
+    # 使用局部变量，确保与全局变量一致
+    local ifb_dev="$IFB_DEVICE"
+    
     qos_log "INFO" "创建下载类别: $class_name, ID: 1:$class_index, 过滤器优先级: $filter_prio"
     
     # IFB设备热插拔支持
     local retries=5
-    while ! ip link show dev "$IFB_DEVICE" >/dev/null 2>&1 && ((retries-- > 0)); do
-        ip link add dev "$IFB_DEVICE" type ifb
+    while ! ip link show dev "$ifb_dev" >/dev/null 2>&1 && ((retries-- > 0)); do
+        ip link add dev "$ifb_dev" type ifb
         sleep 1
     done
     if [ $retries -eq 0 ]; then
@@ -757,13 +753,13 @@ create_hfsc_download_class() {
         qos_log "INFO" "类别 $class_name 启用最小延迟模式 (d=$d)"
     fi
     
-    # 创建HFSC类别
+    # 创建HFSC类别（简化 ul 参数为 rate）
     qos_log "INFO" "正在创建下载HFSC类别 1:$class_index (带宽: ls=$m2, ul=$ul_m2)"
     
-    if ! tc class add dev "$IFB_DEVICE" parent 1:1 \
+    if ! tc class add dev "$ifb_dev" parent 1:1 \
         classid 1:$class_index hfsc \
         ls m1 $m1 d $d m2 $m2 \
-        ul m1 0bit d 0us m2 $ul_m2; then
+        ul rate $ul_m2; then
         qos_log "ERROR" "创建下载类别 1:$class_index 失败"
         return 1
     fi
@@ -785,7 +781,7 @@ create_hfsc_download_class() {
     
     qos_log "INFO" "添加下载fq_codel队列参数: $fq_codel_params"
     
-    if ! tc qdisc add dev "$IFB_DEVICE" parent 1:$class_index \
+    if ! tc qdisc add dev "$ifb_dev" parent 1:$class_index \
         handle ${class_index}:1 fq_codel $fq_codel_params; then
         qos_log "ERROR" "添加下载fq_codel队列失败"
         return 1
@@ -793,7 +789,7 @@ create_hfsc_download_class() {
     
     # 添加IPv4过滤器（使用 filter_prio 和掩码）
     if [ "$class_mark" != "0x0" ]; then
-        if ! tc filter add dev "$IFB_DEVICE" parent 1:0 protocol ip \
+        if ! tc filter add dev "$ifb_dev" parent 1:0 protocol ip \
             prio $filter_prio handle ${class_mark}/$DOWNLOAD_MASK fw classid 1:$class_index 2>/dev/null; then
             qos_log "WARN" "添加下载IPv4过滤器失败 (标记:$class_mark -> 类别:1:$class_index)"
         else
@@ -806,7 +802,7 @@ create_hfsc_download_class() {
         local base_prio=100
         local ipv6_priority=$((base_prio + filter_prio))
         
-        if ! tc filter add dev "$IFB_DEVICE" parent 1:0 protocol ipv6 \
+        if ! tc filter add dev "$ifb_dev" parent 1:0 protocol ipv6 \
             prio $ipv6_priority handle ${class_mark}/$DOWNLOAD_MASK fw classid 1:$class_index 2>/dev/null; then
             qos_log "WARN" "添加下载IPv6过滤器失败 (标记:$class_mark -> 类别:1:$class_index)"
         else
@@ -830,7 +826,7 @@ create_default_upload_class() {
     
     # 创建默认类别
     if ! tc class add dev "$qos_interface" parent 1:1 \
-        classid 1:2 hfsc ls m2 ${total_upload_bandwidth}kbit ul m2 ${total_upload_bandwidth}kbit; then
+        classid 1:2 hfsc ls rate ${total_upload_bandwidth}kbit ul rate ${total_upload_bandwidth}kbit; then
         qos_log "ERROR" "创建上传类 1:2 失败"
         return 1
     fi
@@ -879,17 +875,17 @@ create_default_upload_class() {
     return 0
 }
 
-# 创建默认下载类别
+# 创建默认下载类别（统一使用局部IFB变量）
 create_default_download_class() {
     qos_log "INFO" "创建默认下载类别"
     
-    # 从配置获取IFB设备名称（兼容原有配置）
-    local ifb_device="$IFB_DEVICE"
+    # 使用局部变量，确保与全局变量一致
+    local ifb_dev="$IFB_DEVICE"
     
     # IFB设备热插拔支持
     local retries=5
-    while ! ip link show dev "$ifb_device" >/dev/null 2>&1 && ((retries-- > 0)); do
-        ip link add dev "$ifb_device" type ifb
+    while ! ip link show dev "$ifb_dev" >/dev/null 2>&1 && ((retries-- > 0)); do
+        ip link add dev "$ifb_dev" type ifb
         sleep 1
     done
     if [ $retries -eq 0 ]; then
@@ -898,20 +894,20 @@ create_default_download_class() {
     fi
     
     # 确保IFB设备已启动
-    if ! ip link set dev "$ifb_device" up; then
-        qos_log "ERROR" "无法启动IFB设备 $ifb_device"
+    if ! ip link set dev "$ifb_dev" up; then
+        qos_log "ERROR" "无法启动IFB设备 $ifb_dev"
         return 1
     fi
     
     # 首先创建根队列
-    if ! create_hfsc_root_qdisc "$ifb_device" "download" "1:0" "1:1"; then
+    if ! create_hfsc_root_qdisc "$ifb_dev" "download" "1:0" "1:1"; then
         qos_log "ERROR" "创建下载根队列失败"
         return 1
     fi
     
     # 创建默认类别
-    if ! tc class add dev "$ifb_device" parent 1:1 \
-        classid 1:2 hfsc ls m2 ${total_download_bandwidth}kbit ul m2 ${total_download_bandwidth}kbit; then
+    if ! tc class add dev "$ifb_dev" parent 1:1 \
+        classid 1:2 hfsc ls rate ${total_download_bandwidth}kbit ul rate ${total_download_bandwidth}kbit; then
         qos_log "ERROR" "创建下载类 1:2 失败"
         return 1
     fi
@@ -933,24 +929,24 @@ create_default_download_class() {
     
     qos_log "INFO" "添加下载默认fq_codel队列参数: $fq_codel_params"
     
-    if ! tc qdisc add dev "$ifb_device" parent 1:2 \
+    if ! tc qdisc add dev "$ifb_dev" parent 1:2 \
         handle 2:1 fq_codel $fq_codel_params; then
         qos_log "ERROR" "添加下载默认fq_codel队列失败"
         return 1
     fi
     
     # 设置根队列的默认类
-    tc qdisc change dev "$ifb_device" root handle 1:0 hfsc default 2 2>/dev/null || true
+    tc qdisc change dev "$ifb_dev" root handle 1:0 hfsc default 2 2>/dev/null || true
     
     # 添加IPv4过滤器
     local mark_hex="0x100"
-    if ! tc filter add dev "$ifb_device" parent 1:0 protocol ip \
+    if ! tc filter add dev "$ifb_dev" parent 1:0 protocol ip \
         prio 1 handle ${mark_hex}/$DOWNLOAD_MASK fw flowid 1:2 2>/dev/null; then
         qos_log "WARN" "添加下载默认IPv4过滤器失败"
     fi
     
     # 添加IPv6过滤器
-    if ! tc filter add dev "$ifb_device" parent 1:0 protocol ipv6 \
+    if ! tc filter add dev "$ifb_dev" parent 1:0 protocol ipv6 \
         prio 2 handle ${mark_hex}/$DOWNLOAD_MASK fw flowid 1:2 2>/dev/null; then
         qos_log "WARN" "添加下载默认IPv6过滤器失败"
     fi
@@ -1092,8 +1088,6 @@ initialize_hfsc_upload() {
             
             # 添加标记到列表
             upload_class_mark_list="$upload_class_mark_list$class_name:$class_mark_hex "
-            
-            # 添加过滤器（已在create_hfsc_upload_class中添加，此处不再重复）
         fi
         class_index=$((class_index + 1))
     done
@@ -1170,13 +1164,29 @@ initialize_hfsc_download() {
     return 0
 }
 
+# 设置上传默认类别（增强：找不到时回退，增加根队列检查）
 set_default_upload_class() {
     qos_log "INFO" "设置上传默认类别"
     
+    # 修复2：检查根队列是否存在
+    if ! tc qdisc show dev "$qos_interface" root 2>/dev/null | grep -q "hfsc"; then
+        qos_log "ERROR" "上传根队列不存在，无法设置默认类"
+        return
+    fi
+    
     local default_class_name=$(uci -q get qos_gargoyle.upload.default_class 2>/dev/null)
     if [ -z "$default_class_name" ]; then
-        qos_log "ERROR" "上传默认类别未配置"
-        return
+        qos_log "ERROR" "上传默认类别未配置，将使用第一个类别"
+        # 若未配置，直接使用第一个类别（如果有）
+        if [ -n "$upload_class_list" ]; then
+            default_class_name=$(echo "$upload_class_list" | awk '{print $1}')
+            qos_log "INFO" "自动选择第一个类别: $default_class_name"
+        else
+            # 无自定义类别，使用默认类2
+            tc qdisc change dev "$qos_interface" root handle 1:0 hfsc default 2 2>/dev/null || true
+            qos_log "INFO" "上传默认类别设置为TC类ID: 1:2"
+            return
+        fi
     fi
     
     qos_log "INFO" "用户配置的上传默认类别名称: $default_class_name"
@@ -1196,22 +1206,54 @@ set_default_upload_class() {
     done
     
     if [ $found -eq 0 ]; then
-        qos_log "ERROR" "未找到上传默认类别 '$default_class_name'"
-        return
+        qos_log "WARN" "未找到上传默认类别 '$default_class_name'，使用第一个类别"
+        # 获取第一个类别
+        local first_class=$(echo "$upload_class_list" | awk '{print $1}')
+        if [ -n "$first_class" ]; then
+            class_index=2
+            found_index=2
+            for cn in $upload_class_list; do
+                if [ "$cn" = "$first_class" ]; then
+                    found_index=$class_index
+                    break
+                fi
+                class_index=$((class_index + 1))
+            done
+            qos_log "INFO" "回退使用类别 '$first_class' (ID: 1:$found_index)"
+        else
+            # 无自定义类别，使用默认类2
+            found_index=2
+            qos_log "INFO" "无自定义类别，使用默认类ID 1:2"
+        fi
     fi
     
     # 设置TC默认类别
     tc qdisc change dev "$qos_interface" root handle 1:0 hfsc default $found_index 2>/dev/null || true
-    qos_log "INFO" "上传默认类别设置为TC类ID: 1:$found_index (对应配置: $default_class_name)"
+    qos_log "INFO" "上传默认类别设置为TC类ID: 1:$found_index"
 }
 
+# 设置下载默认类别（增强：找不到时回退，增加根队列检查）
 set_default_download_class() {
     qos_log "INFO" "设置下载默认类别"
     
+    # 修复2：检查根队列是否存在
+    if ! tc qdisc show dev "$IFB_DEVICE" root 2>/dev/null | grep -q "hfsc"; then
+        qos_log "ERROR" "下载根队列不存在，无法设置默认类"
+        return
+    fi
+    
     local default_class_name=$(uci -q get qos_gargoyle.download.default_class 2>/dev/null)
     if [ -z "$default_class_name" ]; then
-        qos_log "ERROR" "下载默认类别未配置"
-        return
+        qos_log "ERROR" "下载默认类别未配置，将使用第一个类别"
+        if [ -n "$download_class_list" ]; then
+            default_class_name=$(echo "$download_class_list" | awk '{print $1}')
+            qos_log "INFO" "自动选择第一个类别: $default_class_name"
+        else
+            # 无自定义类别，使用默认类2
+            tc qdisc change dev "$IFB_DEVICE" root handle 1:0 hfsc default 2 2>/dev/null || true
+            qos_log "INFO" "下载默认类别设置为TC类ID: 1:2"
+            return
+        fi
     fi
     
     qos_log "INFO" "用户配置的下载默认类别名称: $default_class_name"
@@ -1231,17 +1273,36 @@ set_default_download_class() {
     done
     
     if [ $found -eq 0 ]; then
-        qos_log "ERROR" "未找到下载默认类别 '$default_class_name'"
-        return
+        qos_log "WARN" "未找到下载默认类别 '$default_class_name'，使用第一个类别"
+        local first_class=$(echo "$download_class_list" | awk '{print $1}')
+        if [ -n "$first_class" ]; then
+            class_index=2
+            found_index=2
+            for cn in $download_class_list; do
+                if [ "$cn" = "$first_class" ]; then
+                    found_index=$class_index
+                    break
+                fi
+                class_index=$((class_index + 1))
+            done
+            qos_log "INFO" "回退使用类别 '$first_class' (ID: 1:$found_index)"
+        else
+            found_index=2
+            qos_log "INFO" "无自定义类别，使用默认类ID 1:2"
+        fi
     fi
     
     # 设置TC默认类别
     tc qdisc change dev "$IFB_DEVICE" root handle 1:0 hfsc default $found_index 2>/dev/null || true
-    qos_log "INFO" "下载默认类别设置为TC类ID: 1:$found_index (对应配置: $default_class_name)"
+    qos_log "INFO" "下载默认类别设置为TC类ID: 1:$found_index"
 }
 
 apply_hfsc_specific_rules() {
     qos_log "INFO" "应用HFSC特定增强规则"
+    
+    # 确保相关链存在并清空（主脚本已创建，这里清空确保唯一）
+    nft flush chain inet gargoyle-qos-priority filter_qos_egress 2>/dev/null || true
+    nft flush chain inet gargoyle-qos-priority filter_qos_ingress 2>/dev/null || true
     
     # DoS防护：限制单个IP的新连接速率
     nft add rule inet gargoyle-qos-priority filter_qos_egress \
@@ -1254,7 +1315,7 @@ apply_hfsc_specific_rules() {
         limit rate 100/second burst 20 packets \
         meta mark set 0x7F00 counter 2>/dev/null || true
     
-    # 防御DoS攻击 - 增强
+    # 防御DoS攻击 - 增强（可能失败，忽略）
     nft add rule inet filter input ct state new limit rate 100/second burst 20 accept 2>/dev/null || true
     
     # HFSC优先级设置
@@ -1451,9 +1512,9 @@ show_hfsc_status() {
         return 1
     fi
     
-    # 检查 IFB 设备
+    # 检查 IFB 设备 - 使用 grep -q "qdisc" 判断是否存在有效队列
     if ip link show "$qos_ifb" >/dev/null 2>&1; then
-        if tc qdisc show dev "$qos_ifb" >/dev/null 2>&1; then
+        if tc qdisc show dev "$qos_ifb" 2>/dev/null | grep -q "qdisc"; then
             echo "IFB设备: 已启动且运行中 ($qos_ifb)"
         else
             echo "IFB设备: 已创建但无 TC 队列 ($qos_ifb)"
@@ -1530,7 +1591,6 @@ show_hfsc_status() {
         # 检查入口重定向
         echo -e "\n入口重定向检查:"
         if tc qdisc show dev "$qos_interface" 2>/dev/null | grep -q "ingress"; then
-            # 调用通用的重定向检查函数（需提前定义）
             check_ingress_redirect "$qos_interface" "$qos_ifb"
         else
             echo "  ✗ 入口队列未配置"
