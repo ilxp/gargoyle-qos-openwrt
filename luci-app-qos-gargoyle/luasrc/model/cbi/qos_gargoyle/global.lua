@@ -103,64 +103,101 @@ o = s:option(Value, "total_bandwidth", translate("Total Download Bandwidth"),
     .. "in kbps, leave blank to disable download QoS. There are 8 kilobits per kilobyte."))
 o.datatype = "uinteger"
 
---o = s:option(Flag, "qos_monenabled", translate("Enable Active Congestion Control"),
-    --translate("<p>The active congestion control (ACC) observes your download activity and "
-    --.. "automatically adjusts your download link limit to maintain proper QoS performance. ACC "
-    --.. "automatically compensates for changes in your ISP's download speed and the demand from your "
-    --.. "network adjusting the link speed to the highest speed possible which will maintain proper QoS "
-    --.. "function. The effective range of this control is between 15% and 100% of the total download "
-    --.. "bandwidth you entered above.</p>") ..
-    --translate("<p>While ACC does not adjust your upload link speed you must enable and properly "
-    --.. "configure your upload QoS for it to function properly.</p>")
-    --)
---o.enabled  = "true"
---o.disabled = "false"
+-- ==================== 自动调整分类百分比及 min/max ====================
+-- 上传分档表
+local upload_tiers = {
+    { threshold = 10000,   realtime = 25, normal = 50, bulk = 25 },
+    { threshold = 30000,   realtime = 20, normal = 60, bulk = 20 },
+    { threshold = 50000,   realtime = 15, normal = 70, bulk = 15 },
+    { threshold = 100000,  realtime = 12, normal = 73, bulk = 15 },
+    { threshold = math.huge, realtime = 10, normal = 75, bulk = 15 }
+}
 
---o = s:option(Value, "ptarget_ip", translate("Use Non-standard Ping Target"),
-    --translate("The segment of network between your router and the ping target is where congestion is "
-    --.. "controlled. By monitoring the round trip ping times to the target congestion is detected. By "
-    --.. "default ACC uses your WAN gateway as the ping target. If you know that congestion on your "
-    --.. "link will occur in a different segment then you can enter an alternate ping target. Leave "
-    --.. "empty to use the default settings."))
---o:depends("qos_monenabled", "true")
---local wan = qos.get_wan()
---if wan then o:value(wan:gwaddr()) end
---o.datatype = "ipaddr"
+-- 下载分档表
+local download_tiers = {
+    { threshold = 20000,   realtime = 20, normal = 60, bulk = 20 },
+    { threshold = 50000,   realtime = 15, normal = 70, bulk = 15 },
+    { threshold = 100000,  realtime = 12, normal = 73, bulk = 15 },
+    { threshold = 200000,  realtime = 10, normal = 70, bulk = 20 },
+    { threshold = 500000,  realtime = 8,  normal = 67, bulk = 25 },
+    { threshold = math.huge, realtime = 5,  normal = 65, bulk = 30 }
+}
 
---o = s:option(Value, "pinglimit", translate("Manual Ping Limit"),
-    --translate("Round trip ping times are compared against the ping limits. ACC controls the link "
-    --.. "limit to maintain ping times under the appropriate limit. By default ACC attempts to "
-    --.. "automatically select appropriate target ping limits for you based on the link speeds you "
-    --.. "entered and the performance of your link it measures during initialization. You cannot change "
-    --.. "the target ping time for the minRTT mode but by entering a manual time you can control the "
-    --.. "target ping time of the active mode. The time you enter becomes the increase in the target "
-    --.. "ping time between minRTT and active mode. Leave empty to use the default settings."))
---o:depends("qos_monenabled", "true")
---o:value("Auto", translate("Auto"))
---o.datatype = "or('Auto', range(10, 250))")
-
--- 保存配置后的服务控制函数
-local function handle_service_control()
-    -- 创建新的uci游标，获取最新的配置值
-    local cursor = uci.cursor()
-    local enabled = cursor:get(qos_gargoyle, "global", "enabled") or "0"
-    
-    -- 调试信息
-    sys.call("logger -t qos_gargoyle_debug '服务控制函数被调用，enabled 值: " .. tostring(enabled) .. "'")
-    
-    if enabled == "1" then
-        sys.call("logger -t qos_gargoyle '启用 QoS 服务'")
-        -- 启用并启动服务
-        os.execute("/etc/init.d/qos_gargoyle enable >/dev/null 2>&1")
-        os.execute("/etc/init.d/qos_gargoyle start >/dev/null 2>&1")
-    else
-        sys.call("logger -t qos_gargoyle '禁用 QoS 服务'")
-        -- 停止并禁用服务
-        os.execute("/etc/init.d/qos_gargoyle stop >/dev/null 2>&1")
-        os.execute("/etc/init.d/qos_gargoyle disable >/dev/null 2>&1")
+-- 根据带宽和链路类型获取百分比数组（返回 {realtime, normal, bulk}）
+local function get_percentages(direction, bw, linklayer)
+    local tiers = (direction == "upload") and upload_tiers or download_tiers
+    local percents
+    for _, tier in ipairs(tiers) do
+        if bw < tier.threshold then
+            percents = { tier.realtime, tier.normal, tier.bulk }
+            break
+        end
     end
+    if not percents then
+        local last = tiers[#tiers]
+        percents = { last.realtime, last.normal, last.bulk }
+    end
+
+    -- ADSL 上行微调：realtime +5，优先从 normal 扣除
+    if direction == "upload" and linklayer == "adsl" then
+        if percents[2] >= 5 then
+            percents[1] = percents[1] + 5
+            percents[2] = percents[2] - 5
+        else
+            percents[1] = percents[1] + 5
+            percents[3] = percents[3] - 5
+        end
+        -- 边界保护
+        percents[1] = math.min(percents[1], 100)
+        percents[2] = math.max(percents[2], 0)
+        percents[3] = math.max(percents[3], 0)
+    end
+
+    return percents
+end
+
+-- 应用百分比及 min/max（通过分类名称直接查找 section）
+-- adjust_minmax: 是否同时更新最小/最大带宽
+local function apply_class_percentages(direction, bw, linklayer, adjust_minmax)
+    local percents = get_percentages(direction, bw, linklayer)
+    local class_names = { "realtime", "normal", "bulk" }
     
-    return true
+    for idx, class_name in ipairs(class_names) do
+        local section = nil
+        uci:foreach(qos_gargoyle, direction .. "_class", function(s)
+            if s.name == class_name then
+                section = s[".name"]
+                return false -- 找到后停止遍历
+            end
+        end)
+        if section then
+            -- 设置百分比
+            uci:set(qos_gargoyle, section, "percent_bandwidth", tostring(percents[idx]))
+            
+            if adjust_minmax then
+                local min_pct, max_pct
+                if class_name == "realtime" then
+                    min_pct = 60    -- 保证带宽占分类带宽的 60%
+                    max_pct = 200   -- nil 表示删除（无限制）
+                elseif class_name == "normal" then
+                    min_pct = 0
+                    max_pct = 200   -- 最大带宽占分类带宽的 200%
+                else -- bulk
+                    min_pct = 0
+                    max_pct = 100   -- 最大带宽占分类带宽的 100%
+                end
+                
+                uci:set(qos_gargoyle, section, "per_min_bandwidth", tostring(min_pct))
+                if max_pct then
+                    uci:set(qos_gargoyle, section, "per_max_bandwidth", tostring(max_pct))
+                else
+                    uci:delete(qos_gargoyle, section, "per_max_bandwidth")  -- 留空表示无限制
+                end
+            end
+        else
+            sys.call("logger -t qos_gargoyle '警告：未找到分类 " .. class_name .. "，跳过自动调整'")
+        end
+    end
 end
 
 -- 保存配置后的服务控制函数
@@ -202,6 +239,17 @@ local function after_apply(self)
     
     -- 处理服务控制
     handle_service_control()
+    
+    -- ===== 自动调整分类百分比 =====
+    local upload_bw = tonumber(uci:get(qos_gargoyle, "upload", "total_bandwidth")) or 50000
+    local download_bw = tonumber(uci:get(qos_gargoyle, "download", "total_bandwidth")) or 100000
+    local linklayer = uci:get(qos_gargoyle, "global", "linklayer") or "atm"
+    
+    apply_class_percentages("upload", upload_bw, linklayer, true)
+    apply_class_percentages("download", download_bw, linklayer, true)
+    
+    uci:commit(qos_gargoyle)
+    -- ===== 结束 =====
     
     return true
 end
