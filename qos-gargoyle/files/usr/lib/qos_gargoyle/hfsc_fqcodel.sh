@@ -1300,10 +1300,6 @@ set_default_download_class() {
 apply_hfsc_specific_rules() {
     qos_log "INFO" "应用HFSC特定增强规则"
     
-    # 确保相关链存在并清空（主脚本已创建，这里清空确保唯一）
-    nft flush chain inet gargoyle-qos-priority filter_qos_egress 2>/dev/null || true
-    nft flush chain inet gargoyle-qos-priority filter_qos_ingress 2>/dev/null || true
-    
     # DoS防护：限制单个IP的新连接速率
     nft add rule inet gargoyle-qos-priority filter_qos_egress \
         ct state new \
@@ -1488,13 +1484,11 @@ stop_hfsc_qos() {
     qos_log "INFO" "HFSC QoS停止完成 (清理前: ${tc_count_before}队列/${nft_count_before}规则, 清理后: ${tc_count_after}队列/${nft_count_after}规则)"
 }
 
-# ========== 状态查询函数（优化版） ==========
+# ========== 状态查询函数（优化版，去除标记文件展示） ==========
 show_hfsc_status() {
     # 确保必要的变量已设置
     local qos_ifb="$IFB_DEVICE"
     local mark_dir="/etc/qos_gargoyle"
-    local upload_marks_file="$mark_dir/upload_class_marks"
-    local download_marks_file="$mark_dir/download_class_marks"
     
     # 如果接口未定义，尝试从 TC 输出推断
     if [ -z "$qos_interface" ]; then
@@ -1512,7 +1506,7 @@ show_hfsc_status() {
         return 1
     fi
     
-    # 检查 IFB 设备 - 使用 grep -q "qdisc" 判断是否存在有效队列
+    # 检查 IFB 设备
     if ip link show "$qos_ifb" >/dev/null 2>&1; then
         if tc qdisc show dev "$qos_ifb" 2>/dev/null | grep -q "qdisc"; then
             echo "IFB设备: 已启动且运行中 ($qos_ifb)"
@@ -1547,21 +1541,13 @@ show_hfsc_status() {
         echo "  $line"
     done
     
-    # ========== nftables 分类规则 ==========
-    echo -e "\n======== nftables 分类规则 ========"
-    if nft list chain inet gargoyle-qos-priority filter_qos_egress &>/dev/null; then
-        echo "上传方向规则 (filter_qos_egress):"
-        nft list chain inet gargoyle-qos-priority filter_qos_egress 2>/dev/null | sed 's/^/  /'
-    else
-        echo "  上传方向规则链不存在"
-    fi
-    
-    if nft list chain inet gargoyle-qos-priority filter_qos_ingress &>/dev/null; then
-        echo -e "\n下载方向规则 (filter_qos_ingress):"
-        nft list chain inet gargoyle-qos-priority filter_qos_ingress 2>/dev/null | sed 's/^/  /'
-    else
-        echo "  下载方向规则链不存在"
-    fi
+	# ========== nftables 分类规则（完整展示） ==========
+	echo -e "\n======== nftables 分类规则 ========"
+	if nft list table inet gargoyle-qos-priority &>/dev/null; then
+		nft list table inet gargoyle-qos-priority 2>/dev/null | sed 's/^/  /'
+	else
+		echo "  nftables 表不存在"
+	fi
     
     # ========== 入口 QoS (下载) ==========
     echo -e "\n======== 入口QoS ($qos_ifb) ========"
@@ -1597,27 +1583,6 @@ show_hfsc_status() {
         fi
     else
         echo "  IFB设备不存在，无入口配置"
-    fi
-    
-    # ========== QoS分类标记（带统计） ==========
-    echo -e "\n======== QoS分类标记 ========"
-    
-    if [ -f "$upload_marks_file" ]; then
-        local upload_count=$(grep -c "^upload:" "$upload_marks_file" 2>/dev/null || echo 0)
-        echo "上传标记文件 ($upload_marks_file) - 共 ${upload_count} 条:"
-        cat "$upload_marks_file" 2>/dev/null | sed 's/^/  /' || echo "  文件读取错误"
-    else
-        echo "上传标记文件: 未找到"
-    fi
-    
-    echo ""
-    
-    if [ -f "$download_marks_file" ]; then
-        local download_count=$(grep -c "^download:" "$download_marks_file" 2>/dev/null || echo 0)
-        echo "下载标记文件 ($download_marks_file) - 共 ${download_count} 条:"
-        cat "$download_marks_file" 2>/dev/null | sed 's/^/  /' || echo "  文件读取错误"
-    else
-        echo "下载标记文件: 未找到"
     fi
     
     # ========== QoS运行状态摘要 ==========
@@ -1664,7 +1629,7 @@ show_hfsc_status() {
         done
     fi
     
-    # ========== 活动连接标记 ==========
+    # ========== 活动连接标记（保留，用于调试） ==========
     echo -e "\n======== 活动连接标记 ========"
 
     # 获取 WAN 接口的 IP 地址

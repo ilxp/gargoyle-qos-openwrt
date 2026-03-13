@@ -180,10 +180,10 @@ local function apply_class_percentages(direction, bw, linklayer, adjust_minmax)
                     min_pct = 60    -- 保证带宽占分类带宽的 60%
                     max_pct = 200   -- nil 表示删除（无限制）
                 elseif class_name == "normal" then
-                    min_pct = 0
+                    min_pct = 1
                     max_pct = 200   -- 最大带宽占分类带宽的 200%
                 else -- bulk
-                    min_pct = 0
+                    min_pct = 1
                     max_pct = 100   -- 最大带宽占分类带宽的 100%
                 end
                 

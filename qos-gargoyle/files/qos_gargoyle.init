@@ -2,6 +2,7 @@
 #
 # QoS Gargoyle 初始化脚本 - 传统 init.d 版本
 # 支持多算法：HFSC, CAKE, FQ_CoDel, HTB
+# 版本：2.1.0（修复跳转规则问题）
 #
 
 START=50
@@ -413,12 +414,19 @@ load_qos_config() {
             echo "提示: 自动检测到 WAN 接口为 '$qos_interface'" >&2
             success=1
         else
-            echo "错误: 自动检测 WAN 接口失败，请手动配置 qos_gargoyle.global.wan_interface" >&2
-            return 1
+            # 最后手段：从默认路由获取接口
+            qos_interface=$(ip route show default 2>/dev/null | awk '/default/ {print $5}' | head -1)
+            if [ -n "$qos_interface" ]; then
+                echo "提示: 从默认路由检测到接口 '$qos_interface'" >&2
+                success=1
+            else
+                echo "错误: 自动检测 WAN 接口失败，请手动配置 qos_gargoyle.global.wan_interface" >&2
+                return 1
+            fi
         fi
     fi
 
-    # 3. 输出最终配置信息（可选）
+    # 3. 输出最终配置信息
     echo "加载配置完成：算法=$algorithm, 上传带宽=${total_upload_bandwidth}kbit, 下载带宽=${total_download_bandwidth}kbit, 接口=$qos_interface" >&2
 
     # 导出必要变量供后续使用
@@ -470,47 +478,88 @@ check_configuration() {
     return 0
 }
 
-# 等待 WAN 接口就绪
+# 等待网络接口就绪（支持 IPv4/IPv6，可配置超时）
+# 用法: wait_interface <接口名> [超时秒数] [协议]
+# 协议: ipv4 (默认), ipv6, both
 wait_interface() {
     local iface="$1"
-    local fast_checks=3
-    local wait_sec=15
-    local i=0
-    
+    local timeout="${2:-15}"          # 默认超时 15 秒
+    local proto="${3:-ipv4}"          # 默认检查 IPv4
+    local start_time=$(date +%s)
+    local elapsed=0
+    local found=0
+
     if [ -z "$iface" ]; then
-        echo "错误: 无法确定要等待的接口" >&2
+        echo "错误: 未指定接口名称" >&2
         return 1
     fi
-    
-    echo "等待接口 $iface 就绪..."
-    
-    # 快速预检
-    while [ $i -lt $fast_checks ]; do
-        if ip link show dev "$iface" 2>/dev/null | grep -q "state UP"; then
-            echo "接口 $iface 已就绪（快速检测）"
-            return 0
+
+    echo "等待接口 $iface 就绪 (超时 ${timeout}秒, 协议: $proto)..."
+
+    # 第一阶段：等待接口出现（最多 timeout/3 秒）
+    local wait_exists=$((timeout / 3))
+    [ $wait_exists -lt 1 ] && wait_exists=1
+    while [ $elapsed -lt $wait_exists ]; do
+        if ip link show dev "$iface" >/dev/null 2>&1; then
+            break
         fi
         sleep 1
-        i=$((i + 1))
+        elapsed=$(( $(date +%s) - start_time ))
     done
-    
-    # 正常等待（每1秒检查一次）
-    while [ $wait_sec -gt 0 ]; do
-        if ip link show dev "$iface" 2>/dev/null | grep -q "state UP"; then
-            echo "接口 $iface 已就绪（耗时 $((15 - wait_sec)) 秒）"
-            return 0
-        fi
+
+    if ! ip link show dev "$iface" >/dev/null 2>&1; then
+        echo "错误: 接口 $iface 在 ${elapsed} 秒后仍未出现" >&2
+        return 1
+    fi
+
+    # 第二阶段：等待协议地址
+    local addr_ok=0
+    while [ $elapsed -lt $timeout ]; do
+        case "$proto" in
+            ipv4)
+                ip -4 addr show dev "$iface" | grep -q "inet " && addr_ok=1
+                ;;
+            ipv6)
+                ip -6 addr show dev "$iface" | grep -q "inet6 " && addr_ok=1
+                ;;
+            both)
+                if ip -4 addr show dev "$iface" | grep -q "inet " || \
+                   ip -6 addr show dev "$iface" | grep -q "inet6 "; then
+                    addr_ok=1
+                fi
+                ;;
+        esac
+        [ $addr_ok -eq 1 ] && break
         sleep 1
-        wait_sec=$((wait_sec - 1))
+        elapsed=$(( $(date +%s) - start_time ))
     done
-    
-    echo "错误: 接口 $iface 在超时后仍未就绪" >&2
-    return 1
+
+    if [ $addr_ok -eq 1 ]; then
+        echo "接口 $iface 已获得 $proto 地址 (耗时 ${elapsed} 秒)"
+        return 0
+    else
+        echo "错误: 接口 $iface 在 ${timeout} 秒内未获得 $proto 地址" >&2
+        return 1
+    fi
 }
 
-# 初始化 NFT 表
+# 初始化 NFT 表（修复跳转规则问题）
 setup_nft_tables() {
     echo "Setting up nftables..."
+    
+    # 确保 qos_interface 非空（再次检查）
+    if [ -z "$qos_interface" ]; then
+        echo "警告: qos_interface 为空，尝试重新获取..." >&2
+        # 从 UCI 重新读取
+        qos_interface=$(uci -q get "$CONFIG_FILE.global.wan_interface")
+        if [ -z "$qos_interface" ] || [ "$qos_interface" = "auto" ]; then
+            network_find_wan qos_interface 2>/dev/null
+        fi
+        if [ -z "$qos_interface" ]; then
+            # 最后手段：从默认路由获取
+            qos_interface=$(ip route show default 2>/dev/null | awk '/default/ {print $5}' | head -1)
+        fi
+    fi
     
     # 清除现有表
     nft flush table inet gargoyle-qos-priority 2>/dev/null
@@ -529,13 +578,19 @@ setup_nft_tables() {
     nft add chain inet gargoyle-qos-priority filter_forward '{ type filter hook forward priority 115; }'
     nft add chain inet gargoyle-qos-priority filter_prerouting '{ type filter hook prerouting priority -150; }'
     
-    # 添加跳转规则（从基础链到分类链），确保接口变量非空
+    # 添加跳转规则（从基础链到分类链），带接口条件
     if [ -n "$qos_interface" ]; then
+        echo "添加跳转规则，接口: $qos_interface"
+        nft add rule inet gargoyle-qos-priority filter_postrouting oifname "$qos_interface" jump filter_qos_egress
+        nft add rule inet gargoyle-qos-priority filter_input iifname "$qos_interface" jump filter_qos_ingress
+        nft add rule inet gargoyle-qos-priority filter_forward iifname "$qos_interface" jump filter_qos_ingress
+    else
+        echo "错误: 无法确定 WAN 接口，跳转规则未添加" >&2
+        # 作为应急，添加无条件跳转规则（可能影响本地流量，但至少分类会生效）
+        echo "添加无条件跳转规则作为应急..." >&2
         nft add rule inet gargoyle-qos-priority filter_postrouting jump filter_qos_egress
         nft add rule inet gargoyle-qos-priority filter_input jump filter_qos_ingress
         nft add rule inet gargoyle-qos-priority filter_forward jump filter_qos_ingress
-    else
-        echo "警告: qos_interface 为空，无法添加跳转规则" >&2
     fi
     
     echo "NFT tables initialized"
@@ -968,7 +1023,7 @@ initialize_qos() {
     # 清理现有 QoS 设置
     stop_qos
     
-    # 初始化 NFT 表
+    # 初始化 NFT 表（此处 qos_interface 应已非空）
     setup_nft_tables
     
     # 创建 IFB 设备
@@ -977,11 +1032,11 @@ initialize_qos() {
     # 加载带宽配置
     load_bandwidth_config
 	
-	# 生成标记文件
-     if [ ! -f "/etc/qos_gargoyle/qos_class_marks" ]; then
-        logger -t "qos_gargoyle" "生成类别标记文件..."
-        generate_class_marks
-    fi
+	# 生成标记文件（注释掉，因为 rule.sh 已强制计算标记）
+	# if [ ! -f "/etc/qos_gargoyle/qos_class_marks" ]; then
+	#     logger -t "qos_gargoyle" "生成类别标记文件..."
+	#     generate_class_marks
+	# fi
     
     # 应用分类规则 - cake算法不应用
     echo "调用分类规则应用..."	

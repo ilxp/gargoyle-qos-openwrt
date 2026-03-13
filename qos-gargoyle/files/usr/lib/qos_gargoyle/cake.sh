@@ -686,62 +686,59 @@ health_check_cake() {
 }
 
 # ========== 状态显示（使用运行时参数，优先显示实际生效值）==========
+# ========== 状态显示（原版+入口状态+多队列统计）==========
 show_cake_status() {
     echo "===== CAKE QoS状态报告 (v5.2-mq) ====="
     echo "时间: $(date)"
     echo "网络接口: ${qos_interface:-未知}"
 
-    # 加载UCI配置（用于显示默认配置，但运行时参数优先）
+    # 加载UCI配置
     load_cake_config
 
-    # 如果运行时参数文件存在，则读取实际运行的参数
     if [ -f "$RUNTIME_PARAMS_FILE" ]; then
         . "$RUNTIME_PARAMS_FILE"
-        log_debug "使用运行时参数: RTT=$CAKE_RTT, MEM=$CAKE_MEMORY_LIMIT, SPLIT_GSO=$RUNTIME_SPLIT_GSO, INGRESS=$RUNTIME_INGRESS, AUTORATE=$RUNTIME_AUTORATE_INGRESS"
+        log_debug "使用运行时参数: RTT=$CAKE_RTT, MEM=$CAKE_MEMORY_LIMIT"
     else
         log_debug "无运行时参数文件，使用UCI配置"
-        # 若没有运行时文件，则运行时标志仍为0（默认），但UCI配置可能为1
     fi
 
-    if ! tc qdisc show dev "${qos_interface}" 2>/dev/null | grep -q "qdisc"; then
+    if ! tc qdisc show dev "${qos_interface}" 2>/dev/null | grep -q "qdisc cake"; then
         echo "警告: QoS未在接口 ${qos_interface} 上激活"
         return 1
     fi
 
-    # 出口队列
+    # ===== 出口队列 =====
     echo -e "\n===== 出口CAKE队列 ($qos_interface) ====="
     if tc qdisc show dev "$qos_interface" root 2>/dev/null | grep -q "cake"; then
         echo "状态: 已启用 ✅"
-        # 判断是否为多队列
-        if tc qdisc show dev "$qos_interface" root 2>/dev/null | grep -q "^qdisc mq"; then
-            echo "模式: CAKE-MQ (多队列)"
-            local queues=$(tc qdisc show dev "$qos_interface" root 2>/dev/null | grep -c "^qdisc cake")
-            echo "队列数: $queues"
+        # 统计所有出口队列数量
+        local egress_count=$(tc qdisc show dev "$qos_interface" 2>/dev/null | grep -c "qdisc cake")
+        if [ "$egress_count" -gt 1 ]; then
+            echo "多队列模式: 共 $egress_count 个队列"
         else
             echo "模式: 普通CAKE"
         fi
         echo "队列参数:"
-        tc qdisc show dev "$qos_interface" root 2>/dev/null | head -1 | sed 's/^/  /'
+        tc qdisc show dev "$qos_interface" root 2>/dev/null | grep "qdisc cake" | sed 's/^qdisc cake //' | sed 's/^/  /'
         echo -e "\nTC队列统计:"
         tc -s qdisc show dev "$qos_interface" root 2>/dev/null | sed 's/^/  /'
     else
         echo "状态: 未启用 ❌"
     fi
 
-    # 入口队列
+    # ===== 入口队列 =====
     echo -e "\n===== 入口CAKE队列 ($IFB_DEVICE) ====="
     if ip link show "$IFB_DEVICE" >/dev/null 2>&1; then
         if tc qdisc show dev "$IFB_DEVICE" root 2>/dev/null | grep -q "cake"; then
             echo "状态: 已启用 ✅"
-            if tc qdisc show dev "$IFB_DEVICE" root 2>/dev/null | grep -q "^qdisc mq"; then
-                echo "模式: CAKE-MQ (多队列)"
-                local queues=$(tc qdisc show dev "$IFB_DEVICE" root 2>/dev/null | grep -c "^qdisc cake")
-                echo "队列数: $queues"
+            local ingress_count=$(tc qdisc show dev "$IFB_DEVICE" 2>/dev/null | grep -c "qdisc cake")
+            if [ "$ingress_count" -gt 1 ]; then
+                echo "多队列模式: 共 $ingress_count 个队列"
             else
                 echo "模式: 普通CAKE"
             fi
             echo "队列参数:"
-            tc qdisc show dev "$IFB_DEVICE" root 2>/dev/null | head -1 | sed 's/^/  /'
+            tc qdisc show dev "$IFB_DEVICE" root 2>/dev/null | grep "qdisc cake" | sed 's/^qdisc cake //' | sed 's/^/  /'
             echo -e "\nTC队列统计:"
             tc -s qdisc show dev "$IFB_DEVICE" root 2>/dev/null | sed 's/^/  /'
         else
@@ -751,8 +748,14 @@ show_cake_status() {
         echo "状态: IFB设备未创建"
     fi
 
-    # 入口重定向检查
+    # ===== 入口重定向检查 =====
     echo -e "\n===== 入口重定向检查 ====="
+    if tc filter show dev "$qos_interface" parent ffff: 2>/dev/null | grep -q "ifb0"; then
+        echo "✅ 入口重定向: 已生效"
+    else
+        echo "❌ 入口重定向: 未生效"
+    fi
+    # 列出规则详情
     if tc qdisc show dev "$qos_interface" 2>/dev/null | grep -q "ingress"; then
         echo "入口队列状态: 已配置"
         tc filter show dev "$qos_interface" parent ffff: 2>/dev/null | sed 's/^/  /' || echo "  无过滤器规则"
@@ -760,7 +763,7 @@ show_cake_status() {
         echo "入口队列状态: 未配置"
     fi
 
-    # CAKE配置参数（显示实际运行值，优先使用运行时标志）
+    # ===== CAKE配置参数 =====
     echo -e "\n===== CAKE配置参数 ====="
     echo "DiffServ模式: $CAKE_DIFFSERV_MODE"
     echo "RTT: $CAKE_RTT"
@@ -770,22 +773,10 @@ show_cake_status() {
     echo "ACK过滤: $([ "$CAKE_ACK_FILTER" = "1" ] && echo "启用 ✅" || echo "禁用 ❌")"
     echo "NAT支持: $([ "$CAKE_NAT" = "1" ] && echo "启用 ✅" || echo "禁用 ❌")"
     echo "Wash: $([ "$CAKE_WASH" = "1" ] && echo "启用 ✅" || echo "禁用 ❌")"
-    # 高级参数：如果运行时文件存在则显示实际值，否则显示配置值
-    local split_gso_display="$CAKE_SPLIT_GSO"
-    [ -f "$RUNTIME_PARAMS_FILE" ] && split_gso_display="$RUNTIME_SPLIT_GSO"
-    echo "Split GSO: $([ "$split_gso_display" = "1" ] && echo "启用 ✅" || echo "禁用 ❌")"
-
-    local ingress_display="$CAKE_INGRESS"
-    [ -f "$RUNTIME_PARAMS_FILE" ] && ingress_display="$RUNTIME_INGRESS"
-    echo "Ingress模式: $([ "$ingress_display" = "1" ] && echo "启用 ✅" || echo "禁用 ❌")"
-
-    local autorate_display="$CAKE_AUTORATE_INGRESS"
-    [ -f "$RUNTIME_PARAMS_FILE" ] && autorate_display="$RUNTIME_AUTORATE_INGRESS"
-    echo "AutoRate Ingress: $([ "$autorate_display" = "1" ] && echo "启用 ✅" || echo "禁用 ❌")"
-
+    echo "Split GSO: $([ "$CAKE_SPLIT_GSO" = "1" ] && echo "启用 ✅" || echo "禁用 ❌")"
+    echo "Ingress模式: $([ "$CAKE_INGRESS" = "1" ] && echo "启用 ✅" || echo "禁用 ❌")"
+    echo "AutoRate Ingress: $([ "$CAKE_AUTORATE_INGRESS" = "1" ] && echo "启用 ✅" || echo "禁用 ❌")"
     echo "自动调优: $([ "$ENABLE_AUTO_TUNE" = "1" ] && echo "启用 ✅" || echo "禁用 ❌")"
-    echo "CAKE-MQ多队列: $([ "$CAKE_MQ_ENABLED" = "1" ] && echo "启用 ✅" || echo "禁用 ❌")"
-    echo "停止时删除IFB: $([ "$CAKE_DELETE_IFB_ON_STOP" = "1" ] && echo "是 ✅" || echo "否 ❌")"
 
     echo -e "\n===== 状态报告结束 ====="
     return 0
