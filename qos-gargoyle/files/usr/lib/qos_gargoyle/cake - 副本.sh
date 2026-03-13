@@ -1,13 +1,8 @@
 #!/bin/sh
-# version=5.2-mq
-# CAKE算法实现模块 - 多队列增强版 v5.2
-# 基于v5.1，修复了以下问题：
-# 1. 硬编码 IFB 设备名
-# 2. 参数内核支持检测误判（先清空 lo 的根 qdisc）
-# 3. ethtool 队列数解析改进（优先 Current hardware settings）
-# 4. 运行时参数记录（实际生效的高级参数）
-# 5. 多队列参数构建效率优化
-# 6. IFB 设备 up 状态检查
+# version=4.12
+# CAKE算法实现模块 - 最终优化版 v4.12
+# 基于v4.11，优化：状态显示使用运行时参数、带宽单位转换增强警告
+# 修正：带宽转换函数中警告使用未初始化变量的问题
 
 # ========== 变量初始化 ==========
 : ${total_upload_bandwidth:=40000}
@@ -23,7 +18,7 @@ if [ -z "$qos_interface" ]; then
     qos_interface="${qos_interface:-pppoe-wan}"
 fi
 
-echo "CAKE 模块初始化完成 (v5.2-mq)"
+echo "CAKE 模块初始化完成 (v4.12)"
 echo "  网络接口: $qos_interface"
 echo "  IFB 设备: $IFB_DEVICE"
 echo "  上传带宽: ${total_upload_bandwidth}kbit/s"
@@ -42,13 +37,6 @@ CAKE_INGRESS="0"          # 用户配置，决定是否附加 ingress 参数
 CAKE_AUTORATE_INGRESS="0"
 CAKE_MEMORY_LIMIT="32mb"
 ENABLE_AUTO_TUNE="1"
-CAKE_MQ_ENABLED="1"        # 是否启用多队列 CAKE-MQ
-CAKE_DELETE_IFB_ON_STOP="1" # 停止时是否删除 IFB 设备（默认删除）
-
-# 运行时生效的高级参数标志（初始为0）
-RUNTIME_SPLIT_GSO=0
-RUNTIME_INGRESS=0
-RUNTIME_AUTORATE_INGRESS=0
 
 # ========== 参数消毒 ==========
 sanitize_param() {
@@ -91,9 +79,6 @@ check_dependencies() {
     if ! command -v uci >/dev/null 2>&1; then
         log_error "uci 命令未找到，请安装 uci"
         return 1
-    fi
-    if ! command -v ethtool >/dev/null 2>&1; then
-        log_warn "ethtool 命令未找到，队列数检测将回退到 sysfs"
     fi
     return 0
 }
@@ -172,61 +157,6 @@ validate_diffserv_mode() {
     return 1
 }
 
-# ========== 获取设备发送队列数（增强版）==========
-get_tx_queues() {
-    local dev="$1"
-    local queues=1
-
-    # 优先使用 ethtool 获取 Combined 值（硬件队列数）
-    if command -v ethtool >/dev/null 2>&1; then
-        local ethtool_out
-        # 尝试从 Current hardware settings 块中提取 Combined
-        ethtool_out=$(ethtool -l "$dev" 2>/dev/null | awk '
-            /^Current hardware settings:/ { in_current=1; next }
-            /^[^ ]/ { in_current=0 }
-            in_current && /Combined:/ { print $2; exit }
-        ')
-        if [ -n "$ethtool_out" ] && [ "$ethtool_out" -gt 0 ] 2>/dev/null; then
-            queues=$ethtool_out
-            log_debug "ethtool (current) 获取 $dev 队列数: $queues"
-            echo "$queues"
-            return
-        fi
-        # 若无 Current 块，则取所有 Combined 行的最后一个值
-        ethtool_out=$(ethtool -l "$dev" 2>/dev/null | grep "Combined:" | tail -1 | awk '{print $2}')
-        if [ -n "$ethtool_out" ] && [ "$ethtool_out" -gt 0 ] 2>/dev/null; then
-            queues=$ethtool_out
-            log_debug "ethtool (fallback) 获取 $dev 队列数: $queues"
-            echo "$queues"
-            return
-        fi
-    fi
-
-    # 回退到 sysfs 检测
-    if [ -d "/sys/class/net/$dev/queues" ]; then
-        queues=$(ls -d /sys/class/net/$dev/queues/tx-* 2>/dev/null | wc -l)
-        log_debug "sysfs 获取 $dev 队列数: $queues"
-    fi
-
-    # 若队列数为0，则默认为1
-    [ "$queues" -eq 0 ] && queues=1
-    echo "$queues"
-}
-
-# ========== 检测内核是否支持特定 CAKE 参数（增强版：先清空 lo）==========
-check_cake_param_support() {
-    local param="$1"
-    # 临时删除 lo 的根 qdisc（如果存在）
-    tc qdisc del dev lo root 2>/dev/null
-    # 尝试添加测试 qdisc
-    if tc qdisc add dev lo root cake bandwidth 1mbit "$param" 2>/dev/null; then
-        tc qdisc del dev lo root 2>/dev/null
-        return 0  # 支持
-    else
-        return 1  # 不支持
-    fi
-}
-
 # ========== 配置加载（带消毒）==========
 load_cake_config() {
     log_info "加载CAKE配置"
@@ -280,14 +210,6 @@ load_cake_config() {
 
     val=$(uci -q get qos_gargoyle.cake.enable_auto_tune 2>/dev/null)
     [ -n "$val" ] && ENABLE_AUTO_TUNE=$(sanitize_param "$val")
-
-    # 多队列CAKE-MQ开关
-    val=$(uci -q get qos_gargoyle.cake.enable_mq 2>/dev/null)
-    [ -n "$val" ] && CAKE_MQ_ENABLED=$(sanitize_param "$val")
-
-    # 停止时是否删除IFB设备
-    val=$(uci -q get qos_gargoyle.cake.delete_ifb_on_stop 2>/dev/null)
-    [ -n "$val" ] && CAKE_DELETE_IFB_ON_STOP=$(sanitize_param "$val")
 
     log_info "CAKE配置加载完成"
 }
@@ -414,7 +336,7 @@ setup_ingress_redirect() {
 # ========== 检查入口重定向 ==========
 check_ingress_redirect() {
     log_info "检查入口重定向状态"
-    if tc filter show dev "$qos_interface" parent ffff: 2>/dev/null | grep -q "$IFB_DEVICE"; then
+    if tc filter show dev "$qos_interface" parent ffff: 2>/dev/null | grep -q "ifb0"; then
         echo "✅ 入口重定向: 已生效"
         return 0
     else
@@ -441,61 +363,13 @@ cleanup_existing_queues() {
     fi
 }
 
-# ========== 构建CAKE参数串（并记录运行时生效的参数）==========
-build_cake_params() {
-    local bandwidth="$1"
-    local direction="$2"
-    local params="bandwidth ${bandwidth}kbit $CAKE_DIFFSERV_MODE"
-
-    # 基础参数
-    [ "$CAKE_OVERHEAD" != "0" ] && params="$params overhead $CAKE_OVERHEAD"
-    [ "$CAKE_MPU" != "0" ] && params="$params mpu $CAKE_MPU"
-    [ -n "$CAKE_RTT" ] && params="$params rtt $CAKE_RTT"
-    [ "$CAKE_ACK_FILTER" = "1" ] && params="$params ack-filter"
-    [ "$CAKE_NAT" = "1" ] && params="$params nat"
-    [ "$CAKE_WASH" = "1" ] && params="$params wash"
-    [ -n "$CAKE_MEMORY_LIMIT" ] && params="$params memlimit $CAKE_MEMORY_LIMIT"
-
-    # 高级参数：需要内核支持，检测后动态添加，并记录运行时标志
-    # split-gso
-    if [ "$CAKE_SPLIT_GSO" = "1" ]; then
-        if check_cake_param_support "split-gso"; then
-            params="$params split-gso"
-            RUNTIME_SPLIT_GSO=1
-        else
-            log_warn "内核不支持 split-gso 参数，已禁用"
-        fi
-    fi
-
-    # ingress 相关参数（仅下载方向）
-    if [ "$direction" = "download" ] && [ "$CAKE_INGRESS" = "1" ]; then
-        if check_cake_param_support "ingress"; then
-            params="$params ingress"
-            RUNTIME_INGRESS=1
-            # autorate-ingress 依赖于 ingress
-            if [ "$CAKE_AUTORATE_INGRESS" = "1" ]; then
-                if check_cake_param_support "autorate-ingress"; then
-                    params="$params autorate-ingress"
-                    RUNTIME_AUTORATE_INGRESS=1
-                else
-                    log_warn "内核不支持 autorate-ingress 参数，已禁用"
-                fi
-            fi
-        else
-            log_warn "内核不支持 ingress 参数，已禁用 ingress 相关功能"
-        fi
-    fi
-
-    echo "$params"
-}
-
-# ========== 创建CAKE队列（支持多队列）==========
+# ========== 创建CAKE队列 ==========
 create_cake_root_qdisc() {
     local device="$1"
     local direction="$2"
     local bandwidth="$3"
 
-    log_info "为$device创建$direction方向CAKE队列 (带宽: ${bandwidth}kbit)"
+    log_info "为$device创建$direction方向CAKE根队列 (带宽: ${bandwidth}kbit)"
 
     if ! validate_cake_parameters "$bandwidth" "bandwidth"; then
         return 1
@@ -503,73 +377,39 @@ create_cake_root_qdisc() {
 
     cleanup_existing_queues "$device" "$direction"
 
-    # 获取设备队列数
-    local queues=1
-    local use_mq=0
-    if [ "$CAKE_MQ_ENABLED" = "1" ]; then
-        queues=$(get_tx_queues "$device")
-        if [ "$queues" -gt 1 ]; then
-            use_mq=1
-            log_info "设备 $device 支持 $queues 个发送队列，启用 CAKE-MQ"
-        else
-            log_info "设备 $device 仅单个队列，使用普通 CAKE"
-        fi
-    else
-        log_info "CAKE-MQ 已被禁用，使用普通 CAKE"
-    fi
+    local cake_params="bandwidth ${bandwidth}kbit $CAKE_DIFFSERV_MODE"
+    [ "$CAKE_OVERHEAD" != "0" ] && cake_params="$cake_params overhead $CAKE_OVERHEAD"
+    [ "$CAKE_MPU" != "0" ] && cake_params="$cake_params mpu $CAKE_MPU"
+    [ -n "$CAKE_RTT" ] && cake_params="$cake_params rtt $CAKE_RTT"
+    [ "$CAKE_ACK_FILTER" = "1" ] && cake_params="$cake_params ack-filter"
+    [ "$CAKE_NAT" = "1" ] && cake_params="$cake_params nat"
+    [ "$CAKE_WASH" = "1" ] && cake_params="$cake_params wash"
+    [ "$CAKE_SPLIT_GSO" = "1" ] && cake_params="$cake_params split-gso"
+    [ -n "$CAKE_MEMORY_LIMIT" ] && cake_params="$cake_params memlimit $CAKE_MEMORY_LIMIT"
 
-    if [ "$use_mq" = "1" ]; then
-        # 多队列模式：创建 mq 根 qdisc，然后为每个队列添加 CAKE 子 qdisc
-        # 精确带宽分配：向下取整，余数分配给第一个队列
-        local base_bw=$(( bandwidth / queues ))
-        local remainder=$(( bandwidth % queues ))
-        log_info "带宽分配: 基础 ${base_bw}kbit/队列，余数 ${remainder}kbit 给队列1"
-
-        # 添加 mq 根
-        if ! tc qdisc add dev "$device" root handle 1: mq; then
-            log_error "无法在$device上创建 mq 根队列"
-            return 1
-        fi
-
-        # 构建一次基础参数（不含 bandwidth）
-        local full_params=$(build_cake_params "$bandwidth" "$direction")
-        local base_params=$(echo "$full_params" | sed 's/bandwidth [0-9]*kbit //')
-
-        # 为每个队列添加 CAKE 子 qdisc
-        local success=0
-        for i in $(seq 1 $queues); do
-            local queue_bw=$base_bw
-            [ $i -eq 1 ] && queue_bw=$((queue_bw + remainder))
-
-            echo "正在为 $device 队列 $i 创建 CAKE 子队列 (带宽: ${queue_bw}kbit)..."
-            if ! tc qdisc add dev "$device" parent 1:$i cake bandwidth ${queue_bw}kbit $base_params; then
-                log_error "无法在$device队列$i上创建CAKE子队列"
-                success=1
-                break
-            fi
-        done
-
-        if [ "$success" -ne 0 ]; then
-            # 清理已添加的队列
-            tc qdisc del dev "$device" root 2>/dev/null
-            return 1
-        fi
-
-        log_info "$device 的 $direction 方向 CAKE-MQ 队列创建完成 (共 $queues 个队列)"
-        echo "✅ $device 的 $direction 方向 CAKE-MQ 队列创建完成 (队列数: $queues)"
-    else
-        # 单队列模式：直接创建 CAKE
-        local cake_params=$(build_cake_params "$bandwidth" "$direction")
-        echo "正在为 $device 创建普通CAKE队列..."
+    if [ "$direction" = "upload" ]; then
+        echo "正在为 $device 创建上传CAKE队列..."
         echo "  参数: $cake_params"
         if ! tc qdisc add dev "$device" root cake $cake_params; then
-            log_error "无法在$device上创建普通CAKE队列"
+            log_error "无法在$device上创建上传CAKE队列"
             return 1
         fi
-        log_info "$device 的 $direction 方向普通CAKE队列创建完成"
-        echo "✅ $device 的 $direction 方向普通CAKE队列创建完成"
+    elif [ "$direction" = "download" ]; then
+        # 为下载队列附加 ingress 相关参数（如果启用）
+        if [ "$CAKE_INGRESS" = "1" ]; then
+            cake_params="$cake_params ingress"
+            [ "$CAKE_AUTORATE_INGRESS" = "1" ] && cake_params="$cake_params autorate-ingress"
+        fi
+        echo "正在为 $device 创建下载CAKE根队列..."
+        echo "  参数: $cake_params"
+        if ! tc qdisc add dev "$device" root cake $cake_params; then
+            log_error "无法在$device上创建下载CAKE队列"
+            return 1
+        fi
     fi
 
+    log_info "$device的$direction方向CAKE队列创建完成"
+    echo "✅ $device 的 $direction 方向 CAKE 队列创建完成"
     return 0
 }
 
@@ -586,7 +426,7 @@ initialize_cake_upload() {
     create_cake_root_qdisc "$qos_interface" "upload" "$total_upload_bandwidth"
 }
 
-# ========== 下载初始化（增强：检查IFB队列数一致性 + 避免冗余up）==========
+# ========== 下载初始化 ==========
 initialize_cake_download() {
     log_info "初始化下载方向CAKE"
 
@@ -595,46 +435,20 @@ initialize_cake_download() {
         return 0
     fi
 
-    # 确定期望的队列数（主接口的队列数）
-    local expected_queues=1
-    if [ "$CAKE_MQ_ENABLED" = "1" ]; then
-        expected_queues=$(get_tx_queues "$qos_interface")
-    fi
+    echo "为 $IFB_DEVICE 创建下载CAKE队列 (带宽: ${total_download_bandwidth}kbit/s)"
 
-    # 检查 IFB 设备是否存在，若存在则验证队列数
-    if ip link show dev "$IFB_DEVICE" >/dev/null 2>&1; then
-        log_info "IFB设备 $IFB_DEVICE 已存在，检查队列数一致性"
-        local current_queues=$(get_tx_queues "$IFB_DEVICE")
-        if [ "$current_queues" -ne "$expected_queues" ]; then
-            log_warn "IFB设备队列数 ($current_queues) 与期望值 ($expected_queues) 不符，将删除并重建"
-            ip link set dev "$IFB_DEVICE" down
-            ip link del "$IFB_DEVICE" 2>/dev/null || {
-                log_error "无法删除旧的IFB设备 $IFB_DEVICE"
-                return 1
-            }
-        else
-            log_info "IFB设备队列数一致 ($current_queues)，继续使用"
-        fi
-    fi
-
-    # 如果 IFB 设备不存在（或已被删除），则创建
     if ! ip link show dev "$IFB_DEVICE" >/dev/null 2>&1; then
-        log_info "创建IFB设备 $IFB_DEVICE，队列数: $expected_queues"
-        if ! ip link add "$IFB_DEVICE" numtxqueues "$expected_queues" numrxqueues "$expected_queues" type ifb; then
-            log_error "无法创建IFB设备 $IFB_DEVICE (队列数: $expected_queues)"
-            return 1
-        fi
-    fi
-
-    # 检查设备是否已 up，若未 up 则启动
-    if ! ip link show dev "$IFB_DEVICE" | grep -q "UP"; then
-        ip link set dev "$IFB_DEVICE" up || {
-            log_error "无法启动IFB设备 $IFB_DEVICE"
+        log_info "IFB设备 $IFB_DEVICE 不存在，尝试创建"
+        ip link add "$IFB_DEVICE" type ifb || {
+            log_error "无法创建IFB设备 $IFB_DEVICE"
             return 1
         }
-    else
-        log_info "IFB设备 $IFB_DEVICE 已是 UP 状态"
     fi
+
+    ip link set dev "$IFB_DEVICE" up || {
+        log_error "无法启动IFB设备 $IFB_DEVICE"
+        return 1
+    }
 
     setup_ingress_redirect || return 1
     create_cake_root_qdisc "$IFB_DEVICE" "download" "$total_download_bandwidth"
@@ -685,25 +499,24 @@ health_check_cake() {
     return $((health_score >= 70 ? 0 : 1))
 }
 
-# ========== 状态显示（使用运行时参数，优先显示实际生效值）==========
+# ========== 状态显示（使用运行时参数）==========
 show_cake_status() {
-    echo "===== CAKE QoS状态报告 (v5.2-mq) ====="
+    echo "===== CAKE QoS状态报告 (v4.12) ====="
     echo "时间: $(date)"
     echo "网络接口: ${qos_interface:-未知}"
 
     # 加载UCI配置（用于显示默认配置，但运行时参数优先）
     load_cake_config
 
-    # 如果运行时参数文件存在，则读取实际运行的参数
+    # 如果运行时参数文件存在，则读取实际运行的RTT和内存限制
     if [ -f "$RUNTIME_PARAMS_FILE" ]; then
         . "$RUNTIME_PARAMS_FILE"
-        log_debug "使用运行时参数: RTT=$CAKE_RTT, MEM=$CAKE_MEMORY_LIMIT, SPLIT_GSO=$RUNTIME_SPLIT_GSO, INGRESS=$RUNTIME_INGRESS, AUTORATE=$RUNTIME_AUTORATE_INGRESS"
+        log_debug "使用运行时参数: RTT=$CAKE_RTT, MEM=$CAKE_MEMORY_LIMIT"
     else
         log_debug "无运行时参数文件，使用UCI配置"
-        # 若没有运行时文件，则运行时标志仍为0（默认），但UCI配置可能为1
     fi
 
-    if ! tc qdisc show dev "${qos_interface}" 2>/dev/null | grep -q "qdisc"; then
+    if ! tc qdisc show dev "${qos_interface}" 2>/dev/null | grep -q "qdisc cake"; then
         echo "警告: QoS未在接口 ${qos_interface} 上激活"
         return 1
     fi
@@ -712,16 +525,8 @@ show_cake_status() {
     echo -e "\n===== 出口CAKE队列 ($qos_interface) ====="
     if tc qdisc show dev "$qos_interface" root 2>/dev/null | grep -q "cake"; then
         echo "状态: 已启用 ✅"
-        # 判断是否为多队列
-        if tc qdisc show dev "$qos_interface" root 2>/dev/null | grep -q "^qdisc mq"; then
-            echo "模式: CAKE-MQ (多队列)"
-            local queues=$(tc qdisc show dev "$qos_interface" root 2>/dev/null | grep -c "^qdisc cake")
-            echo "队列数: $queues"
-        else
-            echo "模式: 普通CAKE"
-        fi
         echo "队列参数:"
-        tc qdisc show dev "$qos_interface" root 2>/dev/null | head -1 | sed 's/^/  /'
+        tc qdisc show dev "$qos_interface" root 2>/dev/null | grep "qdisc cake" | sed 's/^qdisc cake //' | sed 's/^/  /'
         echo -e "\nTC队列统计:"
         tc -s qdisc show dev "$qos_interface" root 2>/dev/null | sed 's/^/  /'
     else
@@ -733,15 +538,8 @@ show_cake_status() {
     if ip link show "$IFB_DEVICE" >/dev/null 2>&1; then
         if tc qdisc show dev "$IFB_DEVICE" root 2>/dev/null | grep -q "cake"; then
             echo "状态: 已启用 ✅"
-            if tc qdisc show dev "$IFB_DEVICE" root 2>/dev/null | grep -q "^qdisc mq"; then
-                echo "模式: CAKE-MQ (多队列)"
-                local queues=$(tc qdisc show dev "$IFB_DEVICE" root 2>/dev/null | grep -c "^qdisc cake")
-                echo "队列数: $queues"
-            else
-                echo "模式: 普通CAKE"
-            fi
             echo "队列参数:"
-            tc qdisc show dev "$IFB_DEVICE" root 2>/dev/null | head -1 | sed 's/^/  /'
+            tc qdisc show dev "$IFB_DEVICE" root 2>/dev/null | grep "qdisc cake" | sed 's/^qdisc cake //' | sed 's/^/  /'
             echo -e "\nTC队列统计:"
             tc -s qdisc show dev "$IFB_DEVICE" root 2>/dev/null | sed 's/^/  /'
         else
@@ -760,8 +558,8 @@ show_cake_status() {
         echo "入口队列状态: 未配置"
     fi
 
-    # CAKE配置参数（显示实际运行值，优先使用运行时标志）
-    echo -e "\n===== CAKE配置参数 ====="
+    # CAKE配置参数（显示实际运行值）
+    echo -e "\n===== CAKE配置参数 (运行时) ====="
     echo "DiffServ模式: $CAKE_DIFFSERV_MODE"
     echo "RTT: $CAKE_RTT"
     echo "Overhead: $CAKE_OVERHEAD"
@@ -770,28 +568,16 @@ show_cake_status() {
     echo "ACK过滤: $([ "$CAKE_ACK_FILTER" = "1" ] && echo "启用 ✅" || echo "禁用 ❌")"
     echo "NAT支持: $([ "$CAKE_NAT" = "1" ] && echo "启用 ✅" || echo "禁用 ❌")"
     echo "Wash: $([ "$CAKE_WASH" = "1" ] && echo "启用 ✅" || echo "禁用 ❌")"
-    # 高级参数：如果运行时文件存在则显示实际值，否则显示配置值
-    local split_gso_display="$CAKE_SPLIT_GSO"
-    [ -f "$RUNTIME_PARAMS_FILE" ] && split_gso_display="$RUNTIME_SPLIT_GSO"
-    echo "Split GSO: $([ "$split_gso_display" = "1" ] && echo "启用 ✅" || echo "禁用 ❌")"
-
-    local ingress_display="$CAKE_INGRESS"
-    [ -f "$RUNTIME_PARAMS_FILE" ] && ingress_display="$RUNTIME_INGRESS"
-    echo "Ingress模式: $([ "$ingress_display" = "1" ] && echo "启用 ✅" || echo "禁用 ❌")"
-
-    local autorate_display="$CAKE_AUTORATE_INGRESS"
-    [ -f "$RUNTIME_PARAMS_FILE" ] && autorate_display="$RUNTIME_AUTORATE_INGRESS"
-    echo "AutoRate Ingress: $([ "$autorate_display" = "1" ] && echo "启用 ✅" || echo "禁用 ❌")"
-
+    echo "Split GSO: $([ "$CAKE_SPLIT_GSO" = "1" ] && echo "启用 ✅" || echo "禁用 ❌")"
+    echo "Ingress模式: $([ "$CAKE_INGRESS" = "1" ] && echo "启用 ✅" || echo "禁用 ❌")"
+    echo "AutoRate Ingress: $([ "$CAKE_AUTORATE_INGRESS" = "1" ] && echo "启用 ✅" || echo "禁用 ❌")"
     echo "自动调优: $([ "$ENABLE_AUTO_TUNE" = "1" ] && echo "启用 ✅" || echo "禁用 ❌")"
-    echo "CAKE-MQ多队列: $([ "$CAKE_MQ_ENABLED" = "1" ] && echo "启用 ✅" || echo "禁用 ❌")"
-    echo "停止时删除IFB: $([ "$CAKE_DELETE_IFB_ON_STOP" = "1" ] && echo "是 ✅" || echo "否 ❌")"
 
     echo -e "\n===== 状态报告结束 ====="
     return 0
 }
 
-# ========== 停止清理（增强：按配置删除IFB设备）==========
+# ========== 停止清理 ==========
 stop_cake_qos() {
     log_info "停止CAKE QoS"
 
@@ -810,11 +596,7 @@ stop_cake_qos() {
 
     if ip link show dev "$IFB_DEVICE" >/dev/null 2>&1; then
         ip link set dev "$IFB_DEVICE" down
-        if [ "$CAKE_DELETE_IFB_ON_STOP" = "1" ]; then
-            ip link del "$IFB_DEVICE" 2>/dev/null && log_info "删除IFB设备: $IFB_DEVICE"
-        else
-            log_info "停用IFB设备: $IFB_DEVICE (保留)"
-        fi
+        log_info "停用IFB设备: $IFB_DEVICE"
     fi
 
     # 清理运行时参数文件
@@ -822,7 +604,7 @@ stop_cake_qos() {
     log_info "CAKE QoS停止完成"
 }
 
-# ========== 锁函数（增强清理）==========
+# ========== 锁函数（增强）==========
 acquire_lock() {
     if [ -d "$LOCK_DIR" ]; then
         if [ -f "$LOCK_PID_FILE" ]; then
@@ -835,11 +617,11 @@ acquire_lock() {
                 return 1
             fi
         else
-            # 无PID文件，可能是不完整锁或意外文件
-            log_warn "锁目录 $LOCK_DIR 存在但无PID文件，尝试强制清理"
-            rm -rf "$LOCK_DIR" 2>/dev/null
-            if [ -d "$LOCK_DIR" ]; then
-                log_error "无法清理锁目录 $LOCK_DIR"
+            # 无PID文件，可能是不完整锁，但需确保目录为空再删除
+            if rmdir "$LOCK_DIR" 2>/dev/null; then
+                : # 目录为空，删除成功
+            else
+                log_error "锁目录 $LOCK_DIR 非空且无PID文件，无法清理"
                 return 1
             fi
         fi
@@ -871,11 +653,6 @@ initialize_cake_qos() {
             check_dependencies || exit 1
             acquire_lock || exit 1
 
-            # 重置运行时标志
-            RUNTIME_SPLIT_GSO=0
-            RUNTIME_INGRESS=0
-            RUNTIME_AUTORATE_INGRESS=0
-
             load_cake_config
             total_upload_bandwidth=$(convert_bandwidth_to_kbit "$total_upload_bandwidth") || { release_lock; exit 1; }
             total_download_bandwidth=$(convert_bandwidth_to_kbit "$total_download_bandwidth") || { release_lock; exit 1; }
@@ -891,14 +668,9 @@ initialize_cake_qos() {
                 check_ingress_redirect
             fi
 
-            # 保存最终运行时参数（包括高级参数标志）
-            {
-                echo "CAKE_RTT='$CAKE_RTT'"
-                echo "CAKE_MEMORY_LIMIT='$CAKE_MEMORY_LIMIT'"
-                echo "RUNTIME_SPLIT_GSO='$RUNTIME_SPLIT_GSO'"
-                echo "RUNTIME_INGRESS='$RUNTIME_INGRESS'"
-                echo "RUNTIME_AUTORATE_INGRESS='$RUNTIME_AUTORATE_INGRESS'"
-            } > "$RUNTIME_PARAMS_FILE"
+            # 保存最终运行时参数
+            echo "CAKE_RTT='$CAKE_RTT'" > "$RUNTIME_PARAMS_FILE"
+            echo "CAKE_MEMORY_LIMIT='$CAKE_MEMORY_LIMIT'" >> "$RUNTIME_PARAMS_FILE"
 
             health_check_cake
             release_lock
