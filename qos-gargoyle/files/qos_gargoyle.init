@@ -367,18 +367,64 @@ load_algorithm_module() {
 
 # 加载 QoS 配置
 load_qos_config() {
-    # 获取算法配置
-    algorithm=$(uci -q get "$CONFIG_FILE.global.algorithm")
-    algorithm="${algorithm:-hfsc_fqcodel}"
-    
-    # 获取带宽配置
-    total_upload_bandwidth=$(uci -q get "$CONFIG_FILE.upload.total_bandwidth")
-    total_download_bandwidth=$(uci -q get "$CONFIG_FILE.download.total_bandwidth")
-    total_upload_bandwidth="${total_upload_bandwidth:-0}"
-    total_download_bandwidth="${total_download_bandwidth:-0}"
-    
-    # 获取接口配置
-    qos_interface=$(uci -q get "$CONFIG_FILE.global.wan_interface")
+    local retries=5
+    local success=0
+
+    # 1. 重试读取 UCI 配置（最多5次）
+    echo "尝试读取 UCI 配置..." >&2
+    while [ $retries -gt 0 ]; do
+        # 获取算法配置
+        algorithm=$(uci -q get "$CONFIG_FILE.global.algorithm")
+        algorithm="${algorithm:-hfsc_fqcodel}"
+        
+        # 获取带宽配置
+        total_upload_bandwidth=$(uci -q get "$CONFIG_FILE.upload.total_bandwidth")
+        total_download_bandwidth=$(uci -q get "$CONFIG_FILE.download.total_bandwidth")
+        total_upload_bandwidth="${total_upload_bandwidth:-0}"
+        total_download_bandwidth="${total_download_bandwidth:-0}"
+        
+        # 获取接口配置
+        qos_interface=$(uci -q get "$CONFIG_FILE.global.wan_interface")
+        
+        if [ -n "$qos_interface" ]; then
+            success=1
+            break
+        fi
+        
+        echo "警告: 未能读取到 wan_interface，剩余重试次数: $((retries-1))" >&2
+        retries=$((retries - 1))
+        [ $retries -gt 0 ] && sleep 1
+    done
+
+    # 2. 如果重试后仍未获取到接口，尝试自动检测
+    if [ -z "$qos_interface" ]; then
+        echo "错误: 无法从 UCI 配置中读取 wan_interface，尝试自动检测..." >&2
+        
+        # 加载网络函数库（如果尚未加载）
+        if [ -f "/lib/functions/network.sh" ]; then
+            . /lib/functions/network.sh
+            include /lib/network
+        fi
+        
+        # 自动检测 WAN 接口
+        network_find_wan qos_interface 2>/dev/null
+        
+        if [ -n "$qos_interface" ]; then
+            echo "提示: 自动检测到 WAN 接口为 '$qos_interface'" >&2
+            success=1
+        else
+            echo "错误: 自动检测 WAN 接口失败，请手动配置 qos_gargoyle.global.wan_interface" >&2
+            return 1
+        fi
+    fi
+
+    # 3. 输出最终配置信息（可选）
+    echo "加载配置完成：算法=$algorithm, 上传带宽=${total_upload_bandwidth}kbit, 下载带宽=${total_download_bandwidth}kbit, 接口=$qos_interface" >&2
+
+    # 导出必要变量供后续使用
+    export algorithm total_upload_bandwidth total_download_bandwidth qos_interface
+
+    return 0
 }
 
 # 获取网络接口信息
@@ -426,21 +472,40 @@ check_configuration() {
 
 # 等待 WAN 接口就绪
 wait_interface() {
+    local iface="$1"
+    local fast_checks=3
     local wait_sec=15
-    echo "Waiting for WAN interface to come up..."
+    local i=0
     
-    while ! network_is_up wan && [ $wait_sec -gt 0 ]; do
+    if [ -z "$iface" ]; then
+        echo "错误: 无法确定要等待的接口" >&2
+        return 1
+    fi
+    
+    echo "等待接口 $iface 就绪..."
+    
+    # 快速预检
+    while [ $i -lt $fast_checks ]; do
+        if ip link show dev "$iface" 2>/dev/null | grep -q "state UP"; then
+            echo "接口 $iface 已就绪（快速检测）"
+            return 0
+        fi
+        sleep 1
+        i=$((i + 1))
+    done
+    
+    # 正常等待（每1秒检查一次）
+    while [ $wait_sec -gt 0 ]; do
+        if ip link show dev "$iface" 2>/dev/null | grep -q "state UP"; then
+            echo "接口 $iface 已就绪（耗时 $((15 - wait_sec)) 秒）"
+            return 0
+        fi
         sleep 1
         wait_sec=$((wait_sec - 1))
     done
     
-    if [ $wait_sec -le 0 ]; then
-        echo "WAN interface not ready after 15 seconds"
-        return 1
-    fi
-    
-    echo "WAN interface is ready"
-    return 0
+    echo "错误: 接口 $iface 在超时后仍未就绪" >&2
+    return 1
 }
 
 # 初始化 NFT 表
@@ -870,13 +935,18 @@ get_class_counts_from_file() {
 initialize_qos() {
     echo "Initializing QoS system..."
     
+    # 加载 QoS 配置（获取接口名）
+    if ! load_qos_config; then
+        return 1
+    fi
+    
     # 等待 WAN 接口就绪
-    wait_interface
+    if ! wait_interface "$qos_interface"; then
+        echo "WAN 接口未就绪，启动中止" >&2
+        return 1
+    fi
     
-    # 加载 QoS 配置
-    load_qos_config
-    
-    # 获取网络信息
+    # 获取网络信息（IP 地址等）
     get_network_info
     
     # 检查配置是否存在
