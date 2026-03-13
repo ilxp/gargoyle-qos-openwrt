@@ -1427,7 +1427,7 @@ stop_hfsc_qos() {
     qos_log "INFO" "HFSC QoS停止完成 (清理前: ${tc_count_before}队列/${nft_count_before}规则, 清理后: ${tc_count_after}队列/${nft_count_after}规则)"
 }
 
-# ========== 状态查询函数 ==========
+# ========== 状态查询函数（优化版） ==========
 show_hfsc_status() {
     # 确保必要的变量已设置
     local qos_ifb="$IFB_DEVICE"
@@ -1435,9 +1435,8 @@ show_hfsc_status() {
     local upload_marks_file="$mark_dir/upload_class_marks"
     local download_marks_file="$mark_dir/download_class_marks"
     
-    # 如果接口未定义，尝试获取
+    # 如果接口未定义，尝试从 TC 输出推断
     if [ -z "$qos_interface" ]; then
-        # 尝试从TC输出推断接口
         qos_interface=$(tc qdisc show 2>/dev/null | grep -E "hfsc.*root" | awk '{print $5}' | head -1)
         [ -z "$qos_interface" ] && qos_interface="未知"
     fi
@@ -1446,13 +1445,13 @@ show_hfsc_status() {
     echo "时间: $(date)"
     echo "WAN接口: ${qos_interface}"
     
-    # 检查QoS是否实际运行
+    # 检查 QoS 是否实际运行
     if ! tc qdisc show dev "${qos_interface}" 2>/dev/null | grep -q hfsc; then
-        echo "警告: QoS未在接口 ${qos_interface} 上激活"
+        echo "警告: QoS 未在接口 ${qos_interface} 上激活"
         return 1
     fi
     
-    # 检查IFB设备
+    # 检查 IFB 设备
     if ip link show "$qos_ifb" >/dev/null 2>&1; then
         if tc qdisc show dev "$qos_ifb" >/dev/null 2>&1; then
             echo "IFB设备: 已启动且运行中 ($qos_ifb)"
@@ -1463,7 +1462,7 @@ show_hfsc_status() {
         echo "IFB设备: 未创建"
     fi
     
-    # 显示出口配置
+    # ========== 出口 QoS (上传) ==========
     echo -e "\n======== 出口QoS ($qos_interface) ========"
     
     echo -e "\nTC队列:"
@@ -1487,7 +1486,23 @@ show_hfsc_status() {
         echo "  $line"
     done
     
-    # 显示入口配置
+    # ========== nftables 分类规则 ==========
+    echo -e "\n======== nftables 分类规则 ========"
+    if nft list chain inet gargoyle-qos-priority filter_qos_egress &>/dev/null; then
+        echo "上传方向规则 (filter_qos_egress):"
+        nft list chain inet gargoyle-qos-priority filter_qos_egress 2>/dev/null | sed 's/^/  /'
+    else
+        echo "  上传方向规则链不存在"
+    fi
+    
+    if nft list chain inet gargoyle-qos-priority filter_qos_ingress &>/dev/null; then
+        echo -e "\n下载方向规则 (filter_qos_ingress):"
+        nft list chain inet gargoyle-qos-priority filter_qos_ingress 2>/dev/null | sed 's/^/  /'
+    else
+        echo "  下载方向规则链不存在"
+    fi
+    
+    # ========== 入口 QoS (下载) ==========
     echo -e "\n======== 入口QoS ($qos_ifb) ========"
     
     if ip link show "$qos_ifb" >/dev/null 2>&1; then
@@ -1515,6 +1530,7 @@ show_hfsc_status() {
         # 检查入口重定向
         echo -e "\n入口重定向检查:"
         if tc qdisc show dev "$qos_interface" 2>/dev/null | grep -q "ingress"; then
+            # 调用通用的重定向检查函数（需提前定义）
             check_ingress_redirect "$qos_interface" "$qos_ifb"
         else
             echo "  ✗ 入口队列未配置"
@@ -1523,12 +1539,13 @@ show_hfsc_status() {
         echo "  IFB设备不存在，无入口配置"
     fi
     
-    # 显示标记文件
+    # ========== QoS分类标记（带统计） ==========
     echo -e "\n======== QoS分类标记 ========"
     
     if [ -f "$upload_marks_file" ]; then
-        echo "上传标记文件 ($upload_marks_file):"
-        cat "$upload_marks_file" 2>/dev/null || echo "  文件读取错误"
+        local upload_count=$(grep -c "^upload:" "$upload_marks_file" 2>/dev/null || echo 0)
+        echo "上传标记文件 ($upload_marks_file) - 共 ${upload_count} 条:"
+        cat "$upload_marks_file" 2>/dev/null | sed 's/^/  /' || echo "  文件读取错误"
     else
         echo "上传标记文件: 未找到"
     fi
@@ -1536,99 +1553,77 @@ show_hfsc_status() {
     echo ""
     
     if [ -f "$download_marks_file" ]; then
-        echo "下载标记文件 ($download_marks_file):"
-        cat "$download_marks_file" 2>/dev/null || echo "  文件读取错误"
+        local download_count=$(grep -c "^download:" "$download_marks_file" 2>/dev/null || echo 0)
+        echo "下载标记文件 ($download_marks_file) - 共 ${download_count} 条:"
+        cat "$download_marks_file" 2>/dev/null | sed 's/^/  /' || echo "  文件读取错误"
     else
         echo "下载标记文件: 未找到"
     fi
     
-    # QoS运行状态摘要
+    # ========== QoS运行状态摘要 ==========
     echo -e "\n===== QoS运行状态 ====="
     local upload_active=0
     local download_active=0
     
-    # 检查上传QoS
-    if tc qdisc show dev "$qos_interface" 2>/dev/null | grep -q "hfsc"; then
-        upload_active=1
-        echo "上传QoS: 已启用 (HFSC+fq_codel)"
-        
-        # 显示上传带宽配置
-        tc -s class show dev "$qos_interface" 2>/dev/null | grep "m2" | while read -r line; do
-            echo "  $line"
-        done
-    else
-        echo "上传QoS: 未启用"
-    fi
+    tc qdisc show dev "$qos_interface" 2>/dev/null | grep -q "hfsc" && upload_active=1
+    tc qdisc show dev "$qos_ifb" 2>/dev/null | grep -q "hfsc" && download_active=1
     
-    # 检查下载QoS
-    if tc qdisc show dev "$qos_ifb" 2>/dev/null | grep -q "hfsc"; then
-        download_active=1
-        echo -e "\n下载QoS: 已启用 (HFSC+fq_codel)"
-        
-        # 显示下载带宽配置
-        tc -s class show dev "$qos_ifb" 2>/dev/null | grep "m2" | while read -r line; do
-            echo "  $line"
-        done
-    else
-        echo -e "\n下载QoS: 未启用"
-    fi
+    echo "上传QoS: $([ $upload_active -eq 1 ] && echo "已启用 (HFSC+fq_codel)" || echo "未启用")"
+    echo "下载QoS: $([ $download_active -eq 1 ] && echo "已启用 (HFSC+fq_codel)" || echo "未启用")"
     
-    # 总体状态
-    if [ "$upload_active" -eq 1 ] && [ "$download_active" -eq 1 ]; then
-        echo -e "\n✓ QoS双向流量整形已启用 (HFSC+fq_codel)"
-    elif [ "$upload_active" -eq 1 ]; then
-        echo -e "\n⚠ 仅上传QoS已启用 (HFSC+fq_codel)"
-    elif [ "$download_active" -eq 1 ]; then
-        echo -e "\n⚠ 仅下载QoS已启用 (HFSC+fq_codel)"
+    if [ $upload_active -eq 1 ] && [ $download_active -eq 1 ]; then
+        echo -e "\n✓ QoS双向流量整形已启用"
+    elif [ $upload_active -eq 1 ] || [ $download_active -eq 1 ]; then
+        echo -e "\n⚠ 部分方向QoS已启用"
     else
         echo -e "\n✗ QoS未运行"
     fi
     
-    # 显示详细的队列统计
+    # ========== 详细队列统计（fq_codel） ==========
     echo -e "\n===== 详细队列统计 ====="
     
-    # 检查上传方向fq_codel队列统计
     echo -e "\n上传方向fq_codel队列:"
     tc -s qdisc show dev "$qos_interface" 2>/dev/null | grep -A 3 "fq_codel" | while read -r line; do
         if echo "$line" | grep -q "parent"; then
             echo "  $line"
-        elif echo "$line" | grep -q "Sent" || echo "$line" | grep -q "maxpacket" || echo "$line" | grep -q "ecn_mark" || echo "$line" | grep -q "new_flows_len"; then
+        elif echo "$line" | grep -q "Sent" || echo "$line" | grep -q "maxpacket" || \
+             echo "$line" | grep -q "ecn_mark" || echo "$line" | grep -q "new_flows_len"; then
             echo "    $line"
         fi
     done
     
-    # 检查下载方向fq_codel队列统计
     if ip link show "$qos_ifb" >/dev/null 2>&1; then
         echo -e "\n下载方向fq_codel队列:"
         tc -s qdisc show dev "$qos_ifb" 2>/dev/null | grep -A 3 "fq_codel" | while read -r line; do
             if echo "$line" | grep -q "parent"; then
                 echo "  $line"
-            elif echo "$line" | grep -q "Sent" || echo "$line" | grep -q "maxpacket" || echo "$line" | grep -q "ecn_mark" || echo "$line" | grep -q "new_flows_len"; then
+            elif echo "$line" | grep -q "Sent" || echo "$line" | grep -q "maxpacket" || \
+                 echo "$line" | grep -q "ecn_mark" || echo "$line" | grep -q "new_flows_len"; then
                 echo "    $line"
             fi
         done
     fi
     
-    # 显示活动连接标记
+    # ========== 活动连接标记 ==========
     echo -e "\n======== 活动连接标记 ========"
 
     # 获取 WAN 接口的 IP 地址
     local wan_ipv4=""
     local wan_ipv6=""
 
-    # 多种方法获取 IPv4 地址
+    # IPv4 地址
     wan_ipv4=$(ip -4 addr show dev "$qos_interface" 2>/dev/null | grep "inet " | awk '{print $2}' | cut -d/ -f1 | head -1)
     if [ -z "$wan_ipv4" ]; then
         wan_ipv4=$(ifconfig "$qos_interface" 2>/dev/null | grep "inet addr:" | awk '{print $2}' | cut -d: -f2)
     fi
 
-    # 多种方法获取 IPv6 地址
+    # IPv6 地址
     wan_ipv6=$(ip -6 addr show dev "$qos_interface" 2>/dev/null | grep "inet6 " | grep -v "fe80::" | awk '{print $2}' | cut -d/ -f1 | head -1)
     if [ -z "$wan_ipv6" ]; then
         wan_ipv6=$(ifconfig "$qos_interface" 2>/dev/null | grep "inet6 addr:" | grep -v "fe80::" | awk '{print $3}' | cut -d/ -f1)
     fi
 
-    # IPv4 连接标记
+    # IPv4 连接标记（目的地址为 WAN）
     echo -e "\nIPv4 连接标记 (目标地址为 WAN):"
     if [ -n "$wan_ipv4" ]; then
         echo "WAN IPv4: $wan_ipv4"
@@ -1653,7 +1648,7 @@ show_hfsc_status() {
         echo "  WAN IPv4 地址不可用"
     fi
 
-    # IPv6 连接标记
+    # IPv6 连接标记（目的地址为 WAN）
     echo -e "\nIPv6 连接标记 (目标地址为 WAN):"
     if [ -n "$wan_ipv6" ]; then
         echo "WAN IPv6: $wan_ipv6"
@@ -1682,7 +1677,7 @@ show_hfsc_status() {
         echo "  WAN IPv6 地址不可用"
     fi
 
-    # 同时显示源地址为 WAN 的连接（上传方向）
+    # 上传方向连接标记（源地址为 WAN）
     echo -e "\n上传方向连接标记 (源地址为 WAN):"
     if [ -n "$wan_ipv4" ]; then
         local upload_marks=$(conntrack -L -s "$wan_ipv4" 2>/dev/null | grep -E "mark=[0-9]+" | head -n 3)
@@ -1704,10 +1699,9 @@ show_hfsc_status() {
         fi
     fi
     
-    # 显示网络接口统计
+    # ========== 网络接口统计 ==========
     echo -e "\n===== 网络接口统计 ====="
     
-    # 获取接口统计
     echo -e "\n接口流量统计:"
     echo "WAN接口 ($qos_interface):"
     ifconfig "$qos_interface" 2>/dev/null | grep "RX bytes\|TX bytes" | sed 's/^/  /'
