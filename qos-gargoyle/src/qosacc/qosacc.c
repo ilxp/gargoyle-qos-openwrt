@@ -952,6 +952,9 @@ static int detect_qdisc_cb(struct nlmsghdr *n, void *arg) {
     struct tcmsg *t = NLMSG_DATA(n);
     int len = n->nlmsg_len;
     struct rtattr * tb[TCA_MAX+1];
+	
+	// 临时调试：打印消息类型
+    fprintf(stderr, "DEBUG: nlmsg_type = %d\n", n->nlmsg_type);
 
     if (n->nlmsg_type != RTM_NEWTCLASS && n->nlmsg_type != RTM_NEWQDISC)
         return 0;
@@ -964,6 +967,10 @@ static int detect_qdisc_cb(struct nlmsghdr *n, void *arg) {
 
     if (tb[TCA_KIND] == NULL) return 0;
     char* kind = (char*)RTA_DATA(tb[TCA_KIND]);
+	
+	// 打印队列类型和 parent
+    fprintf(stderr, "DEBUG: kind = %s, parent = 0x%x, handle = 0x%x\n", 
+            kind, t->tcm_parent, t->tcm_handle);
 
     int is_root = 0;
     if (n->nlmsg_type == RTM_NEWQDISC && t->tcm_parent == TC_H_ROOT)
@@ -978,6 +985,7 @@ static int detect_qdisc_cb(struct nlmsghdr *n, void *arg) {
         return -1;
     }
 
+    // 如果要求解析实时类且当前是类消息且队列为hfsc，则记录类的实时性
     if (dctx->parse_realtime && n->nlmsg_type == RTM_NEWTCLASS && strcmp(kind, "hfsc") == 0) {
         qosacc_context_t* ctx = dctx->ctx;
         if (ctx->class_count < MAX_CLASSES) {
@@ -1381,12 +1389,16 @@ int tc_controller_init(tc_controller_t* tc, qosacc_context_t* ctx) {
         return QMON_ERR_SYSTEM;
     }
 
-    if (strcmp(ctx->detected_qdisc, "fq_codel") == 0 || strcmp(ctx->detected_qdisc, "pfifo_fast") == 0) {
+    // 检查队列是否支持动态带宽调整（包括新增的 noqueue）
+    if (strcmp(ctx->detected_qdisc, "fq_codel") == 0 || 
+        strcmp(ctx->detected_qdisc, "pfifo_fast") == 0 ||
+        strcmp(ctx->detected_qdisc, "noqueue") == 0) {
         qosacc_log(ctx, QMON_LOG_ERROR, "队列 %s 不支持动态带宽调整，程序退出\n", ctx->detected_qdisc);
         rtnl_close(&ctx->rth);
         return QMON_ERR_CONFIG;
     }
 
+    // 如果是HFSC，获取实时类信息
     if (strcmp(ctx->detected_qdisc, "hfsc") == 0) {
         ctx->class_count = 0;
         if (fetch_hfsc_class_info(ctx) != QMON_OK) {
@@ -1735,7 +1747,8 @@ int status_file_update(qosacc_context_t* ctx) {
     fprintf(fp, "总错误数: %ld\n", ctx->stats.total_errors);
     fprintf(fp, "心跳检查: %ld次\n", ctx->stats.total_heartbeat_checks);
     fprintf(fp, "心跳超时: %ld次\n", ctx->stats.total_heartbeat_timeouts);
-    time_t t = (time_t)(now / 1000);
+    // 修正点：使用系统时间
+    time_t t = time(NULL);
     struct tm* tm_info = localtime(&t);
     char time_buf[26];
     strftime(time_buf, sizeof(time_buf), "%Y-%m-%d %H:%M:%S", tm_info);
