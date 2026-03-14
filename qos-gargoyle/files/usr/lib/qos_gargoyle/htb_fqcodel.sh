@@ -3,7 +3,7 @@
 # 基于HTB与FQ_CODEL组合算法实现QoS流量控制。
 # 必要工具：tc, nft, conntrack, ethtool, sysctl
 # 内核模块：ifb, sch_htb, sch_fq_codel
-# version=2.4
+# version=2.5
 
 # ========== 全局配置常量 ==========
 : ${CONFIG_FILE:=qos_gargoyle}
@@ -1286,7 +1286,7 @@ initialize_htb_download() {
 set_default_upload_class() {
     qos_log "INFO" "设置上传默认类别"
     
-    # 修复2：检查根队列是否存在
+    # 检查根队列是否存在
     if ! tc qdisc show dev "$qos_interface" root 2>/dev/null | grep -q "htb"; then
         qos_log "ERROR" "上传根队列不存在，无法设置默认类"
         return
@@ -1354,7 +1354,7 @@ set_default_upload_class() {
 set_default_download_class() {
     qos_log "INFO" "设置下载默认类别"
     
-    # 修复2：检查根队列是否存在
+    # 检查根队列是否存在
     if ! tc qdisc show dev "$IFB_DEVICE" root 2>/dev/null | grep -q "htb"; then
         qos_log "ERROR" "下载根队列不存在，无法设置默认类"
         return
@@ -1434,8 +1434,8 @@ apply_htb_specific_rules() {
         limit rate 100/second burst 20 packets \
         meta mark set 0x7F00 counter 2>/dev/null || true
     
-    # 防御DoS攻击 - 增强（可能失败，忽略）
-    nft add rule inet filter input ct state new limit rate 100/second burst 20 accept 2>/dev/null || true
+    # 防御DoS攻击 - 增强（移除，避免与防火墙冲突）
+    # nft add rule inet filter input ct state new limit rate 100/second burst 20 accept 2>/dev/null || true
     
     # HTB优先级映射规则
     nft add rule inet gargoyle-qos-priority filter_qos_egress_enhance \
@@ -1582,24 +1582,16 @@ stop_htb_qos() {
     tc qdisc del dev "$IFB_DEVICE" ingress 2>/dev/null || true
     tc qdisc del dev "$IFB_DEVICE" root 2>/dev/null || true
     
-    # 清理NFTables规则：删除增强链和跳转规则
-    nft delete chain inet gargoyle-qos-priority filter_qos_egress_enhance 2>/dev/null || true
-    nft delete chain inet gargoyle-qos-priority filter_qos_ingress_enhance 2>/dev/null || true
-    
-    # 删除跳转规则（需匹配跳转规则内容）
-    # 由于无法精确删除，我们直接删除整个链可能更简单，但主链必须保留。
-    # 这里采用清空主链并重新添加基础跳转的方式？实际上我们不需要删除跳转规则，
-    # 因为增强链已被删除，跳转规则会因目标链不存在而失效，但nftables不会自动删除，
-    # 规则会保留但指向无效链，可能导致错误。所以必须显式删除跳转规则。
-    # 我们可以尝试删除所有指向增强链的规则。
+    # 清理NFTables规则：先删除跳转规则，再删除增强链
     nft delete rule inet gargoyle-qos-priority filter_qos_egress handle \
         $(nft -a list chain inet gargoyle-qos-priority filter_qos_egress 2>/dev/null | \
-          grep "jump filter_qos_egress_enhance" | awk '{print $NF}') 2>/dev/null || true
+          grep "jump filter_qos_egress_enhance" | awk '{print $NF}' | head -1) 2>/dev/null || true
     nft delete rule inet gargoyle-qos-priority filter_qos_ingress handle \
         $(nft -a list chain inet gargoyle-qos-priority filter_qos_ingress 2>/dev/null | \
-          grep "jump filter_qos_ingress_enhance" | awk '{print $NF}') 2>/dev/null || true
+          grep "jump filter_qos_ingress_enhance" | awk '{print $NF}' | head -1) 2>/dev/null || true
     
-    # 清理主链中的其他规则？不清理，保留分类规则。
+    nft delete chain inet gargoyle-qos-priority filter_qos_egress_enhance 2>/dev/null || true
+    nft delete chain inet gargoyle-qos-priority filter_qos_ingress_enhance 2>/dev/null || true
     
     # 清理入口队列
     tc qdisc del dev "$qos_interface" ingress 2>/dev/null || true

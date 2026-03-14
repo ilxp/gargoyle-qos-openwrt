@@ -1843,16 +1843,18 @@ int status_file_update(qosacc_context_t* ctx) {
     fprintf(fp, "总错误数: %ld\n", ctx->stats.total_errors);
     fprintf(fp, "心跳检查: %ld次\n", ctx->stats.total_heartbeat_checks);
     fprintf(fp, "心跳超时: %ld次\n", ctx->stats.total_heartbeat_timeouts);
-    // 修正点：使用系统时间
-    time_t t = time(NULL);
-    struct tm* tm_info = localtime(&t);
+    // 使用系统时间（带毫秒）
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    struct tm* tm_info = localtime(&ts.tv_sec);
     char time_buf[26];
     strftime(time_buf, sizeof(time_buf), "%Y-%m-%d %H:%M:%S", tm_info);
-    fprintf(fp, "最后更新: %s.%03ld\n", time_buf, (long)(now % 1000));
+    fprintf(fp, "最后更新: %s.%03ld\n", time_buf, ts.tv_nsec / 1000000);
     fflush(fp);
     lock.l_type = F_UNLCK;
     fcntl(fd, F_SETLK, &lock);
     fclose(fp);
+    
     for (int i = 0; i < STATUS_FILE_RETRY_COUNT; i++) {
         if (rename(temp, ctx->config.status_file) == 0) break;
         usleep(STATUS_FILE_RETRY_DELAY_MS * 1000);

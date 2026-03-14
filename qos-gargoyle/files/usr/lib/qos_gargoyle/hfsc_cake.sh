@@ -1,5 +1,5 @@
 #!/bin/sh
-# version=2.4-cake
+# version=2.5
 # HFSC_CAKE算法实现模块
 # 基于HFSC与CAKE组合算法实现QoS流量控制。
 # 必要工具：tc, nft, conntrack, ethtool, sysctl
@@ -437,7 +437,12 @@ create_hfsc_root_qdisc() {
 build_cake_params() {
     local params=""
     
-    [ -n "$CAKE_BANDWIDTH" ] && params="$params bandwidth $CAKE_BANDWIDTH"
+    if [ -n "$CAKE_BANDWIDTH" ]; then
+        params="$params bandwidth $CAKE_BANDWIDTH"
+    else
+        qos_log "WARN" "CAKE bandwidth 未配置，CAKE 将使用接口速率，可能影响 HFSC 调度"
+    fi
+    
     [ -n "$CAKE_RTT" ] && params="$params rtt $CAKE_RTT"
     [ -n "$CAKE_FLOWMODE" ] && params="$params $CAKE_FLOWMODE"
     [ -n "$CAKE_DIFFSERV" ] && params="$params $CAKE_DIFFSERV"
@@ -544,10 +549,13 @@ create_hfsc_upload_class() {
         m2="$ul_m2"
     fi
     
-    if [ "${minRTT:-No}" = "Yes" ]; then
-        d="$HFSC_MINRTT_DELAY"
-        qos_log "INFO" "类别 $class_name 启用最小延迟模式 (d=$d)"
-    fi
+    # 改进的 minRTT 判断，支持不区分大小写及常见值
+    case "${minRTT:-No}" in
+        [Yy]es|[Yy]|1|[Tt]rue)
+            d="$HFSC_MINRTT_DELAY"
+            qos_log "INFO" "类别 $class_name 启用最小延迟模式 (d=$d)"
+            ;;
+    esac
     
     qos_log "INFO" "正在创建HFSC类别 1:$class_index (带宽: ls=$m2, ul=$ul_m2)"
     if ! tc class add dev "$qos_interface" parent 1:1 \
@@ -673,10 +681,12 @@ create_hfsc_download_class() {
         m2="$ul_m2"
     fi
     
-    if [ "${minRTT:-No}" = "Yes" ]; then
-        d="$HFSC_MINRTT_DELAY"
-        qos_log "INFO" "类别 $class_name 启用最小延迟模式 (d=$d)"
-    fi
+    case "${minRTT:-No}" in
+        [Yy]es|[Yy]|1|[Tt]rue)
+            d="$HFSC_MINRTT_DELAY"
+            qos_log "INFO" "类别 $class_name 启用最小延迟模式 (d=$d)"
+            ;;
+    esac
     
     qos_log "INFO" "正在创建下载HFSC类别 1:$class_index (带宽: ls=$m2, ul=$ul_m2)"
     if ! tc class add dev "$ifb_dev" parent 1:1 \
@@ -1139,7 +1149,8 @@ apply_hfsc_specific_rules() {
         limit rate 100/second burst 20 packets \
         meta mark set 0x7F00 counter 2>/dev/null || true
     
-    nft add rule inet filter input ct state new limit rate 100/second burst 20 accept 2>/dev/null || true
+    # 移除直接操作系统 filter 表的规则，避免冲突
+    # nft add rule inet filter input ct state new limit rate 100/second burst 20 accept 2>/dev/null || true
     
     nft add rule inet gargoyle-qos-priority filter_qos_egress_enhance \
         meta mark and 0x007f != 0 counter meta priority set "bulk" 2>/dev/null || true
@@ -1254,15 +1265,16 @@ stop_hfsc_cake_qos() {
     tc qdisc del dev "$IFB_DEVICE" ingress 2>/dev/null || true
     tc qdisc del dev "$IFB_DEVICE" root 2>/dev/null || true
     
-    nft delete chain inet gargoyle-qos-priority filter_qos_egress_enhance 2>/dev/null || true
-    nft delete chain inet gargoyle-qos-priority filter_qos_ingress_enhance 2>/dev/null || true
-    
+    # 先删除跳转规则，再删除增强链
     nft delete rule inet gargoyle-qos-priority filter_qos_egress handle \
         $(nft -a list chain inet gargoyle-qos-priority filter_qos_egress 2>/dev/null | \
-          grep "jump filter_qos_egress_enhance" | awk '{print $NF}') 2>/dev/null || true
+          grep "jump filter_qos_egress_enhance" | awk '{print $NF}' | head -1) 2>/dev/null || true
     nft delete rule inet gargoyle-qos-priority filter_qos_ingress handle \
         $(nft -a list chain inet gargoyle-qos-priority filter_qos_ingress 2>/dev/null | \
-          grep "jump filter_qos_ingress_enhance" | awk '{print $NF}') 2>/dev/null || true
+          grep "jump filter_qos_ingress_enhance" | awk '{print $NF}' | head -1) 2>/dev/null || true
+    
+    nft delete chain inet gargoyle-qos-priority filter_qos_egress_enhance 2>/dev/null || true
+    nft delete chain inet gargoyle-qos-priority filter_qos_ingress_enhance 2>/dev/null || true
     
     tc qdisc del dev "$qos_interface" ingress 2>/dev/null || true
     

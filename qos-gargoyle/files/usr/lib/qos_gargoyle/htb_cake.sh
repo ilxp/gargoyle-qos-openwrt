@@ -3,7 +3,7 @@
 # 基于HTB与CAKE组合算法实现QoS流量控制。
 # 必要工具：tc, nft, conntrack, ethtool, sysctl
 # 内核模块：ifb, sch_htb, sch_cake
-# version=2.4-cake
+# version=2.5
 
 # ========== 全局配置常量 ==========
 : ${CONFIG_FILE:=qos_gargoyle}
@@ -348,7 +348,12 @@ load_htb_cake_config() {
 build_cake_params() {
     local params=""
     
-    [ -n "$CAKE_BANDWIDTH" ] && params="$params bandwidth $CAKE_BANDWIDTH"
+    if [ -n "$CAKE_BANDWIDTH" ]; then
+        params="$params bandwidth $CAKE_BANDWIDTH"
+    else
+        qos_log "WARN" "CAKE bandwidth 未配置，CAKE 将使用接口速率，可能影响 HTB 调度"
+    fi
+    
     [ -n "$CAKE_RTT" ] && params="$params rtt $CAKE_RTT"
     [ -n "$CAKE_FLOWMODE" ] && params="$params $CAKE_FLOWMODE"
     [ -n "$CAKE_DIFFSERV" ] && params="$params $CAKE_DIFFSERV"
@@ -1372,7 +1377,7 @@ set_default_download_class() {
     qos_log "INFO" "下载默认类别设置为TC类ID: 1:$found_index"
 }
 
-# ========== 增强规则函数：操作专用链（与原来相同） ==========
+# ========== 增强规则函数：操作专用链 ==========
 apply_htb_specific_rules() {
     qos_log "INFO" "应用HTB特定增强规则（专用链）"
     
@@ -1391,8 +1396,8 @@ apply_htb_specific_rules() {
         limit rate 100/second burst 20 packets \
         meta mark set 0x7F00 counter 2>/dev/null || true
     
-    # 防御DoS攻击 - 增强（可能失败，忽略）
-    nft add rule inet filter input ct state new limit rate 100/second burst 20 accept 2>/dev/null || true
+    # 防御DoS攻击 - 增强（移除，避免与防火墙冲突）
+    # nft add rule inet filter input ct state new limit rate 100/second burst 20 accept 2>/dev/null || true
     
     # HTB优先级映射规则
     nft add rule inet gargoyle-qos-priority filter_qos_egress_enhance \
@@ -1539,17 +1544,16 @@ stop_htb_cake_qos() {
     tc qdisc del dev "$IFB_DEVICE" ingress 2>/dev/null || true
     tc qdisc del dev "$IFB_DEVICE" root 2>/dev/null || true
     
-    # 清理NFTables规则：删除增强链和跳转规则
-    nft delete chain inet gargoyle-qos-priority filter_qos_egress_enhance 2>/dev/null || true
-    nft delete chain inet gargoyle-qos-priority filter_qos_ingress_enhance 2>/dev/null || true
-    
-    # 删除跳转规则（需匹配跳转规则句柄）
+    # 清理NFTables规则：先删除跳转规则，再删除增强链
     nft delete rule inet gargoyle-qos-priority filter_qos_egress handle \
         $(nft -a list chain inet gargoyle-qos-priority filter_qos_egress 2>/dev/null | \
-          grep "jump filter_qos_egress_enhance" | awk '{print $NF}') 2>/dev/null || true
+          grep "jump filter_qos_egress_enhance" | awk '{print $NF}' | head -1) 2>/dev/null || true
     nft delete rule inet gargoyle-qos-priority filter_qos_ingress handle \
         $(nft -a list chain inet gargoyle-qos-priority filter_qos_ingress 2>/dev/null | \
-          grep "jump filter_qos_ingress_enhance" | awk '{print $NF}') 2>/dev/null || true
+          grep "jump filter_qos_ingress_enhance" | awk '{print $NF}' | head -1) 2>/dev/null || true
+    
+    nft delete chain inet gargoyle-qos-priority filter_qos_egress_enhance 2>/dev/null || true
+    nft delete chain inet gargoyle-qos-priority filter_qos_ingress_enhance 2>/dev/null || true
     
     # 清理入口队列
     tc qdisc del dev "$qos_interface" ingress 2>/dev/null || true

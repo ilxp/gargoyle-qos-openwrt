@@ -1,5 +1,5 @@
 #!/bin/sh
-# version=2.4
+# version=2.5
 # HFSC_FQCODEL算法实现模块
 # 基于HFSC与FQ_CODEL组合算法实现QoS流量控制。
 # 必要工具：tc, nft, conntrack, ethtool, sysctl
@@ -604,11 +604,13 @@ create_hfsc_upload_class() {
         m2="$ul_m2"
     fi
     
-    # 5. 应用最小延迟参数
-    if [ "${minRTT:-No}" = "Yes" ]; then
-        d="$HFSC_MINRTT_DELAY"
-        qos_log "INFO" "类别 $class_name 启用最小延迟模式 (d=$d)"
-    fi
+    # 5. 应用最小延迟参数（增强：支持多种真值）
+    case "${minRTT:-No}" in
+        [Yy]es|[Yy]|1|[Tt]rue)
+            d="$HFSC_MINRTT_DELAY"
+            qos_log "INFO" "类别 $class_name 启用最小延迟模式 (d=$d)"
+            ;;
+    esac
     
     # 创建HFSC类别
     qos_log "INFO" "正在创建HFSC类别 1:$class_index (带宽: ls=$m2, ul=$ul_m2)"
@@ -764,11 +766,13 @@ create_hfsc_download_class() {
         m2="$ul_m2"
     fi
     
-    # 5. 应用最小延迟参数
-    if [ "${minRTT:-No}" = "Yes" ]; then
-        d="$HFSC_MINRTT_DELAY"
-        qos_log "INFO" "类别 $class_name 启用最小延迟模式 (d=$d)"
-    fi
+    # 5. 应用最小延迟参数（增强：支持多种真值）
+    case "${minRTT:-No}" in
+        [Yy]es|[Yy]|1|[Tt]rue)
+            d="$HFSC_MINRTT_DELAY"
+            qos_log "INFO" "类别 $class_name 启用最小延迟模式 (d=$d)"
+            ;;
+    esac
     
     # 创建HFSC类别（简化 ul 参数为 rate）
     qos_log "INFO" "正在创建下载HFSC类别 1:$class_index (带宽: ls=$m2, ul=$ul_m2)"
@@ -1333,8 +1337,8 @@ apply_hfsc_specific_rules() {
         limit rate 100/second burst 20 packets \
         meta mark set 0x7F00 counter 2>/dev/null || true
     
-    # 防御DoS攻击 - 增强（可能失败，忽略）
-    nft add rule inet filter input ct state new limit rate 100/second burst 20 accept 2>/dev/null || true
+    # 防御DoS攻击 - 增强（移除以避免与防火墙冲突）
+    # nft add rule inet filter input ct state new limit rate 100/second burst 20 accept 2>/dev/null || true
     
     # HFSC优先级设置
     nft add rule inet gargoyle-qos-priority filter_qos_egress_enhance \
@@ -1477,17 +1481,16 @@ stop_hfsc_qos() {
     tc qdisc del dev "$IFB_DEVICE" ingress 2>/dev/null || true
     tc qdisc del dev "$IFB_DEVICE" root 2>/dev/null || true
     
-    # 清理NFTables规则：删除增强链和跳转规则
-    nft delete chain inet gargoyle-qos-priority filter_qos_egress_enhance 2>/dev/null || true
-    nft delete chain inet gargoyle-qos-priority filter_qos_ingress_enhance 2>/dev/null || true
-    
-    # 删除跳转规则（需匹配跳转规则句柄）
+    # 清理NFTables规则：先删除跳转规则，再删除增强链
     nft delete rule inet gargoyle-qos-priority filter_qos_egress handle \
         $(nft -a list chain inet gargoyle-qos-priority filter_qos_egress 2>/dev/null | \
-          grep "jump filter_qos_egress_enhance" | awk '{print $NF}') 2>/dev/null || true
+          grep "jump filter_qos_egress_enhance" | awk '{print $NF}' | head -1) 2>/dev/null || true
     nft delete rule inet gargoyle-qos-priority filter_qos_ingress handle \
         $(nft -a list chain inet gargoyle-qos-priority filter_qos_ingress 2>/dev/null | \
-          grep "jump filter_qos_ingress_enhance" | awk '{print $NF}') 2>/dev/null || true
+          grep "jump filter_qos_ingress_enhance" | awk '{print $NF}' | head -1) 2>/dev/null || true
+    
+    nft delete chain inet gargoyle-qos-priority filter_qos_egress_enhance 2>/dev/null || true
+    nft delete chain inet gargoyle-qos-priority filter_qos_ingress_enhance 2>/dev/null || true
     
     # 清理入口队列
     tc qdisc del dev "$qos_interface" ingress 2>/dev/null || true
