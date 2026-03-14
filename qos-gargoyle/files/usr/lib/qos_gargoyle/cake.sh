@@ -518,6 +518,12 @@ create_cake_root_qdisc() {
         log_info "CAKE-MQ 已被禁用，使用普通 CAKE"
     fi
 
+    # ======== 检查：带宽不足时自动降级 ============
+    if [ "$use_mq" = "1" ] && [ "$bandwidth" -lt "$queues" ]; then
+        log_warn "总带宽 ${bandwidth}kbit 小于队列数 $queues，多队列可能导致部分队列带宽为0，已自动回退到单队列模式。"
+        use_mq=0
+    fi
+
     if [ "$use_mq" = "1" ]; then
         # 多队列模式：创建 mq 根 qdisc，然后为每个队列添加 CAKE 子 qdisc
         # 精确带宽分配：向下取整，余数分配给第一个队列
@@ -685,7 +691,6 @@ health_check_cake() {
     return $((health_score >= 70 ? 0 : 1))
 }
 
-# ========== 状态显示（使用运行时参数，优先显示实际生效值）==========
 # ========== 状态显示（原版+入口状态+多队列统计）==========
 show_cake_status() {
     echo "===== CAKE QoS状态报告 (v5.2-mq) ====="
@@ -750,7 +755,7 @@ show_cake_status() {
 
     # ===== 入口重定向检查 =====
     echo -e "\n===== 入口重定向检查 ====="
-    if tc filter show dev "$qos_interface" parent ffff: 2>/dev/null | grep -q "ifb0"; then
+	if tc filter show dev "$qos_interface" parent ffff: 2>/dev/null | grep -q "$IFB_DEVICE"; then
         echo "✅ 入口重定向: 已生效"
     else
         echo "❌ 入口重定向: 未生效"

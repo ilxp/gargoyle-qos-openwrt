@@ -1450,6 +1450,9 @@ initialize_htb_cake_qos() {
         return 1
     fi
     
+	# 确保 nftables 表存在（避免后续规则添加失败）
+	nft add table inet gargoyle-qos-priority 2>/dev/null || true
+
     # 检查qos_interface是否已设置
     if [ -z "$qos_interface" ]; then
         # 尝试从 UCI 配置读取

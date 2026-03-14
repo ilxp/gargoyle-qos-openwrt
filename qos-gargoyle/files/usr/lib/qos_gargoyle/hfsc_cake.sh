@@ -1190,11 +1190,16 @@ apply_hfsc_specific_rules() {
 initialize_hfsc_cake_qos() {
     qos_log "INFO" "开始初始化HFSC+CAKE QoS系统"
     
+	# 获取并发锁
     if ! acquire_lock; then
         qos_log "ERROR" "无法获取并发锁，可能已有其他QoS进程在运行"
         return 1
     fi
     
+	# 确保 nftables 表存在（避免后续规则添加失败）
+	nft add table inet gargoyle-qos-priority 2>/dev/null || true
+	
+	# 检查qos_interface是否已设置
     if [ -z "$qos_interface" ]; then
         qos_interface=$(uci -q get qos_gargoyle.global.wan_interface 2>/dev/null)
         if [ -z "$qos_interface" ] && [ -f "/lib/functions/network.sh" ]; then

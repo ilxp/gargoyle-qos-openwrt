@@ -335,6 +335,8 @@ load_htb_config() {
     FQCODEL_MEMORY_LIMIT=$(uci -q get qos_gargoyle.fq_codel.memory_limit 2>/dev/null)
     if [ -n "$FQCODEL_MEMORY_LIMIT" ]; then
         FQCODEL_MEMORY_LIMIT=$(calculate_memory_limit "$FQCODEL_MEMORY_LIMIT")
+		# 统一转换为小写，避免 tc 不识别大写单位
+		FQCODEL_MEMORY_LIMIT=$(echo "$FQCODEL_MEMORY_LIMIT" | tr 'A-Z' 'a-z')
     fi
     
     # 读取 ce_threshold 参数
@@ -1487,6 +1489,9 @@ initialize_htb_qos() {
         qos_log "ERROR" "无法获取并发锁，可能已有其他QoS进程在运行"
         return 1
     fi
+	
+	# 确保 nftables 表存在（避免后续规则添加失败）
+	nft add table inet gargoyle-qos-priority 2>/dev/null || true
     
     # 检查qos_interface是否已设置
     if [ -z "$qos_interface" ]; then

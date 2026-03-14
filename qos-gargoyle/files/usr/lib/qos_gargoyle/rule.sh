@@ -319,14 +319,14 @@ get_class_mark_for_rule() {
     fi
 }
 
-# 计算类别的标记值（哈希取模 8 后左移）
+# 计算类别的标记值（哈希取模 7 后左移）
 calculate_class_mark() {
     local class="$1"
     local mask="$2"
     local chain_type="$3"
     
     local index=$(calculate_hash_index "$class")
-    index=$(( (index % 8) + 1 ))
+    index=$(( (index % 7) + 1 ))
     
     local base_value=0
     [ "$chain_type" = "upload" ] && base_value=$((0x1))
@@ -413,9 +413,9 @@ build_nft_rule_fast() {
     
     if [ -n "$connbytes_kb" ] && [ "$connbytes_kb" != "0" ]; then
         local connbytes_kb_clean=$(echo "$connbytes_kb" | tr -d ' ')
-        if echo "$connbytes_kb_clean" | grep -qE '^[<>=!]+[0-9]+$'; then
-            local operator=$(echo "$connbytes_kb_clean" | sed -r 's/^([<>=!]+).*$/\1/')
-            local value=$(echo "$connbytes_kb_clean" | sed -r 's/^[<>=!]+([0-9]+)$/\1/')
+        if echo "$connbytes_kb_clean" | grep -qE '^[<>=!]+[0-9]+$'; then			
+			local operator=$(echo "$connbytes_kb_clean" | sed 's/[0-9]*$//')
+			local value=$(echo "$connbytes_kb_clean" | grep -o '[0-9]\+')
             local bytes_value=$((value * 1024))
             nft_cmd="$nft_cmd ct bytes $operator $bytes_value"
         fi
