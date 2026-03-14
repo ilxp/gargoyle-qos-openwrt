@@ -344,14 +344,14 @@ load_htb_cake_config() {
     return 0
 }
 
-# 构建CAKE参数字符串
+# ========== 构建CAKE参数字符串 ==========
 build_cake_params() {
     local params=""
     
+    # 仅在用户显式配置了CAKE_BANDWIDTH时添加，HTB场景下通常不应设置
     if [ -n "$CAKE_BANDWIDTH" ]; then
         params="$params bandwidth $CAKE_BANDWIDTH"
-    else
-        qos_log "WARN" "CAKE bandwidth 未配置，CAKE 将使用接口速率，可能影响 HTB 调度"
+        qos_log "INFO" "用户显式配置了CAKE bandwidth: $CAKE_BANDWIDTH，CAKE将进行二次整形（可能影响HTB调度）"
     fi
     
     [ -n "$CAKE_RTT" ] && params="$params rtt $CAKE_RTT"
@@ -1042,7 +1042,7 @@ create_default_download_class() {
     return 0
 }
 
-# ========== 入口重定向 ==========
+# ========== 入口重定向（统一为全球单播匹配）==========
 setup_ingress_redirect() {
     if [ -z "$qos_interface" ]; then
         qos_log "ERROR" "无法确定 WAN 接口"
@@ -1051,41 +1051,50 @@ setup_ingress_redirect() {
     
     qos_log "INFO" "设置入口重定向: $qos_interface -> $IFB_DEVICE"
     
-    # 在WAN接口上创建ingress队列
     tc qdisc del dev "$qos_interface" ingress 2>/dev/null || true
     if ! tc qdisc add dev "$qos_interface" handle ffff: ingress; then
         qos_log "ERROR" "无法在 $qos_interface 上创建入口队列"
         return 1
     fi
     
-    # 清除现有的入口过滤器
     tc filter del dev "$qos_interface" parent ffff: 2>/dev/null || true
     
-    # 重定向所有IPv4流量到IFB设备
+    # IPv4重定向（必须成功）
     if ! tc filter add dev "$qos_interface" parent ffff: protocol ip \
         u32 match u32 0 0 \
         action connmark \
         action mirred egress redirect dev "$IFB_DEVICE" 2>&1; then
         qos_log "ERROR" "IPv4入口重定向规则添加失败"
+        tc qdisc del dev "$qos_interface" ingress 2>/dev/null
         return 1
     else
         qos_log "INFO" "IPv4入口重定向规则添加成功"
     fi
     
-    # 重定向所有IPv6流量到IFB设备
-    if ! tc filter add dev "$qos_interface" parent ffff: protocol ipv6 \
-        u32 match u32 0 0 \
+    # IPv6重定向：尝试全球单播匹配，失败则回退到无过滤规则
+    local ipv6_success=false
+    if tc filter add dev "$qos_interface" parent ffff: protocol ipv6 \
+        match ip6 dst 2000::/3 \
         action connmark \
         action mirred egress redirect dev "$IFB_DEVICE" 2>&1; then
-        qos_log "ERROR" "IPv6入口重定向规则添加失败"
-        return 1
+        ipv6_success=true
     else
+        qos_log "WARN" "IPv6入口重定向规则（全球单播）添加失败，尝试无过滤规则"
+        if tc filter add dev "$qos_interface" parent ffff: protocol ipv6 \
+            u32 match u32 0 0 \
+            action connmark \
+            action mirred egress redirect dev "$IFB_DEVICE" 2>&1; then
+            ipv6_success=true
+        else
+            qos_log "WARN" "IPv6入口重定向规则添加失败，IPv6流量将不会通过IFB"
+        fi
+    fi
+    
+    if [ "$ipv6_success" = "true" ]; then
         qos_log "INFO" "IPv6入口重定向规则添加成功"
     fi
     
-    # 验证入口重定向配置
     local ingress_rules=$(tc filter show dev "$qos_interface" parent ffff: 2>/dev/null | wc -l)
-    
     if [ "$ingress_rules" -ge 2 ]; then
         qos_log "INFO" "入口重定向已成功设置: $qos_interface -> $IFB_DEVICE ($ingress_rules 条规则)"
     else
