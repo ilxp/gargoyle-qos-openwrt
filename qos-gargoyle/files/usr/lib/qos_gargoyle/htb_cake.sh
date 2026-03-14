@@ -289,8 +289,8 @@ load_htb_cake_config() {
     CAKE_FLOWMODE=$(uci -q get qos_gargoyle.cake.flowmode 2>/dev/null)
     [ -z "$CAKE_FLOWMODE" ] && CAKE_FLOWMODE="srchost"
     
-    CAKE_DIFFSERV=$(uci -q get qos_gargoyle.cake.diffserv 2>/dev/null)
-    [ -z "$CAKE_DIFFSERV" ] && CAKE_DIFFSERV="diffserv3"
+    CAKE_DIFFSERV=$(uci -q get qos_gargoyle.cake.diffserv_mode 2>/dev/null)
+    [ -z "$CAKE_DIFFSERV" ] && CAKE_DIFFSERV="diffserv4"
     
     CAKE_NAT=$(uci -q get qos_gargoyle.cake.nat 2>/dev/null)
     [ -z "$CAKE_NAT" ] && CAKE_NAT="1"
@@ -318,25 +318,25 @@ load_htb_cake_config() {
     fi
     
     CAKE_ECN=$(uci -q get qos_gargoyle.cake.ecn 2>/dev/null)
-    if [ -n "$CAKE_ECN" ]; then
-        case "$CAKE_ECN" in
-            yes|1|enable|on|true)
-                CAKE_ECN="ecn"
-                ;;
-            no|0|disable|off|false)
-                CAKE_ECN="noecn"
-                ;;
-            ecn|noecn)
-                # keep as is
-                ;;
-            *)
-                qos_log "WARN" "无效的ECN配置值 '$CAKE_ECN'，将使用noecn"
-                CAKE_ECN="noecn"
-                ;;
-        esac
-    else
-        CAKE_ECN="noecn"
-    fi
+	if [ -n "$CAKE_ECN" ]; then
+		case "$CAKE_ECN" in
+			yes|1|enable|on|true|ecn)
+				CAKE_ECN="ecn"
+				qos_log "INFO" "CAKE ECN 已启用"
+				;;
+			no|0|disable|off|false|noecn)
+				CAKE_ECN=""   # 不传递任何参数
+				qos_log "INFO" "CAKE ECN 已禁用"
+				;;
+			*)
+				qos_log "WARN" "无效的 ECN 配置值 '$CAKE_ECN'，将禁用 ECN"
+				CAKE_ECN=""
+				;;
+		esac
+	else
+		CAKE_ECN=""   # 未配置时默认禁用，不传递参数
+		qos_log "INFO" "CAKE ECN 未配置，使用默认禁用"
+	fi
     
     qos_log "INFO" "HTB配置: R2Q=${HTB_R2Q}, DRR量子=${HTB_DRR_QUANTUM}"
     qos_log "INFO" "CAKE参数: bandwidth=${CAKE_BANDWIDTH:-未配置}, rtt=${CAKE_RTT:-未配置}, flowmode=${CAKE_FLOWMODE}, diffserv=${CAKE_DIFFSERV}, nat=${CAKE_NAT}, wash=${CAKE_WASH}, overhead=${CAKE_OVERHEAD:-未配置}, mpu=${CAKE_MPU:-未配置}, ack_filter=${CAKE_ACK_FILTER}, split_gso=${CAKE_SPLIT_GSO}, limit=${CAKE_LIMIT:-未配置}, memlimit=${CAKE_MEMLIMIT:-未配置}, ecn=${CAKE_ECN}"
@@ -387,7 +387,10 @@ build_cake_params() {
     
     [ -n "$CAKE_LIMIT" ] && params="$params limit $CAKE_LIMIT"
     [ -n "$CAKE_MEMLIMIT" ] && params="$params memlimit $CAKE_MEMLIMIT"
-    [ -n "$CAKE_ECN" ] && params="$params $CAKE_ECN"
+	
+	if [ "$CAKE_ECN" = "ecn" ]; then
+		params="$params ecn"
+	fi
     
     echo "$params"
 }
@@ -415,7 +418,7 @@ load_htb_class_config() {
         per_min_bandwidth=""
     fi
     
-    if [ -n "$per_max_bandwidth" ] && ! validate_number "$per_max_bandwidth" "$class_name.per_max_bandwidth" 0 100; then
+    if [ -n "$per_max_bandwidth" ] && ! validate_number "$per_max_bandwidth" "$class_name.per_max_bandwidth" 0 1000; then  #允许借用
         per_max_bandwidth=""
     fi
     

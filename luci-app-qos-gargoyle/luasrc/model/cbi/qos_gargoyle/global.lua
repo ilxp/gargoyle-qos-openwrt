@@ -59,11 +59,11 @@ o.rmempty = false
 -- QoS算法选择
 o = s:option(ListValue, "algorithm", translate("QoS Algorithm"), 
     translate("HFSC: Guarantees low latency, ideal for gaming/voip.HTB: Flexible bandwidth control, good for multi-service management.CAKE: Modern and plug-and-play, simple to use."))
-o:value("hfsc_cake", "HFSC_CAKE (Hfsc With Cake)")
-o:value("htb_cake", "HTB_CAKE (Htb With Cake)")
+o:value("hfsc_cake", "HFSC+CAKE (HFSC With CAKE)")
+o:value("htb_cake", "HTB+CAKE (HTB With CAKE)")
 o:value("cake", "CAKE (Common Applications Kept Enhanced)")
-o:value("hfsc_fqcodel", "HFSC_Fqcodel (Hfsc With Fq_Codel)")
-o:value("htb_fqcodel", "HTB_Fqcodel (Htb With Fq_Codel)")
+o:value("hfsc_fqcodel", "HFSC+Fq_Codel (HFSC With Fq_Codel)")
+o:value("htb_fqcodel", "HTB+Fq_Codel (HTB With Fq_Codel)")
 o.default = "hfsc_cake"
 
 -- 链路类型

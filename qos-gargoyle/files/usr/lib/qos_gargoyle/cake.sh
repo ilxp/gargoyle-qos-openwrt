@@ -783,7 +783,7 @@ show_cake_status() {
     echo "AutoRate Ingress: $([ "$CAKE_AUTORATE_INGRESS" = "1" ] && echo "启用 ✅" || echo "禁用 ❌")"
     echo "自动调优: $([ "$ENABLE_AUTO_TUNE" = "1" ] && echo "启用 ✅" || echo "禁用 ❌")"
 
-    echo -e "\n===== 状态报告结束 ====="
+    echo -e "\n===== CAKE-MQ 状态报告结束 ====="
     return 0
 }
 

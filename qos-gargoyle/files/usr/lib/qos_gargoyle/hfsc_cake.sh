@@ -230,8 +230,8 @@ load_hfsc_cake_config() {
     CAKE_FLOWMODE=$(uci -q get qos_gargoyle.cake.flowmode 2>/dev/null)
     [ -z "$CAKE_FLOWMODE" ] && CAKE_FLOWMODE="srchost"
     
-    CAKE_DIFFSERV=$(uci -q get qos_gargoyle.cake.diffserv 2>/dev/null)
-    [ -z "$CAKE_DIFFSERV" ] && CAKE_DIFFSERV="diffserv3"
+    CAKE_DIFFSERV=$(uci -q get qos_gargoyle.cake.diffserv_mode 2>/dev/null)
+    [ -z "$CAKE_DIFFSERV" ] && CAKE_DIFFSERV="diffserv4"
     
     CAKE_NAT=$(uci -q get qos_gargoyle.cake.nat 2>/dev/null)
     [ -z "$CAKE_NAT" ] && CAKE_NAT="1"
@@ -259,25 +259,25 @@ load_hfsc_cake_config() {
     fi
     
     CAKE_ECN=$(uci -q get qos_gargoyle.cake.ecn 2>/dev/null)
-    if [ -n "$CAKE_ECN" ]; then
-        case "$CAKE_ECN" in
-            yes|1|enable|on|true)
-                CAKE_ECN="ecn"
-                ;;
-            no|0|disable|off|false)
-                CAKE_ECN="noecn"
-                ;;
-            ecn|noecn)
-                # keep as is
-                ;;
-            *)
-                qos_log "WARN" "无效的ECN配置值 '$CAKE_ECN'，将使用noecn"
-                CAKE_ECN="noecn"
-                ;;
-        esac
-    else
-        CAKE_ECN="noecn"
-    fi
+	if [ -n "$CAKE_ECN" ]; then
+		case "$CAKE_ECN" in
+			yes|1|enable|on|true|ecn)
+				CAKE_ECN="ecn"
+				qos_log "INFO" "CAKE ECN 已启用"
+				;;
+			no|0|disable|off|false|noecn)
+				CAKE_ECN=""   # 不传递任何参数
+				qos_log "INFO" "CAKE ECN 已禁用"
+				;;
+			*)
+				qos_log "WARN" "无效的 ECN 配置值 '$CAKE_ECN'，将禁用 ECN"
+				CAKE_ECN=""
+				;;
+		esac
+	else
+		CAKE_ECN=""   # 未配置时默认禁用，不传递参数
+		qos_log "INFO" "CAKE ECN 未配置，使用默认禁用"
+	fi
     
     qos_log "INFO" "HFSC配置: latency_mode=${HFSC_LATENCY_MODE}, minrtt_enabled=${HFSC_MINRTT_ENABLED}"
     qos_log "INFO" "CAKE参数: bandwidth=${CAKE_BANDWIDTH:-未配置}, rtt=${CAKE_RTT:-未配置}, flowmode=${CAKE_FLOWMODE}, diffserv=${CAKE_DIFFSERV}, nat=${CAKE_NAT}, wash=${CAKE_WASH}, overhead=${CAKE_OVERHEAD:-未配置}, mpu=${CAKE_MPU:-未配置}, ack_filter=${CAKE_ACK_FILTER}, split_gso=${CAKE_SPLIT_GSO}, limit=${CAKE_LIMIT:-未配置}, memlimit=${CAKE_MEMLIMIT:-未配置}, ecn=${CAKE_ECN}"
@@ -305,7 +305,7 @@ load_hfsc_class_config() {
     if [ -n "$per_min_bandwidth" ] && ! validate_number "$per_min_bandwidth" "$class_name.per_min_bandwidth" 0 100; then
         per_min_bandwidth=""
     fi
-    if [ -n "$per_max_bandwidth" ] && ! validate_number "$per_max_bandwidth" "$class_name.per_max_bandwidth" 0 100; then
+    if [ -n "$per_max_bandwidth" ] && ! validate_number "$per_max_bandwidth" "$class_name.per_max_bandwidth" 0 1000; then  #运行借用
         per_max_bandwidth=""
     fi
     if [ -n "$priority" ] && ! validate_number "$priority" "$class_name.priority" 1 255; then
@@ -476,7 +476,10 @@ build_cake_params() {
     
     [ -n "$CAKE_LIMIT" ] && params="$params limit $CAKE_LIMIT"
     [ -n "$CAKE_MEMLIMIT" ] && params="$params memlimit $CAKE_MEMLIMIT"
-    [ -n "$CAKE_ECN" ] && params="$params $CAKE_ECN"
+    	
+	if [ "$CAKE_ECN" = "ecn" ]; then
+		params="$params ecn"
+	fi
     
     echo "$params"
 }
@@ -523,7 +526,7 @@ create_hfsc_upload_class() {
     
     if [ -n "$per_min_bandwidth" ] && [ "$per_min_bandwidth" -ge 0 ] 2>/dev/null; then
         if [ "$per_min_bandwidth" -eq 0 ]; then
-            m2="0kbit"
+            m2="1kbit"   # 设置为极小值避免 HFSC 报错
             qos_log "INFO" "类别 $class_name 不保证最小带宽 (per_min_bandwidth=0)"
         else
             m2="$((class_total_bw * per_min_bandwidth / 100))kbit"
@@ -654,7 +657,7 @@ create_hfsc_download_class() {
     
     if [ -n "$per_min_bandwidth" ] && [ "$per_min_bandwidth" -ge 0 ] 2>/dev/null; then
         if [ "$per_min_bandwidth" -eq 0 ]; then
-            m2="0kbit"
+            m2="1kbit"   # 设置为极小值避免 HFSC 报错
             qos_log "INFO" "类别 $class_name 不保证最小带宽 (per_min_bandwidth=0)"
         else
             m2="$((class_total_bw * per_min_bandwidth / 100))kbit"

@@ -577,7 +577,7 @@ create_hfsc_upload_class() {
     # 2. 计算保证带宽 (m2)
     if [ -n "$per_min_bandwidth" ] && [ "$per_min_bandwidth" -ge 0 ] 2>/dev/null; then
         if [ "$per_min_bandwidth" -eq 0 ]; then
-            m2="0kbit"
+			m2="1kbit"   # 设置为极小值避免 HFSC 报错
             qos_log "INFO" "类别 $class_name 不保证最小带宽 (per_min_bandwidth=0)"
         else
             m2="$((class_total_bw * per_min_bandwidth / 100))kbit"
@@ -739,7 +739,7 @@ create_hfsc_download_class() {
     # 2. 计算保证带宽 (m2)
     if [ -n "$per_min_bandwidth" ] && [ "$per_min_bandwidth" -ge 0 ] 2>/dev/null; then
         if [ "$per_min_bandwidth" -eq 0 ]; then
-            m2="0kbit"
+            m2="1kbit"   # 设置为极小值避免 HFSC 报错
             qos_log "INFO" "类别 $class_name 不保证最小带宽 (per_min_bandwidth=0)"
         else
             m2="$((class_total_bw * per_min_bandwidth / 100))kbit"

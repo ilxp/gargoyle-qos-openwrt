@@ -103,6 +103,9 @@ msgstr "HTB参数"
 msgid "CAKE Parameters"
 msgstr "CAKE参数"
 
+msgid "CAKE Parameters (Leaf Queue)"
+msgstr "CAKE参数（叶子队列）"
+
 msgid "FQ-CoDel Parameters (Leaf Queue)"
 msgstr "FQ-CoDel参数（叶子队列）"
 

@@ -403,7 +403,7 @@ load_htb_class_config() {
         per_min_bandwidth=""
     fi
     
-    if [ -n "$per_max_bandwidth" ] && ! validate_number "$per_max_bandwidth" "$class_name.per_max_bandwidth" 0 100; then
+    if [ -n "$per_max_bandwidth" ] && ! validate_number "$per_max_bandwidth" "$class_name.per_max_bandwidth" 0 1000; then   #允许借用带宽
         per_max_bandwidth=""
     fi
     
