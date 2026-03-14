@@ -6,325 +6,660 @@ local uci  = require "luci.model.uci".cursor()
 local http = require "luci.http"
 
 local m = Map("qos_gargoyle", translate("QoS Algorithm Configuration"),
-    translate("Modify the QoS algorithm parameters. After completing the modification, you need to save/apply them again in the global settings for them to take effect."))
+	translate("Modify the QoS algorithm parameters. After completing the modification, you need to save/apply them again in the global settings for them to take effect."))
 
--- 获取当前URL参数
+-- 获取当前URL参数（可用于切换算法，暂未使用）
 local query_string = http.getenv("QUERY_STRING") or ""
-local algo_param = "hfsc_fqcodel"
+local algo_param = "hfsc_cake"
 
 if query_string:find("algo=") then
-    for k, v in query_string:gmatch("([^&=]+)=([^&=]+)") do
-        if k == "algo" then
-            algo_param = v
-            break
-        end
-    end
+	for k, v in query_string:gmatch("([^&=]+)=([^&=]+)") do
+		if k == "algo" then
+			algo_param = v
+			break
+		end
+	end
 end
 
--- 定义算法映射表 - 只有3个算法
+-- 定义算法映射表
 local algo_map = {
-    ["hfsc_fqcodel"] = {config = "hfsc", display = "HFSC + FQ-CoDel", leaf_qdisc = "fq_codel"},
-    ["htb_fqcodel"]  = {config = "htb", display = "HTB + FQ-CoDel", leaf_qdisc = "fq_codel"},
-    ["cake"]         = {config = "cake", display = "CAKE", leaf_qdisc = nil}
+	["hfsc_cake"]    = {config = "hfsc", display = "HFSC + CAKE", leaf_qdisc = "cake"},
+	["htb_cake"]     = {config = "htb",  display = "HTB + CAKE", leaf_qdisc = "cake"},
+	["hfsc_fqcodel"] = {config = "hfsc", display = "HFSC + FQ-CoDel", leaf_qdisc = "fq_codel"},
+	["htb_fqcodel"]  = {config = "htb",  display = "HTB + FQ-CoDel", leaf_qdisc = "fq_codel"},
+	["cake"]         = {config = "cake", display = "CAKE", leaf_qdisc = nil}
 }
 
 -- 获取当前活动的算法（从全局配置获取）
 local function get_active_algorithm()
-    -- 从全局配置获取当前激活的算法
-    local global_algo = uci:get("qos_gargoyle", "global", "algorithm")
-    
-    -- 验证算法是否有效
-    if global_algo and algo_map[global_algo] then
-        return global_algo
-    end
-    
-    -- 如果全局配置没有设置，默认返回第一个算法
-    return "hfsc_fqcodel"
+	local global_algo = uci:get("qos_gargoyle", "global", "algorithm")
+	if global_algo and algo_map[global_algo] then
+		return global_algo
+	end
+	return "hfsc_cake" -- 默认
 end
 
--- 获取当前算法（用于显示对应的参数配置）
 local current_algo = get_active_algorithm()
 
--- 算法专属配置部分
-if current_algo == "hfsc_fqcodel" then
-    local s_hfsc = m:section(TypedSection, "hfsc", translate("HFSC Parameters"))
-    s_hfsc.anonymous = true
-    s_hfsc.addremove = false
-    
-    local latency_mode = s_hfsc:option(ListValue, "latency_mode", translate("Latency Mode"))
-    latency_mode:value("normal", translate("Normal"))
-    latency_mode:value("priority", translate("Priority"))
-    latency_mode:value("dynamic", translate("Dynamic"))
-    latency_mode.default = "dynamic"
-    latency_mode.rmempty = false
-    
-    local minrtt_enabled = s_hfsc:option(ListValue, "minrtt_enabled", translate("minRTT Enabled"))
-    minrtt_enabled:value("0", translate("Disable"))
-    minrtt_enabled:value("1", translate("Enable"))
-    minrtt_enabled.default = "0"
-    minrtt_enabled.rmempty = false
-    
-    -- 显示FQ-CoDel参数（叶队列）
-    local s_fq_codel = m:section(TypedSection, "fq_codel", translate("FQ-CoDel Parameters (Leaf Queue)"))
-    s_fq_codel.anonymous = true
-    s_fq_codel.addremove = false
-    
-    local target = s_fq_codel:option(Value, "target", translate("Target Delay(microseconds)"))
-    target.default = "5000"
-    target.datatype = "uinteger"
-    target.rmempty = false
-    
-    local limit = s_fq_codel:option(Value, "limit", translate("Queue Length Limit"))
-    limit.default = "10240"
-    limit.datatype = "uinteger"
-    limit.rmempty = false
-    
-    local quantum_fq = s_fq_codel:option(Value, "quantum", translate("Quantum(bytes)"))
-    quantum_fq.default = "1514"
-    quantum_fq.datatype = "uinteger"
-    quantum_fq.rmempty = false
-    
-    local flows = s_fq_codel:option(Value, "flows", translate("Number of Flows"))
-    flows.default = "1024"
-    flows.datatype = "uinteger"
-    flows.rmempty = false
-    
-    local interval = s_fq_codel:option(Value, "interval", translate("Interval(microseconds)"))
-    interval.default = "100000"
-    interval.datatype = "uinteger"
-    interval.rmempty = false
-	
-	local memory_limit = s_fq_codel:option(Value, "memory_limit", translate("Memory Llimit"))
-    memory_limit.default = "auto"
-    memory_limit.datatype = "uinteger"
-    memory_limit.rmempty = false
-	
+-- ========== HFSC + CAKE ==========
+if current_algo == "hfsc_cake" then
+	local s_hfsc = m:section(TypedSection, "hfsc", translate("HFSC Parameters"))
+	s_hfsc.anonymous = true
+	s_hfsc.addremove = false
+
+	local latency_mode = s_hfsc:option(ListValue, "latency_mode", translate("Latency Mode"))
+	latency_mode:value("normal", translate("Normal"))
+	latency_mode:value("priority", translate("Priority"))
+	latency_mode:value("dynamic", translate("Dynamic"))
+	latency_mode.default = "dynamic"
+	latency_mode.rmempty = false
+
+	local minrtt_enabled = s_hfsc:option(ListValue, "minrtt_enabled", translate("minRTT Enabled"))
+	minrtt_enabled:value("0", translate("Disable"))
+	minrtt_enabled:value("1", translate("Enable"))
+	minrtt_enabled.default = "0"
+	minrtt_enabled.rmempty = false
+
+	-- CAKE叶队列参数
+	local s_cake = m:section(TypedSection, "cake", translate("CAKE Parameters (Leaf Queue)"))
+	s_cake.anonymous = true
+	s_cake.addremove = false
+
+	local diffserv_mode = s_cake:option(ListValue, "diffserv_mode", translate("DiffServ Mode"))
+	diffserv_mode:value("diffserv3", "DiffServ3")
+	diffserv_mode:value("diffserv4", "DiffServ4")
+	diffserv_mode:value("diffserv5", "DiffServ5")
+	diffserv_mode:value("diffserv8", "DiffServ8")
+	diffserv_mode:value("besteffort", "Best Effort")
+	diffserv_mode.default = "diffserv4"
+	diffserv_mode.rmempty = false
+
+	local nat = s_cake:option(ListValue, "nat", translate("NAT Support"))
+	nat:value("1", translate("Enable"))
+	nat:value("0", translate("Disable"))
+	nat.default = "1"
+	nat.rmempty = false
+
+	local ack_filter = s_cake:option(ListValue, "ack_filter", translate("ACK Filter"))
+	ack_filter:value("1", translate("Enable"))
+	ack_filter:value("0", translate("Disable"))
+	ack_filter.default = "1"
+	ack_filter.rmempty = false
+
+	local memlimit = s_cake:option(ListValue, "memlimit", translate("Memory Limit"))
+	memlimit.default = "64Mb"
+	memlimit:value("8Mb", "8MB")
+	memlimit:value("16Mb", "16MB")
+	memlimit:value("32Mb", "32MB")
+	memlimit:value("64Mb", "64MB")
+	memlimit:value("128Mb", "128MB")
+	memlimit.rmempty = false
+
+	local wash = s_cake:option(ListValue, "wash", translate("Wash Traffic"))
+	wash:value("1", translate("Enable"))
+	wash:value("0", translate("Disable"))
+	wash.default = "0"
+	wash.rmempty = false
+
+	local split_gso = s_cake:option(ListValue, "split_gso", translate("Split GSO"))
+	split_gso:value("1", translate("Enable"))
+	split_gso:value("0", translate("Disable"))
+	split_gso.default = "1"
+	split_gso.rmempty = false
+
+	local ingress = s_cake:option(ListValue, "ingress", translate("Ingress Mode"),
+		translate("Ingress queueing method: 0=Use IFB (recommended), 1=Use ingress queue directly"))
+	ingress:value("0", "Use IFB (0)")
+	ingress:value("1", "Use ingress queue (1)")
+	ingress.default = "0"
+	ingress.rmempty = false
+
+	local autorate_ingress = s_cake:option(ListValue, "autorate_ingress", translate("AutoRate Ingress"),
+		translate("Automatically adjust ingress bandwidth based on measured throughput"))
+	autorate_ingress:value("0", translate("Disable"))
+	autorate_ingress:value("1", translate("Enable"))
+	autorate_ingress.default = "0"
+	autorate_ingress.rmempty = false
+
+	local rtt = s_cake:option(ListValue, "rtt", translate("Target RTT"))
+	rtt.default = "50ms"
+	rtt:value("5ms", "5ms")
+	rtt:value("10ms", "10ms")
+	rtt:value("20ms", "20ms")
+	rtt:value("50ms", "50ms")
+	rtt:value("100ms", "100ms")
+	rtt:value("150ms", "150ms")
+	rtt:value("200ms", "200ms")
+	rtt.rmempty = false
+
+	local overhead = s_cake:option(Value, "overhead", translate("Overhead (bytes)"))
+	overhead.default = "0"
+	overhead.datatype = "integer"
+	overhead.rmempty = false
+
+	local mpu = s_cake:option(Value, "mpu", translate("MPU (bytes)"))
+	mpu.default = "0"
+	mpu.datatype = "uinteger"
+	mpu.rmempty = false
+
+	local quantum_cake = s_cake:option(Value, "quantum", translate("Quantum (bytes)"))
+	quantum_cake.default = "300"
+	quantum_cake.datatype = "uinteger"
+	quantum_cake.rmempty = false
+
+	-- CAKE-autorate 参数
+	local autorate_enabled = s_cake:option(ListValue, "autorate_enabled", translate("AutoRate Enabled"))
+	autorate_enabled:value("0", translate("Disable"))
+	autorate_enabled:value("1", translate("Enable"))
+	autorate_enabled.default = "1"
+	autorate_enabled.rmempty = false
+	autorate_enabled.description = translate("Enable dynamic bandwidth adjustment based on network latency")
+
+	local autorate_persist = s_cake:option(ListValue, "autorate_persist", translate("Configuration Persistence"))
+	autorate_persist:value("0", translate("Disable"))
+	autorate_persist:value("1", translate("Enable"))
+	autorate_persist.default = "1"
+	autorate_persist.rmempty = false
+	autorate_persist.description = translate("Save optimized bandwidth to configuration file (saves every 5 minutes at most)")
+
+	local autorate_interval = s_cake:option(Value, "autorate_interval", translate("Adjustment Interval (seconds)"))
+	autorate_interval.default = "10"
+	autorate_interval.datatype = "uinteger"
+	autorate_interval.rmempty = false
+	autorate_interval.description = translate("Time between each bandwidth adjustment (5-60 seconds)")
+
+	local autorate_ping_hosts = s_cake:option(Value, "autorate_ping_hosts", translate("Ping Hosts"))
+	autorate_ping_hosts.default = "223.5.5.5 119.29.29.29 180.76.76.76"
+	autorate_ping_hosts.rmempty = false
+	autorate_ping_hosts.description = translate("Target hosts for latency measurement, separated by spaces")
+
+	local autorate_min_rtt = s_cake:option(ListValue, "autorate_min_rtt", translate("Minimum Target RTT"))
+	autorate_min_rtt.default = "10ms"
+	autorate_min_rtt:value("5ms", "5ms")
+	autorate_min_rtt:value("10ms", "10ms")
+	autorate_min_rtt:value("20ms", "20ms")
+	autorate_min_rtt:value("30ms", "30ms")
+	autorate_min_rtt:value("50ms", "50ms")
+	autorate_min_rtt.rmempty = false
+	autorate_min_rtt.description = translate("Target minimum latency. When RTT is below this, increase bandwidth")
+
+	local autorate_max_rtt = s_cake:option(ListValue, "autorate_max_rtt", translate("Maximum Target RTT"))
+	autorate_max_rtt.default = "50ms"
+	autorate_max_rtt:value("50ms", "50ms")
+	autorate_max_rtt:value("80ms", "80ms")
+	autorate_max_rtt:value("100ms", "100ms")
+	autorate_max_rtt:value("150ms", "150ms")
+	autorate_max_rtt:value("200ms", "200ms")
+	autorate_max_rtt.rmempty = false
+	autorate_max_rtt.description = translate("Maximum acceptable latency. When RTT exceeds this, decrease bandwidth")
+
+	local autorate_min_bw_percent = s_cake:option(Value, "autorate_min_bw_percent", translate("Minimum Bandwidth Percentage (%)"))
+	autorate_min_bw_percent.default = "50"
+	autorate_min_bw_percent.datatype = "range(10, 100)"
+	autorate_min_bw_percent.rmempty = false
+	autorate_min_bw_percent.description = translate("Minimum bandwidth as percentage of configured bandwidth (10-100%)")
+
+	local autorate_max_bw_percent = s_cake:option(Value, "autorate_max_bw_percent", translate("Maximum Bandwidth Percentage (%)"))
+	autorate_max_bw_percent.default = "150"
+	autorate_max_bw_percent.datatype = "range(100, 200)"
+	autorate_max_bw_percent.rmempty = false
+	autorate_max_bw_percent.description = translate("Maximum bandwidth as percentage of configured bandwidth (100-200%)")
+
+-- ========== HTB + CAKE ==========
+elseif current_algo == "htb_cake" then
+	local s_htb = m:section(TypedSection, "htb", translate("HTB Parameters"))
+	s_htb.anonymous = true
+	s_htb.addremove = false
+
+	local priomap_enabled = s_htb:option(ListValue, "priomap_enabled", translate("Priority Mapping Enabled"))
+	priomap_enabled:value("0", translate("Disable"))
+	priomap_enabled:value("1", translate("Enable"))
+	priomap_enabled.default = "1"
+	priomap_enabled.rmempty = false
+
+	local drr_quantum = s_htb:option(Value, "drr_quantum", translate("DRR Quantum"))
+	drr_quantum:value("auto", "Auto")
+	drr_quantum:value("100", "100")
+	drr_quantum:value("300", "300")
+	drr_quantum:value("500", "500")
+	drr_quantum:value("1000", "1000")
+	drr_quantum:value("1514", "1514 (MTU)")
+	drr_quantum.default = "auto"
+	drr_quantum.rmempty = false
+
+	-- CAKE叶队列参数（与上面完全一致，可复用，但为清晰单独写出）
+	local s_cake = m:section(TypedSection, "cake", translate("CAKE Parameters (Leaf Queue)"))
+	s_cake.anonymous = true
+	s_cake.addremove = false
+
+	local diffserv_mode = s_cake:option(ListValue, "diffserv_mode", translate("DiffServ Mode"))
+	diffserv_mode:value("diffserv3", "DiffServ3")
+	diffserv_mode:value("diffserv4", "DiffServ4")
+	diffserv_mode:value("diffserv5", "DiffServ5")
+	diffserv_mode:value("diffserv8", "DiffServ8")
+	diffserv_mode:value("besteffort", "Best Effort")
+	diffserv_mode.default = "diffserv4"
+	diffserv_mode.rmempty = false
+
+	local nat = s_cake:option(ListValue, "nat", translate("NAT Support"))
+	nat:value("1", translate("Enable"))
+	nat:value("0", translate("Disable"))
+	nat.default = "1"
+	nat.rmempty = false
+
+	local ack_filter = s_cake:option(ListValue, "ack_filter", translate("ACK Filter"))
+	ack_filter:value("1", translate("Enable"))
+	ack_filter:value("0", translate("Disable"))
+	ack_filter.default = "1"
+	ack_filter.rmempty = false
+
+	local memlimit = s_cake:option(ListValue, "memlimit", translate("Memory Limit"))
+	memlimit.default = "64Mb"
+	memlimit:value("8Mb", "8MB")
+	memlimit:value("16Mb", "16MB")
+	memlimit:value("32Mb", "32MB")
+	memlimit:value("64Mb", "64MB")
+	memlimit:value("128Mb", "128MB")
+	memlimit.rmempty = false
+
+	local wash = s_cake:option(ListValue, "wash", translate("Wash Traffic"))
+	wash:value("1", translate("Enable"))
+	wash:value("0", translate("Disable"))
+	wash.default = "0"
+	wash.rmempty = false
+
+	local split_gso = s_cake:option(ListValue, "split_gso", translate("Split GSO"))
+	split_gso:value("1", translate("Enable"))
+	split_gso:value("0", translate("Disable"))
+	split_gso.default = "1"
+	split_gso.rmempty = false
+
+	local ingress = s_cake:option(ListValue, "ingress", translate("Ingress Mode"),
+		translate("Ingress queueing method: 0=Use IFB (recommended), 1=Use ingress queue directly"))
+	ingress:value("0", "Use IFB (0)")
+	ingress:value("1", "Use ingress queue (1)")
+	ingress.default = "0"
+	ingress.rmempty = false
+
+	local autorate_ingress = s_cake:option(ListValue, "autorate_ingress", translate("AutoRate Ingress"),
+		translate("Automatically adjust ingress bandwidth based on measured throughput"))
+	autorate_ingress:value("0", translate("Disable"))
+	autorate_ingress:value("1", translate("Enable"))
+	autorate_ingress.default = "0"
+	autorate_ingress.rmempty = false
+
+	local rtt = s_cake:option(ListValue, "rtt", translate("Target RTT"))
+	rtt.default = "50ms"
+	rtt:value("5ms", "5ms")
+	rtt:value("10ms", "10ms")
+	rtt:value("20ms", "20ms")
+	rtt:value("50ms", "50ms")
+	rtt:value("100ms", "100ms")
+	rtt:value("150ms", "150ms")
+	rtt:value("200ms", "200ms")
+	rtt.rmempty = false
+
+	local overhead = s_cake:option(Value, "overhead", translate("Overhead (bytes)"))
+	overhead.default = "0"
+	overhead.datatype = "integer"
+	overhead.rmempty = false
+
+	local mpu = s_cake:option(Value, "mpu", translate("MPU (bytes)"))
+	mpu.default = "0"
+	mpu.datatype = "uinteger"
+	mpu.rmempty = false
+
+	local quantum_cake = s_cake:option(Value, "quantum", translate("Quantum (bytes)"))
+	quantum_cake.default = "300"
+	quantum_cake.datatype = "uinteger"
+	quantum_cake.rmempty = false
+
+	-- CAKE-autorate 参数（同上）
+	local autorate_enabled = s_cake:option(ListValue, "autorate_enabled", translate("AutoRate Enabled"))
+	autorate_enabled:value("0", translate("Disable"))
+	autorate_enabled:value("1", translate("Enable"))
+	autorate_enabled.default = "1"
+	autorate_enabled.rmempty = false
+	autorate_enabled.description = translate("Enable dynamic bandwidth adjustment based on network latency")
+
+	local autorate_persist = s_cake:option(ListValue, "autorate_persist", translate("Configuration Persistence"))
+	autorate_persist:value("0", translate("Disable"))
+	autorate_persist:value("1", translate("Enable"))
+	autorate_persist.default = "1"
+	autorate_persist.rmempty = false
+	autorate_persist.description = translate("Save optimized bandwidth to configuration file (saves every 5 minutes at most)")
+
+	local autorate_interval = s_cake:option(Value, "autorate_interval", translate("Adjustment Interval (seconds)"))
+	autorate_interval.default = "10"
+	autorate_interval.datatype = "uinteger"
+	autorate_interval.rmempty = false
+	autorate_interval.description = translate("Time between each bandwidth adjustment (5-60 seconds)")
+
+	local autorate_ping_hosts = s_cake:option(Value, "autorate_ping_hosts", translate("Ping Hosts"))
+	autorate_ping_hosts.default = "223.5.5.5 119.29.29.29 180.76.76.76"
+	autorate_ping_hosts.rmempty = false
+	autorate_ping_hosts.description = translate("Target hosts for latency measurement, separated by spaces")
+
+	local autorate_min_rtt = s_cake:option(ListValue, "autorate_min_rtt", translate("Minimum Target RTT"))
+	autorate_min_rtt.default = "10ms"
+	autorate_min_rtt:value("5ms", "5ms")
+	autorate_min_rtt:value("10ms", "10ms")
+	autorate_min_rtt:value("20ms", "20ms")
+	autorate_min_rtt:value("30ms", "30ms")
+	autorate_min_rtt:value("50ms", "50ms")
+	autorate_min_rtt.rmempty = false
+	autorate_min_rtt.description = translate("Target minimum latency. When RTT is below this, increase bandwidth")
+
+	local autorate_max_rtt = s_cake:option(ListValue, "autorate_max_rtt", translate("Maximum Target RTT"))
+	autorate_max_rtt.default = "50ms"
+	autorate_max_rtt:value("50ms", "50ms")
+	autorate_max_rtt:value("80ms", "80ms")
+	autorate_max_rtt:value("100ms", "100ms")
+	autorate_max_rtt:value("150ms", "150ms")
+	autorate_max_rtt:value("200ms", "200ms")
+	autorate_max_rtt.rmempty = false
+	autorate_max_rtt.description = translate("Maximum acceptable latency. When RTT exceeds this, decrease bandwidth")
+
+	local autorate_min_bw_percent = s_cake:option(Value, "autorate_min_bw_percent", translate("Minimum Bandwidth Percentage (%)"))
+	autorate_min_bw_percent.default = "50"
+	autorate_min_bw_percent.datatype = "range(10, 100)"
+	autorate_min_bw_percent.rmempty = false
+	autorate_min_bw_percent.description = translate("Minimum bandwidth as percentage of configured bandwidth (10-100%)")
+
+	local autorate_max_bw_percent = s_cake:option(Value, "autorate_max_bw_percent", translate("Maximum Bandwidth Percentage (%)"))
+	autorate_max_bw_percent.default = "150"
+	autorate_max_bw_percent.datatype = "range(100, 200)"
+	autorate_max_bw_percent.rmempty = false
+	autorate_max_bw_percent.description = translate("Maximum bandwidth as percentage of configured bandwidth (100-200%)")
+
+-- ========== HFSC + FQ-CoDel ==========
+elseif current_algo == "hfsc_fqcodel" then
+	local s_hfsc = m:section(TypedSection, "hfsc", translate("HFSC Parameters"))
+	s_hfsc.anonymous = true
+	s_hfsc.addremove = false
+
+	local latency_mode = s_hfsc:option(ListValue, "latency_mode", translate("Latency Mode"))
+	latency_mode:value("normal", translate("Normal"))
+	latency_mode:value("priority", translate("Priority"))
+	latency_mode:value("dynamic", translate("Dynamic"))
+	latency_mode.default = "dynamic"
+	latency_mode.rmempty = false
+
+	local minrtt_enabled = s_hfsc:option(ListValue, "minrtt_enabled", translate("minRTT Enabled"))
+	minrtt_enabled:value("0", translate("Disable"))
+	minrtt_enabled:value("1", translate("Enable"))
+	minrtt_enabled.default = "0"
+	minrtt_enabled.rmempty = false
+
+	-- FQ-CoDel 叶队列参数
+	local s_fq_codel = m:section(TypedSection, "fq_codel", translate("FQ-CoDel Parameters (Leaf Queue)"))
+	s_fq_codel.anonymous = true
+	s_fq_codel.addremove = false
+
+	local target = s_fq_codel:option(Value, "target", translate("Target Delay (microseconds)"))
+	target.default = "5000"
+	target.datatype = "uinteger"
+	target.rmempty = false
+
+	local limit = s_fq_codel:option(Value, "limit", translate("Queue Length Limit"))
+	limit.default = "10240"
+	limit.datatype = "uinteger"
+	limit.rmempty = false
+
+	local quantum_fq = s_fq_codel:option(Value, "quantum", translate("Quantum (bytes)"))
+	quantum_fq.default = "1514"
+	quantum_fq.datatype = "uinteger"
+	quantum_fq.rmempty = false
+
+	local flows = s_fq_codel:option(Value, "flows", translate("Number of Flows"))
+	flows.default = "1024"
+	flows.datatype = "uinteger"
+	flows.rmempty = false
+
+	local interval = s_fq_codel:option(Value, "interval", translate("Interval (microseconds)"))
+	interval.default = "100000"
+	interval.datatype = "uinteger"
+	interval.rmempty = false
+
+	local memory_limit = s_fq_codel:option(Value, "memory_limit", translate("Memory Limit"))
+	memory_limit.default = "auto"
+	memory_limit.datatype = "string"   -- 允许 "auto" 或数字+Mb
+	memory_limit.rmempty = false
+
 	local ce_threshold = s_fq_codel:option(Value, "ce_threshold", translate("CE Threshold"))
-    ce_threshold.default = "0"
-    ce_threshold.datatype = "uinteger"
-    ce_threshold.rmempty = false
-    
-    local ecn = s_fq_codel:option(ListValue, "ecn", translate("ECN"))
-    ecn:value("", translate("Not Set (Default)"))
-    ecn:value("ecn", translate("Enable ECN"))
-    ecn:value("noecn", translate("Disable ECN"))
-    ecn.default = "ecn"  -- 允许为空，因为"Not Set (Default)"是有效选项
-    ecn.rmempty = true  
-    
+	ce_threshold.default = "0"
+	ce_threshold.datatype = "string"
+	ce_threshold.rmempty = false
+
+	local ecn = s_fq_codel:option(ListValue, "ecn", translate("ECN"))
+	ecn:value("", translate("Not Set (Default)"))
+	ecn:value("ecn", translate("Enable ECN"))
+	ecn:value("noecn", translate("Disable ECN"))
+	ecn.default = "ecn"
+	ecn.rmempty = true
+
+-- ========== HTB + FQ-CoDel ==========
 elseif current_algo == "htb_fqcodel" then
-    local s_htb = m:section(TypedSection, "htb", translate("HTB Parameters"))
-    s_htb.anonymous = true
-    s_htb.addremove = false
-    
-    local priomap_enabled = s_htb:option(ListValue, "priomap_enabled", translate("Priority Mapping Enabled"))
-    priomap_enabled:value("0", translate("Disable"))
-    priomap_enabled:value("1", translate("Enable"))
-    priomap_enabled.default = "1"
-    priomap_enabled.rmempty = false
-    
-    local drr_quantum = s_htb:option(Value, "drr_quantum", translate("DRR Quantum"))
-    drr_quantum:value("auto", "Auto")
-    drr_quantum:value("100", "100")
-    drr_quantum:value("300", "300")
-    drr_quantum:value("500", "500")
-    drr_quantum:value("1000", "1000")
-    drr_quantum:value("1514", "1514 (MTU)")
-    drr_quantum.default = "auto"
-    drr_quantum.rmempty = false
-    
-    -- 显示FQ-CoDel参数（叶队列）
-    local s_fq_codel = m:section(TypedSection, "fq_codel", translate("FQ-CoDel Parameters (Leaf Queue)"))
-    s_fq_codel.anonymous = true
-    s_fq_codel.addremove = false
-    
-    local target = s_fq_codel:option(Value, "target", translate("Target Delay (microseconds)"))
-    target.default = "5000"
-    target.datatype = "uinteger"
-    target.rmempty = false
-    
-    local limit = s_fq_codel:option(Value, "limit", translate("Queue Length Limit"))
-    limit.default = "10240"
-    limit.datatype = "uinteger"
-    limit.rmempty = false
-    
-    local quantum_fq = s_fq_codel:option(Value, "quantum", translate("Quantum (bytes)"))
-    quantum_fq.default = "1514"
-    quantum_fq.datatype = "uinteger"
-    quantum_fq.rmempty = false
-    
-    local flows = s_fq_codel:option(Value, "flows", translate("Number of Flows"))
-    flows.default = "1024"
-    flows.datatype = "uinteger"
-    flows.rmempty = false
-    
-    local interval = s_fq_codel:option(Value, "interval", translate("Interval (microseconds)"))
-    interval.default = "100000"
-    interval.datatype = "uinteger"
-    interval.rmempty = false
-    
-    local ecn = s_fq_codel:option(ListValue, "ecn", translate("ECN"))
-    ecn:value("", translate("Not Set (Default)"))
-    ecn:value("ecn", translate("Enable ECN"))
-    ecn:value("noecn", translate("Disable ECN"))
-    ecn.default = ""
-    ecn.rmempty = true
-    
+	local s_htb = m:section(TypedSection, "htb", translate("HTB Parameters"))
+	s_htb.anonymous = true
+	s_htb.addremove = false
+
+	local priomap_enabled = s_htb:option(ListValue, "priomap_enabled", translate("Priority Mapping Enabled"))
+	priomap_enabled:value("0", translate("Disable"))
+	priomap_enabled:value("1", translate("Enable"))
+	priomap_enabled.default = "1"
+	priomap_enabled.rmempty = false
+
+	local drr_quantum = s_htb:option(Value, "drr_quantum", translate("DRR Quantum"))
+	drr_quantum:value("auto", "Auto")
+	drr_quantum:value("100", "100")
+	drr_quantum:value("300", "300")
+	drr_quantum:value("500", "500")
+	drr_quantum:value("1000", "1000")
+	drr_quantum:value("1514", "1514 (MTU)")
+	drr_quantum.default = "auto"
+	drr_quantum.rmempty = false
+
+	-- FQ-CoDel 叶队列参数（同上）
+	local s_fq_codel = m:section(TypedSection, "fq_codel", translate("FQ-CoDel Parameters (Leaf Queue)"))
+	s_fq_codel.anonymous = true
+	s_fq_codel.addremove = false
+
+	local target = s_fq_codel:option(Value, "target", translate("Target Delay (microseconds)"))
+	target.default = "5000"
+	target.datatype = "uinteger"
+	target.rmempty = false
+
+	local limit = s_fq_codel:option(Value, "limit", translate("Queue Length Limit"))
+	limit.default = "10240"
+	limit.datatype = "uinteger"
+	limit.rmempty = false
+
+	local quantum_fq = s_fq_codel:option(Value, "quantum", translate("Quantum (bytes)"))
+	quantum_fq.default = "1514"
+	quantum_fq.datatype = "uinteger"
+	quantum_fq.rmempty = false
+
+	local flows = s_fq_codel:option(Value, "flows", translate("Number of Flows"))
+	flows.default = "1024"
+	flows.datatype = "uinteger"
+	flows.rmempty = false
+
+	local interval = s_fq_codel:option(Value, "interval", translate("Interval (microseconds)"))
+	interval.default = "100000"
+	interval.datatype = "uinteger"
+	interval.rmempty = false
+
+	local memory_limit = s_fq_codel:option(Value, "memory_limit", translate("Memory Limit"))
+	memory_limit.default = "auto"
+	memory_limit.datatype = "string"
+	memory_limit.rmempty = false
+
+	local ce_threshold = s_fq_codel:option(Value, "ce_threshold", translate("CE Threshold"))
+	ce_threshold.default = "0"
+	ce_threshold.datatype = "string"
+	ce_threshold.rmempty = false
+
+	local ecn = s_fq_codel:option(ListValue, "ecn", translate("ECN"))
+	ecn:value("", translate("Not Set (Default)"))
+	ecn:value("ecn", translate("Enable ECN"))
+	ecn:value("noecn", translate("Disable ECN"))
+	ecn.default = ""
+	ecn.rmempty = true
+
+-- ========== CAKE 单独 ==========
 elseif current_algo == "cake" then
-    local s_cake = m:section(TypedSection, "cake", translate("CAKE Parameters"))
-    s_cake.anonymous = true
-    s_cake.addremove = false
-    
-    local diffserv_mode = s_cake:option(ListValue, "diffserv_mode", translate("DiffServ Mode"))
-    diffserv_mode:value("diffserv3", "DiffServ3")
-    diffserv_mode:value("diffserv4", "DiffServ4")
-    diffserv_mode:value("diffserv5", "DiffServ5")
-    diffserv_mode:value("diffserv8", "DiffServ8")
-    diffserv_mode:value("besteffort", "Best Effort")
-    diffserv_mode.default = "diffserv4"
-    diffserv_mode.rmempty = false
-    
-    local nat = s_cake:option(ListValue, "nat", translate("NAT Support"))
-    nat:value("1", translate("Enable"))
-    nat:value("0", translate("Disable"))
-    nat.default = "1"
-    nat.rmempty = false
-    
-    local ack_filter = s_cake:option(ListValue, "ack_filter", translate("ACK Filter"))
-    ack_filter:value("1", translate("Enable"))
-    ack_filter:value("0", translate("Disable"))
-    ack_filter.default = "1"
-    ack_filter.rmempty = false
-    
-    local memlimit = s_cake:option(ListValue, "memlimit", translate("Memory Limit"))
-    memlimit.default = "64Mb"
-    memlimit:value("8Mb", "8MB")
-    memlimit:value("16Mb", "16MB")
-    memlimit:value("32Mb", "32MB")
-    memlimit:value("64Mb", "64MB")
-    memlimit:value("128Mb", "128MB")
-    memlimit.rmempty = false
-    
-    local wash = s_cake:option(ListValue, "wash", translate("Wash Traffic"))
-    wash:value("1", translate("Enable"))
-    wash:value("0", translate("Disable"))
-    wash.default = "0" 
-    wash.rmempty = false
-    
-    local split_gso = s_cake:option(ListValue, "split_gso", translate("Split GSO"))
-    split_gso:value("1", translate("Enable"))
-    split_gso:value("0", translate("Disable"))
-    split_gso.default = "1" 
-    split_gso.rmempty = false
-    
-    local ingress = s_cake:option(ListValue, "ingress", translate("Ingress Mode"),
-        translate("Ingress queueing method: 0=Use IFB (recommended), 1=Use ingress queue directly"))
-    ingress:value("0", "Use IFB (0)")
-    ingress:value("1", "Use ingress queue (1)")
-    ingress.default = "0"
-    ingress.rmempty = false
-    
-    local autorate_ingress = s_cake:option(ListValue, "autorate_ingress", translate("AutoRate Ingress"),
-        translate("Automatically adjust ingress bandwidth based on measured throughput"))
-    autorate_ingress:value("0", translate("Disable"))
-    autorate_ingress:value("1", translate("Enable"))
-    autorate_ingress.default = "0"
-    autorate_ingress.rmempty = false
-    
-    local rtt = s_cake:option(ListValue, "rtt", translate("Target RTT"))
-    rtt.default = "50ms"
-    rtt:value("5ms", "5ms")
-    rtt:value("10ms", "10ms")
-    rtt:value("20ms", "20ms")
-    rtt:value("50ms", "50ms")
-    rtt:value("100ms", "100ms")
-    rtt:value("150ms", "150ms")
-    rtt:value("200ms", "200ms")
-    rtt.rmempty = false
-    
-    local overhead = s_cake:option(Value, "overhead", translate("Overhead (bytes)"))
-    overhead.default = "0"
-    overhead.datatype = "integer"
-    overhead.rmempty = false
-    
-    local mpu = s_cake:option(Value, "mpu", translate("MPU (bytes)"))
-    mpu.default = "0"
-    mpu.datatype = "uinteger"
-    mpu.rmempty = false
-    
-    local quantum_cake = s_cake:option(Value, "quantum", translate("Quantum (bytes)"))
-    quantum_cake.default = "300"
-    quantum_cake.datatype = "uinteger"
-    quantum_cake.rmempty = false
-	
-	 -- CAKE-autorate 参数配置 
-    local autorate_enabled = s_cake:option(ListValue, "autorate_enabled", translate("AutoRate Enabled"))
-    autorate_enabled:value("0", translate("Disable"))
-    autorate_enabled:value("1", translate("Enable"))
-    autorate_enabled.default = "1"
-    autorate_enabled.rmempty = false
-    autorate_enabled.description = translate("Enable dynamic bandwidth adjustment based on network latency")
-    
-    local autorate_persist = s_cake:option(ListValue, "autorate_persist", translate("Configuration Persistence"))
-    autorate_persist:value("0", translate("Disable"))
-    autorate_persist:value("1", translate("Enable"))
-    autorate_persist.default = "1"
-    autorate_persist.rmempty = false
-    autorate_persist.description = translate("Save optimized bandwidth to configuration file (saves every 5 minutes at most)")
-    
-    local autorate_interval = s_cake:option(Value, "autorate_interval", translate("Adjustment Interval (seconds)"))
-    autorate_interval.default = "10"
-    autorate_interval.datatype = "uinteger"
-    autorate_interval.rmempty = false
-    autorate_interval.description = translate("Time between each bandwidth adjustment (5-60 seconds)")
-    
-    local autorate_ping_hosts = s_cake:option(Value, "autorate_ping_hosts", translate("Ping Hosts"))
-    autorate_ping_hosts.default = "223.5.5.5 119.29.29.29 180.76.76.76"
-    autorate_ping_hosts.rmempty = false
-    autorate_ping_hosts.description = translate("Target hosts for latency measurement, separated by spaces")
-    
-    local autorate_min_rtt = s_cake:option(ListValue, "autorate_min_rtt", translate("Minimum Target RTT"))
-    autorate_min_rtt.default = "10ms"
-    autorate_min_rtt:value("5ms", "5ms")
-    autorate_min_rtt:value("10ms", "10ms")
-    autorate_min_rtt:value("20ms", "20ms")
-    autorate_min_rtt:value("30ms", "30ms")
-    autorate_min_rtt:value("50ms", "50ms")
-    autorate_min_rtt.rmempty = false
-    autorate_min_rtt.description = translate("Target minimum latency. When RTT is below this, increase bandwidth")
-    
-    local autorate_max_rtt = s_cake:option(ListValue, "autorate_max_rtt", translate("Maximum Target RTT"))
-    autorate_max_rtt.default = "50ms"
-    autorate_max_rtt:value("50ms", "50ms")
-    autorate_max_rtt:value("80ms", "80ms")
-    autorate_max_rtt:value("100ms", "100ms")
-    autorate_max_rtt:value("150ms", "150ms")
-    autorate_max_rtt:value("200ms", "200ms")
-    autorate_max_rtt.rmempty = false
-    autorate_max_rtt.description = translate("Maximum acceptable latency. When RTT exceeds this, decrease bandwidth")
-    
-    local autorate_min_bw_percent = s_cake:option(Value, "autorate_min_bw_percent", translate("Minimum Bandwidth Percentage (%)"))
-    autorate_min_bw_percent.default = "50"
-    autorate_min_bw_percent.datatype = "range(10, 100)"
-    autorate_min_bw_percent.rmempty = false
-    autorate_min_bw_percent.description = translate("Minimum bandwidth as percentage of configured bandwidth (10-100%)")
-    
-    local autorate_max_bw_percent = s_cake:option(Value, "autorate_max_bw_percent", translate("Maximum Bandwidth Percentage (%)"))
-    autorate_max_bw_percent.default = "150"
-    autorate_max_bw_percent.datatype = "range(100, 200)"
-    autorate_max_bw_percent.rmempty = false
-    autorate_max_bw_percent.description = translate("Maximum bandwidth as percentage of configured bandwidth (100-200%)")
+	local s_cake = m:section(TypedSection, "cake", translate("CAKE Parameters"))
+	s_cake.anonymous = true
+	s_cake.addremove = false
+
+	local diffserv_mode = s_cake:option(ListValue, "diffserv_mode", translate("DiffServ Mode"))
+	diffserv_mode:value("diffserv3", "DiffServ3")
+	diffserv_mode:value("diffserv4", "DiffServ4")
+	diffserv_mode:value("diffserv5", "DiffServ5")
+	diffserv_mode:value("diffserv8", "DiffServ8")
+	diffserv_mode:value("besteffort", "Best Effort")
+	diffserv_mode.default = "diffserv4"
+	diffserv_mode.rmempty = false
+
+	local nat = s_cake:option(ListValue, "nat", translate("NAT Support"))
+	nat:value("1", translate("Enable"))
+	nat:value("0", translate("Disable"))
+	nat.default = "1"
+	nat.rmempty = false
+
+	local ack_filter = s_cake:option(ListValue, "ack_filter", translate("ACK Filter"))
+	ack_filter:value("1", translate("Enable"))
+	ack_filter:value("0", translate("Disable"))
+	ack_filter.default = "1"
+	ack_filter.rmempty = false
+
+	local memlimit = s_cake:option(ListValue, "memlimit", translate("Memory Limit"))
+	memlimit.default = "64Mb"
+	memlimit:value("8Mb", "8MB")
+	memlimit:value("16Mb", "16MB")
+	memlimit:value("32Mb", "32MB")
+	memlimit:value("64Mb", "64MB")
+	memlimit:value("128Mb", "128MB")
+	memlimit.rmempty = false
+
+	local wash = s_cake:option(ListValue, "wash", translate("Wash Traffic"))
+	wash:value("1", translate("Enable"))
+	wash:value("0", translate("Disable"))
+	wash.default = "0"
+	wash.rmempty = false
+
+	local split_gso = s_cake:option(ListValue, "split_gso", translate("Split GSO"))
+	split_gso:value("1", translate("Enable"))
+	split_gso:value("0", translate("Disable"))
+	split_gso.default = "1"
+	split_gso.rmempty = false
+
+	local ingress = s_cake:option(ListValue, "ingress", translate("Ingress Mode"),
+		translate("Ingress queueing method: 0=Use IFB (recommended), 1=Use ingress queue directly"))
+	ingress:value("0", "Use IFB (0)")
+	ingress:value("1", "Use ingress queue (1)")
+	ingress.default = "0"
+	ingress.rmempty = false
+
+	local autorate_ingress = s_cake:option(ListValue, "autorate_ingress", translate("AutoRate Ingress"),
+		translate("Automatically adjust ingress bandwidth based on measured throughput"))
+	autorate_ingress:value("0", translate("Disable"))
+	autorate_ingress:value("1", translate("Enable"))
+	autorate_ingress.default = "0"
+	autorate_ingress.rmempty = false
+
+	local rtt = s_cake:option(ListValue, "rtt", translate("Target RTT"))
+	rtt.default = "50ms"
+	rtt:value("5ms", "5ms")
+	rtt:value("10ms", "10ms")
+	rtt:value("20ms", "20ms")
+	rtt:value("50ms", "50ms")
+	rtt:value("100ms", "100ms")
+	rtt:value("150ms", "150ms")
+	rtt:value("200ms", "200ms")
+	rtt.rmempty = false
+
+	local overhead = s_cake:option(Value, "overhead", translate("Overhead (bytes)"))
+	overhead.default = "0"
+	overhead.datatype = "integer"
+	overhead.rmempty = false
+
+	local mpu = s_cake:option(Value, "mpu", translate("MPU (bytes)"))
+	mpu.default = "0"
+	mpu.datatype = "uinteger"
+	mpu.rmempty = false
+
+	local quantum_cake = s_cake:option(Value, "quantum", translate("Quantum (bytes)"))
+	quantum_cake.default = "300"
+	quantum_cake.datatype = "uinteger"
+	quantum_cake.rmempty = false
+
+	-- CAKE-autorate 参数
+	local autorate_enabled = s_cake:option(ListValue, "autorate_enabled", translate("AutoRate Enabled"))
+	autorate_enabled:value("0", translate("Disable"))
+	autorate_enabled:value("1", translate("Enable"))
+	autorate_enabled.default = "1"
+	autorate_enabled.rmempty = false
+	autorate_enabled.description = translate("Enable dynamic bandwidth adjustment based on network latency")
+
+	local autorate_persist = s_cake:option(ListValue, "autorate_persist", translate("Configuration Persistence"))
+	autorate_persist:value("0", translate("Disable"))
+	autorate_persist:value("1", translate("Enable"))
+	autorate_persist.default = "1"
+	autorate_persist.rmempty = false
+	autorate_persist.description = translate("Save optimized bandwidth to configuration file (saves every 5 minutes at most)")
+
+	local autorate_interval = s_cake:option(Value, "autorate_interval", translate("Adjustment Interval (seconds)"))
+	autorate_interval.default = "10"
+	autorate_interval.datatype = "uinteger"
+	autorate_interval.rmempty = false
+	autorate_interval.description = translate("Time between each bandwidth adjustment (5-60 seconds)")
+
+	local autorate_ping_hosts = s_cake:option(Value, "autorate_ping_hosts", translate("Ping Hosts"))
+	autorate_ping_hosts.default = "223.5.5.5 119.29.29.29 180.76.76.76"
+	autorate_ping_hosts.rmempty = false
+	autorate_ping_hosts.description = translate("Target hosts for latency measurement, separated by spaces")
+
+	local autorate_min_rtt = s_cake:option(ListValue, "autorate_min_rtt", translate("Minimum Target RTT"))
+	autorate_min_rtt.default = "10ms"
+	autorate_min_rtt:value("5ms", "5ms")
+	autorate_min_rtt:value("10ms", "10ms")
+	autorate_min_rtt:value("20ms", "20ms")
+	autorate_min_rtt:value("30ms", "30ms")
+	autorate_min_rtt:value("50ms", "50ms")
+	autorate_min_rtt.rmempty = false
+	autorate_min_rtt.description = translate("Target minimum latency. When RTT is below this, increase bandwidth")
+
+	local autorate_max_rtt = s_cake:option(ListValue, "autorate_max_rtt", translate("Maximum Target RTT"))
+	autorate_max_rtt.default = "50ms"
+	autorate_max_rtt:value("50ms", "50ms")
+	autorate_max_rtt:value("80ms", "80ms")
+	autorate_max_rtt:value("100ms", "100ms")
+	autorate_max_rtt:value("150ms", "150ms")
+	autorate_max_rtt:value("200ms", "200ms")
+	autorate_max_rtt.rmempty = false
+	autorate_max_rtt.description = translate("Maximum acceptable latency. When RTT exceeds this, decrease bandwidth")
+
+	local autorate_min_bw_percent = s_cake:option(Value, "autorate_min_bw_percent", translate("Minimum Bandwidth Percentage (%)"))
+	autorate_min_bw_percent.default = "50"
+	autorate_min_bw_percent.datatype = "range(10, 100)"
+	autorate_min_bw_percent.rmempty = false
+	autorate_min_bw_percent.description = translate("Minimum bandwidth as percentage of configured bandwidth (10-100%)")
+
+	local autorate_max_bw_percent = s_cake:option(Value, "autorate_max_bw_percent", translate("Maximum Bandwidth Percentage (%)"))
+	autorate_max_bw_percent.default = "150"
+	autorate_max_bw_percent.datatype = "range(100, 200)"
+	autorate_max_bw_percent.rmempty = false
+	autorate_max_bw_percent.description = translate("Maximum bandwidth as percentage of configured bandwidth (100-200%)")
 end
 
--- 系统会自动添加"保存并应用"和"重置"按钮
+-- 保存后重启服务
 function m.on_after_apply(self)
-    uci:save("qos_gargoyle")
-    uci:commit("qos_gargoyle")
-    
-    -- 重启qos_gargoyle服务以确保所有配置生效
-    os.execute("/etc/init.d/qos_gargoyle restart 2>/dev/null")
-    
-    -- 重定向回当前页面
-    http.redirect(dsp.build_url("admin/qos/qos_gargoyle/algorithm"))
+	uci:save("qos_gargoyle")
+	uci:commit("qos_gargoyle")
+	os.execute("/etc/init.d/qos_gargoyle restart 2>/dev/null")
+	http.redirect(dsp.build_url("admin/qos/qos_gargoyle/algorithm"))
 end
 
 return m

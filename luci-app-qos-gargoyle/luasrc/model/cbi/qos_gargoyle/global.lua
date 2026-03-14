@@ -59,10 +59,12 @@ o.rmempty = false
 -- QoS算法选择
 o = s:option(ListValue, "algorithm", translate("QoS Algorithm"), 
     translate("HFSC+fq_codel: Guarantees low latency, ideal for gaming/voip.HTB+fq_codel: Flexible bandwidth control, good for multi-service management.CAKE: Modern and plug-and-play, simple to use."))
-o:value("hfsc_fqcodel", "HFSC_fqcodel (HFSC plus fq_codel)")
-o:value("htb_fqcodel", "HTB_fqcodel (HTB plus fq_codel)")
+o:value("hfsc_cake", "HFSC_CAKE (Hfsc With Cake)")
+o:value("htb_cake", "HTB_CAKE (Htb With Cake)")
 o:value("cake", "CAKE (Common Applications Kept Enhanced)")
-o.default = "hfsc_fqcodel"
+o:value("hfsc_fqcodel", "HFSC_Fqcodel (Hfsc With Fq_Codel)")
+o:value("htb_fqcodel", "HTB_Fqcodel (Htb With Fq_Codel)")
+o.default = "hfsc_cake"
 
 -- 链路类型
 o = s:option(ListValue, "linklayer", translate("Linklayer Type"), translate("Select linkelayer type"))

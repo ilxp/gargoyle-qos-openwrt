@@ -4,17 +4,6 @@
 # 支持多算法：HFSC, CAKE, FQ_CoDel, HTB
 # 版本：2.2.1（进一步优化：POSIX 循环、监控参数传递、错误处理完善）
 #
-# 优化内容：
-#   - 移除未使用的函数：load_algorithm_config, add_connmark_pass_rules
-#   - 修复 generate_class_marks 中的未定义变量
-#   - 调整 NFT prerouting 优先级为 -149 避免与 fw4 冲突
-#   - 为 nft flush 添加存在性检查，减少错误输出
-#   - 优化启动时序和接口检测
-#   - 清理无用代码，保留手动标记文件生成能力
-#   - 将 seq 循环替换为 POSIX 兼容的 while 循环
-#   - 完善 QoS 监控启动，从 UCI 读取参数并传递
-#   - 确保所有 tc 命令错误输出被忽略
-#
 
 START=50
 STOP=89
@@ -34,9 +23,11 @@ SERVICE_NAME="qos_gargoyle"
 
 # 算法模块路径
 QOS_MODULES_DIR="/usr/lib/qos_gargoyle"
-HFSC_MODULE="$QOS_MODULES_DIR/hfsc_fqcodel.sh"
 CAKE_MODULE="$QOS_MODULES_DIR/cake.sh"
-HTB_MODULE="$QOS_MODULES_DIR/htb_fqcodel.sh"
+HFSC_CAKE_MODULE="$QOS_MODULES_DIR/hfsc_cake.sh"      
+HTB_CAKE_MODULE="$QOS_MODULES_DIR/htb_cake.sh" 
+HFSC_MODULE="$QOS_MODULES_DIR/hfsc_fqcodel.sh"
+HTB_MODULE="$QOS_MODULES_DIR/htb_fqcodel.sh"  
 RULE_HELPER="$QOS_MODULES_DIR/rule.sh"
 
 # 服务状态文件
@@ -319,13 +310,16 @@ load_algorithm_module() {
     local module=""
     
     case "$algo" in
-        "hfsc_fqcodel") module="$HFSC_MODULE" ;;
+	    "hfsc_cake") module="$HFSC_CAKE_MODULE" ;;   
+        "htb_cake") module="$HTB_CAKE_MODULE" ;; 
         "cake") module="$CAKE_MODULE" ;;
-        "htb_fqcodel") module="$HTB_MODULE" ;;  
+		"hfsc_fqcodel") module="$HFSC_MODULE" ;;
+        "htb_fqcodel") module="$HTB_MODULE" ;;
+    
         *)
-            echo "Unknown algorithm: $algo, using hfsc as default"
-            module="$HFSC_MODULE"
-            algo="hfsc_fqcodel"
+            echo "Unknown algorithm: $algo, using hfsc_cake as default"
+            module="$HFSC_CAKE_MODULE"
+            algo="hfsc_cake"
             ;;
     esac
     
@@ -337,11 +331,11 @@ load_algorithm_module() {
         return 0
     else
         echo "Error: Algorithm module not found: $module"
-        # 尝试加载 HFSC 作为默认
-        if [ -f "$HFSC_MODULE" ] && [ "$algo" != "hfsc_fqcodel" ]; then
-            . "$HFSC_MODULE"
-            algorithm="hfsc_fqcodel"
-            echo "Falling back to HFSC module"
+        # 尝试加载 HFSC_CAKE 作为默认
+        if [ -f "$HFSC_CAKE_MODULE" ] && [ "$algo" != "hfsc_cake" ]; then
+            . "$HFSC_CAKE_MODULE"
+            algorithm="hfsc_cake"
+            echo "Falling back to HFSC_CAKE module"
             return 0
         else
             return 1
@@ -357,7 +351,7 @@ load_qos_config() {
     echo "尝试读取 UCI 配置..." >&2
     while [ $retries -gt 0 ]; do
         algorithm=$(uci -q get "$CONFIG_FILE.global.algorithm")
-        algorithm="${algorithm:-hfsc_fqcodel}"
+        algorithm="${algorithm:-hfsc_cake}"          # 修改默认算法为 hfsc_cake
         
         total_upload_bandwidth=$(uci -q get "$CONFIG_FILE.upload.total_bandwidth")
         total_download_bandwidth=$(uci -q get "$CONFIG_FILE.download.total_bandwidth")
@@ -925,6 +919,26 @@ initialize_qos() {
                 return 1
             fi
             ;;
+        "hfsc_cake")                               # 新增
+            if type initialize_hfsc_cake_qos >/dev/null 2>&1; then
+                export RULES_ALREADY_APPLIED=1
+                initialize_hfsc_cake_qos start
+            else
+                echo "HFSC+CAKE initialization function not found"
+                rm -rf "$LOCK_FILE"
+                return 1
+            fi
+            ;;
+        "htb_cake")                                 # 新增
+            if type initialize_htb_cake_qos >/dev/null 2>&1; then
+                export RULES_ALREADY_APPLIED=1
+                initialize_htb_cake_qos start
+            else
+                echo "HTB+CAKE initialization function not found"
+                rm -rf "$LOCK_FILE"
+                return 1
+            fi
+            ;;
         *)
             echo "Unknown algorithm: $algorithm"
             rm -rf "$LOCK_FILE"
@@ -999,6 +1013,22 @@ display_algorithm_specific_status() {
                 show_htb_status
             else
                 echo "HTB status function not found, showing basic status..."
+                show_basic_status
+            fi
+            ;;
+        "hfsc_cake")                               
+            if type show_hfsc_cake_status >/dev/null 2>&1; then
+                show_hfsc_cake_status
+            else
+                echo "HFSC+CAKE status function not found, showing basic status..."
+                show_basic_status
+            fi
+            ;;
+        "htb_cake")                                 
+            if type show_htb_cake_status >/dev/null 2>&1; then
+                show_htb_cake_status
+            else
+                echo "HTB+CAKE status function not found, showing basic status..."
                 show_basic_status
             fi
             ;;
