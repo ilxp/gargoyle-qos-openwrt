@@ -2,7 +2,7 @@
 #
 # QoS Gargoyle 初始化脚本 - 传统 init.d 版本
 # 支持多算法：HFSC, CAKE, FQ_CoDel, HTB
-# 版本：2.2.0（代码精简与健壮性优化）
+# 版本：2.2.1（进一步优化：POSIX 循环、监控参数传递、错误处理完善）
 #
 # 优化内容：
 #   - 移除未使用的函数：load_algorithm_config, add_connmark_pass_rules
@@ -11,6 +11,9 @@
 #   - 为 nft flush 添加存在性检查，减少错误输出
 #   - 优化启动时序和接口检测
 #   - 清理无用代码，保留手动标记文件生成能力
+#   - 将 seq 循环替换为 POSIX 兼容的 while 循环
+#   - 完善 QoS 监控启动，从 UCI 读取参数并传递
+#   - 确保所有 tc 命令错误输出被忽略
 #
 
 START=50
@@ -612,23 +615,53 @@ apply_classification_rules() {
     echo "分类规则应用完成"
 }
 
-# 启动 QoS 监控（简化：仅检查 qosacc 是否存在）
+# 启动 QoS 监控（从 UCI 读取参数并传递给 qosacc）
 start_qos_acc() {
     echo "Starting QoS acc..."
     
     local acc_enabled=$(uci -q get "$CONFIG_FILE.download.acc_monenabled")
-    
-    if [ "$acc_enabled" = "true" ] || [ "$acc_enabled" = "1" ]; then
-        if command -v qosacc >/dev/null 2>&1; then
-            # 尝试启动监控，具体参数由监控模块处理
-            qosacc &
-            echo "QoS acc started"
-        else
-            echo "Warning: qosacc not found"
-        fi
-    else
+    if [ "$acc_enabled" != "true" ] && [ "$acc_enabled" != "1" ]; then
         echo "QoS acc is disabled in configuration"
+        return 0
     fi
+    
+    if ! command -v qosacc >/dev/null 2>&1; then
+        echo "Warning: qosacc not found, QoS acc cannot start"
+        return 1
+    fi
+    
+    # 获取目标 IP
+    local ptarget_ip=$(uci -q get "$CONFIG_FILE.global.ptarget_ip")
+    if [ -z "$ptarget_ip" ]; then
+        echo "自动检测 ping 目标..."
+        # 尝试使用默认网关
+        ptarget_ip=$(ip route show default 2>/dev/null | awk '/default/ {print $3}')
+        if [ -z "$ptarget_ip" ]; then
+            echo "Warning: Cannot determine ping target, QoS acc may not work correctly"
+        fi
+    fi
+    
+    # 获取 pinglimit
+    local pinglimit=$(uci -q get "$CONFIG_FILE.download.pinglimit")
+    if [ -z "$pinglimit" ]; then
+        # 自动计算：基于带宽的经验公式（参考原 qosmon）
+        if [ -n "$total_download_bandwidth" ] && [ "$total_download_bandwidth" -gt 0 ] && \
+           [ -n "$total_upload_bandwidth" ] && [ "$total_upload_bandwidth" -gt 0 ]; then
+            pinglimit=$((1500 * 10 * 2 / 3 / total_download_bandwidth + 1500 * 10 / total_upload_bandwidth + 2))
+        else
+            pinglimit=""
+        fi
+    fi
+    
+    if [ -n "$ptarget_ip" ] && [ -n "$total_download_bandwidth" ] && [ -n "$pinglimit" ]; then
+        echo "启动 QoS 监控: qosacc -a -b 800 $ptarget_ip $total_download_bandwidth $pinglimit"
+        qosacc -a -b 800 "$ptarget_ip" "$total_download_bandwidth" "$pinglimit" &
+    else
+        echo "Warning: Missing parameters for qosacc, starting with defaults"
+        qosacc &
+    fi
+    
+    echo "QoS acc started"
 }
 
 # 生成标记文件（可选，用于调试）
@@ -656,13 +689,15 @@ generate_class_marks() {
     echo "# 标记范围: 0x1-0x$((1 << (upload_count-1)))" >> "$UPLOAD_MARK_FILE"
     echo "--------------------------------------" >> "$UPLOAD_MARK_FILE"
     
-    for i in $(seq 1 $upload_count); do
+    i=1
+    while [ $i -le $upload_count ]; do
         class="uclass_$i"
         base_value=$((0x1))
         shift_amount=$((i - 1))
         mark_value=$((base_value << shift_amount))
         mark_hex=$(printf "0x%X" "$mark_value")        
-        echo "upload:${class}:${mark_hex}" >> "$UPLOAD_MARK_FILE"   # 移除未定义的 $description
+        echo "upload:${class}:${mark_hex}" >> "$UPLOAD_MARK_FILE"
+        i=$((i + 1))
     done
     
     echo "--------------------------------------" >> "$UPLOAD_MARK_FILE"
@@ -680,14 +715,16 @@ generate_class_marks() {
     echo "# 标记范围: 0x100-0x$((0x100 << (download_count-1)))" >> "$DOWNLOAD_MARK_FILE"
     echo "--------------------------------------" >> "$DOWNLOAD_MARK_FILE"
     
-    for i in $(seq 1 $download_count); do
+    i=1
+    while [ $i -le $download_count ]; do
         class="dclass_$i"
         base_value=$((0x100))
         shift_amount=$((i - 1))
         mark_value=$((base_value << shift_amount))
         mark_hex=$(printf "0x%X" "$mark_value")
         
-        echo "download:${class}:${mark_hex}" >> "$DOWNLOAD_MARK_FILE"  # 移除未定义的 $description
+        echo "download:${class}:${mark_hex}" >> "$DOWNLOAD_MARK_FILE"
+        i=$((i + 1))
     done
     
     echo "--------------------------------------" >> "$DOWNLOAD_MARK_FILE"
@@ -717,7 +754,8 @@ generate_combined_marks_file() {
 # 上传类别 (出口流量) - 用于pppoe-wan接口
 EOF
     
-    for i in $(seq 1 $upload_count); do
+    i=1
+    while [ $i -le $upload_count ]; do
         base_value=$((0x1))
         shift_amount=$((i - 1))
         mark_value=$((base_value << shift_amount))
@@ -725,12 +763,14 @@ EOF
         dec_value=$((mark_value))
         
         echo "upload:uclass_$i:${mark_hex}  # 十进制: $dec_value" >> "$COMBINED_FILE"
+        i=$((i + 1))
     done
     
     echo "" >> "$COMBINED_FILE"
     echo "# 下载类别 (入口流量) - 用于ifb0接口" >> "$COMBINED_FILE"
     
-    for i in $(seq 1 $download_count); do
+    i=1
+    while [ $i -le $download_count ]; do
         base_value=$((0x100))
         shift_amount=$((i - 1))
         mark_value=$((base_value << shift_amount))
@@ -738,6 +778,7 @@ EOF
         dec_value=$((mark_value))
         
         echo "download:dclass_$i:${mark_hex}  # 十进制: $dec_value" >> "$COMBINED_FILE"
+        i=$((i + 1))
     done
     
     echo "--------------------------------------" >> "$COMBINED_FILE"
