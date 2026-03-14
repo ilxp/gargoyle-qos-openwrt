@@ -3,7 +3,7 @@
 # 基于HTB与FQ_CODEL组合算法实现QoS流量控制。
 # 必要工具：tc, nft, conntrack, ethtool, sysctl
 # 内核模块：ifb, sch_htb, sch_fq_codel
-# version=2.1 修复内存计算向上取整，增加默认类设置前的根队列检查
+# version=2.4
 
 # ========== 全局配置常量 ==========
 : ${CONFIG_FILE:=qos_gargoyle}
@@ -510,6 +510,23 @@ setup_ipv6_specific_rules() {
         meta mark set 0x7F counter 2>/dev/null || true
     
     qos_log "INFO" "IPv6关键流量规则设置完成"
+}
+
+# ========== 新增：创建增强规则链并添加跳转 ==========
+setup_htb_enhance_chains() {
+    qos_log "INFO" "设置HTB增强规则链"
+    
+    # 创建增强链（如果不存在）
+    nft add chain inet gargoyle-qos-priority filter_qos_egress_enhance 2>/dev/null || true
+    nft add chain inet gargoyle-qos-priority filter_qos_ingress_enhance 2>/dev/null || true
+    
+    # 在主链开头添加跳转规则（如果不存在）
+    # 注意：这里使用 insert 将规则插入到链开头，确保增强规则优先执行
+    nft insert rule inet gargoyle-qos-priority filter_qos_egress \
+        jump filter_qos_egress_enhance 2>/dev/null || true
+    
+    nft insert rule inet gargoyle-qos-priority filter_qos_ingress \
+        jump filter_qos_ingress_enhance 2>/dev/null || true
 }
 
 # ========== HTB核心队列函数 ==========
@@ -1277,7 +1294,7 @@ set_default_upload_class() {
     
     local default_class_name=$(uci -q get qos_gargoyle.upload.default_class 2>/dev/null)
     if [ -z "$default_class_name" ]; then
-        qos_log "ERROR" "上传默认类别未配置，将使用第一个类别"
+        qos_log "WARN" "上传默认类别未配置，将使用第一个类别"
         # 若未配置，直接使用第一个类别（如果有）
         if [ -n "$upload_class_list" ]; then
             default_class_name=$(echo "$upload_class_list" | awk '{print $1}')
@@ -1345,7 +1362,7 @@ set_default_download_class() {
     
     local default_class_name=$(uci -q get qos_gargoyle.download.default_class 2>/dev/null)
     if [ -z "$default_class_name" ]; then
-        qos_log "ERROR" "下载默认类别未配置，将使用第一个类别"
+        qos_log "WARN" "下载默认类别未配置，将使用第一个类别"
         if [ -n "$download_class_list" ]; then
             default_class_name=$(echo "$download_class_list" | awk '{print $1}')
             qos_log "INFO" "自动选择第一个类别: $default_class_name"
@@ -1398,16 +1415,21 @@ set_default_download_class() {
     qos_log "INFO" "下载默认类别设置为TC类ID: 1:$found_index"
 }
 
+# ========== 增强规则函数：操作专用链 ==========
 apply_htb_specific_rules() {
-    qos_log "INFO" "应用HTB特定增强规则"
+    qos_log "INFO" "应用HTB特定增强规则（专用链）"
+    
+    # 清空增强链，确保每次启动规则唯一
+    nft flush chain inet gargoyle-qos-priority filter_qos_egress_enhance 2>/dev/null || true
+    nft flush chain inet gargoyle-qos-priority filter_qos_ingress_enhance 2>/dev/null || true
     
     # DoS防护：限制单个IP的新连接速率
-    nft add rule inet gargoyle-qos-priority filter_qos_egress \
+    nft add rule inet gargoyle-qos-priority filter_qos_egress_enhance \
         ct state new \
         limit rate 100/second burst 20 packets \
         meta mark set 0x7F counter 2>/dev/null || true
     
-    nft add rule inet gargoyle-qos-priority filter_qos_ingress \
+    nft add rule inet gargoyle-qos-priority filter_qos_ingress_enhance \
         ct state new \
         limit rate 100/second burst 20 packets \
         meta mark set 0x7F00 counter 2>/dev/null || true
@@ -1416,32 +1438,32 @@ apply_htb_specific_rules() {
     nft add rule inet filter input ct state new limit rate 100/second burst 20 accept 2>/dev/null || true
     
     # HTB优先级映射规则
-    nft add rule inet gargoyle-qos-priority filter_qos_egress \
+    nft add rule inet gargoyle-qos-priority filter_qos_egress_enhance \
         meta mark and 0x007f != 0 counter meta priority set "bulk" 2>/dev/null || true
     
-    nft add rule inet gargoyle-qos-priority filter_qos_ingress \
+    nft add rule inet gargoyle-qos-priority filter_qos_ingress_enhance \
         meta mark and 0x7f00 != 0 counter meta priority set "bulk" 2>/dev/null || true
     
     # HTB连接跟踪优化
-    nft add rule inet gargoyle-qos-priority filter_qos_egress \
+    nft add rule inet gargoyle-qos-priority filter_qos_egress_enhance \
         ct state established,related counter meta mark set ct mark 2>/dev/null || true
     
     # HTB延迟敏感流量优化
-    nft add rule inet gargoyle-qos-priority filter_qos_egress \
+    nft add rule inet gargoyle-qos-priority filter_qos_egress_enhance \
         meta mark and 0x0010 != 0 counter meta priority set "critical" 2>/dev/null || true
     
-    nft add rule inet gargoyle-qos-priority filter_qos_ingress \
+    nft add rule inet gargoyle-qos-priority filter_qos_ingress_enhance \
         meta mark and 0x1000 != 0 counter meta priority set "critical" 2>/dev/null || true
     
     # 小包优先处理（VoIP、游戏等）
-    nft add rule inet gargoyle-qos-priority filter_qos_egress \
+    nft add rule inet gargoyle-qos-priority filter_qos_egress_enhance \
         ct bytes lt 200 counter meta priority set "normal" 2>/dev/null || true
     
-    nft add rule inet gargoyle-qos-priority filter_qos_ingress \
+    nft add rule inet gargoyle-qos-priority filter_qos_ingress_enhance \
         ct bytes lt 200 counter meta priority set "normal" 2>/dev/null || true
     
     # HTB特定的TCP优化
-    nft add rule inet gargoyle-qos-priority filter_qos_egress \
+    nft add rule inet gargoyle-qos-priority filter_qos_egress_enhance \
         tcp flags syn tcp option maxseg size set rt mtu counter meta mark set 0x3F 2>/dev/null || true
     
     qos_log "INFO" "HTB特定增强规则应用完成"
@@ -1514,7 +1536,10 @@ initialize_htb_qos() {
         return 1
     fi
     
-    # 5. 应用HTB特定的nftables规则
+    # 5. 设置增强规则链（必须在应用规则之前，确保链存在）
+    setup_htb_enhance_chains
+    
+    # 6. 应用HTB特定的nftables规则（增强链）
     apply_htb_specific_rules
     
     qos_log "INFO" "HTB QoS初始化完成"
@@ -1557,9 +1582,24 @@ stop_htb_qos() {
     tc qdisc del dev "$IFB_DEVICE" ingress 2>/dev/null || true
     tc qdisc del dev "$IFB_DEVICE" root 2>/dev/null || true
     
-    # 清理NFTables规则
-    nft delete chain inet gargoyle-qos-priority filter_qos_egress 2>/dev/null || true
-    nft delete chain inet gargoyle-qos-priority filter_qos_ingress 2>/dev/null || true
+    # 清理NFTables规则：删除增强链和跳转规则
+    nft delete chain inet gargoyle-qos-priority filter_qos_egress_enhance 2>/dev/null || true
+    nft delete chain inet gargoyle-qos-priority filter_qos_ingress_enhance 2>/dev/null || true
+    
+    # 删除跳转规则（需匹配跳转规则内容）
+    # 由于无法精确删除，我们直接删除整个链可能更简单，但主链必须保留。
+    # 这里采用清空主链并重新添加基础跳转的方式？实际上我们不需要删除跳转规则，
+    # 因为增强链已被删除，跳转规则会因目标链不存在而失效，但nftables不会自动删除，
+    # 规则会保留但指向无效链，可能导致错误。所以必须显式删除跳转规则。
+    # 我们可以尝试删除所有指向增强链的规则。
+    nft delete rule inet gargoyle-qos-priority filter_qos_egress handle \
+        $(nft -a list chain inet gargoyle-qos-priority filter_qos_egress 2>/dev/null | \
+          grep "jump filter_qos_egress_enhance" | awk '{print $NF}') 2>/dev/null || true
+    nft delete rule inet gargoyle-qos-priority filter_qos_ingress handle \
+        $(nft -a list chain inet gargoyle-qos-priority filter_qos_ingress 2>/dev/null | \
+          grep "jump filter_qos_ingress_enhance" | awk '{print $NF}') 2>/dev/null || true
+    
+    # 清理主链中的其他规则？不清理，保留分类规则。
     
     # 清理入口队列
     tc qdisc del dev "$qos_interface" ingress 2>/dev/null || true

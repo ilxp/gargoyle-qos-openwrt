@@ -1,7 +1,7 @@
 #!/bin/sh
 # 规则辅助模块 (rule.sh)
 # 支持多样化端口、协议、IPv6双栈和连接字节数过滤
-# version=1.6.11 最终稳定版（强制计算标记 + 类数量警告 + 日志优化）
+# version=1.6.12 最终稳定版
 
 CONFIG_FILE="qos_gargoyle"
 TEMP_FILES=""
@@ -16,15 +16,18 @@ if [ "$ALGORITHM" = "cake" ]; then
 fi
 
 # ========== 辅助函数 ==========
+# 转义字符串中的特殊字符，使其可安全用于 eval 赋值
 escape_for_eval() {
     echo "$1" | sed 's/\\/\\\\/g; s/"/\\"/g; s/\$/\\$/g; s/`/\\`/g'
 }
 
+# 清理输入字符串，只允许安全字符，防止命令注入
 sanitize_input() {
     local input="$1"
     echo "$input" | sed 's/[^][a-zA-Z0-9_:/., -]//g'
 }
 
+# 统一日志函数，同时输出到系统日志和控制台
 log() {
     local level="$1"
     local message="$2"
@@ -51,6 +54,7 @@ log() {
 }
 
 # ========== 验证函数 ==========
+# 验证数字是否在指定范围内
 validate_number() {
     local value="$1"
     local param_name="$2"
@@ -75,6 +79,7 @@ validate_number() {
     return 0
 }
 
+# 验证端口参数（支持逗号分隔列表和端口范围）
 validate_port() {
     local value="$1"
     local param_name="$2"
@@ -134,6 +139,7 @@ validate_port() {
     return 0
 }
 
+# 验证 IP 地址（支持 IPv4 和 IPv6，包括 IPv4-mapped 格式）
 validate_ip_address() {
     local ip="$1"
     local param_name="$2"
@@ -153,6 +159,7 @@ validate_ip_address() {
     return 1
 }
 
+# 验证协议名称，接受标准协议或 tcp_udp 作为组合协议
 validate_protocol() {
     local proto="$1"
     local param_name="$2"
@@ -167,6 +174,7 @@ validate_protocol() {
 }
 
 # ========== 配置加载函数 ==========
+# 加载指定类型的所有配置节名称
 load_all_config_sections() {
     local config_name="$1"
     local section_type="$2"
@@ -185,6 +193,7 @@ load_all_config_sections() {
     fi
 }
 
+# 加载指定配置节的所有选项，并赋值给带前缀的变量
 load_all_config_options() {
     local config_name="$1"
     local section_id="$2"
@@ -267,6 +276,7 @@ load_all_config_options() {
 }
 
 # ========== 类别标记计算函数 ==========
+# 计算类名的哈希索引（基于 SHA1 或 CRC32）
 calculate_hash_index() {
     local class="$1"
     if command -v sha1sum >/dev/null 2>&1; then
@@ -286,7 +296,7 @@ calculate_hash_index() {
     fi
 }
 
-# 强制使用计算标记，忽略文件和UCI配置（仅记录一次标记信息）
+# 获取类别的标记值，强制使用计算标记，忽略文件和 UCI 配置
 get_class_mark_for_rule() {
     local class="$1"
     local direction="$2"
@@ -309,6 +319,7 @@ get_class_mark_for_rule() {
     fi
 }
 
+# 计算类别的标记值（哈希取模 8 后左移）
 calculate_class_mark() {
     local class="$1"
     local mask="$2"
@@ -326,7 +337,8 @@ calculate_class_mark() {
     printf "0x%X" "$mark_value"
 }
 
-# ========== 快速排序（实时获取类优先级）==========
+# ========== 快速排序（实时获取类优先级，并立即清理临时文件）==========
+# 根据规则配置文件和实时获取的类优先级排序规则
 sort_rules_by_priority_fast() {
     local config_file="$1"
     
@@ -350,10 +362,17 @@ EOF
         echo "$composite:$r_name" >> "$temp_sort"
     done < "$config_file"
     
-    sort -t ':' -k1,1n "$temp_sort" 2>/dev/null | cut -d: -f2- | tr '\n' ' ' | sed 's/ $//'
+    # 排序输出
+    local result=$(sort -t ':' -k1,1n "$temp_sort" 2>/dev/null | cut -d: -f2- | tr '\n' ' ' | sed 's/ $//')
+    
+    # 立即删除临时文件
+    rm -f "$temp_sort" 2>/dev/null
+    
+    echo "$result"
 }
 
-# ========== 快速构建nft规则（输出到文件）==========
+# ========== 快速构建nft规则 ==========
+# 构建单条 nft 规则命令并输出到标准输出
 build_nft_rule_fast() {
     local rule_name="$1"
     local chain="$2"
@@ -395,8 +414,8 @@ build_nft_rule_fast() {
     if [ -n "$connbytes_kb" ] && [ "$connbytes_kb" != "0" ]; then
         local connbytes_kb_clean=$(echo "$connbytes_kb" | tr -d ' ')
         if echo "$connbytes_kb_clean" | grep -qE '^[<>=!]+[0-9]+$'; then
-            local operator=$(echo "$connbytes_kb_clean" | sed -E 's/^([<>=!]+).*$/\1/')
-            local value=$(echo "$connbytes_kb_clean" | sed -E 's/^[<>=!]+([0-9]+)$/\1/')
+            local operator=$(echo "$connbytes_kb_clean" | sed -r 's/^([<>=!]+).*$/\1/')
+            local value=$(echo "$connbytes_kb_clean" | sed -r 's/^[<>=!]+([0-9]+)$/\1/')
             local bytes_value=$((value * 1024))
             nft_cmd="$nft_cmd ct bytes $operator $bytes_value"
         fi
@@ -406,7 +425,8 @@ build_nft_rule_fast() {
     echo "$nft_cmd"
 }
 
-# ========== 增强规则应用函数（最终版）==========
+# ========== 增强规则应用函数 ==========
+# 应用指定方向的所有规则（上传或下载），支持优先级排序和批量提交
 apply_enhanced_direction_rules() {
     local rule_type="$1"
     local chain="$2"
@@ -476,30 +496,33 @@ EOF
         rule_count=$((rule_count + 1))
     done
     
-	if [ -s "$nft_batch_file" ]; then
-		log "INFO" "执行批量nft规则 (共 $rule_count 条)..."
-		# 执行并捕获输出和退出码
-		nft_output=$(nft -f "$nft_batch_file" 2>&1)
-		nft_ret=$?
-		if [ $nft_ret -eq 0 ]; then
-			log "INFO" "✅ 批量规则应用成功"
-		else
-			log "ERROR" "❌ 批量规则应用失败 (退出码: $nft_ret)"
-			log "ERROR" "nft 错误输出: $nft_output"
-			# 可选：将批处理文件内容也打印出来，便于检查语法
-			log "ERROR" "批处理文件内容:"
-			cat "$nft_batch_file" | while IFS= read -r line; do
-				log "ERROR" "  $line"
-			done
-		fi
-		log "INFO" "当前链 $chain 中的规则:"
-			nft list chain inet gargoyle-qos-priority $chain 2>&1 | while IFS= read -r line; do
-		log "INFO" "  $line"
-		done
-	fi
+    if [ -s "$nft_batch_file" ]; then
+        log "INFO" "执行批量nft规则 (共 $rule_count 条)..."
+        nft_output=$(nft -f "$nft_batch_file" 2>&1)
+        nft_ret=$?
+        if [ $nft_ret -eq 0 ]; then
+            log "INFO" "✅ 批量规则应用成功"
+        else
+            log "ERROR" "❌ 批量规则应用失败 (退出码: $nft_ret)"
+            log "ERROR" "nft 错误输出: $nft_output"
+            log "ERROR" "批处理文件内容:"
+            cat "$nft_batch_file" | while IFS= read -r line; do
+                log "ERROR" "  $line"
+            done
+        fi
+        log "INFO" "当前链 $chain 中的规则:"
+        nft list chain inet gargoyle-qos-priority $chain 2>&1 | while IFS= read -r line; do
+            log "INFO" "  $line"
+        done
+        # 立即删除批处理文件
+        rm -f "$nft_batch_file" 2>/dev/null
+    fi
+    
+    # 删除配置临时文件
+    rm -f "$temp_config" 2>/dev/null
 }
 
-# ========== 以下为原有兼容函数，保持不变 ==========
+# 应用所有规则（兼容旧版本调用）
 apply_all_rules() {
     local rule_type="$1"
     local mask="$2"
@@ -508,6 +531,7 @@ apply_all_rules() {
     apply_enhanced_direction_rules "$rule_type" "$chain" "$mask"
 }
 
+# 处理单个规则（兼容旧版本调用）
 process_single_rule() {
     local rule_id="$1"
     local chain="$2"
@@ -574,6 +598,7 @@ process_single_rule() {
     fi
 }
 
+# 处理协议为 all 的规则，分别创建 TCP 和 UDP 规则（兼容旧版本）
 apply_all_protocol_rule() {
     local chain="$1"
     local mark="$2"
@@ -681,6 +706,7 @@ apply_all_protocol_rule() {
 }
 
 # ========== 双栈过滤器函数 ==========
+# 创建双栈（IPv4/IPv6）fwmark 过滤器
 create_dualstack_filter() {
     local dev="$1"
     local parent="$2"
@@ -694,6 +720,7 @@ create_dualstack_filter() {
         handle ${mark}/$mask fw flowid "$class_id" 2>/dev/null || true
 }
 
+# 创建带优先级的双栈 fwmark 过滤器
 create_priority_dualstack_filter() {
     local dev="$1"
     local parent="$2"

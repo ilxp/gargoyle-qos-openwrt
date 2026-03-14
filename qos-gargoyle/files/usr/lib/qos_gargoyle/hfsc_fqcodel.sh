@@ -1,5 +1,5 @@
 #!/bin/sh
-# version=2.1 修复内存计算向上取整，增加默认类设置前的根队列检查
+# version=2.4
 # HFSC_FQCODEL算法实现模块
 # 基于HFSC与FQ_CODEL组合算法实现QoS流量控制。
 # 必要工具：tc, nft, conntrack, ethtool, sysctl
@@ -149,7 +149,7 @@ load_bandwidth_from_config() {
     return 0
 }
 
-# 计算内存限制 - 修复1：使用向上取整避免除法结果为0
+# 计算内存限制 - 使用向上取整避免除法结果为0
 calculate_memory_limit() {
     local config_value="$1"
     local result
@@ -348,7 +348,7 @@ load_hfsc_class_config() {
     priority=$(uci -q get qos_gargoyle.$class_name.priority 2>/dev/null)
     name=$(uci -q get qos_gargoyle.$class_name.name 2>/dev/null)
     
-    # 验证百分比参数
+    # 验证百分比参数（允许0）
     if [ -n "$percent_bandwidth" ] && ! validate_number "$percent_bandwidth" "$class_name.percent_bandwidth" 0 100; then
         percent_bandwidth=""
     fi
@@ -466,6 +466,23 @@ setup_ipv6_specific_rules() {
         meta mark set 0x7F counter 2>/dev/null || true
     
     qos_log "INFO" "IPv6关键流量规则设置完成"
+}
+
+# ========== 新增：创建增强规则链并添加跳转 ==========
+setup_hfsc_enhance_chains() {
+    qos_log "INFO" "设置HFSC增强规则链"
+    
+    # 创建增强链（如果不存在）
+    nft add chain inet gargoyle-qos-priority filter_qos_egress_enhance 2>/dev/null || true
+    nft add chain inet gargoyle-qos-priority filter_qos_ingress_enhance 2>/dev/null || true
+    
+    # 在主链开头添加跳转规则（如果不存在）
+    # 使用 insert 将规则插入到链开头，确保增强规则优先执行
+    nft insert rule inet gargoyle-qos-priority filter_qos_egress \
+        jump filter_qos_egress_enhance 2>/dev/null || true
+    
+    nft insert rule inet gargoyle-qos-priority filter_qos_ingress \
+        jump filter_qos_ingress_enhance 2>/dev/null || true
 }
 
 # ========== HFSC核心队列函数 ==========
@@ -1168,7 +1185,7 @@ initialize_hfsc_download() {
 set_default_upload_class() {
     qos_log "INFO" "设置上传默认类别"
     
-    # 修复2：检查根队列是否存在
+    # 检查根队列是否存在
     if ! tc qdisc show dev "$qos_interface" root 2>/dev/null | grep -q "hfsc"; then
         qos_log "ERROR" "上传根队列不存在，无法设置默认类"
         return
@@ -1176,7 +1193,7 @@ set_default_upload_class() {
     
     local default_class_name=$(uci -q get qos_gargoyle.upload.default_class 2>/dev/null)
     if [ -z "$default_class_name" ]; then
-        qos_log "ERROR" "上传默认类别未配置，将使用第一个类别"
+        qos_log "WARN" "上传默认类别未配置，将使用第一个类别"
         # 若未配置，直接使用第一个类别（如果有）
         if [ -n "$upload_class_list" ]; then
             default_class_name=$(echo "$upload_class_list" | awk '{print $1}')
@@ -1236,7 +1253,7 @@ set_default_upload_class() {
 set_default_download_class() {
     qos_log "INFO" "设置下载默认类别"
     
-    # 修复2：检查根队列是否存在
+    # 检查根队列是否存在
     if ! tc qdisc show dev "$IFB_DEVICE" root 2>/dev/null | grep -q "hfsc"; then
         qos_log "ERROR" "下载根队列不存在，无法设置默认类"
         return
@@ -1244,7 +1261,7 @@ set_default_download_class() {
     
     local default_class_name=$(uci -q get qos_gargoyle.download.default_class 2>/dev/null)
     if [ -z "$default_class_name" ]; then
-        qos_log "ERROR" "下载默认类别未配置，将使用第一个类别"
+        qos_log "WARN" "下载默认类别未配置，将使用第一个类别"
         if [ -n "$download_class_list" ]; then
             default_class_name=$(echo "$download_class_list" | awk '{print $1}')
             qos_log "INFO" "自动选择第一个类别: $default_class_name"
@@ -1297,16 +1314,21 @@ set_default_download_class() {
     qos_log "INFO" "下载默认类别设置为TC类ID: 1:$found_index"
 }
 
+# ========== 修正后的增强规则函数：操作专用链 ==========
 apply_hfsc_specific_rules() {
-    qos_log "INFO" "应用HFSC特定增强规则"
+    qos_log "INFO" "应用HFSC特定增强规则（专用链）"
+    
+    # 清空增强链，确保每次启动规则唯一
+    nft flush chain inet gargoyle-qos-priority filter_qos_egress_enhance 2>/dev/null || true
+    nft flush chain inet gargoyle-qos-priority filter_qos_ingress_enhance 2>/dev/null || true
     
     # DoS防护：限制单个IP的新连接速率
-    nft add rule inet gargoyle-qos-priority filter_qos_egress \
+    nft add rule inet gargoyle-qos-priority filter_qos_egress_enhance \
         ct state new \
         limit rate 100/second burst 20 packets \
         meta mark set 0x7F counter 2>/dev/null || true
     
-    nft add rule inet gargoyle-qos-priority filter_qos_ingress \
+    nft add rule inet gargoyle-qos-priority filter_qos_ingress_enhance \
         ct state new \
         limit rate 100/second burst 20 packets \
         meta mark set 0x7F00 counter 2>/dev/null || true
@@ -1315,28 +1337,28 @@ apply_hfsc_specific_rules() {
     nft add rule inet filter input ct state new limit rate 100/second burst 20 accept 2>/dev/null || true
     
     # HFSC优先级设置
-    nft add rule inet gargoyle-qos-priority filter_qos_egress \
+    nft add rule inet gargoyle-qos-priority filter_qos_egress_enhance \
         meta mark and 0x007f != 0 counter meta priority set "bulk" 2>/dev/null || true
     
-    nft add rule inet gargoyle-qos-priority filter_qos_ingress \
+    nft add rule inet gargoyle-qos-priority filter_qos_ingress_enhance \
         meta mark and 0x7f00 != 0 counter meta priority set "bulk" 2>/dev/null || true
     
     # HFSC连接跟踪优化
-    nft add rule inet gargoyle-qos-priority filter_qos_egress \
+    nft add rule inet gargoyle-qos-priority filter_qos_egress_enhance \
         ct state established,related counter meta mark set ct mark 2>/dev/null || true
     
     # HFSC延迟敏感流量优化
-    nft add rule inet gargoyle-qos-priority filter_qos_egress \
+    nft add rule inet gargoyle-qos-priority filter_qos_egress_enhance \
         meta mark and 0x0010 != 0 counter meta priority set "critical" 2>/dev/null || true
     
-    nft add rule inet gargoyle-qos-priority filter_qos_ingress \
+    nft add rule inet gargoyle-qos-priority filter_qos_ingress_enhance \
         meta mark and 0x1000 != 0 counter meta priority set "critical" 2>/dev/null || true
     
     # 小包优先处理（VoIP、游戏等）
-    nft add rule inet gargoyle-qos-priority filter_qos_egress \
+    nft add rule inet gargoyle-qos-priority filter_qos_egress_enhance \
         ct bytes lt 200 counter meta priority set "normal" 2>/dev/null || true
     
-    nft add rule inet gargoyle-qos-priority filter_qos_ingress \
+    nft add rule inet gargoyle-qos-priority filter_qos_ingress_enhance \
         ct bytes lt 200 counter meta priority set "normal" 2>/dev/null || true
     
     qos_log "INFO" "HFSC特定增强规则应用完成"
@@ -1409,7 +1431,10 @@ initialize_hfsc_qos() {
         return 1
     fi
     
-    # 5. 应用HFSC特定的nftables规则
+    # 5. 设置增强规则链（必须在应用规则之前，确保链存在）
+    setup_hfsc_enhance_chains
+    
+    # 6. 应用HFSC特定的nftables规则（增强链）
     apply_hfsc_specific_rules
     
     qos_log "INFO" "HFSC QoS初始化完成"
@@ -1452,9 +1477,17 @@ stop_hfsc_qos() {
     tc qdisc del dev "$IFB_DEVICE" ingress 2>/dev/null || true
     tc qdisc del dev "$IFB_DEVICE" root 2>/dev/null || true
     
-    # 清理NFTables规则
-    nft delete chain inet gargoyle-qos-priority filter_qos_egress 2>/dev/null || true
-    nft delete chain inet gargoyle-qos-priority filter_qos_ingress 2>/dev/null || true
+    # 清理NFTables规则：删除增强链和跳转规则
+    nft delete chain inet gargoyle-qos-priority filter_qos_egress_enhance 2>/dev/null || true
+    nft delete chain inet gargoyle-qos-priority filter_qos_ingress_enhance 2>/dev/null || true
+    
+    # 删除跳转规则（需匹配跳转规则句柄）
+    nft delete rule inet gargoyle-qos-priority filter_qos_egress handle \
+        $(nft -a list chain inet gargoyle-qos-priority filter_qos_egress 2>/dev/null | \
+          grep "jump filter_qos_egress_enhance" | awk '{print $NF}') 2>/dev/null || true
+    nft delete rule inet gargoyle-qos-priority filter_qos_ingress handle \
+        $(nft -a list chain inet gargoyle-qos-priority filter_qos_ingress 2>/dev/null | \
+          grep "jump filter_qos_ingress_enhance" | awk '{print $NF}') 2>/dev/null || true
     
     # 清理入口队列
     tc qdisc del dev "$qos_interface" ingress 2>/dev/null || true

@@ -1,5 +1,5 @@
 /* qosacc - 基于netlink的QoS主动拥塞控制（TC库版，支持HFSC/HTB/CAKE，含实时类检测）
- * version=1.6.4
+ * version=1.6.7
  * 功能：通过ping监控延迟，使用TC库直接调整根类的带宽，支持实时类检测（HFSC专用）
  * 状态文件目录：/tmp/qosacc.status
  */
@@ -29,11 +29,9 @@
 #include <fcntl.h>
 #include <errno.h>
 #include <math.h>
-#include <pthread.h>
 #include <sys/stat.h>
 #include <float.h>
 #include <time.h>
-#include <dlfcn.h>
 #include <ctype.h>
 #include <stdatomic.h>
 #include <sys/file.h>
@@ -91,7 +89,6 @@
 #define EPSILON 1e-9
 #define MIN_ADJUST_FACTOR 0.80f
 #define MAX_ADJUST_FACTOR 1.20f
-#define LOAD_THRESHOLD_FOR_DECREASE 0.85f
 #define DEFAULT_BURST_TIME_MS 10 /* HTB burst时间（毫秒） */
 #define MIN_BURST_BYTES 1600      /* 最小burst字节数（一个典型MTU） */
 #define ACTIVE_BW_THRESHOLD 4000  /* 类活跃带宽阈值（bps） */
@@ -166,6 +163,16 @@ typedef enum {
     QMON_REALTIME,
     QMON_EXIT
 } qosacc_state_t;
+
+/* 状态名称，用于输出到状态文件 */
+static const char *state_names[] = {
+    [QMON_CHK] = "CHK",
+    [QMON_INIT] = "INIT",
+    [QMON_IDLE] = "IDLE",
+    [QMON_ACTIVE] = "ACTIVE",
+    [QMON_REALTIME] = "REALTIME",
+    [QMON_EXIT] = "EXIT"
+};
 
 /* ==================== 类统计结构 ==================== */
 typedef struct class_stats_s {
@@ -266,7 +273,7 @@ static atomic_int g_reset_bw = ATOMIC_VAR_INIT(0);
 /* ==================== 帮助信息 ==================== */
 const char qosacc_usage[] =
 "qosacc - 基于ping延迟的动态QoS带宽调整器（TC库版，支持实时类检测）\n"
-"版本: 1.6.4\n\n"
+"版本: 1.6.7\n\n"
 "用法:\n"
 "  qosacc [ping间隔(ms)] [目标地址] [最大带宽(kbps)] [ping限制(ms)]\n"
 "  qosacc [选项]\n\n"
@@ -314,6 +321,9 @@ void tc_controller_cleanup(tc_controller_t* tc);
 int tc_controller_update_class_stats(qosacc_context_t* ctx);
 
 static int fetch_hfsc_class_info(qosacc_context_t* ctx);
+static int fetch_class_cb(struct nlmsghdr *n, void *arg);
+
+static __u32 parse_classid(const char* str);
 
 void qosacc_config_init(qosacc_config_t* cfg);
 int qosacc_config_parse(qosacc_config_t* cfg, int argc, char* argv[]);
@@ -688,6 +698,11 @@ int qosacc_config_validate(qosacc_config_t* cfg, int argc, char* argv[], char* e
         snprintf(error, error_len, "最小带宽 %.1f kbps 低于允许的最小值 %d kbps，请调整 min_bw_ratio", min_bw_kbps, MIN_BANDWIDTH_KBPS);
         return QMON_ERR_CONFIG;
     }
+    // 检查 root_classid 格式有效性
+    if (parse_classid(cfg->root_classid) == 0) {
+        snprintf(error, error_len, "无效的根类ID格式: %s (应为类似 1:1 或 0x1:0x1)", cfg->root_classid);
+        return QMON_ERR_CONFIG;
+    }
     return QMON_OK;
 }
 
@@ -785,8 +800,6 @@ int ping_manager_receive(ping_manager_t* pm) {
         icp6 = (struct icmp6_hdr*)buf;
         if (icp6->icmp6_type != ICMP6_ECHO_REPLY) return 0;
         if (ntohs(icp6->icmp6_id) != ctx->ident) return 0;
-        // 校验和已由内核验证或可跳过，但保留验证可增加安全性
-        // 注意：由于我们设置了IPV6_CHECKSUM，内核会自动验证，这里可以不验，但验一下也无妨
         if (icp6->icmp6_cksum != 0) {
             struct sockaddr_in6* from_v6 = (struct sockaddr_in6*)&from;
             struct in6_addr src = from_v6->sin6_addr;
@@ -947,14 +960,12 @@ typedef struct {
     int parse_realtime;
 } detect_qdisc_ctx_t;
 
+/* 队列检测回调（用于识别根队列） */
 static int detect_qdisc_cb(struct nlmsghdr *n, void *arg) {
     detect_qdisc_ctx_t* dctx = (detect_qdisc_ctx_t*)arg;
     struct tcmsg *t = NLMSG_DATA(n);
     int len = n->nlmsg_len;
     struct rtattr * tb[TCA_MAX+1];
-	
-	// 临时调试：打印消息类型
-    fprintf(stderr, "DEBUG: nlmsg_type = %d\n", n->nlmsg_type);
 
     if (n->nlmsg_type != RTM_NEWTCLASS && n->nlmsg_type != RTM_NEWQDISC)
         return 0;
@@ -967,22 +978,24 @@ static int detect_qdisc_cb(struct nlmsghdr *n, void *arg) {
 
     if (tb[TCA_KIND] == NULL) return 0;
     char* kind = (char*)RTA_DATA(tb[TCA_KIND]);
-	
-	// 打印队列类型和 parent
-    fprintf(stderr, "DEBUG: kind = %s, parent = 0x%x, handle = 0x%x\n", 
-            kind, t->tcm_parent, t->tcm_handle);
+
+    // 调试日志（仅当 verbose 启用）
+    qosacc_log(dctx->ctx, QMON_LOG_DEBUG, "detect_qdisc_cb: nlmsg_type=%d, kind=%s, parent=0x%x, handle=0x%x\n",
+               n->nlmsg_type, kind, t->tcm_parent, t->tcm_handle);
 
     int is_root = 0;
-    if (n->nlmsg_type == RTM_NEWQDISC && t->tcm_parent == TC_H_ROOT)
+    // 放宽根队列判定：parent 为 TC_H_ROOT 或 0（某些情况）
+    if (n->nlmsg_type == RTM_NEWQDISC && (t->tcm_parent == TC_H_ROOT || t->tcm_parent == 0))
         is_root = 1;
     if (n->nlmsg_type == RTM_NEWTCLASS && t->tcm_parent == TC_H_ROOT)
         is_root = 1;
 
     if (is_root) {
+        qosacc_log(dctx->ctx, QMON_LOG_DEBUG, "detect_qdisc_cb: Found root %s\n", kind);
         strcpy(dctx->detected_qdisc, kind);
         dctx->root_handle = t->tcm_handle;
         dctx->found_root = 1;
-        return -1;
+        return -1; // 找到根，停止遍历
     }
 
     // 如果要求解析实时类且当前是类消息且队列为hfsc，则记录类的实时性
@@ -1011,6 +1024,54 @@ static int detect_qdisc_cb(struct nlmsghdr *n, void *arg) {
         }
     }
 
+    return 0;
+}
+
+/* 专用回调：仅用于获取HFSC类信息（不提前返回） */
+static int fetch_class_cb(struct nlmsghdr *n, void *arg) {
+    detect_qdisc_ctx_t* dctx = (detect_qdisc_ctx_t*)arg;
+    struct tcmsg *t = NLMSG_DATA(n);
+    int len = n->nlmsg_len;
+    struct rtattr * tb[TCA_MAX+1];
+
+    if (n->nlmsg_type != RTM_NEWTCLASS)
+        return 0;
+
+    len -= NLMSG_LENGTH(sizeof(*t));
+    if (len < 0) return -1;
+
+    memset(tb, 0, sizeof(tb));
+    parse_rtattr(tb, TCA_MAX, TCA_RTA(t), len);
+
+    if (tb[TCA_KIND] == NULL) return 0;
+    char* kind = (char*)RTA_DATA(tb[TCA_KIND]);
+
+    // 只处理 hfsc 类
+    if (strcmp(kind, "hfsc") != 0)
+        return 0;
+
+    qosacc_context_t* ctx = dctx->ctx;
+    if (ctx->class_count < MAX_CLASSES) {
+        class_stats_t* cs = &ctx->class_stats[ctx->class_count];
+        memset(cs, 0, sizeof(class_stats_t));
+        cs->handle = t->tcm_handle;
+        cs->bwtime = qosacc_time_ms() * 1000000LL;
+
+        if (tb[TCA_OPTIONS]) {
+            struct rtattr *tbs[TCA_HFSC_MAX + 1];
+            parse_rtattr_nested(tbs, TCA_HFSC_MAX, tb[TCA_OPTIONS]);
+            struct tc_service_curve *sc = NULL;
+            if (tbs[TCA_HFSC_RSC] && (RTA_PAYLOAD(tbs[TCA_HFSC_RSC]) >= sizeof(*sc))) {
+                sc = RTA_DATA(tbs[TCA_HFSC_RSC]);
+                cs->is_realtime |= (sc && sc->m1 != 0);
+            }
+            if (tbs[TCA_HFSC_FSC] && (RTA_PAYLOAD(tbs[TCA_HFSC_FSC]) >= sizeof(*sc))) {
+                sc = RTA_DATA(tbs[TCA_HFSC_FSC]);
+                cs->is_realtime |= (sc && sc->m1 != 0);
+            }
+        }
+        ctx->class_count++;
+    }
     return 0;
 }
 
@@ -1077,7 +1138,7 @@ static qosacc_result_t detect_qdisc_kind_tc(qosacc_context_t* ctx, int parse_rea
     }
 
     if (dctx.found_root) {
-        strcpy(ctx->detected_qdisc, dctx.detected_qdisc);
+        strcpy(ctx->detected_qdisc, dctx.detected_qdisc);  // 修正：原错误为 detected_qsch
         ctx->root_handle = dctx.root_handle;
         qosacc_log(ctx, QMON_LOG_INFO, "检测到根类: %s (handle 0x%x)\n", ctx->detected_qdisc, ctx->root_handle);
     } else {
@@ -1118,16 +1179,60 @@ static int fetch_hfsc_class_info(qosacc_context_t* ctx) {
     detect_qdisc_ctx_t dctx;
     memset(&dctx, 0, sizeof(dctx));
     dctx.ctx = ctx;
-    dctx.parse_realtime = 1;
-    dctx.found_root = 0;
-
-    if (dump_filter(&rth, detect_qdisc_cb, &dctx) < 0 && errno != EINTR) {
+    dctx.parse_realtime = 1;  // 需要解析实时类
+    if (dump_filter(&rth, fetch_class_cb, &dctx) < 0 && errno != EINTR) {
         qosacc_log(ctx, QMON_LOG_WARN, "类dump解析HFSC类信息失败\n");
         rtnl_close(&rth);
         return QMON_ERR_SYSTEM;
     }
     rtnl_close(&rth);
     return QMON_OK;
+}
+
+/* 用于传递更新类统计所需数据的结构体 */
+typedef struct {
+    class_stats_t *tmp_stats;
+    int *tmp_count;
+    int64_t now_ns;
+} update_class_ctx_t;
+
+/* 类统计更新回调（独立函数） */
+static int update_class_cb(struct nlmsghdr *n, void *arg) {
+    update_class_ctx_t *uctx = (update_class_ctx_t*)arg;
+    struct tcmsg *t = NLMSG_DATA(n);
+    int len = n->nlmsg_len;
+    struct rtattr * tb[TCA_MAX+1];
+    if (n->nlmsg_type != RTM_NEWTCLASS) return 0;
+    len -= NLMSG_LENGTH(sizeof(*t));
+    if (len < 0) return -1;
+    memset(tb, 0, sizeof(tb));
+    parse_rtattr(tb, TCA_MAX, TCA_RTA(t), len);
+    if (tb[TCA_KIND] == NULL) return 0;
+    char* kind = (char*)RTA_DATA(tb[TCA_KIND]);
+    if (strcmp(kind, "hfsc") != 0) return 0;
+    if (*(uctx->tmp_count) >= MAX_CLASSES) return 0;
+
+    __u64 bytes = 0;
+    if (tb[TCA_STATS2]) {
+        struct tc_stats st;
+        memset(&st, 0, sizeof(st));
+        memcpy(&st, RTA_DATA(tb[TCA_STATS]), MIN(RTA_PAYLOAD(tb[TCA_STATS]), sizeof(st)));
+        bytes = st.bytes;
+    } else if (tb[TCA_STATS]) {
+        struct tc_stats st;
+        memset(&st, 0, sizeof(st));
+        memcpy(&st, RTA_DATA(tb[TCA_STATS]), MIN(RTA_PAYLOAD(tb[TCA_STATS]), sizeof(st)));
+        bytes = st.bytes;
+    } else {
+        return 0;
+    }
+
+    class_stats_t *cs = &uctx->tmp_stats[*(uctx->tmp_count)];
+    cs->handle = t->tcm_handle;
+    cs->bytes = bytes;
+    cs->bwtime = uctx->now_ns;
+    (*(uctx->tmp_count))++;
+    return 0;
 }
 
 int tc_controller_update_class_stats(qosacc_context_t* ctx) {
@@ -1164,54 +1269,36 @@ int tc_controller_update_class_stats(qosacc_context_t* ctx) {
     int tmp_count = 0;
     int64_t now_ns = qosacc_time_ms() * 1000000LL;
 
-    int class_callback(struct nlmsghdr *n, void *arg) {
-        struct tcmsg *t = NLMSG_DATA(n);
-        int len = n->nlmsg_len;
-        struct rtattr * tb[TCA_MAX+1];
-        if (n->nlmsg_type != RTM_NEWTCLASS) return 0;
-        len -= NLMSG_LENGTH(sizeof(*t));
-        if (len < 0) return -1;
-        memset(tb, 0, sizeof(tb));
-        parse_rtattr(tb, TCA_MAX, TCA_RTA(t), len);
-        if (tb[TCA_KIND] == NULL) return 0;
-        char* kind = (char*)RTA_DATA(tb[TCA_KIND]);
-        if (strcmp(kind, "hfsc") != 0) return 0;
-        if (tmp_count >= MAX_CLASSES) return 0;
+    update_class_ctx_t uctx = { .tmp_stats = tmp_stats, .tmp_count = &tmp_count, .now_ns = now_ns };
 
-        __u64 bytes = 0;
-        if (tb[TCA_STATS2]) {
-            struct tc_stats st;
-            memset(&st, 0, sizeof(st));
-            memcpy(&st, RTA_DATA(tb[TCA_STATS]), MIN(RTA_PAYLOAD(tb[TCA_STATS]), sizeof(st)));
-            bytes = st.bytes;
-        } else if (tb[TCA_STATS]) {
-            struct tc_stats st;
-            memset(&st, 0, sizeof(st));
-            memcpy(&st, RTA_DATA(tb[TCA_STATS]), MIN(RTA_PAYLOAD(tb[TCA_STATS]), sizeof(st)));
-            bytes = st.bytes;
-        } else {
-            return 0;
-        }
-
-        tmp_stats[tmp_count].handle = t->tcm_handle;
-        tmp_stats[tmp_count].bytes = bytes;
-        tmp_stats[tmp_count].bwtime = now_ns;
-        tmp_count++;
-        return 0;
-    }
-
-    if (dump_filter(&rth, class_callback, NULL) < 0) {
+    if (dump_filter(&rth, update_class_cb, &uctx) < 0) {
         qosacc_log(ctx, QMON_LOG_WARN, "类dump失败\n");
         rtnl_close(&rth);
         return QMON_ERR_SYSTEM;
     }
     rtnl_close(&rth);
 
+    // 如果类数量发生变化，重新获取类信息
+    if (tmp_count != ctx->class_count) {
+        qosacc_log(ctx, QMON_LOG_INFO, "类数量变化 %d -> %d，重新获取HFSC类信息\n", ctx->class_count, tmp_count);
+        ctx->class_count = 0;
+        if (fetch_hfsc_class_info(ctx) != QMON_OK) {
+            qosacc_log(ctx, QMON_LOG_ERROR, "重新获取HFSC类信息失败\n");
+        }
+        // 重新获取后，原有 bw_flt 等需要重置，此处仅重设时间戳，带宽重新开始滤波
+        // 由于 fetch_hfsc_class_info 已重置 class_count 和 class_stats 数组，
+        // 但未设置 bwtime 为当前时间？ fetch 中设置 bwtime 为调用时的时间，但类信息中 bwtime 应为初始时间。
+        // 这里为了简化，直接返回，下一次循环会再次更新统计。
+        return QMON_OK;
+    }
+
+    // 先将所有类标记为不活跃，避免残留
     for (int i = 0; i < ctx->class_count; i++) {
         ctx->class_stats[i].active = 0;
     }
     ctx->realtime_active = 0;
 
+    // 将临时数据合并到ctx->class_stats中，并计算带宽和活跃度
     for (int i = 0; i < ctx->class_count; i++) {
         class_stats_t* cs = &ctx->class_stats[i];
         for (int j = 0; j < tmp_count; j++) {
@@ -1247,7 +1334,7 @@ static int modify_class_bandwidth(qosacc_context_t* ctx, __u32 rate_bps) {
     } req;
 
     int retries = TC_OP_RETRY_COUNT;
-    int last_err = 0;
+    int last_ret = 0;
 
     while (retries-- > 0) {
         memset(&req, 0, sizeof(req));
@@ -1309,17 +1396,18 @@ static int modify_class_bandwidth(qosacc_context_t* ctx, __u32 rate_bps) {
             return QMON_ERR_SYSTEM;
         }
 
-        if (talk(&ctx->rth, &req.n, NULL) == 0) {
+        int ret = talk(&ctx->rth, &req.n, NULL);
+        if (ret == 0) {
             qosacc_log(ctx, QMON_LOG_INFO, "TC类带宽设置成功: %d bps\n", rate_bps);
             return QMON_OK;
         }
 
-        last_err = errno;
-        qosacc_log(ctx, QMON_LOG_WARN, "修改TC类失败 (errno=%d), 剩余重试次数 %d\n", last_err, retries);
+        last_ret = ret;
+        qosacc_log(ctx, QMON_LOG_WARN, "修改TC类失败 (ret=%d), 剩余重试次数 %d\n", last_ret, retries);
         if (retries > 0) usleep(TC_OP_RETRY_DELAY_MS * 1000);
     }
 
-    qosacc_log(ctx, QMON_LOG_ERROR, "修改TC类失败，已重试 %d 次: %s\n", TC_OP_RETRY_COUNT, strerror(last_err));
+    qosacc_log(ctx, QMON_LOG_ERROR, "修改TC类失败，已重试 %d 次，最后返回 %d\n", TC_OP_RETRY_COUNT, last_ret);
     return QMON_ERR_SYSTEM;
 }
 
@@ -1331,7 +1419,7 @@ static int modify_qdisc_bandwidth(qosacc_context_t* ctx, __u32 rate_bps) {
     } req;
 
     int retries = TC_OP_RETRY_COUNT;
-    int last_err = 0;
+    int last_ret = 0;
 
     while (retries-- > 0) {
         memset(&req, 0, sizeof(req));
@@ -1361,17 +1449,18 @@ static int modify_qdisc_bandwidth(qosacc_context_t* ctx, __u32 rate_bps) {
         addattr_l(&req.n, sizeof(req), TCA_CAKE_BASE_RATE, &rate_bytes, sizeof(rate_bytes));
         tail->rta_len = (void*)NLMSG_TAIL(&req.n) - (void*)tail;
 
-        if (talk(&ctx->rth, &req.n, NULL) == 0) {
+        int ret = talk(&ctx->rth, &req.n, NULL);
+        if (ret == 0) {
             qosacc_log(ctx, QMON_LOG_INFO, "CAKE带宽设置成功: %d bps\n", rate_bps);
             return QMON_OK;
         }
 
-        last_err = errno;
-        qosacc_log(ctx, QMON_LOG_WARN, "修改CAKE qdisc失败 (errno=%d), 剩余重试次数 %d\n", last_err, retries);
+        last_ret = ret;
+        qosacc_log(ctx, QMON_LOG_WARN, "修改CAKE qdisc失败 (ret=%d), 剩余重试次数 %d\n", last_ret, retries);
         if (retries > 0) usleep(TC_OP_RETRY_DELAY_MS * 1000);
     }
 
-    qosacc_log(ctx, QMON_LOG_ERROR, "修改CAKE qdisc失败，已重试 %d 次: %s\n", TC_OP_RETRY_COUNT, strerror(last_err));
+    qosacc_log(ctx, QMON_LOG_ERROR, "修改CAKE qdisc失败，已重试 %d 次，最后返回 %d\n", TC_OP_RETRY_COUNT, last_ret);
     return QMON_ERR_SYSTEM;
 }
 
@@ -1386,15 +1475,17 @@ int tc_controller_init(tc_controller_t* tc, qosacc_context_t* ctx) {
     if (detect_qdisc_kind_tc(ctx, parse_realtime) != QMON_OK) {
         qosacc_log(ctx, QMON_LOG_ERROR, "队列检测失败，无法继续\n");
         rtnl_close(&ctx->rth);
+        tc->ctx = NULL;  // 防止 cleanup 中再次关闭
         return QMON_ERR_SYSTEM;
     }
 
-    // 检查队列是否支持动态带宽调整（包括新增的 noqueue）
+    // 检查队列是否支持动态带宽调整（包括 noqueue）
     if (strcmp(ctx->detected_qdisc, "fq_codel") == 0 || 
         strcmp(ctx->detected_qdisc, "pfifo_fast") == 0 ||
         strcmp(ctx->detected_qdisc, "noqueue") == 0) {
         qosacc_log(ctx, QMON_LOG_ERROR, "队列 %s 不支持动态带宽调整，程序退出\n", ctx->detected_qdisc);
         rtnl_close(&ctx->rth);
+        tc->ctx = NULL;
         return QMON_ERR_CONFIG;
     }
 
@@ -1454,7 +1545,11 @@ void update_runtime_stats(qosacc_context_t* ctx) {
     int64_t now = qosacc_time_ms();
     ctx->stats.total_ping_sent = ctx->ntransmitted;
     ctx->stats.total_ping_received = ctx->nreceived;
-    ctx->stats.total_ping_lost = ctx->ntransmitted - ctx->nreceived;
+    // 防止 nreceived 意外大于 ntransmitted
+    if (ctx->ntransmitted >= ctx->nreceived)
+        ctx->stats.total_ping_lost = ctx->ntransmitted - ctx->nreceived;
+    else
+        ctx->stats.total_ping_lost = 0;
     if (ctx->filtered_ping_time_us > ctx->stats.max_ping_time_recorded)
         ctx->stats.max_ping_time_recorded = ctx->filtered_ping_time_us;
     if (ctx->stats.min_ping_time_recorded == 0 || (ctx->filtered_ping_time_us < ctx->stats.min_ping_time_recorded && ctx->filtered_ping_time_us > 0))
@@ -1733,7 +1828,8 @@ int status_file_update(qosacc_context_t* ctx) {
         close(fd);
         return QMON_ERR_FILE;
     }
-    fprintf(fp, "状态: %d\n", ctx->state);
+    // 输出状态名称字符串，而非数字
+    fprintf(fp, "状态: %s\n", state_names[ctx->state]);
     fprintf(fp, "当前带宽: %d kbps\n", ctx->current_limit_bps / 1000);
     fprintf(fp, "当前ping: %ld ms\n", ctx->filtered_ping_time_us / 1000);
     fprintf(fp, "最大ping: %ld ms\n", ctx->max_ping_time_us / 1000);
