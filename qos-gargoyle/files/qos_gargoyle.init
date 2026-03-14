@@ -2,7 +2,15 @@
 #
 # QoS Gargoyle 初始化脚本 - 传统 init.d 版本
 # 支持多算法：HFSC, CAKE, FQ_CoDel, HTB
-# 版本：2.1.0（修复跳转规则问题）
+# 版本：2.2.0（代码精简与健壮性优化）
+#
+# 优化内容：
+#   - 移除未使用的函数：load_algorithm_config, add_connmark_pass_rules
+#   - 修复 generate_class_marks 中的未定义变量
+#   - 调整 NFT prerouting 优先级为 -149 避免与 fw4 冲突
+#   - 为 nft flush 添加存在性检查，减少错误输出
+#   - 优化启动时序和接口检测
+#   - 清理无用代码，保留手动标记文件生成能力
 #
 
 START=50
@@ -18,7 +26,6 @@ CONFIG_FILE="qos_gargoyle"
 UPLOAD_MASK="0x007F"
 DOWNLOAD_MASK="0x7F00"
 LOCK_FILE="/var/run/qos_gargoyle_updating"
-MARK_FILE="/etc/qos_gargoyle/qos_class_marks"
 IFB_DEVICE="ifb0"
 SERVICE_NAME="qos_gargoyle"
 
@@ -67,10 +74,7 @@ get_service_status() {
 # 检查服务是否正在运行
 is_service_running() {
     # 检查是否有 TC 队列
-    if tc qdisc show 2>/dev/null | grep -q "qdisc hfsc" || \
-       tc qdisc show 2>/dev/null | grep -q "qdisc cake" || \
-       tc qdisc show 2>/dev/null | grep -q "qdisc fq_codel" || \
-       tc qdisc show 2>/dev/null | grep -q "qdisc htb"; then
+    if tc qdisc show 2>/dev/null | grep -q "qdisc hfsc\|qdisc cake\|qdisc fq_codel\|qdisc htb"; then
         return 0
     fi
     return 1
@@ -100,7 +104,6 @@ update_config_state() {
 
 # ========== 核心清理函数 ==========
 
-# 修改 stop_qos() 函数，避免破坏网络
 stop_qos() {
     echo "Stopping QoS system..."
     
@@ -116,11 +119,15 @@ stop_qos() {
     
     echo "Cleaning QoS-specific configuration..."
     
-    # 只清理 QoS 相关的 TC 队列，不清理所有接口
+    # 只清理 QoS 相关的 TC 队列
     echo "Cleaning TC queues for QoS interfaces..."
     
-    # 获取 QoS 接口
-    local qos_iface=$(uci -q get "$CONFIG_FILE.global.wan_interface")
+    # 获取 QoS 接口（优先使用已设置的变量，否则从 UCI 读取）
+    local qos_iface="$qos_interface"
+    if [ -z "$qos_iface" ]; then
+        qos_iface=$(uci -q get "$CONFIG_FILE.global.wan_interface")
+    fi
+    
     if [ -n "$qos_iface" ] && [ "$qos_iface" != "auto" ]; then
         # 清理出口队列
         if tc qdisc show dev "$qos_iface" root 2>/dev/null | grep -q "hfsc\|cake\|fq_codel\|htb"; then
@@ -147,18 +154,14 @@ stop_qos() {
     # 只清除 QoS 特定的 NFT 规则，不删除整个表
     echo "Clearing QoS-specific NFT rules..."
     
-    if nft list table inet gargoyle-qos-priority 2>/dev/null; then
-        # 只清除规则，不删除表
+    if nft list table inet gargoyle-qos-priority >/dev/null 2>&1; then
         echo "  Flushing QoS NFT rules..."
         nft flush table inet gargoyle-qos-priority 2>/dev/null
-        
-        # 保留表结构，只清空规则
-        # 不删除表，这样不会影响其他服务
     else
         echo "  QoS NFT table not found, skipping"
     fi
     
-    # 不删除 IFB 设备，因为其他服务可能在使用
+    # 不删除 IFB 设备
     echo "Note: IFB device $IFB_DEVICE is not deleted to avoid network disruption"
     echo "To manually remove IFB device: ip link delete $IFB_DEVICE"
     
@@ -176,17 +179,14 @@ stop_qos() {
 start() {
     echo "Starting QoS Gargoyle service..."
     
-    # 加载必要的库文件
     load_common_libraries
     
-    # 检查配置是否启用
     if ! is_config_enabled; then
         echo "QoS is disabled in configuration. Use 'enable' command first."
         save_service_status "stopped"
         return 0
     fi
     
-    # 调用主初始化并捕获返回值
     initialize_qos
     ret=$?
     echo "initialize_qos returned: $ret"
@@ -205,10 +205,7 @@ start() {
 stop() {
     echo "Stopping QoS Gargoyle service..."
     
-    # 加载必要的库文件
     load_common_libraries
-    
-    # 停止 QoS 系统
     stop_qos
     
     echo "QoS Gargoyle stopped"
@@ -218,12 +215,8 @@ stop() {
 
 restart() {
     echo "Restarting QoS Gargoyle..."
-    
-    # 先完全停止
     stop
     sleep 2
-    
-    # 如果配置启用，则重新启动
     if is_config_enabled; then
         start
         return $?
@@ -241,11 +234,9 @@ enable() {
     local start_link="/etc/rc.d/S${START}${SERVICE_NAME}"
     local stop_link="/etc/rc.d/K${STOP}${SERVICE_NAME}"
     
-    # 删除已存在的链接
     rm -f "/etc/rc.d/S[0-9][0-9]${SERVICE_NAME}" 2>/dev/null
     rm -f "/etc/rc.d/K[0-9][0-9]${SERVICE_NAME}" 2>/dev/null
     
-    # 创建新链接
     ln -sf "../init.d/${SERVICE_NAME}" "${start_link}"
     ln -sf "../init.d/${SERVICE_NAME}" "${stop_link}"
     
@@ -253,16 +244,11 @@ enable() {
     ls -l "${start_link}"
     ls -l "${stop_link}"
     
-    # 更新配置状态
     update_config_state "enable"
     
-    # 立即启动服务
     echo "Starting QoS service immediately..."
-    
-    # 加载必要的库文件
     load_common_libraries
     
-    # 调用主初始化
     if initialize_qos; then
         echo "✅ QoS Gargoyle enabled and started"
         save_service_status "running"
@@ -277,14 +263,11 @@ enable() {
 disable() {
     echo "Disabling QoS Gargoyle..."
     
-    # 首先更新配置状态，然后停止服务
     update_config_state "disable"
     
-    # 停止服务
     echo "Stopping QoS service..."
     stop
     
-    # 手动删除启动链接
     echo "删除启动链接..."
     local start_link="/etc/rc.d/S${START}${SERVICE_NAME}"
     local stop_link="/etc/rc.d/K${STOP}${SERVICE_NAME}"
@@ -292,7 +275,6 @@ disable() {
     rm -f "${start_link}" 2>/dev/null && echo "已删除 ${start_link}" || echo "未找到 ${start_link}"
     rm -f "${stop_link}" 2>/dev/null && echo "已删除 ${stop_link}" || echo "未找到 ${stop_link}"
     
-    # 清理可能的其他链接
     rm -f "/etc/rc.d/S[0-9][0-9]${SERVICE_NAME}" 2>/dev/null
     rm -f "/etc/rc.d/K[0-9][0-9]${SERVICE_NAME}" 2>/dev/null
     
@@ -303,8 +285,6 @@ disable() {
 
 reload() {
     echo "Reloading QoS Gargoyle configuration..."
-    
-    # 如果服务正在运行，先停止
     if is_service_running; then
         echo "Service is running, restarting with new configuration..."
         restart
@@ -318,7 +298,6 @@ reload() {
 
 # ========== 公共辅助函数 ==========
 
-# 加载必要的库文件
 load_common_libraries() {
     if [ -f "/lib/functions.sh" ]; then
         . /lib/functions.sh
@@ -350,10 +329,11 @@ load_algorithm_module() {
     if [ -f "$module" ]; then
         . "$module"
         echo "Loaded $algo algorithm module from $module"
+        # 更新 algorithm 变量为实际加载的算法（如果回退则已修改）
+        algorithm="$algo"
         return 0
     else
         echo "Error: Algorithm module not found: $module"
-        
         # 尝试加载 HFSC 作为默认
         if [ -f "$HFSC_MODULE" ] && [ "$algo" != "hfsc_fqcodel" ]; then
             . "$HFSC_MODULE"
@@ -371,20 +351,16 @@ load_qos_config() {
     local retries=5
     local success=0
 
-    # 1. 重试读取 UCI 配置（最多5次）
     echo "尝试读取 UCI 配置..." >&2
     while [ $retries -gt 0 ]; do
-        # 获取算法配置
         algorithm=$(uci -q get "$CONFIG_FILE.global.algorithm")
         algorithm="${algorithm:-hfsc_fqcodel}"
         
-        # 获取带宽配置
         total_upload_bandwidth=$(uci -q get "$CONFIG_FILE.upload.total_bandwidth")
         total_download_bandwidth=$(uci -q get "$CONFIG_FILE.download.total_bandwidth")
         total_upload_bandwidth="${total_upload_bandwidth:-0}"
         total_download_bandwidth="${total_download_bandwidth:-0}"
         
-        # 获取接口配置
         qos_interface=$(uci -q get "$CONFIG_FILE.global.wan_interface")
         
         if [ -n "$qos_interface" ]; then
@@ -397,24 +373,20 @@ load_qos_config() {
         [ $retries -gt 0 ] && sleep 1
     done
 
-    # 2. 如果重试后仍未获取到接口，尝试自动检测
     if [ -z "$qos_interface" ]; then
         echo "错误: 无法从 UCI 配置中读取 wan_interface，尝试自动检测..." >&2
         
-        # 加载网络函数库（如果尚未加载）
         if [ -f "/lib/functions/network.sh" ]; then
             . /lib/functions/network.sh
             include /lib/network
         fi
         
-        # 自动检测 WAN 接口
         network_find_wan qos_interface 2>/dev/null
         
         if [ -n "$qos_interface" ]; then
             echo "提示: 自动检测到 WAN 接口为 '$qos_interface'" >&2
             success=1
         else
-            # 最后手段：从默认路由获取接口
             qos_interface=$(ip route show default 2>/dev/null | awk '/default/ {print $5}' | head -1)
             if [ -n "$qos_interface" ]; then
                 echo "提示: 从默认路由检测到接口 '$qos_interface'" >&2
@@ -426,10 +398,8 @@ load_qos_config() {
         fi
     fi
 
-    # 3. 输出最终配置信息
     echo "加载配置完成：算法=$algorithm, 上传带宽=${total_upload_bandwidth}kbit, 下载带宽=${total_download_bandwidth}kbit, 接口=$qos_interface" >&2
 
-    # 导出必要变量供后续使用
     export algorithm total_upload_bandwidth total_download_bandwidth qos_interface
 
     return 0
@@ -439,16 +409,13 @@ load_qos_config() {
 get_network_info() {
     echo "Defining network interfaces..."
     
-    # 如果接口未配置，尝试自动获取
     if [ -z "$qos_interface" ]; then
         network_find_wan qos_interface
     fi
     
-    # 获取 IP 地址
     network_get_ipaddr wan_ip "$qos_interface" 2>/dev/null || wan_ip=""
     network_get_ipaddr6 wan_ip6 "$qos_interface" 2>/dev/null || wan_ip6=""
     
-    # 获取 LAN 地址
     network_get_ipaddr local_ip lan 2>/dev/null || local_ip=""
     network_get_ipaddr6 local_ip6 lan 2>/dev/null || local_ip6=""
     
@@ -461,14 +428,12 @@ get_network_info() {
 
 # 检查配置是否有效
 check_configuration() {
-    # 检查是否启用
     local enabled=$(uci -q get "$CONFIG_FILE.global.enabled")
     if [ "$enabled" != "1" ]; then
         echo "QoS is disabled in configuration"
         return 1
     fi
     
-    # 检查带宽配置
     if [ -z "$total_upload_bandwidth" ] && [ -z "$total_download_bandwidth" ]; then
         echo "No bandwidth configuration found"
         return 1
@@ -479,12 +444,10 @@ check_configuration() {
 }
 
 # 等待网络接口就绪（支持 IPv4/IPv6，可配置超时）
-# 用法: wait_interface <接口名> [超时秒数] [协议]
-# 协议: ipv4 (默认), ipv6, both
 wait_interface() {
     local iface="$1"
-    local timeout="${2:-15}"          # 默认超时 15 秒
-    local proto="${3:-ipv4}"          # 默认检查 IPv4
+    local timeout="${2:-15}"
+    local proto="${3:-ipv4}"
     local start_time=$(date +%s)
     local elapsed=0
     local found=0
@@ -496,7 +459,6 @@ wait_interface() {
 
     echo "等待接口 $iface 就绪 (超时 ${timeout}秒, 协议: $proto)..."
 
-    # 第一阶段：等待接口出现（最多 timeout/3 秒）
     local wait_exists=$((timeout / 3))
     [ $wait_exists -lt 1 ] && wait_exists=1
     while [ $elapsed -lt $wait_exists ]; do
@@ -512,7 +474,6 @@ wait_interface() {
         return 1
     fi
 
-    # 第二阶段：等待协议地址
     local addr_ok=0
     while [ $elapsed -lt $timeout ]; do
         case "$proto" in
@@ -547,23 +508,19 @@ wait_interface() {
 setup_nft_tables() {
     echo "Setting up nftables..."
     
-    # 确保 qos_interface 非空（再次检查）
     if [ -z "$qos_interface" ]; then
         echo "警告: qos_interface 为空，尝试重新获取..." >&2
-        # 从 UCI 重新读取
         qos_interface=$(uci -q get "$CONFIG_FILE.global.wan_interface")
         if [ -z "$qos_interface" ] || [ "$qos_interface" = "auto" ]; then
             network_find_wan qos_interface 2>/dev/null
         fi
         if [ -z "$qos_interface" ]; then
-            # 最后手段：从默认路由获取
             qos_interface=$(ip route show default 2>/dev/null | awk '/default/ {print $5}' | head -1)
         fi
     fi
     
-    # 清除现有表
-    nft flush table inet gargoyle-qos-priority 2>/dev/null
-    nft delete table inet gargoyle-qos-priority 2>/dev/null
+    # 清除现有表（如果存在）
+    nft list table inet gargoyle-qos-priority >/dev/null 2>&1 && nft delete table inet gargoyle-qos-priority
     
     # 创建新表
     nft add table inet gargoyle-qos-priority
@@ -576,7 +533,8 @@ setup_nft_tables() {
     nft add chain inet gargoyle-qos-priority filter_postrouting '{ type filter hook postrouting priority 115; }'
     nft add chain inet gargoyle-qos-priority filter_input '{ type filter hook input priority 115; }'
     nft add chain inet gargoyle-qos-priority filter_forward '{ type filter hook forward priority 115; }'
-    nft add chain inet gargoyle-qos-priority filter_prerouting '{ type filter hook prerouting priority -150; }'
+    # 使用 -149 避免与 fw4 mangle 表的默认优先级 -150 冲突
+    nft add chain inet gargoyle-qos-priority filter_prerouting '{ type filter hook prerouting priority -149; }'
     
     # 添加跳转规则（从基础链到分类链），带接口条件
     if [ -n "$qos_interface" ]; then
@@ -586,7 +544,6 @@ setup_nft_tables() {
         nft add rule inet gargoyle-qos-priority filter_forward iifname "$qos_interface" jump filter_qos_ingress
     else
         echo "错误: 无法确定 WAN 接口，跳转规则未添加" >&2
-        # 作为应急，添加无条件跳转规则（可能影响本地流量，但至少分类会生效）
         echo "添加无条件跳转规则作为应急..." >&2
         nft add rule inet gargoyle-qos-priority filter_postrouting jump filter_qos_egress
         nft add rule inet gargoyle-qos-priority filter_input jump filter_qos_ingress
@@ -600,96 +557,11 @@ setup_nft_tables() {
 create_ifb_device() {
     echo "Creating IFB device..."
     
-    # 删除现有设备
     ip link delete dev "$IFB_DEVICE" 2>/dev/null
-    
-    # 创建新的 IFB 设备
     ip link add "$IFB_DEVICE" type ifb
-    
-    # 启用设备
     ip link set dev "$IFB_DEVICE" up
     
     echo "IFB device $IFB_DEVICE created and enabled"
-}
-
-# 加载算法专属配置
-load_algorithm_config() {
-    local algorithm="$1"
-    
-    # 静态变量，用于记录fq_codel配置是否已加载
-    local fq_codel_loaded=false
-    
-    # 检查FQ-CoDel配置是否已加载
-    if [ -n "${FQCODEL_TARGET+x}" ] && [ -n "${FQCODEL_LIMIT+x}" ] && \
-       [ -n "${FQCODEL_QUANTUM+x}" ] && [ -n "${FQCODEL_FLOWS+x}" ] && \
-       [ -n "${FQCODEL_INTERVAL+x}" ] && [ -n "${FQCODEL_ECN+x}" ]; then
-        fq_codel_loaded=true
-    fi
-    
-    case "$algorithm" in
-        hfsc_fqcodel)
-            # 从hfsc配置节加载
-            HFSC_LATENCY_MODE=$(uci -q get "$CONFIG_FILE.hfsc.latency_mode")
-            HFSC_MINRTT_ENABLED=$(uci -q get "$CONFIG_FILE.hfsc.minrtt_enabled")
-            
-            # 从fq_codel配置节加载（如果未加载过）
-            if [ "$fq_codel_loaded" = "false" ]; then
-                FQCODEL_TARGET=$(uci -q get "$CONFIG_FILE.fq_codel.target")
-                FQCODEL_LIMIT=$(uci -q get "$CONFIG_FILE.fq_codel.limit")
-                FQCODEL_QUANTUM=$(uci -q get "$CONFIG_FILE.fq_codel.quantum")
-                FQCODEL_FLOWS=$(uci -q get "$CONFIG_FILE.fq_codel.flows")
-                FQCODEL_INTERVAL=$(uci -q get "$CONFIG_FILE.fq_codel.interval")
-                FQCODEL_ECN=$(uci -q get "$CONFIG_FILE.fq_codel.ecn")
-                logger -t "qos_gargoyle" "加载FQ-CoDel配置: target=${FQCODEL_TARGET}, limit=$FQCODEL_LIMIT, quantum=$FQCODEL_QUANTUM, flows=$FQCODEL_FLOWS, interval=${FQCODEL_INTERVAL}, ecn=$FQCODEL_ECN"
-            else
-                logger -t "qos_gargoyle" "FQ-CoDel配置已加载，跳过重复加载"
-            fi
-            
-            logger -t "qos_gargoyle" "加载HFSC配置: latency_mode=$HFSC_LATENCY_MODE, minrtt_enabled=$HFSC_MINRTT_ENABLED"
-            ;;
-        
-        cake)
-            # 从cake配置节加载
-            CAKE_DIFFSERV_MODE=$(uci -q get "$CONFIG_FILE.cake.diffserv_mode")
-            CAKE_RTT=$(uci -q get "$CONFIG_FILE.cake.rtt")
-            CAKE_OVERHEAD=$(uci -q get "$CONFIG_FILE.cake.overhead")
-            CAKE_MPU=$(uci -q get "$CONFIG_FILE.cake.mpu")
-            CAKE_MEMLIMIT=$(uci -q get "$CONFIG_FILE.cake.memlimit")
-            CAKE_ACK_FILTER=$(uci -q get "$CONFIG_FILE.cake.ack_filter")
-            CAKE_NAT=$(uci -q get "$CONFIG_FILE.cake.nat")
-            CAKE_WASH=$(uci -q get "$CONFIG_FILE.cake.wash")
-            CAKE_SPLIT_GSO=$(uci -q get "$CONFIG_FILE.cake.split_gso")
-            CAKE_INGRESS=$(uci -q get "$CONFIG_FILE.cake.ingress")
-            CAKE_AUTORATE_INGRESS=$(uci -q get "$CONFIG_FILE.cake.autorate_ingress")
-            
-            logger -t "qos_gargoyle" "加载CAKE配置: diffserv_mode=$CAKE_DIFFSERV_MODE, rtt=$CAKE_RTT, overhead=$CAKE_OVERHEAD, mpu=$CAKE_MPU, memlimit=$CAKE_MEMLIMIT, ack_filter=$CAKE_ACK_FILTER, nat=$CAKE_NAT, wash=$CAKE_WASH, split_gso=$CAKE_SPLIT_GSO, ingress=$CAKE_INGRESS, autorate_ingress=$CAKE_AUTORATE_INGRESS"
-            ;;
-        
-        htb_fqcodel)
-            # 从htb配置节加载
-            HTB_PRIOMAP_ENABLED=$(uci -q get "$CONFIG_FILE.htb.priomap_enabled")
-            HTB_DRR_QUANTUM=$(uci -q get "$CONFIG_FILE.htb.drr_quantum")
-            
-            # 从fq_codel配置节加载（如果未加载过）
-            if [ "$fq_codel_loaded" = "false" ]; then
-                FQCODEL_TARGET=$(uci -q get "$CONFIG_FILE.fq_codel.target")
-                FQCODEL_LIMIT=$(uci -q get "$CONFIG_FILE.fq_codel.limit")
-                FQCODEL_QUANTUM=$(uci -q get "$CONFIG_FILE.fq_codel.quantum")
-                FQCODEL_FLOWS=$(uci -q get "$CONFIG_FILE.fq_codel.flows")
-                FQCODEL_INTERVAL=$(uci -q get "$CONFIG_FILE.fq_codel.interval")
-                FQCODEL_ECN=$(uci -q get "$CONFIG_FILE.fq_codel.ecn")
-                logger -t "qos_gargoyle" "加载FQ-CoDel配置: target=${FQCODEL_TARGET}, limit=$FQCODEL_LIMIT, quantum=$FQCODEL_QUANTUM, flows=$FQCODEL_FLOWS, interval=${FQCODEL_INTERVAL}, ecn=$FQCODEL_ECN"
-            else
-                logger -t "qos_gargoyle" "FQ-CoDel配置已加载，跳过重复加载"
-            fi
-            
-            logger -t "qos_gargoyle" "加载HTB配置: priomap_enabled=$HTB_PRIOMAP_ENABLED, drr_quantum=$HTB_DRR_QUANTUM"
-            ;;
-        
-        *)
-            logger -t "qos_gargoyle" "警告: 未知算法类型: $algorithm"
-            ;;
-    esac
 }
 
 load_bandwidth_config() {
@@ -702,12 +574,10 @@ load_bandwidth_config() {
 apply_classification_rules() {
     echo "Applying classification rules..."
     
-    # 1. 清空规则链（确保从干净的状态开始）
-    echo "清空现有规则链..."
-    nft flush chain inet gargoyle-qos-priority filter_qos_egress
-    nft flush chain inet gargoyle-qos-priority filter_qos_ingress
+    # 清空规则链（添加 2>/dev/null 避免链不存在时的错误）
+    nft flush chain inet gargoyle-qos-priority filter_qos_egress 2>/dev/null
+    nft flush chain inet gargoyle-qos-priority filter_qos_ingress 2>/dev/null
     
-    # 2. 第一步：从连接标记恢复数据包标记
     echo "第一步：添加连接标记恢复规则..."
     nft add rule inet gargoyle-qos-priority filter_qos_egress \
         ct mark != 0 meta mark set ct mark counter
@@ -715,18 +585,15 @@ apply_classification_rules() {
     nft add rule inet gargoyle-qos-priority filter_qos_ingress \
         ct mark != 0 meta mark set ct mark counter
     
-    # 3. 第二步：应用分类规则
     echo "第二步：应用分类规则..."
     if [ -f "$RULE_HELPER" ]; then
         . "$RULE_HELPER"
         
-        # 应用上传规则
         if type apply_all_rules >/dev/null 2>&1; then
             echo "应用上传分类规则..."
             apply_all_rules "upload_rule" "$UPLOAD_MASK" "filter_qos_egress"
         fi
         
-        # 应用下载规则
         if type apply_all_rules >/dev/null 2>&1; then
             echo "应用下载分类规则..."
             apply_all_rules "download_rule" "$DOWNLOAD_MASK" "filter_qos_ingress"
@@ -735,7 +602,6 @@ apply_classification_rules() {
         echo "警告: 规则助手模块未找到: $RULE_HELPER"
     fi
     
-    # 4. 第三步：设置连接标记（将数据包标记保存到连接）
     echo "第三步：设置连接标记..."
     nft add rule inet gargoyle-qos-priority filter_qos_egress \
         meta mark != 0 ct mark set meta mark counter
@@ -746,86 +612,34 @@ apply_classification_rules() {
     echo "分类规则应用完成"
 }
 
-# 添加连接标记传递规则函数
-add_connmark_pass_rules() {
-    echo "添加连接标记传递规则..."
-    
-    # 检查 NFT 表是否存在
-    if ! nft list table inet gargoyle-qos-priority 2>/dev/null | grep -q "chain filter_qos_egress"; then
-        echo "警告: NFT 表不存在，跳过连接标记规则添加"
-        return 1
-    fi
-    
-    # 删除现有的连接标记规则（如果存在）
-    echo "  删除现有的连接标记规则..."
-    nft delete rule inet gargoyle-qos-priority filter_qos_egress handle \
-        $(nft -a list chain inet gargoyle-qos-priority filter_qos_egress 2>/dev/null | \
-          grep "meta mark != 0 ct mark set meta mark" | awk '{print $NF}') 2>/dev/null || true
-    
-    nft delete rule inet gargoyle-qos-priority filter_qos_ingress handle \
-        $(nft -a list chain inet gargoyle-qos-priority filter_qos_ingress 2>/dev/null | \
-          grep "meta mark != 0 ct mark set meta mark" | awk '{print $NF}') 2>/dev/null || true
-    
-    # 新增：从连接标记恢复数据包标记
-    echo "  添加连接标记恢复规则 (ct mark -> meta mark)..."
-    nft add rule inet gargoyle-qos-priority filter_qos_egress \
-        ct mark != 0 meta mark set ct mark counter
-    
-    nft add rule inet gargoyle-qos-priority filter_qos_ingress \
-        ct mark != 0 meta mark set ct mark counter
-        
-    # 添加出口连接标记传递规则 - 放在链的最后
-    echo "  添加出口连接标记传递规则 (filter_qos_egress) 在链末尾 (meta mark -> ct mark)..."
-    nft add rule inet gargoyle-qos-priority filter_qos_egress \
-        meta mark != 0 ct mark set meta mark counter
-    
-    # 添加入口连接标记传递规则 - 放在链的最后
-    echo "  添加入口连接标记传递规则 (filter_qos_ingress) 在链末尾 (meta mark -> ct mark)..."
-    nft add rule inet gargoyle-qos-priority filter_qos_ingress \
-        meta mark != 0 ct mark set meta mark counter
-    
-    echo "连接标记传递规则添加完成（在链末尾）"
-    return 0
-}
-
-# 启动 QoS 监控
+# 启动 QoS 监控（简化：仅检查 qosacc 是否存在）
 start_qos_acc() {
     echo "Starting QoS acc..."
     
-    # 检查监控是否启用
     local acc_enabled=$(uci -q get "$CONFIG_FILE.download.acc_monenabled")
     
     if [ "$acc_enabled" = "true" ] || [ "$acc_enabled" = "1" ]; then
-        # 加载监控辅助模块
-        if [ -f "$ACC_HELPER" ]; then
-            . "$ACC_HELPER"
-            
-            if type start_qos_acc >/dev/null 2>&1; then
-                start_qos_acc
-                echo "QoS acc started"
-            else
-                echo "Warning: start_qos_accing function not found"
-            fi
+        if command -v qosacc >/dev/null 2>&1; then
+            # 尝试启动监控，具体参数由监控模块处理
+            qosacc &
+            echo "QoS acc started"
         else
-            echo "Warning: acc helper module not found"
+            echo "Warning: qosacc not found"
         fi
     else
         echo "QoS acc is disabled in configuration"
     fi
 }
 
-#生成标记文件
+# 生成标记文件（可选，用于调试）
 generate_class_marks() {
     echo "从配置文件生成类别标记..."
     
-    # 确保目录存在
     mkdir -p /etc/qos_gargoyle
     
-    # 定义两个独立的标记文件路径
     local UPLOAD_MARK_FILE="/etc/qos_gargoyle/upload_class_marks"
     local DOWNLOAD_MARK_FILE="/etc/qos_gargoyle/download_class_marks"
     
-    # 获取类别数量
     local counts=$(get_class_counts_from_file)
     local upload_count=$(echo "$counts" | awk '{print $1}')
     local download_count=$(echo "$counts" | awk '{print $2}')
@@ -842,14 +656,13 @@ generate_class_marks() {
     echo "# 标记范围: 0x1-0x$((1 << (upload_count-1)))" >> "$UPLOAD_MARK_FILE"
     echo "--------------------------------------" >> "$UPLOAD_MARK_FILE"
     
-    # 生成上传类别标记
     for i in $(seq 1 $upload_count); do
         class="uclass_$i"
         base_value=$((0x1))
         shift_amount=$((i - 1))
         mark_value=$((base_value << shift_amount))
         mark_hex=$(printf "0x%X" "$mark_value")        
-        echo "upload:${class}:${mark_hex}  ${description}" >> "$UPLOAD_MARK_FILE"
+        echo "upload:${class}:${mark_hex}" >> "$UPLOAD_MARK_FILE"   # 移除未定义的 $description
     done
     
     echo "--------------------------------------" >> "$UPLOAD_MARK_FILE"
@@ -867,7 +680,6 @@ generate_class_marks() {
     echo "# 标记范围: 0x100-0x$((0x100 << (download_count-1)))" >> "$DOWNLOAD_MARK_FILE"
     echo "--------------------------------------" >> "$DOWNLOAD_MARK_FILE"
     
-    # 生成下载类别标记
     for i in $(seq 1 $download_count); do
         class="dclass_$i"
         base_value=$((0x100))
@@ -875,7 +687,7 @@ generate_class_marks() {
         mark_value=$((base_value << shift_amount))
         mark_hex=$(printf "0x%X" "$mark_value")
         
-        echo "download:${class}:${mark_hex}  ${description}" >> "$DOWNLOAD_MARK_FILE"
+        echo "download:${class}:${mark_hex}" >> "$DOWNLOAD_MARK_FILE"  # 移除未定义的 $description
     done
     
     echo "--------------------------------------" >> "$DOWNLOAD_MARK_FILE"
@@ -883,11 +695,10 @@ generate_class_marks() {
     echo "下载类别数: $download_count"
     echo ""
     
-    # 可选：生成合并的参考文件（便于查看）
     generate_combined_marks_file "$upload_count" "$download_count"
 }
 
-# 可选：生成合并的标记文件（便于查看）
+# 生成合并的标记文件（参考用）
 generate_combined_marks_file() {
     local upload_count="$1"
     local download_count="$2"
@@ -906,7 +717,6 @@ generate_combined_marks_file() {
 # 上传类别 (出口流量) - 用于pppoe-wan接口
 EOF
     
-    # 添加上传标记
     for i in $(seq 1 $upload_count); do
         base_value=$((0x1))
         shift_amount=$((i - 1))
@@ -920,7 +730,6 @@ EOF
     echo "" >> "$COMBINED_FILE"
     echo "# 下载类别 (入口流量) - 用于ifb0接口" >> "$COMBINED_FILE"
     
-    # 添加下载标记
     for i in $(seq 1 $download_count); do
         base_value=$((0x100))
         shift_amount=$((i - 1))
@@ -932,26 +741,25 @@ EOF
     done
     
     echo "--------------------------------------" >> "$COMBINED_FILE"
-    echo "合并标记文件已生成: $COMBINED_FILE"
     echo "总标记数: $((upload_count + download_count))"
     
-    # 设置文件权限
     chmod 644 "$COMBINED_FILE"
     chown root:root "$COMBINED_FILE"
 }
 
+# 从配置文件获取类别数量（改进计数方式，避免匹配注释）
 get_class_counts_from_file() {
     local config_file="/etc/config/qos_gargoyle"
     local upload_count=6
     local download_count=6
-    local max_classes=8  # 添加最大类别限制
+    local max_classes=8
     
     if [ -f "$config_file" ]; then
         echo "从配置文件读取类别数量: $config_file" >&2
-        local file_upload=$(grep -c "upload_class" "$config_file" 2>/dev/null || echo "$upload_count")
-        local file_download=$(grep -c "download_class" "$config_file" 2>/dev/null || echo "$download_count")
+        # 使用更精确的 grep：匹配以 config 开头的行，后面跟 'upload_class' 或 'download_class'
+        local file_upload=$(grep -c "^config upload_class" "$config_file" 2>/dev/null || echo "$upload_count")
+        local file_download=$(grep -c "^config download_class" "$config_file" 2>/dev/null || echo "$download_count")
         
-        # 边界检查
         if [ -n "$file_upload" ] && [ "$file_upload" -gt 0 ]; then
             if [ "$file_upload" -gt "$max_classes" ]; then
                 echo "警告: 上传类别数($file_upload)超过最大值($max_classes)，将使用最大值" >&2
@@ -970,7 +778,6 @@ get_class_counts_from_file() {
             fi
         fi
         
-        # 检查标记冲突
         if [ $((upload_count + download_count)) -gt 16 ]; then
             echo "警告: 总类别数($((upload_count + download_count)))过多，可能导致标记冲突" >&2
             echo "建议上传+下载类别总数不超过16个" >&2
@@ -986,75 +793,56 @@ get_class_counts_from_file() {
 
 # ========== 主初始化函数 ==========
 
-# 初始化 QoS
 initialize_qos() {
     echo "Initializing QoS system..."
     
-    # 加载 QoS 配置（获取接口名）
     if ! load_qos_config; then
         return 1
     fi
     
-    # 等待 WAN 接口就绪
     if ! wait_interface "$qos_interface"; then
         echo "WAN 接口未就绪，启动中止" >&2
         return 1
     fi
     
-    # 获取网络信息（IP 地址等）
     get_network_info
     
-    # 检查配置是否存在
     if ! check_configuration; then
         echo "QoS configuration is invalid or disabled"
         return 1
     fi
     
-    # 创建锁文件，防止并发执行
     touch "$LOCK_FILE"
     
-    # 加载对应算法模块
     if ! load_algorithm_module "$algorithm"; then
         echo "Failed to load algorithm module: $algorithm"
         rm -rf "$LOCK_FILE"
         return 1
     fi
     
-    # 清理现有 QoS 设置
     stop_qos
     
-    # 初始化 NFT 表（此处 qos_interface 应已非空）
     setup_nft_tables
     
-    # 创建 IFB 设备
     create_ifb_device
     
-    # 加载带宽配置
     load_bandwidth_config
 	
-	# 生成标记文件（注释掉，因为 rule.sh 已强制计算标记）
-	# if [ ! -f "/etc/qos_gargoyle/qos_class_marks" ]; then
-	#     logger -t "qos_gargoyle" "生成类别标记文件..."
-	#     generate_class_marks
-	# fi
-    
-    # 应用分类规则 - cake算法不应用
+    # 应用分类规则（cake 算法跳过）
     echo "调用分类规则应用..."	
-	if [ "$algorithm" = "cake" ]; then
-		echo "CAKE算法，跳过外部分类规则加载"
-		echo "CAKE使用内置DiffServ分类机制，无需NFTables分类规则"
-		# 清空规则链，确保没有残留规则
-		nft flush chain inet gargoyle-qos-priority filter_qos_egress
-		nft flush chain inet gargoyle-qos-priority filter_qos_ingress
-	else
-		echo "调用分类规则应用..."
-		apply_classification_rules
-	fi
+    if [ "$algorithm" = "cake" ]; then
+        echo "CAKE算法，跳过外部分类规则加载"
+        echo "CAKE使用内置DiffServ分类机制，无需NFTables分类规则"
+        nft flush chain inet gargoyle-qos-priority filter_qos_egress 2>/dev/null
+        nft flush chain inet gargoyle-qos-priority filter_qos_ingress 2>/dev/null
+    else
+        echo "调用分类规则应用..."
+        apply_classification_rules
+    fi
     
     # 调用算法特定的初始化
     case "$algorithm" in
         "hfsc_fqcodel")
-            # 导出必要的变量到环境
             export qos_interface="$qos_interface"
             export IFB_DEVICE="$IFB_DEVICE"
             export total_upload_bandwidth="$total_upload_bandwidth"
@@ -1065,23 +853,19 @@ initialize_qos() {
             export DOWNLOAD_MASK="$DOWNLOAD_MASK"
             export CONFIG_FILE="$CONFIG_FILE"
             
-            # 关键修复：函数名必须完全匹配（小写）
             if type initialize_hfsc_qos >/dev/null 2>&1; then
                 echo "正在初始化 HFSC QoS..."
-                # 修改：设置一个标志，告诉算法模块不要重复应用规则
                 export RULES_ALREADY_APPLIED=1
                 initialize_hfsc_qos start
             else
                 echo "错误: HFSC 初始化函数未找到"
-                echo "请检查 /usr/lib/qos_gargoyle/hfsc-helper.sh 中的函数名"
-                echo "应为: initialize_hfsc_qos (全部小写)"
+                echo "请检查 $HFSC_MODULE 中的函数名"
                 rm -rf "$LOCK_FILE"
                 return 1
             fi
             ;;
         "cake")
             if type initialize_cake_qos >/dev/null 2>&1; then
-                # 设置标志，告诉算法模块不要重复应用规则
                 export RULES_ALREADY_APPLIED=1
                 initialize_cake_qos start
             else
@@ -1092,7 +876,6 @@ initialize_qos() {
             ;;
         "htb_fqcodel")
             if type initialize_htb_qos >/dev/null 2>&1; then
-                # 设置标志，告诉算法模块不要重复应用规则
                 export RULES_ALREADY_APPLIED=1
                 initialize_htb_qos start
             else
@@ -1108,10 +891,8 @@ initialize_qos() {
             ;;
     esac
     
-    # 启动监控
     start_qos_acc
     
-    # 清理锁文件
     rm -rf "$LOCK_FILE"
     
     echo "✅ QoS initialized successfully (Algorithm: $algorithm)"
@@ -1148,9 +929,7 @@ show() {
     display_algorithm_specific_status
 }
 
-# 显示算法特定的状态
 display_algorithm_specific_status() {
-    # 加载算法模块
     if ! load_algorithm_module "$algorithm"; then
         echo "Failed to load algorithm module: $algorithm"
         show_basic_status
@@ -1182,7 +961,6 @@ display_algorithm_specific_status() {
                 show_basic_status
             fi
             ;;
-
         *)
             echo "Unknown algorithm: $algorithm"
             show_basic_status
@@ -1190,26 +968,21 @@ display_algorithm_specific_status() {
     esac
 }
 
-# 详细状态显示
 status() {
-    # 调用 show 函数显示基本状态
     show
     
     echo ""
     echo "=== System and Performance Information ==="
     echo ""
     
-    # 系统负载
     echo "1. System Load:"
     uptime
     echo ""
     
-    # 内存使用
     echo "2. Memory Usage:"
     free -h | grep -E "Mem:|Swap:"
     echo ""
     
-    # 接口统计
     echo "3. Interface Statistics:"
     if [ -n "$qos_interface" ]; then
         echo "   $qos_interface:"
@@ -1217,7 +990,6 @@ status() {
     fi
     echo ""
     
-    # QoS 监控状态
     echo "4. QoS accing:"
     if pgrep -x "qosacc" >/dev/null; then
         echo "   QoS acc is running (PID: $(pgrep -x qosacc))"
@@ -1226,7 +998,6 @@ status() {
     fi
 }
 
-# 显示基本状态
 show_basic_status() {
     echo "TC Queue Status:"
     tc qdisc show 2>/dev/null || echo "  No TC queues found"
@@ -1244,6 +1015,5 @@ show_basic_status() {
 # ========== 开机启动 ==========
 
 boot() {
-    # 开机时自动启动服务
     start
 }
