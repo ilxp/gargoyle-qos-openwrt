@@ -325,7 +325,7 @@ load_algorithm_module() {
     
     if [ -f "$module" ]; then
         . "$module"
-        echo "Loaded $algo algorithm module from $module"
+       # echo "Loaded $algo algorithm module from $module"  #取消，不显示
         # 更新 algorithm 变量为实际加载的算法（如果回退则已修改）
         algorithm="$algo"
         return 0

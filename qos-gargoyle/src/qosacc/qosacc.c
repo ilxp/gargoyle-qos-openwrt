@@ -1,5 +1,5 @@
 /* qosacc - 基于netlink的QoS主动拥塞控制（TC库版，支持HFSC/HTB/CAKE，含实时类检测）
- * version=1.6.7
+ * version=1.6.8
  * 功能：通过ping监控延迟，使用TC库直接调整根类的带宽，支持实时类检测（HFSC专用）
  * 状态文件目录：/tmp/qosacc.status
  */
@@ -273,7 +273,7 @@ static atomic_int g_reset_bw = ATOMIC_VAR_INIT(0);
 /* ==================== 帮助信息 ==================== */
 const char qosacc_usage[] =
 "qosacc - 基于ping延迟的动态QoS带宽调整器（TC库版，支持实时类检测）\n"
-"版本: 1.6.7\n\n"
+"版本: 1.6.8\n\n"
 "用法:\n"
 "  qosacc [ping间隔(ms)] [目标地址] [最大带宽(kbps)] [ping限制(ms)]\n"
 "  qosacc [选项]\n\n"
@@ -719,6 +719,7 @@ int ping_manager_init(ping_manager_t* pm, qosacc_context_t* ctx) {
     ctx->ping_socket = socket(af, SOCK_RAW, protocol);
     if (ctx->ping_socket < 0) {
         qosacc_log(ctx, QMON_LOG_ERROR, "创建ping套接字失败: %s\n", strerror(errno));
+        ctx->ping_socket = -1;  // 确保无效fd
         return QMON_ERR_SOCKET;
     }
     int ttl = 64;
@@ -958,6 +959,10 @@ typedef struct {
     __u32 root_handle;
     int found_root;
     int parse_realtime;
+    // 记录第一个遇到的 qdisc（若未找到根则回退）
+    char first_qdisc[16];
+    __u32 first_handle;
+    int found_any;
 } detect_qdisc_ctx_t;
 
 /* 队列检测回调（用于识别根队列） */
@@ -979,9 +984,15 @@ static int detect_qdisc_cb(struct nlmsghdr *n, void *arg) {
     if (tb[TCA_KIND] == NULL) return 0;
     char* kind = (char*)RTA_DATA(tb[TCA_KIND]);
 
-    // 调试日志（仅当 verbose 启用）
     qosacc_log(dctx->ctx, QMON_LOG_DEBUG, "detect_qdisc_cb: nlmsg_type=%d, kind=%s, parent=0x%x, handle=0x%x\n",
                n->nlmsg_type, kind, t->tcm_parent, t->tcm_handle);
+
+    // 记录第一个遇到的 qdisc（非类）
+    if (!dctx->found_any && n->nlmsg_type == RTM_NEWQDISC) {
+        strcpy(dctx->first_qdisc, kind);
+        dctx->first_handle = t->tcm_handle;
+        dctx->found_any = 1;
+    }
 
     int is_root = 0;
     // 放宽根队列判定：parent 为 TC_H_ROOT 或 0（某些情况）
@@ -1118,7 +1129,17 @@ static qosacc_result_t detect_qdisc_kind_tc(qosacc_context_t* ctx, int parse_rea
         return QMON_OK;
     }
 
+    // 如果 qdisc dump 没有找到根，但找到了至少一个 qdisc，则使用第一个作为根（fallback）
+    if (dctx.found_any) {
+        strcpy(ctx->detected_qdisc, dctx.first_qdisc);
+        ctx->root_handle = dctx.first_handle;
+        qosacc_log(ctx, QMON_LOG_INFO, "未找到根队列，使用第一个检测到的队列: %s (handle 0x%x)\n", ctx->detected_qdisc, ctx->root_handle);
+        rtnl_close(&rth);
+        return QMON_OK;
+    }
+
     rtnl_close(&rth);
+    // 尝试 class dump
     if (rtnl_open(&rth, 0) < 0) {
         qosacc_log(ctx, QMON_LOG_ERROR, "无法重新打开rtnetlink\n");
         return QMON_ERR_SYSTEM;
@@ -1133,12 +1154,13 @@ static qosacc_result_t detect_qdisc_kind_tc(qosacc_context_t* ctx, int parse_rea
     }
 
     dctx.found_root = 0;
+    dctx.found_any = 0;
     if (dump_filter(&rth, detect_qdisc_cb, &dctx) < 0 && errno != EINTR) {
         qosacc_log(ctx, QMON_LOG_DEBUG, "类dump未找到根类\n");
     }
 
     if (dctx.found_root) {
-        strcpy(ctx->detected_qdisc, dctx.detected_qdisc);  // 修正：原错误为 detected_qsch
+        strcpy(ctx->detected_qdisc, dctx.detected_qdisc);
         ctx->root_handle = dctx.root_handle;
         qosacc_log(ctx, QMON_LOG_INFO, "检测到根类: %s (handle 0x%x)\n", ctx->detected_qdisc, ctx->root_handle);
     } else {
@@ -1285,10 +1307,6 @@ int tc_controller_update_class_stats(qosacc_context_t* ctx) {
         if (fetch_hfsc_class_info(ctx) != QMON_OK) {
             qosacc_log(ctx, QMON_LOG_ERROR, "重新获取HFSC类信息失败\n");
         }
-        // 重新获取后，原有 bw_flt 等需要重置，此处仅重设时间戳，带宽重新开始滤波
-        // 由于 fetch_hfsc_class_info 已重置 class_count 和 class_stats 数组，
-        // 但未设置 bwtime 为当前时间？ fetch 中设置 bwtime 为调用时的时间，但类信息中 bwtime 应为初始时间。
-        // 这里为了简化，直接返回，下一次循环会再次更新统计。
         return QMON_OK;
     }
 
@@ -1475,7 +1493,7 @@ int tc_controller_init(tc_controller_t* tc, qosacc_context_t* ctx) {
     if (detect_qdisc_kind_tc(ctx, parse_realtime) != QMON_OK) {
         qosacc_log(ctx, QMON_LOG_ERROR, "队列检测失败，无法继续\n");
         rtnl_close(&ctx->rth);
-        tc->ctx = NULL;  // 防止 cleanup 中再次关闭
+        tc->ctx = NULL;
         return QMON_ERR_SYSTEM;
     }
 
@@ -1914,6 +1932,9 @@ int main(int argc, char* argv[]) {
     qosacc_context_t context = {0};
     ping_manager_t ping_mgr = {0};
     tc_controller_t tc_mgr = {0};
+
+    // 初始化 ping_socket 为 -1，避免误关闭
+    context.ping_socket = -1;
 
     if (argc == 1) {
         fprintf(stderr, "qosacc: 未提供参数，使用 -h 查看帮助\n");
