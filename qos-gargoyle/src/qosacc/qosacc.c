@@ -1003,10 +1003,18 @@ static int detect_qdisc_cb(struct nlmsghdr *n, void *arg) {
 
     if (is_root) {
         qosacc_log(dctx->ctx, QMON_LOG_DEBUG, "detect_qdisc_cb: Found root %s\n", kind);
+        // 更新检测到的信息（即使是 noqueue 也先记录）
         strcpy(dctx->detected_qdisc, kind);
         dctx->root_handle = t->tcm_handle;
         dctx->found_root = 1;
-        return -1; // 找到根，停止遍历
+
+        // 如果是 noqueue，继续遍历（期待后面有真正的队列）
+        if (strcmp(kind, "noqueue") == 0) {
+            return 0;
+        } else {
+            // 找到真正的队列，停止遍历
+            return -1;
+        }
     }
 
     // 如果要求解析实时类且当前是类消息且队列为hfsc，则记录类的实时性
@@ -1921,9 +1929,19 @@ void qosacc_cleanup(qosacc_context_t* ctx, ping_manager_t* pm, tc_controller_t* 
     }
     if (tc) tc_controller_cleanup(tc);
     if (pm) ping_manager_cleanup(pm);
-    if (ctx->status_file) fclose(ctx->status_file);
-    if (ctx->debug_log_file) fclose(ctx->debug_log_file);
-    if (ctx->ping_socket >= 0) close(ctx->ping_socket);
+    
+    if (ctx->status_file) {
+        fclose(ctx->status_file);
+        ctx->status_file = NULL;
+    }
+    if (ctx->debug_log_file) {
+        fclose(ctx->debug_log_file);
+        ctx->debug_log_file = NULL;
+    }
+    if (ctx->ping_socket >= 0) {
+        close(ctx->ping_socket);
+        ctx->ping_socket = -1;
+    }
 }
 
 /* ==================== 主函数 ==================== */
