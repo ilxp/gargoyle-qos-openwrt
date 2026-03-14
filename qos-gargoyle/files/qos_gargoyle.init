@@ -108,7 +108,7 @@ stop_qos() {
     echo "Stopping QoS system..."
     
     # 停止监控进程
-    killall -q qosacc 2>/dev/null
+    killall qosacc 2>/dev/null
     sleep 1
     
     # 检查服务是否真的在运行
