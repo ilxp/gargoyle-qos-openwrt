@@ -58,7 +58,7 @@ o.rmempty = false
 
 -- QoS算法选择
 o = s:option(ListValue, "algorithm", translate("QoS Algorithm"), 
-    translate("HFSC+fq_codel: Guarantees low latency, ideal for gaming/voip.HTB+fq_codel: Flexible bandwidth control, good for multi-service management.CAKE: Modern and plug-and-play, simple to use."))
+    translate("HFSC: Guarantees low latency, ideal for gaming/voip.HTB: Flexible bandwidth control, good for multi-service management.CAKE: Modern and plug-and-play, simple to use."))
 o:value("hfsc_cake", "HFSC_CAKE (Hfsc With Cake)")
 o:value("htb_cake", "HTB_CAKE (Htb With Cake)")
 o:value("cake", "CAKE (Common Applications Kept Enhanced)")

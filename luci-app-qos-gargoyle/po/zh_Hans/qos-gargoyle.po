@@ -70,8 +70,8 @@ msgstr "启用或者禁用QoS服务"
 msgid "QoS Algorithm"
 msgstr "QoS算法"
 
-msgid "HFSC+fq_codel: Guarantees low latency, ideal for gaming/voip.HTB+fq_codel: Flexible bandwidth control, good for multi-service management.CAKE: Modern and plug-and-play, simple to use."
-msgstr "HFSC+fq_codel：硬性保证延迟，适合游戏/通话。HTB+fq_codel：灵活控制带宽，适合多业务管理。CAKE：现代高级，简单省事。"
+msgid "HFSC: Guarantees low latency, ideal for gaming/voip.HTB: Flexible bandwidth control, good for multi-service management.CAKE: Modern and plug-and-play, simple to use."
+msgstr "HFSC：硬性保证延迟，适合游戏/通话。HTB：灵活控制带宽，适合多业务管理。CAKE：现代高级，简单省事。"
 
 msgid "Algorithm Settings"
 msgstr "算法配置"
