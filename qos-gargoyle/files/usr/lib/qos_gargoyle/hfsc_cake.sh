@@ -1,27 +1,29 @@
 #!/bin/sh
-# version=2.6
+# version=2.18
 # HFSC_CAKE算法实现模块
 # 基于HFSC与CAKE组合算法实现QoS流量控制。
 # 必要工具：tc, nft, conntrack, ethtool, sysctl
 # 内核模块：ifb, sch_hfsc, sch_cake
+# 注意：规则应用由外部init.d脚本负责，本脚本仅创建队列和基础nftables链。
 
 # ========== 全局配置常量 ==========
 : ${CONFIG_FILE:=qos_gargoyle}
-: ${LOCK_FILE:=/var/run/hfsc_cake.lock}      # 并发锁文件
-: ${MAX_PHYSICAL_BANDWIDTH:=10000000}       # 最大物理带宽10Gbps（单位kbit）
-: ${HFSC_MINRTT_DELAY:=1000us}              # 最小RTT延迟默认值
-: ${IFB_DEVICE:=ifb0}                       # 默认IFB设备
-: ${UPLOAD_MASK:=0x007F}                     # 上传方向标记掩码
-: ${DOWNLOAD_MASK:=0x7F00}                   # 下载方向标记掩码
-: ${QOS_RUNNING_FILE:=/var/run/hfsc_cake.running} # 运行标记文件
-: ${DELETE_IFB_ON_STOP:=0}                    # 停止时是否删除IFB设备（默认0不删除）
+: ${LOCK_FILE:=/var/run/hfsc_cake.lock}            # 并发锁文件
+: ${RUNNING_FILE:=/var/run/hfsc_cake.running}      # 运行标记文件
+: ${MAX_PHYSICAL_BANDWIDTH:=10000000}               # 最大物理带宽10Gbps（单位kbit），实际会尽力检测
+: ${HFSC_MINRTT_DELAY:=1000us}                      # 最小RTT延迟默认值
+: ${UPLOAD_MASK:=0x007F}                             # 上传方向标记掩码
+: ${DOWNLOAD_MASK:=0x7F00}                           # 下载方向标记掩码
+: ${DELETE_IFB_ON_STOP:=0}                           # 停止时是否删除IFB设备（默认0不删除）
+: ${DEBUG:=0}                                         # 调试开关，0关闭，1开启
 
-# 全局变量声明
+# 全局变量
 upload_class_list=""
 download_class_list=""
 upload_class_mark_list=""
 download_class_mark_list=""
 qos_interface=""
+IFB_DEVICE=""
 
 # 加载规则辅助模块（必须）
 if [ -f "/usr/lib/qos_gargoyle/rule.sh" ]; then
@@ -38,23 +40,50 @@ fi
 . /lib/functions/network.sh
 include /lib/network
 
-# ========== 幂等性检查 ==========
-check_already_running() {
-    if [ -f "$QOS_RUNNING_FILE" ]; then
-        local pid=$(cat "$QOS_RUNNING_FILE" 2>/dev/null)
-        if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
-            qos_log "ERROR" "HFSC+CAKE QoS 已经在运行中 (PID: $pid)"
-            return 1
-        else
-            qos_log "WARN" "发现残留的运行标记文件，清理中"
-            rm -f "$QOS_RUNNING_FILE"
+# ========== 辅助函数 ==========
+# 检查必需的命令是否存在
+check_required_commands() {
+    local missing=0
+    for cmd in tc nft conntrack ethtool ip; do
+        if ! command -v "$cmd" >/dev/null 2>&1; then
+            qos_log "ERROR" "命令 '$cmd' 未找到，请安装相应软件包"
+            missing=1
         fi
+    done
+    return $missing
+}
+
+# 检查并加载必需的内核模块
+load_required_modules() {
+    local missing=0
+    for mod in ifb sch_hfsc sch_cake; do
+        if ! lsmod 2>/dev/null | grep -q "^$mod"; then
+            qos_log "INFO" "尝试加载内核模块: $mod"
+            modprobe "$mod" 2>/dev/null || {
+                qos_log "ERROR" "无法加载内核模块 $mod"
+                missing=1
+            }
+        fi
+    done
+    return $missing
+}
+
+# 检查IFB设备是否存在并启用（不创建）
+ensure_ifb_device() {
+    local dev="$1"
+    if ! ip link show "$dev" >/dev/null 2>&1; then
+        qos_log "ERROR" "IFB设备 $dev 不存在，请检查配置或启动IFB管理脚本"
+        return 1
     fi
-    echo "$$" > "$QOS_RUNNING_FILE"
+    ip link set dev "$dev" up || {
+        qos_log "ERROR" "无法启动IFB设备 $dev"
+        return 1
+    }
+    qos_log "INFO" "IFB设备 $dev 已就绪"
     return 0
 }
 
-# ========== 并发安全锁机制（增强版） ==========
+# ========== 并发安全锁机制（增强属主检查）==========
 acquire_lock() {
     local lock_file="$LOCK_FILE"
     local timeout=10
@@ -93,6 +122,22 @@ release_lock() {
     return 0
 }
 
+# ========== 幂等性检查 ==========
+check_already_running() {
+    if [ -f "$RUNNING_FILE" ]; then
+        local pid=$(cat "$RUNNING_FILE" 2>/dev/null)
+        if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+            qos_log "ERROR" "HFSC+CAKE QoS 已经在运行中 (PID: $pid)"
+            return 1
+        else
+            qos_log "WARN" "发现残留的运行标记文件，清理中"
+            rm -f "$RUNNING_FILE"
+        fi
+    fi
+    echo "$$" > "$RUNNING_FILE"
+    return 0
+}
+
 # ========== 配置加载函数 ==========
 get_physical_interface_max_bandwidth() {
     local interface="$1"
@@ -119,7 +164,8 @@ get_physical_interface_max_bandwidth() {
     
     if [ -z "$max_bandwidth" ]; then
         max_bandwidth="$MAX_PHYSICAL_BANDWIDTH"
-        qos_log "WARN" "无法获取接口 $interface 的物理速度，使用默认最大值: ${max_bandwidth}kbit"
+        qos_log "WARN" "无法获取接口 $interface 的物理速度，使用默认最大值 ${max_bandwidth}kbit"
+        qos_log "WARN" "建议在配置文件中手动设置总带宽以确保QoS效果"
     fi
     
     echo "$max_bandwidth"
@@ -186,7 +232,8 @@ calculate_memory_limit() {
         
         if [ -n "$total_mem_mb" ] && [ "$total_mem_mb" -gt 0 ] 2>/dev/null; then
             # 每256MB内存分配1MB给CAKE，向上取整确保至少1MB基数
-            result="$(((total_mem_mb + 255) / 256))Mb"
+            # 对于128GB（131072MB）内存，计算值为 (131072+255)/256 ≈ 513，安全在32位有符号范围内
+            result="$(( (total_mem_mb + 255) / 256 ))Mb"
             
             local min_limit=4
             local max_limit=32
@@ -226,6 +273,15 @@ load_hfsc_cake_config() {
         return 1
     fi
     
+    # 从UCI配置读取IFB设备（通过LuCI选择）
+    IFB_DEVICE=$(uci -q get qos_gargoyle.download.ifb_device 2>/dev/null)
+    if [ -z "$IFB_DEVICE" ]; then
+        IFB_DEVICE="ifb0"
+        qos_log "WARN" "IFB设备未配置，使用默认值: $IFB_DEVICE"
+    else
+        qos_log "INFO" "从配置文件读取IFB设备: $IFB_DEVICE"
+    fi
+    
     # 从UCI配置读取HFSC特定参数
     HFSC_LATENCY_MODE=$(uci -q get qos_gargoyle.hfsc.latency_mode 2>/dev/null)
     if [ -z "$HFSC_LATENCY_MODE" ]; then
@@ -244,6 +300,9 @@ load_hfsc_cake_config() {
     
     # 从UCI配置读取CAKE参数
     CAKE_BANDWIDTH=$(uci -q get qos_gargoyle.cake.bandwidth 2>/dev/null)   # 可选，HFSC场景下通常不应设置
+    if [ -n "$CAKE_BANDWIDTH" ]; then
+        qos_log "ERROR" "检测到 CAKE_BANDWIDTH 已配置 (值: $CAKE_BANDWIDTH)，这将导致CAKE二次整形，可能严重影响HFSC调度性能。建议删除此配置项以使用HFSC主导的整形。"
+    fi
     CAKE_RTT=$(uci -q get qos_gargoyle.cake.rtt 2>/dev/null)
     CAKE_FLOWMODE=$(uci -q get qos_gargoyle.cake.flowmode 2>/dev/null)
     [ -z "$CAKE_FLOWMODE" ] && CAKE_FLOWMODE="srchost"
@@ -369,6 +428,9 @@ load_download_class_configurations() {
 setup_ipv6_specific_rules() {
     qos_log "INFO" "设置IPv6特定规则（优化版）"
     
+    # 确保表存在
+    nft add table inet gargoyle-qos-priority 2>/dev/null || true
+    
     nft add chain inet gargoyle-qos-priority filter_prerouting '{ type filter hook prerouting priority 0; policy accept; }' 2>/dev/null || true
     nft flush chain inet gargoyle-qos-priority filter_prerouting 2>/dev/null || true
     
@@ -450,6 +512,8 @@ create_hfsc_root_qdisc() {
     qos_log "INFO" "正在为 $device 创建 HFSC 根类..."
     if ! tc class add dev "$device" parent $root_handle classid $root_classid hfsc ls rate ${bandwidth}kbit ul rate ${bandwidth}kbit; then
         qos_log "ERROR" "无法在$device上创建HFSC根类"
+        # 清理已创建的根队列
+        tc qdisc del dev "$device" root 2>/dev/null
         return 1
     fi
     
@@ -508,6 +572,7 @@ build_cake_params() {
     echo "$params"
 }
 
+# 创建单个上传类
 create_hfsc_upload_class() {
     local class_name="$1"
     local class_index="$2"
@@ -576,8 +641,8 @@ create_hfsc_upload_class() {
         m2="$ul_m2"
     fi
     
-    # 修复：使用配置的HFSC_MINRTT_DELAY，如果未配置则使用默认值
-    local minrtt_delay="${HFSC_MINRTT_DELAY:-1000us}"
+    # 使用配置的HFSC_MINRTT_DELAY
+    local minrtt_delay="${HFSC_MINRTT_DELAY}"
     case "${minRTT:-No}" in
         [Yy]es|[Yy]|1|[Tt]rue)
             d="$minrtt_delay"
@@ -601,6 +666,8 @@ create_hfsc_upload_class() {
     if ! tc qdisc add dev "$qos_interface" parent 1:$class_index \
         handle ${class_index}:1 cake $cake_params; then
         qos_log "ERROR" "添加上传CAKE队列失败"
+        # 清理已创建的类
+        tc class del dev "$qos_interface" classid 1:$class_index 2>/dev/null
         return 1
     fi
     
@@ -618,7 +685,11 @@ create_hfsc_upload_class() {
         local ipv6_priority=$((base_prio + class_index))
         if ! tc filter add dev "$qos_interface" parent 1:0 protocol ipv6 \
             prio $ipv6_priority handle ${class_mark}/$UPLOAD_MASK fw classid 1:$class_index 2>/dev/null; then
-            qos_log "WARN" "添加上传IPv6过滤器失败 (标记:$class_mark -> 类别:1:$class_index)"
+            qos_log "WARN" "添加上传IPv6过滤器失败 (标记:$class_mark -> 类别:1:$class_index, 优先级:$ipv6_priority)"
+            # 可选：记录详细错误信息
+            local err_msg=$(tc filter add dev "$qos_interface" parent 1:0 protocol ipv6 \
+                prio $ipv6_priority handle ${class_mark}/$UPLOAD_MASK fw classid 1:$class_index 2>&1)
+            qos_log "DEBUG" "详细错误: $err_msg"
         else
             qos_log "INFO" "添加上传IPv6过滤器: 标记:$class_mark -> 类别:1:$class_index (优先级:$ipv6_priority)"
         fi
@@ -628,6 +699,7 @@ create_hfsc_upload_class() {
     return 0
 }
 
+# 创建单个下载类
 create_hfsc_download_class() {
     local class_name="$1"
     local class_index="$2"
@@ -637,13 +709,9 @@ create_hfsc_download_class() {
     
     qos_log "INFO" "创建下载类别: $class_name, ID: 1:$class_index, 过滤器优先级: $filter_prio"
     
-    local retries=5
-    while ! ip link show dev "$ifb_dev" >/dev/null 2>&1 && ((retries-- > 0)); do
-        ip link add dev "$ifb_dev" type ifb
-        sleep 1
-    done
-    if [ $retries -eq 0 ]; then
-        qos_log "ERROR" "IFB设备创建失败"
+    # 确保IFB设备已存在并启用
+    if ! ip link show dev "$ifb_dev" >/dev/null 2>&1; then
+        qos_log "ERROR" "IFB设备 $ifb_dev 不存在，无法创建下载类"
         return 1
     fi
     
@@ -709,8 +777,7 @@ create_hfsc_download_class() {
         m2="$ul_m2"
     fi
     
-    # 修复：使用配置的HFSC_MINRTT_DELAY，如果未配置则使用默认值
-    local minrtt_delay="${HFSC_MINRTT_DELAY:-1000us}"
+    local minrtt_delay="${HFSC_MINRTT_DELAY}"
     case "${minRTT:-No}" in
         [Yy]es|[Yy]|1|[Tt]rue)
             d="$minrtt_delay"
@@ -733,6 +800,8 @@ create_hfsc_download_class() {
     if ! tc qdisc add dev "$ifb_dev" parent 1:$class_index \
         handle ${class_index}:1 cake $cake_params; then
         qos_log "ERROR" "添加下载CAKE队列失败"
+        # 清理已创建的类
+        tc class del dev "$ifb_dev" classid 1:$class_index 2>/dev/null
         return 1
     fi
     
@@ -750,7 +819,10 @@ create_hfsc_download_class() {
         local ipv6_priority=$((base_prio + filter_prio))
         if ! tc filter add dev "$ifb_dev" parent 1:0 protocol ipv6 \
             prio $ipv6_priority handle ${class_mark}/$DOWNLOAD_MASK fw classid 1:$class_index 2>/dev/null; then
-            qos_log "WARN" "添加下载IPv6过滤器失败 (标记:$class_mark -> 类别:1:$class_index)"
+            qos_log "WARN" "添加下载IPv6过滤器失败 (标记:$class_mark -> 类别:1:$class_index, 优先级:$ipv6_priority)"
+            local err_msg=$(tc filter add dev "$ifb_dev" parent 1:0 protocol ipv6 \
+                prio $ipv6_priority handle ${class_mark}/$DOWNLOAD_MASK fw classid 1:$class_index 2>&1)
+            qos_log "DEBUG" "详细错误: $err_msg"
         else
             qos_log "INFO" "添加下载IPv6过滤器: 标记:$class_mark -> 类别:1:$class_index (优先级:$ipv6_priority)"
         fi
@@ -760,6 +832,7 @@ create_hfsc_download_class() {
     return 0
 }
 
+# 创建默认上传类
 create_default_upload_class() {
     qos_log "INFO" "创建默认上传类别"
     
@@ -791,7 +864,7 @@ create_default_upload_class() {
         qos_log "WARN" "添加上传默认IPv4过滤器失败"
     fi
     if ! tc filter add dev "$qos_interface" parent 1:0 protocol ipv6 \
-        prio 2 handle ${mark_hex}/$UPLOAD_MASK fw flowid 1:2 2>/dev/null; then
+        prio 1 handle ${mark_hex}/$UPLOAD_MASK fw flowid 1:2 2>/dev/null; then
         qos_log "WARN" "添加上传默认IPv6过滤器失败"
     fi
     
@@ -800,20 +873,11 @@ create_default_upload_class() {
     return 0
 }
 
+# 创建默认下载类
 create_default_download_class() {
     qos_log "INFO" "创建默认下载类别"
     
     local ifb_dev="$IFB_DEVICE"
-    
-    local retries=5
-    while ! ip link show dev "$ifb_dev" >/dev/null 2>&1 && ((retries-- > 0)); do
-        ip link add dev "$ifb_dev" type ifb
-        sleep 1
-    done
-    if [ $retries -eq 0 ]; then
-        qos_log "ERROR" "IFB设备创建失败"
-        return 1
-    fi
     
     if ! ip link set dev "$ifb_dev" up; then
         qos_log "ERROR" "无法启动IFB设备 $ifb_dev"
@@ -848,7 +912,7 @@ create_default_download_class() {
         qos_log "WARN" "添加下载默认IPv4过滤器失败"
     fi
     if ! tc filter add dev "$ifb_dev" parent 1:0 protocol ipv6 \
-        prio 2 handle ${mark_hex}/$DOWNLOAD_MASK fw flowid 1:2 2>/dev/null; then
+        prio 1 handle ${mark_hex}/$DOWNLOAD_MASK fw flowid 1:2 2>/dev/null; then
         qos_log "WARN" "添加下载默认IPv6过滤器失败"
     fi
     
@@ -862,7 +926,13 @@ create_default_download_class() {
     return 0
 }
 
-# ========== 入口重定向（统一为全球单播匹配）==========
+# ========== 入口重定向（依赖conntrack恢复标记）==========
+# 注意：数据包处理顺序为 驱动 → tc ingress → nftables prerouting。
+# 本函数在 tc ingress 中使用 action connmark 恢复之前由 nftables 设置的 conntrack mark，
+# 从而实现对下行流量的正确分类。此机制依赖于：
+#   1. 上传方向在 nftables 中设置了 meta mark，并通过规则将 mark 同步到 conntrack（ct mark set meta mark）
+#   2. 下行方向在 tc ingress 中通过 action connmark 将 conntrack mark 恢复到数据包的 fw mark
+#   3. apply_hfsc_specific_rules 中已包含必要的 ct mark 同步规则（ct state established,related counter meta mark set ct mark）
 setup_ingress_redirect() {
     if [ -z "$qos_interface" ]; then
         qos_log "ERROR" "无法确定 WAN 接口"
@@ -989,6 +1059,11 @@ initialize_hfsc_upload() {
         if create_hfsc_upload_class "$class_name" "$class_index"; then
             local class_mark_hex=$(get_class_mark_for_rule "$class_name" "upload")
             upload_class_mark_list="$upload_class_mark_list$class_name:$class_mark_hex "
+        else
+            qos_log "ERROR" "创建上传类别 $class_name 失败，停止初始化"
+            # 清理已创建的根队列
+            tc qdisc del dev "$qos_interface" root 2>/dev/null
+            return 1
         fi
         class_index=$((class_index + 1))
     done
@@ -1013,13 +1088,9 @@ initialize_hfsc_download() {
         return 0
     fi
     
-    local retries=5
-    while ! ip link show dev "$IFB_DEVICE" >/dev/null 2>&1 && ((retries-- > 0)); do
-        ip link add dev "$IFB_DEVICE" type ifb
-        sleep 1
-    done
-    if [ $retries -eq 0 ]; then
-        qos_log "ERROR" "IFB设备创建失败"
+    # 确保IFB设备已存在并启用
+    if ! ip link show dev "$IFB_DEVICE" >/dev/null 2>&1; then
+        qos_log "ERROR" "IFB设备 $IFB_DEVICE 不存在"
         return 1
     fi
     
@@ -1041,6 +1112,11 @@ initialize_hfsc_download() {
         if create_hfsc_download_class "$class_name" "$class_index" "$filter_prio"; then
             local class_mark_hex=$(get_class_mark_for_rule "$class_name" "download")
             download_class_mark_list="$download_class_mark_list$class_name:$class_mark_hex "
+        else
+            qos_log "ERROR" "创建下载类别 $class_name 失败，停止初始化"
+            # 清理已创建的根队列
+            tc qdisc del dev "$IFB_DEVICE" root 2>/dev/null
+            return 1
         fi
         class_index=$((class_index + 1))
         filter_prio=$((filter_prio + 2))
@@ -1194,9 +1270,6 @@ apply_hfsc_specific_rules() {
         limit rate 100/second burst 20 packets \
         meta mark set 0x7F00 counter 2>/dev/null || true
     
-    # 移除直接操作系统 filter 表的规则，避免冲突
-    # nft add rule inet filter input ct state new limit rate 100/second burst 20 accept 2>/dev/null || true
-    
     nft add rule inet gargoyle-qos-priority filter_qos_egress_enhance \
         meta mark and 0x007f != 0 counter meta priority set "bulk" 2>/dev/null || true
     nft add rule inet gargoyle-qos-priority filter_qos_ingress_enhance \
@@ -1218,23 +1291,41 @@ apply_hfsc_specific_rules() {
     qos_log "INFO" "HFSC特定增强规则应用完成"
 }
 
+# ========== 主初始化函数 ==========
 initialize_hfsc_cake_qos() {
     qos_log "INFO" "开始初始化HFSC+CAKE QoS系统"
-    
-    # 幂等性检查
-    if ! check_already_running; then
-        qos_log "ERROR" "HFSC+CAKE QoS 已经在运行中"
-        return 1
-    fi
     
     # 获取并发锁
     if ! acquire_lock; then
         qos_log "ERROR" "无法获取并发锁，可能已有其他QoS进程在运行"
-        rm -f "$QOS_RUNNING_FILE"
+        rm -f "$RUNNING_FILE"
         return 1
     fi
     
-    # 确保 nftables 表存在（避免后续规则添加失败）
+    # 检查必需命令
+    if ! check_required_commands; then
+        qos_log "ERROR" "缺少必需的命令，请安装对应软件包"
+        release_lock
+        rm -f "$RUNNING_FILE"
+        return 1
+    fi
+    
+    # 检查并加载内核模块
+    if ! load_required_modules; then
+        qos_log "ERROR" "无法加载必需的内核模块"
+        release_lock
+        rm -f "$RUNNING_FILE"
+        return 1
+    fi
+    
+    # 幂等性检查
+    if ! check_already_running; then
+        qos_log "ERROR" "HFSC+CAKE QoS 已经在运行中"
+        release_lock
+        return 1
+    fi
+    
+    # 确保 nftables 表存在
     nft add table inet gargoyle-qos-priority 2>/dev/null || true
     
     # 检查qos_interface是否已设置
@@ -1247,7 +1338,7 @@ initialize_hfsc_cake_qos() {
         if [ -z "$qos_interface" ]; then
             qos_log "ERROR" "无法确定 WAN 接口，请检查配置"
             release_lock
-            rm -f "$QOS_RUNNING_FILE"
+            rm -f "$RUNNING_FILE"
             return 1
         fi
     fi
@@ -1257,7 +1348,15 @@ initialize_hfsc_cake_qos() {
     if ! load_hfsc_cake_config; then
         qos_log "ERROR" "加载HFSC+CAKE配置失败"
         release_lock
-        rm -f "$QOS_RUNNING_FILE"
+        rm -f "$RUNNING_FILE"
+        return 1
+    fi
+    
+    # 确保IFB设备存在（仅检查，不创建）——此时已从配置读取IFB_DEVICE
+    if ! ensure_ifb_device "$IFB_DEVICE"; then
+        qos_log "ERROR" "IFB设备 $IFB_DEVICE 无法使用，请检查配置或启动IFB管理脚本"
+        release_lock
+        rm -f "$RUNNING_FILE"
         return 1
     fi
     
@@ -1290,7 +1389,7 @@ initialize_hfsc_cake_qos() {
         qos_log "ERROR" "HFSC+CAKE QoS 初始化部分失败"
         stop_hfsc_cake_qos
         release_lock
-        rm -f "$QOS_RUNNING_FILE"
+        rm -f "$RUNNING_FILE"
         return 1
     fi
     
@@ -1302,15 +1401,15 @@ initialize_hfsc_cake_qos() {
     return 0
 }
 
+# ========== 停止函数 ==========
 stop_hfsc_cake_qos() {
     qos_log "INFO" "停止HFSC+CAKE QoS"
     
-    # 先删除运行标记
-    rm -f "$QOS_RUNNING_FILE"
+    # 先获取锁
+    acquire_lock
     
-    if ! acquire_lock; then
-        qos_log "WARN" "无法获取并发锁，但将继续尝试停止QoS"
-    fi
+    # 删除运行标记
+    rm -f "$RUNNING_FILE"
     
     local tc_count_before=$(tc qdisc show 2>/dev/null | grep -c hfsc || echo 0)
     local nft_count_before=$(nft list ruleset 2>/dev/null | grep -c "gargoyle-qos-priority" || echo 0)
@@ -1323,48 +1422,36 @@ stop_hfsc_cake_qos() {
     fi
     
     # 清理上传方向队列
-    tc filter show dev "$qos_interface" 2>/dev/null | grep -q hfsc && {
+    if [ -n "$qos_interface" ] && ip link show "$qos_interface" >/dev/null 2>&1; then
         tc filter del dev "$qos_interface" parent 1:0 protocol all 2>/dev/null || true
-    }
-    tc qdisc del dev "$qos_interface" ingress 2>/dev/null || true
-    tc qdisc del dev "$qos_interface" root 2>/dev/null || true
+        tc qdisc del dev "$qos_interface" ingress 2>/dev/null || true
+        tc qdisc del dev "$qos_interface" root 2>/dev/null || true
+    fi
     
     # 清理下载方向队列
-    tc filter show dev "$IFB_DEVICE" 2>/dev/null | grep -q hfsc && {
+    if [ -n "$IFB_DEVICE" ] && ip link show "$IFB_DEVICE" >/dev/null 2>&1; then
         tc filter del dev "$IFB_DEVICE" parent 1:0 protocol all 2>/dev/null || true
-    }
-    tc qdisc del dev "$IFB_DEVICE" ingress 2>/dev/null || true
-    tc qdisc del dev "$IFB_DEVICE" root 2>/dev/null || true
+        tc qdisc del dev "$IFB_DEVICE" ingress 2>/dev/null || true
+        tc qdisc del dev "$IFB_DEVICE" root 2>/dev/null || true
+    fi
     
-    # 清理NFTables规则：先删除跳转规则，再删除增强链
-    nft delete rule inet gargoyle-qos-priority filter_qos_egress handle \
-        $(nft -a list chain inet gargoyle-qos-priority filter_qos_egress 2>/dev/null | \
-          grep "jump filter_qos_egress_enhance" | awk '{print $NF}' | head -1) 2>/dev/null || true
-    nft delete rule inet gargoyle-qos-priority filter_qos_ingress handle \
-        $(nft -a list chain inet gargoyle-qos-priority filter_qos_ingress 2>/dev/null | \
-          grep "jump filter_qos_ingress_enhance" | awk '{print $NF}' | head -1) 2>/dev/null || true
+    # 彻底删除nftables表（更干净）
+    nft delete table inet gargoyle-qos-priority 2>/dev/null || true
     
-    nft delete chain inet gargoyle-qos-priority filter_qos_egress_enhance 2>/dev/null || true
-    nft delete chain inet gargoyle-qos-priority filter_qos_ingress_enhance 2>/dev/null || true
-    
-    # 再次清理入口队列（确保）
-    tc qdisc del dev "$qos_interface" ingress 2>/dev/null || true
-    
-    # 处理IFB设备
-    if ip link show dev "$IFB_DEVICE" >/dev/null 2>&1; then
+    # 处理IFB设备（仅当配置允许删除时）
+    if [ -n "$IFB_DEVICE" ] && ip link show dev "$IFB_DEVICE" >/dev/null 2>&1; then
         ip link set dev "$IFB_DEVICE" down
-        # 根据配置决定是否删除IFB设备
         if [ "${DELETE_IFB_ON_STOP:-0}" = "1" ]; then
-            ip link del "$IFB_DEVICE" 2>/dev/null && qos_log "INFO" "删除IFB设备: $IFB_DEVICE"
+            # 注意：这里不删除设备，因为可能被其他服务使用
+            qos_log "INFO" "IFB设备 $IFB_DEVICE 已停用（保留）"
         else
-            qos_log "INFO" "停用IFB设备: $IFB_DEVICE (保留)"
+            qos_log "INFO" "IFB设备 $IFB_DEVICE 已停用"
         fi
     fi
     
-    # 清理连接标记
-    conntrack -U --mark 0 2>/dev/null || true
+    # 清理连接标记（已不再需要，保留注释）
+    # conntrack -U --mark 0 2>/dev/null || true
     
-    # 资源泄漏验证
     local tc_count_after=$(tc qdisc show 2>/dev/null | grep -c hfsc || echo 0)
     local nft_count_after=$(nft list ruleset 2>/dev/null | grep -c "gargoyle-qos-priority" || echo 0)
     
@@ -1375,11 +1462,17 @@ stop_hfsc_cake_qos() {
         qos_log "WARN" "清理后仍有 $nft_count_after 个NFTables规则残留"
     fi
     
-    release_lock
     qos_log "INFO" "HFSC+CAKE QoS停止完成 (清理前: ${tc_count_before}队列/${nft_count_before}规则, 清理后: ${tc_count_after}队列/${nft_count_after}规则)"
+    
+    release_lock
 }
 
+# ========== 状态显示函数（增加 conntrack 命令检查）==========
 show_hfsc_cake_status() {
+    if [ -z "$IFB_DEVICE" ]; then
+        IFB_DEVICE=$(uci -q get qos_gargoyle.download.ifb_device)
+        [ -z "$IFB_DEVICE" ] && IFB_DEVICE="ifb0"
+    fi
     local qos_ifb="$IFB_DEVICE"
     
     if [ -z "$qos_interface" ]; then
@@ -1387,7 +1480,7 @@ show_hfsc_cake_status() {
         [ -z "$qos_interface" ] && qos_interface="未知"
     fi
     
-    echo "===== HFSC-CAKE QoS 状态报告 ====="
+    echo "===== HFSC-CAKE QoS 状态报告 (v2.18) ====="
     echo "时间: $(date)"
     echo "WAN接口: ${qos_interface}"
     
@@ -1396,7 +1489,7 @@ show_hfsc_cake_status() {
         return 1
     fi
     
-    if ip link show "$qos_ifb" >/dev/null 2>&1; then
+    if [ -n "$qos_ifb" ] && ip link show "$qos_ifb" >/dev/null 2>&1; then
         if tc qdisc show dev "$qos_ifb" 2>/dev/null | grep -q "qdisc"; then
             echo "IFB设备: 已启动且运行中 ($qos_ifb)"
         else
@@ -1438,7 +1531,7 @@ show_hfsc_cake_status() {
     
     echo -e "\n======== 入口QoS ($qos_ifb) ========"
     
-    if ip link show "$qos_ifb" >/dev/null 2>&1; then
+    if [ -n "$qos_ifb" ] && ip link show "$qos_ifb" >/dev/null 2>&1; then
         echo -e "\nTC队列:"
         tc -s qdisc show dev "$qos_ifb" 2>/dev/null | while read -r line; do
             if echo "$line" | grep -q "hfsc\|cake"; then
@@ -1475,7 +1568,7 @@ show_hfsc_cake_status() {
     local download_active=0
     
     tc qdisc show dev "$qos_interface" 2>/dev/null | grep -q "hfsc" && upload_active=1
-    tc qdisc show dev "$qos_ifb" 2>/dev/null | grep -q "hfsc" && download_active=1
+    [ -n "$qos_ifb" ] && tc qdisc show dev "$qos_ifb" 2>/dev/null | grep -q "hfsc" && download_active=1
     
     echo "上传QoS: $([ $upload_active -eq 1 ] && echo "已启用 (HFSC+cake)" || echo "未启用")"
     echo "下载QoS: $([ $download_active -eq 1 ] && echo "已启用 (HFSC+cake)" || echo "未启用")"
@@ -1500,7 +1593,7 @@ show_hfsc_cake_status() {
         fi
     done
     
-    if ip link show "$qos_ifb" >/dev/null 2>&1; then
+    if [ -n "$qos_ifb" ] && ip link show "$qos_ifb" >/dev/null 2>&1; then
         echo -e "\n下载方向cake队列:"
         tc -s qdisc show dev "$qos_ifb" 2>/dev/null | grep -A 3 "cake" | while read -r line; do
             if echo "$line" | grep -q "parent"; then
@@ -1515,95 +1608,101 @@ show_hfsc_cake_status() {
     # ========== 活动连接标记 ==========
     echo -e "\n======== 活动连接标记 ========"
 
-    # 获取 WAN 接口的 IP 地址
-    local wan_ipv4=""
-    local wan_ipv6=""
-
-    # IPv4 地址
-    wan_ipv4=$(ip -4 addr show dev "$qos_interface" 2>/dev/null | grep "inet " | awk '{print $2}' | cut -d/ -f1 | head -1)
-    if [ -z "$wan_ipv4" ]; then
-        wan_ipv4=$(ifconfig "$qos_interface" 2>/dev/null | grep "inet addr:" | awk '{print $2}' | cut -d: -f2)
-    fi
-
-    # IPv6 地址
-    wan_ipv6=$(ip -6 addr show dev "$qos_interface" 2>/dev/null | grep "inet6 " | grep -v "fe80::" | awk '{print $2}' | cut -d/ -f1 | head -1)
-    if [ -z "$wan_ipv6" ]; then
-        wan_ipv6=$(ifconfig "$qos_interface" 2>/dev/null | grep "inet6 addr:" | grep -v "fe80::" | awk '{print $3}' | cut -d/ -f1)
-    fi
-
-    # IPv4 连接标记（目的地址为 WAN）
-    echo -e "\nIPv4 连接标记 (目标地址为 WAN):"
-    if [ -n "$wan_ipv4" ]; then
-        echo "WAN IPv4: $wan_ipv4"
-        local ipv4_marks=$(conntrack -L -d "$wan_ipv4" 2>/dev/null | grep -E "mark=[0-9]+" | head -n 5)
-        if [ -n "$ipv4_marks" ]; then
-            echo "$ipv4_marks" | while IFS= read -r line; do
-                local src_ip=$(echo "$line" | awk '{for(i=1;i<=NF;i++) if ($i ~ /^src=/) {sub(/^src=/, "", $i); print $i; exit}}')
-                local dst_ip=$(echo "$line" | awk '{for(i=1;i<=NF;i++) if ($i ~ /^dst=/) {sub(/^dst=/, "", $i); print $i; exit}}')
-                local sport=$(echo "$line" | awk '{for(i=1;i<=NF;i++) if ($i ~ /^sport=/) {sub(/^sport=/, "", $i); print $i; exit}}')
-                local dport=$(echo "$line" | awk '{for(i=1;i<=NF;i++) if ($i ~ /^dport=/) {sub(/^dport=/, "", $i); print $i; exit}}')
-                local proto=$(echo "$line" | awk '{print $1}')
-                local dec_mark=$(echo "$line" | grep -o "mark=[0-9]\+" | cut -d= -f2 | head -1)
-                local mark_hex="0x$(printf '%x' "$dec_mark" 2>/dev/null || echo '0')"
-                
-                printf "  %-7s %-15s:%-5s → %-15s:%-5s [标记: %s]\n" \
-                    "$proto" "${src_ip:-N/A}" "${sport:-N/A}" "${dst_ip:-N/A}" "${dport:-N/A}" "$mark_hex"
-            done
-        else
-            echo "  未找到带标记的 IPv4 连接"
-        fi
+    # 检查 conntrack 命令是否存在
+    if ! command -v conntrack >/dev/null 2>&1; then
+        echo "  conntrack 命令未安装，无法显示连接标记信息。"
+        echo "  请安装 conntrack-tools 包以获取此功能。"
     else
-        echo "  WAN IPv4 地址不可用"
-    fi
+        # 获取 WAN 接口的 IP 地址
+        local wan_ipv4=""
+        local wan_ipv6=""
 
-    # IPv6 连接标记（目的地址为 WAN）
-    echo -e "\nIPv6 连接标记 (目标地址为 WAN):"
-    if [ -n "$wan_ipv6" ]; then
-        echo "WAN IPv6: $wan_ipv6"
-        local ipv6_marks=$(conntrack -L -d "$wan_ipv6" 2>/dev/null | grep -E "mark=[0-9]+" | head -n 5)
-        if [ -n "$ipv6_marks" ]; then
-            echo "$ipv6_marks" | while IFS= read -r line; do
-                local src_ip=$(echo "$line" | awk '{for(i=1;i<=NF;i++) if ($i ~ /^src=/) {sub(/^src=/, "", $i); print $i; exit}}')
-                local dst_ip=$(echo "$line" | awk '{for(i=1;i<=NF;i++) if ($i ~ /^dst=/) {sub(/^dst=/, "", $i); print $i; exit}}')
-                local sport=$(echo "$line" | awk '{for(i=1;i<=NF;i++) if ($i ~ /^sport=/) {sub(/^sport=/, "", $i); print $i; exit}}')
-                local dport=$(echo "$line" | awk '{for(i=1;i<=NF;i++) if ($i ~ /^dport=/) {sub(/^dport=/, "", $i); print $i; exit}}')
-                local proto=$(echo "$line" | awk '{print $1}')
-                local dec_mark=$(echo "$line" | grep -o "mark=[0-9]\+" | cut -d= -f2 | head -1)
-                local mark_hex="0x$(printf '%x' "$dec_mark" 2>/dev/null || echo '0')"
-                
-                # 简化 IPv6 地址显示（压缩连续的零）
-                src_ip=$(echo "$src_ip" | sed 's/\(:\)[0:]*/\1/g')
-                dst_ip=$(echo "$dst_ip" | sed 's/\(:\)[0:]*/\1/g')
-                
-                printf "  %-7s %-30s:%-5s → %-30s:%-5s [标记: %s]\n" \
-                    "$proto" "${src_ip:-N/A}" "${sport:-N/A}" "${dst_ip:-N/A}" "${dport:-N/A}" "$mark_hex"
-            done
-        else
-            echo "  未找到带标记的 IPv6 连接"
+        # IPv4 地址
+        wan_ipv4=$(ip -4 addr show dev "$qos_interface" 2>/dev/null | grep "inet " | awk '{print $2}' | cut -d/ -f1 | head -1)
+        if [ -z "$wan_ipv4" ]; then
+            wan_ipv4=$(ifconfig "$qos_interface" 2>/dev/null | grep "inet addr:" | awk '{print $2}' | cut -d: -f2)
         fi
-    else
-        echo "  WAN IPv6 地址不可用"
-    fi
 
-    # 上传方向连接标记（源地址为 WAN）
-    echo -e "\n上传方向连接标记 (源地址为 WAN):"
-    if [ -n "$wan_ipv4" ]; then
-        local upload_marks=$(conntrack -L -s "$wan_ipv4" 2>/dev/null | grep -E "mark=[0-9]+" | head -n 3)
-        if [ -n "$upload_marks" ]; then
-            echo "$upload_marks" | while IFS= read -r line; do
-                local src_ip=$(echo "$line" | awk '{for(i=1;i<=NF;i++) if ($i ~ /^src=/) {sub(/^src=/, "", $i); print $i; exit}}')
-                local dst_ip=$(echo "$line" | awk '{for(i=1;i<=NF;i++) if ($i ~ /^dst=/) {sub(/^dst=/, "", $i); print $i; exit}}')
-                local sport=$(echo "$line" | awk '{for(i=1;i<=NF;i++) if ($i ~ /^sport=/) {sub(/^sport=/, "", $i); print $i; exit}}')
-                local dport=$(echo "$line" | awk '{for(i=1;i<=NF;i++) if ($i ~ /^dport=/) {sub(/^dport=/, "", $i); print $i; exit}}')
-                local proto=$(echo "$line" | awk '{print $1}')
-                local dec_mark=$(echo "$line" | grep -o "mark=[0-9]\+" | cut -d= -f2 | head -1)
-                local mark_hex="0x$(printf '%x' "$dec_mark" 2>/dev/null || echo '0')"
-                
-                printf "  %-7s %-15s:%-5s → %-15s:%-5s [标记: %s]\n" \
-                    "$proto" "${src_ip:-N/A}" "${sport:-N/A}" "${dst_ip:-N/A}" "${dport:-N/A}" "$mark_hex"
-            done
+        # IPv6 地址
+        wan_ipv6=$(ip -6 addr show dev "$qos_interface" 2>/dev/null | grep "inet6 " | grep -v "fe80::" | awk '{print $2}' | cut -d/ -f1 | head -1)
+        if [ -z "$wan_ipv6" ]; then
+            wan_ipv6=$(ifconfig "$qos_interface" 2>/dev/null | grep "inet6 addr:" | grep -v "fe80::" | awk '{print $3}' | cut -d/ -f1)
+        fi
+
+        # IPv4 连接标记（目的地址为 WAN）
+        echo -e "\nIPv4 连接标记 (目标地址为 WAN):"
+        if [ -n "$wan_ipv4" ]; then
+            echo "WAN IPv4: $wan_ipv4"
+            local ipv4_marks=$(conntrack -L -d "$wan_ipv4" 2>/dev/null | grep -E "mark=[0-9]+" | head -n 5)
+            if [ -n "$ipv4_marks" ]; then
+                echo "$ipv4_marks" | while IFS= read -r line; do
+                    local src_ip=$(echo "$line" | awk '{for(i=1;i<=NF;i++) if ($i ~ /^src=/) {sub(/^src=/, "", $i); print $i; exit}}')
+                    local dst_ip=$(echo "$line" | awk '{for(i=1;i<=NF;i++) if ($i ~ /^dst=/) {sub(/^dst=/, "", $i); print $i; exit}}')
+                    local sport=$(echo "$line" | awk '{for(i=1;i<=NF;i++) if ($i ~ /^sport=/) {sub(/^sport=/, "", $i); print $i; exit}}')
+                    local dport=$(echo "$line" | awk '{for(i=1;i<=NF;i++) if ($i ~ /^dport=/) {sub(/^dport=/, "", $i); print $i; exit}}')
+                    local proto=$(echo "$line" | awk '{print $1}')
+                    local dec_mark=$(echo "$line" | grep -o "mark=[0-9]\+" | cut -d= -f2 | head -1)
+                    local mark_hex="0x$(printf '%x' "$dec_mark" 2>/dev/null || echo '0')"
+                    
+                    printf "  %-7s %-15s:%-5s → %-15s:%-5s [标记: %s]\n" \
+                        "$proto" "${src_ip:-N/A}" "${sport:-N/A}" "${dst_ip:-N/A}" "${dport:-N/A}" "$mark_hex"
+                done
+            else
+                echo "  未找到带标记的 IPv4 连接"
+            fi
         else
-            echo "  未找到带标记的上传方向连接"
+            echo "  WAN IPv4 地址不可用"
+        fi
+
+        # IPv6 连接标记（目的地址为 WAN）
+        echo -e "\nIPv6 连接标记 (目标地址为 WAN):"
+        if [ -n "$wan_ipv6" ]; then
+            echo "WAN IPv6: $wan_ipv6"
+            local ipv6_marks=$(conntrack -L -d "$wan_ipv6" 2>/dev/null | grep -E "mark=[0-9]+" | head -n 5)
+            if [ -n "$ipv6_marks" ]; then
+                echo "$ipv6_marks" | while IFS= read -r line; do
+                    local src_ip=$(echo "$line" | awk '{for(i=1;i<=NF;i++) if ($i ~ /^src=/) {sub(/^src=/, "", $i); print $i; exit}}')
+                    local dst_ip=$(echo "$line" | awk '{for(i=1;i<=NF;i++) if ($i ~ /^dst=/) {sub(/^dst=/, "", $i); print $i; exit}}')
+                    local sport=$(echo "$line" | awk '{for(i=1;i<=NF;i++) if ($i ~ /^sport=/) {sub(/^sport=/, "", $i); print $i; exit}}')
+                    local dport=$(echo "$line" | awk '{for(i=1;i<=NF;i++) if ($i ~ /^dport=/) {sub(/^dport=/, "", $i); print $i; exit}}')
+                    local proto=$(echo "$line" | awk '{print $1}')
+                    local dec_mark=$(echo "$line" | grep -o "mark=[0-9]\+" | cut -d= -f2 | head -1)
+                    local mark_hex="0x$(printf '%x' "$dec_mark" 2>/dev/null || echo '0')"
+                    
+                    # 简化 IPv6 地址显示（压缩连续的零）
+                    src_ip=$(echo "$src_ip" | sed 's/\(:\)[0:]*/\1/g')
+                    dst_ip=$(echo "$dst_ip" | sed 's/\(:\)[0:]*/\1/g')
+                    
+                    printf "  %-7s %-30s:%-5s → %-30s:%-5s [标记: %s]\n" \
+                        "$proto" "${src_ip:-N/A}" "${sport:-N/A}" "${dst_ip:-N/A}" "${dport:-N/A}" "$mark_hex"
+                done
+            else
+                echo "  未找到带标记的 IPv6 连接"
+            fi
+        else
+            echo "  WAN IPv6 地址不可用"
+        fi
+
+        # 上传方向连接标记（源地址为 WAN）
+        echo -e "\n上传方向连接标记 (源地址为 WAN):"
+        if [ -n "$wan_ipv4" ]; then
+            local upload_marks=$(conntrack -L -s "$wan_ipv4" 2>/dev/null | grep -E "mark=[0-9]+" | head -n 3)
+            if [ -n "$upload_marks" ]; then
+                echo "$upload_marks" | while IFS= read -r line; do
+                    local src_ip=$(echo "$line" | awk '{for(i=1;i<=NF;i++) if ($i ~ /^src=/) {sub(/^src=/, "", $i); print $i; exit}}')
+                    local dst_ip=$(echo "$line" | awk '{for(i=1;i<=NF;i++) if ($i ~ /^dst=/) {sub(/^dst=/, "", $i); print $i; exit}}')
+                    local sport=$(echo "$line" | awk '{for(i=1;i<=NF;i++) if ($i ~ /^sport=/) {sub(/^sport=/, "", $i); print $i; exit}}')
+                    local dport=$(echo "$line" | awk '{for(i=1;i<=NF;i++) if ($i ~ /^dport=/) {sub(/^dport=/, "", $i); print $i; exit}}')
+                    local proto=$(echo "$line" | awk '{print $1}')
+                    local dec_mark=$(echo "$line" | grep -o "mark=[0-9]\+" | cut -d= -f2 | head -1)
+                    local mark_hex="0x$(printf '%x' "$dec_mark" 2>/dev/null || echo '0')"
+                    
+                    printf "  %-7s %-15s:%-5s → %-15s:%-5s [标记: %s]\n" \
+                        "$proto" "${src_ip:-N/A}" "${sport:-N/A}" "${dst_ip:-N/A}" "${dport:-N/A}" "$mark_hex"
+                done
+            else
+                echo "  未找到带标记的上传方向连接"
+            fi
         fi
     fi
     
@@ -1613,7 +1712,7 @@ show_hfsc_cake_status() {
     echo "WAN接口 ($qos_interface):"
     ifconfig "$qos_interface" 2>/dev/null | grep "RX bytes\|TX bytes" | sed 's/^/  /'
     
-    if ip link show "$qos_ifb" >/dev/null 2>&1; then
+    if [ -n "$qos_ifb" ] && ip link show "$qos_ifb" >/dev/null 2>&1; then
         echo -e "\nIFB接口 ($qos_ifb):"
         ifconfig "$qos_ifb" 2>/dev/null | grep "RX bytes\|TX bytes" | sed 's/^/  /'
     fi
@@ -1623,6 +1722,7 @@ show_hfsc_cake_status() {
     return 0
 }
 
+# ========== 主入口 ==========
 main_hfsc_cake_qos() {
     local action="$1"
     

@@ -18,7 +18,6 @@ CONFIG_FILE="qos_gargoyle"
 UPLOAD_MASK="0x007F"
 DOWNLOAD_MASK="0x7F00"
 LOCK_FILE="/var/run/qos_gargoyle_updating"
-IFB_DEVICE="ifb0"
 SERVICE_NAME="qos_gargoyle"
 
 # 算法模块路径
@@ -359,6 +358,11 @@ load_qos_config() {
         total_download_bandwidth="${total_download_bandwidth:-0}"
         
         qos_interface=$(uci -q get "$CONFIG_FILE.global.wan_interface")
+		
+		# === 读取 IFB 设备 ===
+        IFB_DEVICE=$(uci -q get "$CONFIG_FILE.download.ifb_device")
+        IFB_DEVICE="${IFB_DEVICE:-ifb0}"   # 未配置时默认为 ifb0
+        # =========================
         
         if [ -n "$qos_interface" ]; then
             success=1
@@ -553,12 +557,11 @@ setup_nft_tables() {
 # 创建 IFB 设备
 create_ifb_device() {
     echo "Creating IFB device..."
-    
-    ip link delete dev "$IFB_DEVICE" 2>/dev/null
-    ip link add "$IFB_DEVICE" type ifb
-    ip link set dev "$IFB_DEVICE" up
-    
-    echo "IFB device $IFB_DEVICE created and enabled"
+    local ifb="${IFB_DEVICE:-ifb0}"
+    ip link delete dev "$ifb" 2>/dev/null
+    ip link add "$ifb" type ifb
+    ip link set dev "$ifb" up
+    echo "IFB device $ifb created and enabled"
 }
 
 load_bandwidth_config() {

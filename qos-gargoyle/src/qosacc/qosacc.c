@@ -1,5 +1,5 @@
 /* qosacc - 基于netlink的QoS主动拥塞控制（TC库版，支持HFSC/HTB/CAKE，含实时类检测）
- * version=1.6.8
+ * version=1.7.0
  * 功能：通过ping监控延迟，使用TC库直接调整根类的带宽，支持实时类检测（HFSC专用）
  * 状态文件目录：/tmp/qosacc.status
  */
@@ -219,7 +219,8 @@ typedef struct qosacc_context_s {
     int ident;
     int ntransmitted;
     int nreceived;
-    struct sockaddr_in6 target_addr;
+    struct sockaddr_storage target_addr;   // 通用地址结构
+    socklen_t target_addr_len;              // 地址长度
     
     // 统计数据
     int64_t raw_ping_time_us;
@@ -273,7 +274,7 @@ static atomic_int g_reset_bw = ATOMIC_VAR_INIT(0);
 /* ==================== 帮助信息 ==================== */
 const char qosacc_usage[] =
 "qosacc - 基于ping延迟的动态QoS带宽调整器（TC库版，支持实时类检测）\n"
-"版本: 1.6.8\n\n"
+"版本: 1.7.0\n\n"
 "用法:\n"
 "  qosacc [ping间隔(ms)] [目标地址] [最大带宽(kbps)] [ping限制(ms)]\n"
 "  qosacc [选项]\n\n"
@@ -383,7 +384,7 @@ uint16_t icmpv6_checksum(struct in6_addr* src, struct in6_addr* dst,
     return (uint16_t)~sum;
 }
 
-int resolve_target(const char* target, struct sockaddr_in6* addr, char* error, int error_len) {
+int resolve_target(const char* target, struct sockaddr_storage* addr, socklen_t* addr_len, char* error, int error_len) {
     struct addrinfo hints, *result = NULL;
     memset(&hints, 0, sizeof(hints));
     hints.ai_family = AF_UNSPEC;
@@ -395,13 +396,13 @@ int resolve_target(const char* target, struct sockaddr_in6* addr, char* error, i
         return QMON_ERR_SYSTEM;
     }
     if (result->ai_family == AF_INET) {
-        memset(addr, 0, sizeof(struct sockaddr_in6));
-        addr->sin6_family = AF_INET6;
-        addr->sin6_addr.s6_addr[10] = 0xFF;
-        addr->sin6_addr.s6_addr[11] = 0xFF;
-        memcpy(&addr->sin6_addr.s6_addr[12], &((struct sockaddr_in*)result->ai_addr)->sin_addr, 4);
+        struct sockaddr_in* sin = (struct sockaddr_in*)result->ai_addr;
+        memcpy(addr, sin, sizeof(struct sockaddr_in));
+        *addr_len = sizeof(struct sockaddr_in);
     } else if (result->ai_family == AF_INET6) {
-        memcpy(addr, result->ai_addr, sizeof(struct sockaddr_in6));
+        struct sockaddr_in6* sin6 = (struct sockaddr_in6*)result->ai_addr;
+        memcpy(addr, sin6, sizeof(struct sockaddr_in6));
+        *addr_len = sizeof(struct sockaddr_in6);
     } else {
         snprintf(error, error_len, "不支持的地址族: %d", result->ai_family);
         freeaddrinfo(result);
@@ -714,14 +715,24 @@ struct ping_manager_s {
 
 int ping_manager_init(ping_manager_t* pm, qosacc_context_t* ctx) {
     pm->ctx = ctx;
-    int af = ctx->target_addr.sin6_family;
-    int protocol = (af == AF_INET6) ? IPPROTO_ICMPV6 : IPPROTO_ICMP;
+    int af = ctx->target_addr.ss_family;
+    int protocol;
+    if (af == AF_INET)
+        protocol = IPPROTO_ICMP;
+    else if (af == AF_INET6)
+        protocol = IPPROTO_ICMPV6;
+    else {
+        qosacc_log(ctx, QMON_LOG_ERROR, "未知地址族 %d\n", af);
+        return QMON_ERR_SOCKET;
+    }
+
     ctx->ping_socket = socket(af, SOCK_RAW, protocol);
     if (ctx->ping_socket < 0) {
         qosacc_log(ctx, QMON_LOG_ERROR, "创建ping套接字失败: %s\n", strerror(errno));
-        ctx->ping_socket = -1;  // 确保无效fd
+        ctx->ping_socket = -1;
         return QMON_ERR_SOCKET;
     }
+
     int ttl = 64;
     setsockopt(ctx->ping_socket, IPPROTO_IP, IP_TTL, &ttl, sizeof(ttl));
     int timeout = 2000;
@@ -743,7 +754,7 @@ int ping_manager_send(ping_manager_t* pm) {
     qosacc_context_t* ctx = pm->ctx;
     if (ctx->ping_socket < 0) return QMON_ERR_SOCKET;
     int cc = 0;
-    if (ctx->target_addr.sin6_family == AF_INET6) {
+    if (ctx->target_addr.ss_family == AF_INET6) {
         struct icmp6_hdr* icp6 = (struct icmp6_hdr*)pm->packet;
         icp6->icmp6_type = ICMP6_ECHO_REQUEST;
         icp6->icmp6_code = 0;
@@ -768,7 +779,7 @@ int ping_manager_send(ping_manager_t* pm) {
         icp->icmp_cksum = icmp_checksum(icp, cc);
     }
     ctx->ntransmitted++;
-    int ret = sendto(ctx->ping_socket, pm->packet, cc, 0, (struct sockaddr*)&ctx->target_addr, sizeof(ctx->target_addr));
+    int ret = sendto(ctx->ping_socket, pm->packet, cc, 0, (struct sockaddr*)&ctx->target_addr, ctx->target_addr_len);
     if (ret < 0) {
         qosacc_log(ctx, QMON_LOG_ERROR, "发送ping失败: %s\n", strerror(errno));
         return QMON_ERR_SOCKET;
@@ -802,12 +813,13 @@ int ping_manager_receive(ping_manager_t* pm) {
         if (icp6->icmp6_type != ICMP6_ECHO_REPLY) return 0;
         if (ntohs(icp6->icmp6_id) != ctx->ident) return 0;
         if (icp6->icmp6_cksum != 0) {
+            // 确保目标也是 IPv6
+            if (ctx->target_addr.ss_family != AF_INET6) return 0;
             struct sockaddr_in6* from_v6 = (struct sockaddr_in6*)&from;
-            struct in6_addr src = from_v6->sin6_addr;
-            struct in6_addr dst = ctx->target_addr.sin6_addr;
+            struct sockaddr_in6* target_v6 = (struct sockaddr_in6*)&ctx->target_addr;
             uint16_t saved = icp6->icmp6_cksum;
             icp6->icmp6_cksum = 0;
-            uint16_t calc = icmpv6_checksum(&src, &dst, icp6, cc);
+            uint16_t calc = icmpv6_checksum(&from_v6->sin6_addr, &target_v6->sin6_addr, icp6, cc);
             if (saved != calc) {
                 qosacc_log(ctx, QMON_LOG_WARN, "ICMPv6校验和不匹配，丢弃包\n");
                 return 0;
@@ -963,7 +975,7 @@ typedef struct {
     char first_qdisc[16];
     __u32 first_handle;
     int found_any;
-	int target_ifindex;  // 新增：目标设备的 ifindex
+    int target_ifindex;  // 目标设备的 ifindex
 } detect_qdisc_ctx_t;
 
 /* 队列检测回调（用于识别根队列） */
@@ -975,7 +987,7 @@ static int detect_qdisc_cb(struct nlmsghdr *n, void *arg) {
 
     // 过滤非目标设备的消息
     if (dctx->target_ifindex != 0 && t->tcm_ifindex != dctx->target_ifindex) {
-        return 0;  // 忽略其他接口的消息
+        return 0;
     }
 
     if (n->nlmsg_type != RTM_NEWTCLASS && n->nlmsg_type != RTM_NEWQDISC)
@@ -1116,7 +1128,7 @@ static qosacc_result_t detect_qdisc_kind_tc(qosacc_context_t* ctx, int parse_rea
     memset(&dctx, 0, sizeof(dctx));
     dctx.ctx = ctx;
     dctx.parse_realtime = parse_realtime;
-    dctx.target_ifindex = ifindex;   // 设置目标 ifindex
+    dctx.target_ifindex = ifindex;
 
     struct tcmsg t;
     memset(&t, 0, sizeof(t));
@@ -1169,7 +1181,7 @@ static qosacc_result_t detect_qdisc_kind_tc(qosacc_context_t* ctx, int parse_rea
     memset(&dctx, 0, sizeof(dctx));
     dctx.ctx = ctx;
     dctx.parse_realtime = parse_realtime;
-    dctx.target_ifindex = ifindex;   // 再次设置目标 ifindex
+    dctx.target_ifindex = ifindex;
 
     if (dump_filter(&rth, detect_qdisc_cb, &dctx) < 0 && errno != EINTR) {
         qosacc_log(ctx, QMON_LOG_DEBUG, "类dump未找到根类\n");
@@ -1999,7 +2011,7 @@ int main(int argc, char* argv[]) {
 
     state_machine_init(&context);
 
-    if (resolve_target(context.config.target, &context.target_addr, err, sizeof(err)) != QMON_OK) {
+    if (resolve_target(context.config.target, &context.target_addr, &context.target_addr_len, err, sizeof(err)) != QMON_OK) {
         qosacc_log(&context, QMON_LOG_ERROR, "解析目标失败: %s\n", err);
         goto cleanup;
     }

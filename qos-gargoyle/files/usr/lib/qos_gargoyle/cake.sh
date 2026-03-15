@@ -1,12 +1,7 @@
 #!/bin/sh
-# version=5.3-mq
-# CAKE算法实现模块 - 多队列增强版 v5.3
-# 基于v5.2，修复了以下问题：
-# 1. 带宽单位转换函数的小数处理问题
-# 2. 多队列带宽分配时的除零检查和边界条件
-# 3. 添加幂等性检查，防止重复启动
-# 4. 优化临时文件清理和锁机制
-# 5. 增强参数验证和错误处理
+# version=5.5-mq
+# CAKE算法实现模块 - 多队列增强版 v5.5
+# 基于v5.4，改进带宽转换正则表达式，增加极低带宽多队列提示
 
 # ========== 变量初始化 ==========
 : ${total_upload_bandwidth:=40000}
@@ -23,7 +18,7 @@ if [ -z "$qos_interface" ]; then
     qos_interface="${qos_interface:-pppoe-wan}"
 fi
 
-echo "CAKE 模块初始化完成 (v5.3-mq)"
+echo "CAKE 模块初始化完成 (v5.5-mq)"
 echo "  网络接口: $qos_interface"
 echo "  IFB 设备: $IFB_DEVICE"
 echo "  上传带宽: ${total_upload_bandwidth}kbit/s"
@@ -114,42 +109,36 @@ check_already_running() {
     return 0
 }
 
-# ========== 带宽单位转换（修复小数处理问题）==========
+# ========== 带宽单位转换（改进正则以支持多字母单位）==========
 convert_bandwidth_to_kbit() {
     local bw="$1"
     local num unit result
-    
+
     # 空值检查
     [ -z "$bw" ] && { log_error "带宽值为空"; return 1; }
-    
+
     # 处理纯数字（无单位）
     if echo "$bw" | grep -qE '^[0-9]+$'; then
         echo "$bw"
         return 0
     fi
-    
-    # 处理带单位的带宽
-    if echo "$bw" | grep -qiE '^[0-9]+(\.[0-9]+)?[kKmMgG]?$'; then
+
+    # 处理带单位的带宽：允许数字后跟任意字母组合（如 kbit, mbit, KB, MB 等）
+    if echo "$bw" | grep -qiE '^[0-9]+(\.[0-9]+)?[a-zA-Z]+$'; then
         # 提取数字部分（支持小数）
         num=$(echo "$bw" | grep -oE '^[0-9]+(\.[0-9]+)?')
-        # 提取单位部分
+        # 提取单位部分（去除数字和小数点后的所有字母）
         unit=$(echo "$bw" | sed 's/[0-9.]//g' | tr '[:lower:]' '[:upper:]')
-        
-        # 如果没有单位，直接返回数字部分（转换为整数）
-        if [ -z "$unit" ]; then
-            echo "$num" | awk '{printf "%.0f", $1}'
-            return 0
-        fi
-        
-        # 根据单位转换（处理小数）
+
+        # 根据单位转换（处理常见单位缩写）
         case "$unit" in
-            "K"|"KB"|"Kb"|"KBIT"|"kbit")
+            K|KB|KIB|Kbit|KBIT|KILOBIT)
                 result=$(echo "$num * 1" | awk '{printf "%.0f", $1}')
                 ;;
-            "M"|"MB"|"Mb"|"MBIT"|"mbit")
+            M|MB|MIB|Mbit|MBIT|MEGABIT)
                 result=$(echo "$num * 1000" | awk '{printf "%.0f", $1}')
                 ;;
-            "G"|"GB"|"Gb"|"GBIT"|"gbit")
+            G|GB|GIB|Gbit|GBIT|GIGABIT)
                 result=$(echo "$num * 1000000" | awk '{printf "%.0f", $1}')
                 ;;
             *)
@@ -157,23 +146,17 @@ convert_bandwidth_to_kbit() {
                 return 1
                 ;;
         esac
-        
+
         # 检查结果是否为有效数字
         if [ -z "$result" ] || [ "$result" -lt 0 ] 2>/dev/null; then
             log_error "带宽转换结果无效: $result"
             return 1
         fi
-        
-        # 检查单位后是否有额外字符（如 "MB" -> 单位 "M"，但原字符串非纯单位）
-        local raw_unit=$(echo "$bw" | sed 's/[0-9.]//g' | tr '[:lower:]' '[:upper:]')
-        if [ "$raw_unit" != "$unit" ] && [ -n "$raw_unit" ]; then
-            log_warn "带宽单位 '$raw_unit' 可能不标准，已按 '${unit}' 处理（${num}${unit}=${result}kbit）"
-        fi
-        
+
         echo "$result"
         return 0
     else
-        log_error "无效带宽格式: $bw (应为数字或数字+单位)"
+        log_error "无效带宽格式: $bw (应为数字或数字+单位，例如 100mbit、10M)"
         return 1
     fi
 }
@@ -271,11 +254,11 @@ get_tx_queues() {
     if [ -z "$queues" ] || [ "$queues" -eq 0 ] 2>/dev/null; then
         queues=1
     fi
-    
+
     echo "$queues"
 }
 
-# ========== 检测内核是否支持特定 CAKE 参数（增强版：先清空 lo）==========
+# ========== 检测内核是否支持特定 CAKE 参数 ==========
 check_cake_param_support() {
     local param="$1"
     # 临时删除 lo 的根 qdisc（如果存在）
@@ -300,7 +283,7 @@ load_cake_config() {
     [ -n "$uci_download" ] && total_download_bandwidth=$(sanitize_param "$uci_download")
 
     # IFB设备
-    local uci_ifb=$(uci -q get qos_gargoyle.global.ifb_device 2>/dev/null)
+    local uci_ifb=$(uci -q get qos_gargoyle.download.ifb_device 2>/dev/null)
     [ -n "$uci_ifb" ] && IFB_DEVICE=$(sanitize_param "$uci_ifb")
 
     # CAKE参数（所有值均消毒，内存限制转换为小写）
@@ -551,7 +534,7 @@ build_cake_params() {
     echo "$params"
 }
 
-# ========== 创建CAKE队列（支持多队列）==========
+# ========== 创建CAKE队列（支持多队列，增加极低带宽提示）==========
 create_cake_root_qdisc() {
     local device="$1"
     local direction="$2"
@@ -575,7 +558,7 @@ create_cake_root_qdisc() {
             log_warn "获取到的队列数无效: $queues，使用默认值1"
             queues=1
         fi
-        
+
         if [ "$queues" -gt 1 ]; then
             use_mq=1
             log_info "设备 $device 支持 $queues 个发送队列，启用 CAKE-MQ"
@@ -586,7 +569,7 @@ create_cake_root_qdisc() {
         log_info "CAKE-MQ 已被禁用，使用普通 CAKE"
     fi
 
-    # ======== 检查：带宽不足时自动降级 ============
+    # 检查：带宽不足时自动降级
     if [ "$use_mq" = "1" ] && [ "$bandwidth" -lt "$queues" ] 2>/dev/null; then
         log_warn "总带宽 ${bandwidth}kbit 小于队列数 $queues，多队列可能导致部分队列带宽为0，已自动回退到单队列模式。"
         use_mq=0
@@ -597,14 +580,19 @@ create_cake_root_qdisc() {
         # 精确带宽分配：向下取整，余数分配给第一个队列
         local base_bw=$(( bandwidth / queues ))
         local remainder=$(( bandwidth % queues ))
-        
+
         # 确保 base_bw 至少为1
         if [ "$base_bw" -lt 1 ]; then
             base_bw=1
             remainder=0
             log_warn "带宽分配后基础带宽为0，已调整为1kbit/队列"
         fi
-        
+
+        # 极低带宽提示：当基础带宽 ≤5kbit 时提醒用户
+        if [ "$base_bw" -le 5 ] 2>/dev/null; then
+            log_warn "带宽分配后每个队列的基础带宽仅为 ${base_bw}kbit，可能导致部分队列性能不佳。建议关闭多队列或增加总带宽。"
+        fi
+
         log_info "带宽分配: 基础 ${base_bw}kbit/队列，余数 ${remainder}kbit 给队列1"
 
         # 添加 mq 根
@@ -783,7 +771,7 @@ health_check_cake() {
 
 # ========== 状态显示（原版+入口状态+多队列统计）==========
 show_cake_status() {
-    echo "===== CAKE QoS状态报告 (v5.3-mq) ====="
+    echo "===== CAKE QoS状态报告 (v5.5-mq) ====="
     echo "时间: $(date)"
     echo "网络接口: ${qos_interface:-未知}"
 
@@ -877,23 +865,37 @@ show_cake_status() {
     return 0
 }
 
-# ========== 停止清理（增强：按配置删除IFB设备）==========
+# ========== 停止清理（增强：按配置删除IFB设备，增加锁保护）==========
 stop_cake_qos() {
     log_info "停止CAKE QoS"
 
-    if tc qdisc show dev "$qos_interface" root 2>/dev/null | grep -q "cake"; then
-        tc qdisc del dev "$qos_interface" root 2>/dev/null
-        log_info "清理上传方向CAKE队列"
+    # 尝试获取锁，但不强制；若无法获取锁，记录警告并继续清理
+    local got_lock=false
+    if acquire_lock 2>/dev/null; then
+        got_lock=true
+        log_debug "停止时获取锁成功"
+    else
+        log_warn "无法获取锁，但将继续尝试清理（可能与其他进程冲突）"
     fi
 
+    # 清理上传队列
+    if tc qdisc show dev "$qos_interface" root 2>/dev/null | grep -q "cake"; then
+        tc qdisc del dev "$qos_interface" root 2>/dev/null && \
+            log_info "清理上传方向CAKE队列" || log_warn "上传队列清理可能未完全成功"
+    fi
+
+    # 清理IFB设备上的队列
     if ip link show dev "$IFB_DEVICE" >/dev/null 2>&1; then
         if tc qdisc show dev "$IFB_DEVICE" root 2>/dev/null | grep -q "cake"; then
-            tc qdisc del dev "$IFB_DEVICE" root 2>/dev/null
-            log_info "清理下载方向CAKE队列 (IFB)"
+            tc qdisc del dev "$IFB_DEVICE" root 2>/dev/null && \
+                log_info "清理下载方向CAKE队列 (IFB)" || log_warn "下载队列清理可能未完全成功"
         fi
     fi
-    tc qdisc del dev "$qos_interface" ingress 2>/dev/null && log_info "清理入口重定向队列"
 
+    # 清理入口重定向队列
+    tc qdisc del dev "$qos_interface" ingress 2>/dev/null && log_info "清理入口重定向队列" || true
+
+    # 处理IFB设备
     if ip link show dev "$IFB_DEVICE" >/dev/null 2>&1; then
         ip link set dev "$IFB_DEVICE" down
         if [ "$CAKE_DELETE_IFB_ON_STOP" = "1" ]; then
@@ -906,6 +908,11 @@ stop_cake_qos() {
     # 清理运行时参数文件和运行标记
     rm -f "$RUNTIME_PARAMS_FILE"
     rm -f "$QOS_RUNNING_FILE"
+
+    if $got_lock; then
+        release_lock
+    fi
+
     log_info "CAKE QoS停止完成"
 }
 
