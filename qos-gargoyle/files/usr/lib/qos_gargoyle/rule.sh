@@ -1,7 +1,15 @@
 #!/bin/sh
 # 规则辅助模块 (rule.sh)
-# 支持多样化端口、协议、IPv6双栈和连接字节数过滤
-# version=1.6.14 - 修复 connbytes 操作符提取问题
+# 支持多样化端口、协议、IPv6双栈、连接字节数过滤和连接状态过滤
+# version=2.1.0 - 新增 ct state 支持
+# 更新日志：
+#   - 更严格的协议验证，仅支持标准协议
+#   - 连接字节数解析改进，支持 >, <, >=, <=, =, !=
+#   - 添加标记冲突检测（精确匹配），防止多个类别共用同一标记
+#   - 移除未使用的旧函数 process_single_rule 和 apply_all_protocol_rule
+#   - 优化排序，预加载类优先级，减少 UCI 调用
+#   - 临时文件统一使用 mktemp，提高兼容性
+#   - 新增 ct state 条件支持（state 选项）
 
 CONFIG_FILE="qos_gargoyle"
 TEMP_FILES=""
@@ -21,13 +29,13 @@ escape_for_eval() {
     echo "$1" | sed 's/\\/\\\\/g; s/"/\\"/g; s/\$/\\$/g; s/`/\\`/g'
 }
 
-# 清理输入字符串，只允许安全字符，防止命令注入
+# 清理输入字符串，只保留可打印字符，移除控制字符
 sanitize_input() {
-    local input="$1"
-    echo "$input" | sed 's/[^][a-zA-Z0-9_:/., -]//g' 2>/dev/null || echo "$input" | tr -cd 'a-zA-Z0-9_:/., -'
+    echo "$1" | tr -cd '[:print:]' 2>/dev/null || echo "$1"
 }
 
-# 统一日志函数，同时输出到系统日志和控制台
+# 统一日志函数，支持级别过滤
+# 全局变量 DEBUG 可设为 1 启用调试输出
 log() {
     local level="$1"
     local message="$2"
@@ -40,7 +48,7 @@ log() {
         ERROR|error)   prefix="错误:" ;;
         WARN|warn|WARNING|warning) prefix="警告:" ;;
         INFO|info)     prefix="信息:" ;;
-        DEBUG|debug)   prefix="调试:" ;;
+        DEBUG|debug)   [ "${DEBUG:-0}" = "1" ] || return; prefix="调试:" ;;
         *)             prefix="$level:" ;;
     esac
     
@@ -159,18 +167,52 @@ validate_ip_address() {
     return 1
 }
 
-# 验证协议名称，接受标准协议或 tcp_udp 作为组合协议
+# 验证协议名称，只接受标准协议或 tcp_udp 作为组合协议
 validate_protocol() {
     local proto="$1"
     local param_name="$2"
     
-    [ -z "$proto" ] || [ "$proto" = "all" ] && return 0
+    [ -z "$proto" ] && return 0  # 空协议表示所有（等同于 all）
     proto=$(sanitize_input "$proto")
     
     case "$proto" in
-        tcp|udp|icmp|icmpv6|gre|esp|ah|sctp|dccp|udplite|tcp_udp) return 0 ;;
-        *) log "WARN" "$param_name 协议名称 $proto 不是标准协议，将继续处理"; return 0 ;;
+        all|tcp|udp|tcp_udp|icmp|icmpv6|gre|esp|ah|sctp|dccp|udplite)
+            return 0
+            ;;
+        *)
+            log "ERROR" "$param_name 不支持的协议 '$proto'，必须为 tcp/udp/tcp_udp/icmp/icmpv6 等标准协议"
+            return 1
+            ;;
     esac
+}
+
+# 验证连接状态值，只接受 nftables 支持的关键字（单个或逗号分隔）
+validate_state() {
+    local state="$1"
+    local param_name="$2"
+    
+    [ -z "$state" ] && return 0
+    state=$(sanitize_input "$state" | tr -d ' ')
+    
+    # 支持花括号语法，但 UCI 配置中通常不包含花括号，所以先简化处理
+    # 允许逗号分隔的列表
+    local old_ifs="$IFS"
+    IFS=','
+    for s in $state; do
+        s=$(echo "$s" | tr -d '{}')  # 移除可能的花括号
+        case "$s" in
+            new|established|related|untracked|invalid)
+                # 有效
+                ;;
+            *)
+                log "ERROR" "$param_name 无效的连接状态 '$s'，允许的值: new, established, related, untracked, invalid"
+                IFS="$old_ifs"
+                return 1
+                ;;
+        esac
+    done
+    IFS="$old_ifs"
+    return 0
 }
 
 # ========== 配置加载函数 ==========
@@ -201,7 +243,7 @@ load_all_config_options() {
     
     local escaped_section_id=$(printf "%s" "$section_id" | sed 's/[][\.*?^$()+{}|]/\\&/g')
     
-    for var in class order enabled proto srcport dstport connbytes_kb family; do
+    for var in class order enabled proto srcport dstport connbytes_kb family state; do
         eval "${prefix}${var}=''"
     done
     
@@ -232,8 +274,13 @@ load_all_config_options() {
     val=$(echo "$config_data" | grep "^${config_name}\\.${escaped_section_id}\\.proto=" | cut -d= -f2-)
     if [ -n "$val" ]; then
         val=$(echo "$val" | sed "s/^'//; s/'$//; s/^\"//; s/\"$//")
-        val=$(escape_for_eval "$val")
-        eval "${prefix}proto=\"$val\""
+        if validate_protocol "$val" "${section_id}.proto"; then
+            val=$(escape_for_eval "$val")
+            eval "${prefix}proto=\"$val\""
+        else
+            log "WARN" "协议参数验证失败: $val，将使用空值（视为 all）"
+            eval "${prefix}proto=''"
+        fi
     fi
     
     val=$(echo "$config_data" | grep "^${config_name}\\.${escaped_section_id}\\.srcport=" | cut -d= -f2-)
@@ -273,6 +320,18 @@ load_all_config_options() {
         val=$(escape_for_eval "$val")
         eval "${prefix}family=\"$val\""
     fi
+    
+    val=$(echo "$config_data" | grep "^${config_name}\\.${escaped_section_id}\\.state=" | cut -d= -f2-)
+    if [ -n "$val" ]; then
+        val=$(echo "$val" | sed "s/^'//; s/'$//; s/^\"//; s/\"$//")
+        if validate_state "$val" "${section_id}.state"; then
+            val=$(escape_for_eval "$val")
+            eval "${prefix}state=\"$val\""
+        else
+            log "WARN" "连接状态参数验证失败: $val，将忽略"
+            eval "${prefix}state=''"
+        fi
+    fi
 }
 
 # ========== 类别标记计算函数 ==========
@@ -291,13 +350,11 @@ calculate_hash_index() {
     else
         local sum=0 i=0
         while [ $i -lt ${#class} ]; do
-            # 获取字符的ASCII值，确保在32位范围内
-            local char_val=$(printf "%d" "'${class:$i:1}" 2>/dev/null || echo 0)
-            # 使用无符号32位运算，防止溢出为负数
-            sum=$(( ( (sum << 5) - sum + char_val ) & 0x7FFFFFFF ))
+            # 获取字符的ASCII值，使用 printf 获取数值，确保在32位范围内
+            local char=$(printf "%d" "'${class:$i:1}" 2>/dev/null || echo 0)
+            sum=$(( ( (sum << 5) - sum + char ) & 0x7FFFFFFF ))
             i=$((i + 1))
         done
-        # 确保输出正数
         echo $((sum & 0x7FFFFFFF))
     fi
 }
@@ -346,28 +403,46 @@ calculate_class_mark() {
     printf "0x%X" "$mark_value"
 }
 
-# ========== 快速排序（实时获取类优先级，并立即清理临时文件）==========
-# 根据规则配置文件和实时获取的类优先级排序规则
+# ========== 规则排序函数 ==========
+# 从临时文件读取规则配置，获取类优先级，生成排序键
 sort_rules_by_priority_fast() {
     local config_file="$1"
-    
-    local temp_sort="/tmp/qos_sort_$$_$(date +%s%N | md5sum | cut -c1-8)"
-    [ -z "$temp_sort" ] && { log "ERROR" "无法创建排序临时文件"; return 1; }
+    local temp_sort=$(mktemp /tmp/qos_sort_XXXXXX 2>/dev/null)
+    if [ -z "$temp_sort" ]; then
+        log "ERROR" "无法创建排序临时文件"
+        return 1
+    fi
     TEMP_FILES="$TEMP_FILES $temp_sort"
+    
+    # 预加载所有类的优先级，避免在循环中多次调用 uci
+    # 先收集所有出现过的类名
+    local all_classes=$(cut -d: -f2 "$config_file" | sort -u)
+    local class_priority_cache=""
+    for cls in $all_classes; do
+        [ -n "$cls" ] || continue
+        local prio=$(uci -q get "${CONFIG_FILE}.${cls}.priority" 2>/dev/null)
+        prio=${prio:-999}
+        class_priority_cache="$class_priority_cache$cls:$prio "
+    done
     
     while IFS= read -r line; do
         [ -z "$line" ] && continue
-        IFS=':' read -r r_name r_class r_order r_enabled r_proto r_srcport r_dstport r_connbytes r_family <<EOF
+        IFS=':' read -r r_name r_class r_order r_enabled r_proto r_srcport r_dstport r_connbytes r_family r_state <<EOF
 $line
 EOF
         [ "$r_enabled" != "1" ] && continue
         
-        local class_priority=$(uci -q get "${CONFIG_FILE}.${r_class}.priority" 2>/dev/null)
-        class_priority=${class_priority:-999}
-        local rule_order=${r_order:-100}
+        # 从缓存中查找类优先级
+        local class_prio=999
+        for entry in $class_priority_cache; do
+            if [ "${entry%%:*}" = "$r_class" ]; then
+                class_prio="${entry#*:}"
+                break
+            fi
+        done
         
-        # 综合分数：类优先级*1000 + 规则顺序
-        local composite=$(( class_priority * 1000 + rule_order ))
+        local rule_order=${r_order:-100}
+        local composite=$(( class_prio * 1000 + rule_order ))
         echo "$composite:$r_name" >> "$temp_sort"
     done < "$config_file"
     
@@ -380,8 +455,9 @@ EOF
     echo "$result"
 }
 
-# ========== 快速构建nft规则 ==========
+# ========== 构建 nft 规则 ==========
 # 构建单条 nft 规则命令并输出到标准输出
+# 参数顺序：rule_name, chain, class_mark, mask, family, proto, srcport, dstport, connbytes_kb, state
 build_nft_rule_fast() {
     local rule_name="$1"
     local chain="$2"
@@ -392,9 +468,11 @@ build_nft_rule_fast() {
     local srcport="$7"
     local dstport="$8"
     local connbytes_kb="$9"
+    local state="${10}"
     
     local nft_cmd="add rule $family gargoyle-qos-priority $chain"
     
+    # 处理协议
     if [ "$proto" = "tcp" ]; then
         nft_cmd="$nft_cmd meta l4proto tcp"
     elif [ "$proto" = "udp" ]; then
@@ -405,6 +483,7 @@ build_nft_rule_fast() {
         nft_cmd="$nft_cmd meta l4proto $proto"
     fi
     
+    # 端口处理（根据方向）
     case "$chain" in
         *"ingress"*)
             if [ -n "$srcport" ]; then
@@ -420,24 +499,30 @@ build_nft_rule_fast() {
             ;;
     esac
     
-    # 修复 connbytes_kb 解析逻辑（使用 sed 去除末尾数字，安全可靠）
-    if [ -n "$connbytes_kb" ] && [ "$connbytes_kb" != "0" ]; then
-        local connbytes_kb_clean=$(echo "$connbytes_kb" | tr -d ' ')
-        # 格式验证
-        if echo "$connbytes_kb_clean" | grep -qE '^[<>!]?=?[0-9]+$'; then
-            # 提取操作符：去除末尾数字部分
-            local operator=$(echo "$connbytes_kb_clean" | sed 's/[0-9]*$//')
-            local value=$(echo "$connbytes_kb_clean" | grep -o '[0-9]\+')
-            
-            # 如果没有显式操作符，默认使用 >=（与tc的connbytes行为一致）
-            if [ -z "$operator" ]; then
-                operator=">="
-            fi
-            
-            local bytes_value=$((value * 1024))
-            nft_cmd="$nft_cmd ct bytes $operator $bytes_value"
+    # 处理连接状态条件
+    if [ -n "$state" ]; then
+        # 移除可能的花括号，确保 nft 语法正确
+        local state_value=$(echo "$state" | tr -d '{}')
+        # 如果包含逗号，需要包装为集合
+        if echo "$state_value" | grep -q ','; then
+            nft_cmd="$nft_cmd ct state { $state_value }"
         else
-            log "WARN" "规则 $rule_name 的 connbytes_kb 格式无效: $connbytes_kb_clean，忽略此条件"
+            nft_cmd="$nft_cmd ct state $state_value"
+        fi
+    fi
+    
+    # 处理连接字节数条件
+    if [ -n "$connbytes_kb" ] && [ "$connbytes_kb" != "0" ]; then
+        local clean=$(echo "$connbytes_kb" | tr -d ' ')
+        # 匹配操作符和数字，操作符可以是 >, <, >=, <=, =, !=
+        if echo "$clean" | grep -qE '^([<>]?=?|!=)[0-9]+$'; then
+            local operator=$(echo "$clean" | sed -n 's/^\([<>]\?=\?\|!=\)[0-9]*/\1/p')
+            local value=$(echo "$clean" | grep -o '[0-9]\+$')
+            [ -z "$operator" ] && operator=">="  # 默认 >=
+            local bytes=$((value * 1024))
+            nft_cmd="$nft_cmd ct bytes $operator $bytes"
+        else
+            log "WARN" "规则 $rule_name 的 connbytes_kb 格式无效: $clean，忽略此条件"
         fi
     fi
     
@@ -445,23 +530,23 @@ build_nft_rule_fast() {
     echo "$nft_cmd"
 }
 
-# ========== 增强规则应用函数 ==========
+# ========== 增强规则应用函数（主入口） ==========
 # 应用指定方向的所有规则（上传或下载），支持优先级排序和批量提交
-apply_enhanced_direction_rules() {
+apply_direction_rules() {
     local rule_type="$1"
     local chain="$2"
     local mask="$3"
     
-    log "INFO" "应用增强$rule_type规则到链: $chain, 掩码: $mask"
+    log "INFO" "应用 $rule_type 规则到链: $chain, 掩码: $mask"
     
     local direction=""
     [ "$chain" = "filter_qos_egress" ] && direction="upload"
     [ "$chain" = "filter_qos_ingress" ] && direction="download"
     
     local rule_list=$(load_all_config_sections "$CONFIG_FILE" "$rule_type")
-    [ -z "$rule_list" ] && { log "INFO" "未找到$rule_type规则配置"; return; }
+    [ -z "$rule_list" ] && { log "INFO" "未找到 $rule_type 规则配置"; return; }
     
-    log "INFO" "找到$rule_type规则: $rule_list"
+    log "INFO" "找到 $rule_type 规则: $rule_list"
     
     # 预加载规则配置到临时文件
     local temp_config=$(mktemp /tmp/qos_rule_config_XXXXXX 2>/dev/null)
@@ -476,7 +561,8 @@ apply_enhanced_direction_rules() {
     for rule; do
         [ -n "$rule" ] || continue
         load_all_config_options "$CONFIG_FILE" "$rule" "tmp_"
-        echo "$rule:$tmp_class:$tmp_order:$tmp_enabled:$tmp_proto:$tmp_srcport:$tmp_dstport:$tmp_connbytes_kb:$tmp_family" >> "$temp_config"
+        # 格式：规则名:类:顺序:启用:协议:源端口:目的端口:连接字节数:地址族:连接状态
+        echo "$rule:$tmp_class:$tmp_order:$tmp_enabled:$tmp_proto:$tmp_srcport:$tmp_dstport:$tmp_connbytes_kb:$tmp_family:$tmp_state" >> "$temp_config"
     done
     
     # 提取所有用到的类（用于后续数量检查）
@@ -487,12 +573,12 @@ apply_enhanced_direction_rules() {
         class_count=$((class_count + 1))
     done
     
-    # 类数量超限警告
-    if [ $class_count -gt 8 ]; then
-        log "WARN" "方向 $direction 的启用类数量为 $class_count，超过8个，可能会导致标记冲突！"
+    # 类数量超限警告（最多7个标记可用）
+    if [ $class_count -gt 7 ]; then
+        log "WARN" "方向 $direction 的启用类数量为 $class_count，超过7个，可能导致标记冲突！"
     fi
     
-    # 快速排序（实时获取类优先级）
+    # 快速排序（使用预加载的类优先级）
     local sorted_rule_list=$(sort_rules_by_priority_fast "$temp_config")
     if [ -z "$sorted_rule_list" ]; then
         log "INFO" "没有可用的启用规则"
@@ -509,11 +595,15 @@ apply_enhanced_direction_rules() {
     fi
     TEMP_FILES="$TEMP_FILES $nft_batch_file"
     
-    log "INFO" "按优先级顺序生成nft规则..."
+    # 用于检测标记冲突的关联数组（模拟），使用精确匹配
+    local seen_marks=""
     local rule_count=0
+    local conflict_detected=0
+    
+    log "INFO" "按优先级顺序生成nft规则..."
     for rule_name in $sorted_rule_list; do
         local rule_line=$(grep "^$rule_name:" "$temp_config")
-        IFS=':' read -r r_name r_class r_order r_enabled r_proto r_srcport r_dstport r_connbytes r_family <<EOF
+        IFS=':' read -r r_name r_class r_order r_enabled r_proto r_srcport r_dstport r_connbytes r_family r_state <<EOF
 $rule_line
 EOF
         [ "$r_enabled" = "1" ] || continue
@@ -524,11 +614,31 @@ EOF
             continue
         fi
         
+        # 精确检查标记冲突
+        local conflict=0
+        for m in $seen_marks; do
+            if [ "$m" = "$class_mark" ]; then
+                conflict=1
+                break
+            fi
+        done
+        if [ $conflict -eq 1 ]; then
+            log "ERROR" "标记冲突：类 $r_class 的标记 $class_mark 已被其他规则使用，规则 $rule_name 将被跳过"
+            conflict_detected=1
+            continue
+        fi
+        seen_marks="$seen_marks $class_mark"
+        
         [ -z "$r_family" ] && r_family="inet"
         
-        build_nft_rule_fast "$rule_name" "$chain" "$class_mark" "$mask" "$r_family" "$r_proto" "$r_srcport" "$r_dstport" "$r_connbytes" >> "$nft_batch_file"
+        # 调用构建函数，传入所有参数
+        build_nft_rule_fast "$rule_name" "$chain" "$class_mark" "$mask" "$r_family" "$r_proto" "$r_srcport" "$r_dstport" "$r_connbytes" "$r_state" >> "$nft_batch_file"
         rule_count=$((rule_count + 1))
     done
+    
+    if [ $conflict_detected -eq 1 ]; then
+        log "WARN" "存在标记冲突，部分规则可能未生效。建议减少类别数量或调整类别名称。"
+    fi
     
     local batch_success=0
     if [ -s "$nft_batch_file" ]; then
@@ -537,7 +647,6 @@ EOF
         nft_ret=$?
         if [ $nft_ret -eq 0 ]; then
             log "INFO" "✅ 批量规则应用成功"
-            batch_success=0
         else
             log "ERROR" "❌ 批量规则应用失败 (退出码: $nft_ret)"
             log "ERROR" "nft 错误输出: $nft_output"
@@ -553,198 +662,14 @@ EOF
         done
     fi
     
-    # 清理所有临时文件
+    # 清理临时文件
     rm -f "$nft_batch_file" 2>/dev/null
     rm -f "$temp_config" 2>/dev/null
     
     return $batch_success
 }
 
-# 应用所有规则（兼容旧版本调用）
-apply_all_rules() {
-    local rule_type="$1"
-    local mask="$2"
-    local chain="$3"
-    log "INFO" "开始应用 $rule_type 规则到链 $chain (掩码: $mask)"
-    apply_enhanced_direction_rules "$rule_type" "$chain" "$mask"
-}
-
-# 处理单个规则（兼容旧版本调用）
-process_single_rule() {
-    local rule_id="$1"
-    local chain="$2"
-    local mask="$3"
-    local chain_type="$4"
-    
-    local class=$(uci -q get "$CONFIG_FILE.$rule_id.class")
-    local proto=$(uci -q get "$CONFIG_FILE.$rule_id.proto")
-    local srcport=$(uci -q get "$CONFIG_FILE.$rule_id.srcport")
-    local dstport=$(uci -q get "$CONFIG_FILE.$rule_id.dstport")
-    
-    log "DEBUG" "规则 $rule_id: class=$class, proto=$proto\n  srcport='$srcport', dstport='$dstport'"
-    
-    [ -z "$class" ] && { log "ERROR" "规则 $rule_id 缺少 class 参数"; return 1; }
-    
-    local mark=$(calculate_class_mark "$class" "$mask" "$chain_type")
-    [ -z "$mark" ] && { log "ERROR" "无法计算类别 $class 的标记值"; return 1; }
-    
-    log "INFO" "类别 $class 的标记: $mark"
-    
-    if [ "$proto" = "all" ] || [ -z "$proto" ]; then
-        apply_all_protocol_rule "$chain" "$mark" "$srcport" "$dstport"
-        return $?
-    fi
-    
-    local nft_cmd="add rule inet gargoyle-qos-priority $chain"
-    
-    if [ "$proto" = "tcp" ] || [ "$proto" = "udp" ]; then
-        nft_cmd="$nft_cmd meta l4proto $proto"
-    elif [ -n "$proto" ]; then
-        nft_cmd="$nft_cmd meta l4proto $proto"
-    else
-        nft_cmd="$nft_cmd meta mark set $mark counter"
-    fi
-    
-    case "$chain" in
-        *"ingress"*)
-            if [ -n "$srcport" ]; then
-                local ports=$(echo "$srcport" | tr -d ' ')
-                nft_cmd="$nft_cmd th sport { $ports }"
-            fi
-            ;;
-        *"egress"*)
-            if [ -n "$dstport" ]; then
-                local ports=$(echo "$dstport" | tr -d ' ')
-                nft_cmd="$nft_cmd th dport { $ports }"
-            fi
-            ;;
-    esac
-    
-    nft_cmd="$nft_cmd meta mark set $mark counter"
-    
-    if ! nft -c "$nft_cmd" 2>&1; then
-        log "ERROR" "NFT 规则语法错误"
-        return 1
-    fi
-    
-    if nft $nft_cmd 2>&1; then
-        log "INFO" "✅ NFT 规则添加成功\n  NFT命令: nft $nft_cmd"
-        return 0
-    else
-        log "ERROR" "❌ NFT 规则添加失败\n  NFT命令: nft $nft_cmd"
-        return 1
-    fi
-}
-
-# 处理协议为 all 的规则，分别创建 TCP 和 UDP 规则（兼容旧版本）
-apply_all_protocol_rule() {
-    local chain="$1"
-    local mark="$2"
-    local srcport="$3"
-    local dstport="$4"
-    
-    local success=0
-    local tcp_cmd udp_cmd
-    
-    case "$chain" in
-        *"ingress"*)
-            if [ -n "$srcport" ]; then
-                local ports=$(echo "$srcport" | tr -d ' ')
-                if [ -n "$ports" ]; then
-                    tcp_cmd="add rule inet gargoyle-qos-priority $chain meta l4proto tcp th sport { $ports } meta mark set $mark counter"
-                    if nft -c "$tcp_cmd" 2>&1; then
-                        nft $tcp_cmd 2>&1 && log "INFO" "✅ TCP 规则添加成功\n  NFT命令: nft $tcp_cmd" || { log "ERROR" "❌ TCP 规则添加失败"; success=1; }
-                    else
-                        log "ERROR" "❌ TCP 规则语法错误"
-                        success=1
-                    fi
-                fi
-            else
-                tcp_cmd="add rule inet gargoyle-qos-priority $chain meta l4proto tcp meta mark set $mark counter"
-                if nft -c "$tcp_cmd" 2>&1; then
-                    nft $tcp_cmd 2>&1 && log "INFO" "✅ TCP 规则添加成功\n  NFT命令: nft $tcp_cmd" || { log "ERROR" "❌ TCP 规则添加失败"; success=1; }
-                else
-                    log "ERROR" "❌ TCP 规则语法错误"
-                    success=1
-                fi
-            fi
-            ;;
-        *"egress"*)
-            if [ -n "$dstport" ]; then
-                local ports=$(echo "$dstport" | tr -d ' ')
-                if [ -n "$ports" ]; then
-                    tcp_cmd="add rule inet gargoyle-qos-priority $chain meta l4proto tcp th dport { $ports } meta mark set $mark counter"
-                    if nft -c "$tcp_cmd" 2>&1; then
-                        nft $tcp_cmd 2>&1 && log "INFO" "✅ TCP 规则添加成功\n  NFT命令: nft $tcp_cmd" || { log "ERROR" "❌ TCP 规则添加失败"; success=1; }
-                    else
-                        log "ERROR" "❌ TCP 规则语法错误"
-                        success=1
-                    fi
-                fi
-            else
-                tcp_cmd="add rule inet gargoyle-qos-priority $chain meta l4proto tcp meta mark set $mark counter"
-                if nft -c "$tcp_cmd" 2>&1; then
-                    nft $tcp_cmd 2>&1 && log "INFO" "✅ TCP 规则添加成功\n  NFT命令: nft $tcp_cmd" || { log "ERROR" "❌ TCP 规则添加失败"; success=1; }
-                else
-                    log "ERROR" "❌ TCP 规则语法错误"
-                    success=1
-                fi
-            fi
-            ;;
-    esac
-    
-    case "$chain" in
-        *"ingress"*)
-            if [ -n "$srcport" ]; then
-                local ports=$(echo "$srcport" | tr -d ' ')
-                if [ -n "$ports" ]; then
-                    udp_cmd="add rule inet gargoyle-qos-priority $chain meta l4proto udp th sport { $ports } meta mark set $mark counter"
-                    if nft -c "$udp_cmd" 2>&1; then
-                        nft $udp_cmd 2>&1 && log "INFO" "✅ UDP 规则添加成功\n  NFT命令: nft $udp_cmd" || { log "ERROR" "❌ UDP 规则添加失败"; success=1; }
-                    else
-                        log "ERROR" "❌ UDP 规则语法错误"
-                        success=1
-                    fi
-                fi
-            else
-                udp_cmd="add rule inet gargoyle-qos-priority $chain meta l4proto udp meta mark set $mark counter"
-                if nft -c "$udp_cmd" 2>&1; then
-                    nft $udp_cmd 2>&1 && log "INFO" "✅ UDP 规则添加成功\n  NFT命令: nft $udp_cmd" || { log "ERROR" "❌ UDP 规则添加失败"; success=1; }
-                else
-                    log "ERROR" "❌ UDP 规则语法错误"
-                    success=1
-                fi
-            fi
-            ;;
-        *"egress"*)
-            if [ -n "$dstport" ]; then
-                local ports=$(echo "$dstport" | tr -d ' ')
-                if [ -n "$ports" ]; then
-                    udp_cmd="add rule inet gargoyle-qos-priority $chain meta l4proto udp th dport { $ports } meta mark set $mark counter"
-                    if nft -c "$udp_cmd" 2>&1; then
-                        nft $udp_cmd 2>&1 && log "INFO" "✅ UDP 规则添加成功\n  NFT命令: nft $udp_cmd" || { log "ERROR" "❌ UDP 规则添加失败"; success=1; }
-                    else
-                        log "ERROR" "❌ UDP 规则语法错误"
-                        success=1
-                    fi
-                fi
-            else
-                udp_cmd="add rule inet gargoyle-qos-priority $chain meta l4proto udp meta mark set $mark counter"
-                if nft -c "$udp_cmd" 2>&1; then
-                    nft $udp_cmd 2>&1 && log "INFO" "✅ UDP 规则添加成功\n  NFT命令: nft $udp_cmd" || { log "ERROR" "❌ UDP 规则添加失败"; success=1; }
-                else
-                    log "ERROR" "❌ UDP 规则语法错误"
-                    success=1
-                fi
-            fi
-            ;;
-    esac
-    
-    return $success
-}
-
-# ========== 双栈过滤器函数 ==========
-# 创建双栈（IPv4/IPv6）fwmark 过滤器
+# ========== 双栈过滤器函数（可选，但主脚本中已用 nft 处理，此处保留以供参考） ==========
 create_dualstack_filter() {
     local dev="$1"
     local parent="$2"
@@ -758,7 +683,6 @@ create_dualstack_filter() {
         handle ${mark}/$mask fw flowid "$class_id" 2>/dev/null || true
 }
 
-# 创建带优先级的双栈 fwmark 过滤器
 create_priority_dualstack_filter() {
     local dev="$1"
     local parent="$2"
@@ -775,3 +699,17 @@ create_priority_dualstack_filter() {
     tc filter add dev "$dev" parent "$parent" protocol ipv6 \
         prio $((class_priority + 1)) handle ${mark}/$mask fw flowid "$class_id" 2>/dev/null || true
 }
+
+# ========== 兼容旧版本调用的别名 ==========
+# 为保持与旧版主脚本的兼容性，保留以下别名
+apply_all_rules() {
+    log "WARN" "apply_all_rules 已废弃，请使用 apply_direction_rules"
+    apply_direction_rules "$1" "$2" "$3"
+}
+
+# 脚本被 source 时不会执行任何操作
+# 如果直接执行，则提示用法
+if [ "$(basename "$0")" = "rule.sh" ]; then
+    echo "此脚本为辅助模块，不应直接执行" >&2
+    exit 1
+fi
