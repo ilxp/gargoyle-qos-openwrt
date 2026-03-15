@@ -1,0 +1,546 @@
+msgid ""
+msgstr "Content-Type: text/plain; charset=UTF-8\n"
+
+msgid "\"Active Congestion Control\" not enabled"
+msgstr "“主动拥塞控制”未启用"
+
+msgid ""
+"<p>The active congestion control (ACC) observes your download activity and "
+"automatically adjusts your download link limit to maintain proper QoS "
+"performance. ACC automatically compensates for changes in your ISP's "
+"download speed and the demand from your network adjusting the link speed to "
+"the highest speed possible which will maintain proper QoS function. The "
+"effective range of this control is between 15% and 100% of the total "
+"download bandwidth you entered above.</p>"
+msgstr ""
+"<p>主动拥塞控制系统（ACC）观察你的下载活动并自动调整你的下载链接限制以保持适"
+"当的 QoS 性能。ACC 自动调整 QoS 功能以补偿来自你 ISP 的下载速度变化及来自你网"
+"络链接速度的调整需求，使速度最大化。这个控制的有效范围在你上面输入的下载总带"
+"宽的 15% 至 100% 之间。</p>"
+
+msgid ""
+"<p>While ACC does not adjust your upload link speed you must enable and "
+"properly configure your upload QoS for it to function properly.</p>"
+msgstr ""
+"<p>虽然 ACC 不调整你的上传链路速度，但你必须启用并正确配置你的上传 QoS 带宽以"
+"使该功能正常工作。</p>"
+
+msgid "All"
+msgstr "全部"
+
+msgid "Auto"
+msgstr "自动"
+
+msgid "Class Name"
+msgstr "类型名称"
+
+msgid "Classification Rules"
+msgstr "分类规则"
+
+msgid "Collecting data..."
+msgstr "正在收集数据..."
+
+msgid "Connection Bytes Reach"
+msgstr "连接流量达到"
+
+msgid "DPI Protocol"
+msgstr "DPI 协议"
+
+msgid "Default Service Class"
+msgstr "默认服务类型"
+
+msgid "Dest IP"
+msgstr "目标 IP"
+
+msgid "Dest Port"
+msgstr "目标端口"
+
+msgid "Disable QoS"
+msgstr "禁用 QoS"
+
+msgid "Download Settings"
+msgstr "下载设置"
+
+msgid "Ethernet"
+msgstr "以太网"
+
+msgid "Enable or disable the QoS service"
+msgstr "启用或者禁用QoS服务"
+
+msgid "QoS Algorithm"
+msgstr "QoS算法"
+
+msgid "HFSC: Guarantees low latency, ideal for gaming/voip.HTB: Flexible bandwidth control, good for multi-service management.CAKE: Modern and plug-and-play, simple to use."
+msgstr "HFSC：硬性保证延迟，适合游戏/通话。HTB：灵活控制带宽，适合多业务管理。CAKE：现代高级，简单省事。"
+
+msgid "Algorithm Settings"
+msgstr "算法配置"
+
+msgid "QoS Algorithm Configuration"
+msgstr "Qos各种算法的专属配置"
+
+msgid "Modify the QoS algorithm parameters. After completing the modification, you need to save/apply them again in the global settings for them to take effect."
+msgstr "修改QoS算法参数，完成后还需要在全局设置再次保存/应用才会生效。"
+
+msgid "Algorithm Selection"
+msgstr "选择算法"
+
+msgid "Current Algorithm"
+msgstr "当前算法"
+
+msgid "Switch Algorithm"
+msgstr "切换算法"
+
+msgid "Apply"
+msgstr "应用"
+
+msgid "HFSC Parameters"
+msgstr "HFSC参数"
+
+msgid "HTB Parameters"
+msgstr "HTB参数"
+
+msgid "CAKE Parameters"
+msgstr "CAKE参数"
+
+msgid "CAKE Parameters (Leaf Queue)"
+msgstr "CAKE参数（叶子队列）"
+
+msgid "FQ-CoDel Parameters (Leaf Queue)"
+msgstr "FQ-CoDel参数（叶子队列）"
+
+msgid "Latency Mode"
+msgstr "延迟模式"
+
+msgid "minRTT Enabled"
+msgstr "最小往返延时"
+
+msgid "Priority Mapping Enabled"
+msgstr "优先级映射"
+
+msgid "DRR Quantum"
+msgstr "DRR量子"
+
+msgid "Target Delay(microseconds)"
+msgstr "目标延迟（微秒）"
+
+msgid "Queue Length Limit"
+msgstr "队列长度限制"
+
+msgid "Quantum(bytes)"
+msgstr "量子（字节）"
+
+msgid "Number of Flows"
+msgstr "流量数"
+
+msgid "Interval(microseconds)"
+msgstr "间隔（微秒）"
+
+msgid "Memory Llimit"
+msgstr "内存限制"
+
+msgid "CE Threshold"
+msgstr "CE阈值"
+
+msgid "Queue Length Limit"
+msgstr "最小往返延时"
+
+msgid "DiffServ Mode"
+msgstr "DiffServ 模型"
+
+msgid "NAT Support"
+msgstr "NAT 支持"
+
+msgid "ACK Filter"
+msgstr "ACK 过滤器"
+
+msgid "Memory Limit"
+msgstr "内存限制"
+
+msgid "Wash Traffic"
+msgstr "流量净化"
+
+msgid "Split GSO"
+msgstr "分离 GSO"
+
+msgid "Ingress Mode"
+msgstr "入口模式"
+
+msgid "Ingress queueing method: 0=Use IFB (recommended), 1=Use ingress queue directly"
+msgstr "入口队列方式：0=使用IFB（推荐），1=直接使用入口队列"
+
+msgid "AutoRate Ingress"
+msgstr "自适应入口带宽"
+
+msgid "Automatically adjust ingress bandwidth based on measured throughput"
+msgstr "根据测量的吞吐量自动调整入口带宽"
+
+msgid "Target RTT"
+msgstr "目标延迟"
+
+msgid "Overhead (bytes)"
+msgstr "开销 (字节)"
+
+msgid "MPU (bytes)"
+msgstr "MPU (字节)"
+
+msgid "Quantum (bytes)"
+msgstr "量子 (bytes)"
+
+msgid "AutoRate Enabled"
+msgstr "动态带宽调整"
+
+msgid "Enable dynamic bandwidth adjustment based on network latency"
+msgstr "根据网络延迟启用动态带宽调整"
+
+
+msgid "Disable"
+msgstr "禁用"
+
+msgid "Enable"
+msgstr "启用"
+
+msgid "Configuration Persistence"
+msgstr "配置持久化"
+
+msgid "Save optimized bandwidth to configuration file (saves every 5 minutes at most)"
+msgstr "将优化后的带宽保存到配置文件（最多每5分钟保存一次）"
+
+msgid "Adjustment Interval (seconds)"
+msgstr "调整间隔（秒）"
+
+msgid "Time between each bandwidth adjustment (5-60 seconds)"
+msgstr "每次带宽调整之间的时间间隔（5-60秒）"
+
+msgid "Ping Hosts"
+msgstr "Ping 主机"
+
+msgid "Target hosts for latency measurement, separated by spaces"
+msgstr "用于延迟测量的目标主机，用空格分隔"
+
+msgid "Minimum Target RTT"
+msgstr "最小目标往返时间"
+
+msgid "Target minimum latency. When RTT is below this, increase bandwidth"
+msgstr "目标最小延迟。当往返时延（RTT）低于此值时，增加带宽"
+
+msgid "Maximum Target RTT"
+msgstr "最大目标往返时间"
+
+msgid "Maximum acceptable latency. When RTT exceeds this, decrease bandwidth"
+msgstr "最大可接受延迟。当RTT（往返时延）超过此值时，降低带宽"
+
+msgid "Minimum Bandwidth Percentage (%)"
+msgstr "最低带宽百分比（%）"
+
+msgid "Minimum bandwidth as percentage of configured bandwidth (10-100%)"
+msgstr "最低带宽占配置带宽的百分比（10-100%）"
+
+msgid "Maximum Bandwidth Percentage (%)"
+msgstr "最大带宽百分比（%）"
+
+msgid "Maximum bandwidth as percentage of configured bandwidth (100-200%)"
+msgstr "最大带宽占配置带宽的百分比（100-200%）"
+
+msgid "Active Congestion Control"
+msgstr "主动拥塞控制"
+
+msgid ""
+"Each download service class is specified by five main parameters: priority, percent "
+"bandwidth at capacity, minimum bandwidth and maximum bandwidth，MinRTT."
+msgstr "每个下载服务类型由五个主要参数指定：优先级、带宽占用百分比、最小带宽和最大带宽、"
+"往返延时标志MinRTT。(CAKE算法下负载不会显示数据!)"
+
+msgid ""
+"Each upload service class is specified by four main parameters: priority, percent "
+"bandwidth at capacity, minimum bandwidth and maximum bandwidth."
+msgstr "每个上传服务类型由四个主要参数指定：优先级、带宽占用百分比、最小带宽和最大带宽。(CAKE算法下负载不会显示数据!)"
+
+msgid "Priority"
+msgstr "优先级"
+
+msgid "Description"
+msgstr "描述"
+
+msgid "Load"
+msgstr "负载"
+
+msgid "Edit Download Classification Rule"
+msgstr "编辑下载分类规则"
+
+msgid "Edit Download Service Class"
+msgstr "编辑下载服务类型"
+
+msgid "Edit Upload Classification Rule"
+msgstr "编辑上传分类规则"
+
+msgid "Edit Upload Service Class"
+msgstr "编辑上传服务类型"
+
+msgid "Enable Active Congestion Control"
+msgstr "启用主动拥塞控制"
+
+msgid "Enable QoS"
+msgstr "启用 QoS"
+
+msgid "Error collecting troubleshooting information"
+msgstr "收集故障排查信息失败"
+
+msgid "Gargoyle QoS"
+msgstr "石像鬼 QoS"
+
+msgid "Global Settings"
+msgstr "全局设置"
+
+msgid "ICMP Type"
+msgstr "ICMP 类型"
+
+msgid ""
+"Indicates to the active congestion controller that you wish to minimize "
+"round trip times (RTT) when this class is active. Use this setting for "
+"online gaming or VoIP applications that need low round trip times (ping "
+"times). Minimizing RTT comes at the expense of efficient WAN throughput so "
+"while these class are active your WAN throughput will decline (usually "
+"around 20%)."
+msgstr ""
+"告诉主动拥塞控制器你希望该服务类型启用时尽量减少往返延时（RTT）。该设置一般用"
+"在 VoIP 或在线游戏这类需要低延时（Ping 值）的应用上。减小往返延时（RTT）会带"
+"来WAN有效吞吐量的额外花销，所以当这些服务类型启用时你的 WAN 吞吐量将下降（通"
+"常在20%左右）"
+
+msgid "Rule Order"
+msgstr "规则顺序"
+
+msgid "Position"
+msgstr "排名"
+
+msgid "IP Family"
+msgstr "地址族限制"
+
+msgid "IPV6 and IPV4"
+msgstr "IPV6 和 IPV4"
+
+msgid "Linklayer Type"
+msgstr "链路类型"
+
+msgid "Linklayer Overhead"
+msgstr "链路开销"
+
+msgid "Loading"
+msgstr "正在加载"
+
+msgid "Match feature code in a packet"
+msgstr ""
+"数据包特征码匹配, 格式 为@th,位置,长度 0x特征码"
+"@ll 链路层, @nh 网络层, @th 传输层, @ih 数据包内容"
+"位置: 特征码相对层级所在位置(在第几个字节减去一), 乘以8"
+"长度: 特征码长度(字节数乘以8)"
+"例如: 特征码为112233, 所在位置为第9个字节"
+"则: @th,64,24 0x112233"
+
+msgid "Manual Ping Limit"
+msgstr "手动 Ping 限制"
+
+msgid "Max bandwidth(%)"
+msgstr "最大带宽(百分比)"
+
+msgid "Max Packet"
+msgstr "最大数据包"
+
+msgid "Minimize RTT"
+msgstr "最小往返延时"
+
+msgid "Min bandwidth(%)"
+msgstr "最小带宽(百分比)"
+
+msgid "Min Packet"
+msgstr "最小数据包"
+
+msgid "Optional description for this service class."
+msgstr "分类描述"
+
+msgid "Optional description for this rule."
+msgstr "规则描述"
+
+msgid "Priority of this class. Lower number means higher priority. Used for sorting and bandwidth allocation."
+msgstr "分类优先级。数字越小表示优先级越高，用于排序和带宽分配"
+
+msgid "Dynamic Bandwidth Adjustment"
+msgstr "动态带宽调整"
+
+msgid "Network Interface"
+msgstr "外部网络接口"
+
+msgid "No"
+msgstr "否"
+
+msgid "No data found"
+msgstr "无数据"
+
+msgid "None"
+msgstr "无"
+
+msgid "Not set"
+msgstr "未设置"
+
+msgid ""
+"Packet's destination ip, can optionally have /[mask] after it (see -d option "
+"in iptables man page)."
+msgstr ""
+"数据包的目标 IP，可以在后面加子网掩码（/[mask]，请看 iptables 的 -d 参数说"
+"明）"
+
+msgid "Packet Feature Code Match"
+msgstr "数据包特征码匹配"
+
+msgid "Packet's destination port, can be a range (eg. 80-90, 443, 6000)."
+msgstr "数据包的目标端口，可以是一个范围（例如：80-90, 443, 6000）"
+
+msgid "Packet's maximum size (in bytes)."
+msgstr "数据包的最大大小（单位：bytes）"
+
+msgid "Packet's minimum size (in bytes)."
+msgstr "数据包的最小大小（单位：bytes）"
+
+msgid ""
+"Packet's source ip, can optionally have /[mask] after it (see -s option in "
+"iptables man page)."
+msgstr ""
+"数据包的源 IP，可以在后面加子网掩码（/[mask]，请看 iptables 的 -s 参数说明）"
+
+msgid "Packet's source port, support multi ports (eg. 80-90, 443, 6000)."
+msgstr "数据包的源端口，可以设置多个端口（例如：80-90, 443, 6000）"
+
+msgid ""
+"Packets are tested against the rules in the order specified -- rules toward "
+"the top have priority. As soon as a packet matches a rule it is classified, "
+"and the rest of the rules are ignored. The order of the rules can be altered "
+"using the arrow controls."
+msgstr ""
+"数据包将按规则中指定的顺序进行匹配 —— 靠上的规则优先进行匹配。一旦数据包匹配"
+"一条规则那它将被归类，并且其余的规则将被忽略。使用上下箭头可调整规则的顺序。"
+
+msgid "Percent"
+msgstr "带宽占用百分比"
+
+msgid "QoS Switch"
+msgstr "QoS 开关"
+
+msgid "Quality of Service (QoS) provides a way to control how available bandwidth is allocated."
+msgstr "QoS（服务质量）通过控制网络带宽的分配，确保关键应用的网络性能，并优化网络资源的使用。"
+
+msgid ""
+"Round trip ping times are compared against the ping limits. ACC controls the "
+"link limit to maintain ping times under the appropriate limit. By default "
+"ACC attempts to automatically select appropriate target ping limits for you "
+"based on the link speeds you entered and the performance of your link it "
+"measures during initialization. You cannot change the target ping time for "
+"the minRTT mode but by entering a manual time you can control the target "
+"ping time of the active mode. The time you enter becomes the increase in the "
+"target ping time between minRTT and active mode. Leave empty to use the "
+"default settings."
+msgstr ""
+"Ping 延时会与 Ping 限制进行比较。ACC 控制链路限制以保持 Ping 延时在适当范围。"
+"默认情况下，ACC 会自动根据你输入的链接适当为你选择适当的 Ping 限制。如果你想"
+"尝试不同的 Ping 限制，你可以在这里输入一个时间值。输入高的时间值将导致更高的 "
+"Ping 限制，低的时间值会有更低的限制。留空则将由 ACC 自动控制。"
+
+msgid "Select linkelayer type"
+msgstr "选择链路类型"
+
+msgid "Select the network interface"
+msgstr "选择外网接口"
+
+msgid "Service Class"
+msgstr "服务类型"
+
+msgid "Service Class Name"
+msgstr "服务类型名称"
+
+msgid "Service Classes"
+msgstr "服务类型"
+
+msgid "Set linklayer overhead"
+msgstr "设置链路开销"
+
+msgid ""
+"Should be set to around 98% of your available upload bandwidth. Entering a "
+"number which is too high will result in QoS not meeting its class "
+"requirements. Entering a number which is too low will needlessly penalize "
+"your upload speed. You should use a speed test program (with QoS off) to "
+"determine available upload bandwidth. Note that bandwidth is specified in "
+"kbps, leave blank to disable update QoS. There are 8 kilobits per kilobyte."
+msgstr ""
+"设置为你实际可用上传带宽的 95% 左右。应当在 QoS 关闭的情况下使用"
+"测速程序以确定可用的实际上传带宽，以 kbps 为单位，1M=1000kbps。"
+
+msgid "Source IP"
+msgstr "源 IP"
+
+msgid "Source Port"
+msgstr "源端口"
+
+msgid "Specifie how packets that do not match any rule should be classified."
+msgstr "指定当数据包不匹配任何规则时将被如何归类。"
+
+msgid ""
+"Specifying correctly is crucial to making QoS work. Note that bandwidth is "
+"specified in kbps, leave blank to disable download QoS. There are 8 kilobits "
+"per kilobyte."
+msgstr ""
+"设置为你实际可用下载带宽的 95% 左右。应当在 QoS 关闭的情况下使用"
+"测速程序以确定可用的实际下载带宽，以 kbps 为单位，1M=1000kbps。"
+
+msgid "The minimum percentage of bandwidth that can be allocated to this service type."
+msgstr "该服务类型可被分配的带宽最小百分比。"
+
+msgid "The maximum percentage of bandwidth that can be allocated to this service type."
+msgstr "该服务类型可被分配的带宽最大百分比。"
+
+msgid "The percentage of total bandwidth occupied by this service type."
+msgstr "该服务类型占据总带宽的百分比。"
+
+msgid ""
+"The segment of network between your router and the ping target is where "
+"congestion is controlled. By monitoring the round trip ping times to the "
+"target congestion is detected. By default ACC uses your WAN gateway as the "
+"ping target. If you know that congestion on your link will occur in a "
+"different segment then you can enter an alternate ping target. Leave empty "
+"to use the default settings."
+msgstr ""
+"在路由器和 Ping 目标之间的网络部分是拥塞控制的地方。拥塞通过监视和目标间的 "
+"Ping 延时来检测。默认情况下 ACC 使用你的 WAN 网关作为 Ping 的目标。假如你知道"
+"拥塞会在你链路的不同段发生，你可用输入一个备用的 Ping 目标。留空则将由ACC 自"
+"动控制。"
+
+msgid ""
+"The total size of data transmitted since the establishment of the link (in "
+"kBytes)."
+msgstr "自连接建立以来，传输的数据总量（单位：kBytes）"
+
+msgid "Total Download Bandwidth"
+msgstr "下载总带宽"
+
+msgid "Total Upload Bandwidth"
+msgstr "上传总带宽"
+
+msgid "Protocol"
+msgstr "协议"
+
+msgid "Troubleshooting"
+msgstr "故障排除"
+
+msgid "Troubleshooting Data"
+msgstr "故障排除数据"
+
+msgid "Unlimited"
+msgstr "不限制"
+
+msgid "Upload Settings"
+msgstr "上传设置"
+
+msgid "Use Non-standard Ping Target"
+msgstr "使用自定义 Ping 目标"
+
+msgid "Zero"
+msgstr "零"
