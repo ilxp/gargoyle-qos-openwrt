@@ -399,11 +399,6 @@ load_hfsc_cake_config() {
     CAKE_SPLIT_GSO=$(uci -q get qos_gargoyle.cake.split_gso 2>/dev/null)
     [ -z "$CAKE_SPLIT_GSO" ] && CAKE_SPLIT_GSO="0"
     
-    CAKE_LIMIT=$(uci -q get qos_gargoyle.cake.limit 2>/dev/null)
-    if [ -n "$CAKE_LIMIT" ] && ! validate_number "$CAKE_LIMIT" "cake.limit" 1 65535; then
-        CAKE_LIMIT=""
-    fi
-    
     CAKE_MEMLIMIT=$(uci -q get qos_gargoyle.cake.memlimit 2>/dev/null)
     if [ -n "$CAKE_MEMLIMIT" ]; then
         CAKE_MEMLIMIT=$(calculate_memory_limit "$CAKE_MEMLIMIT")
@@ -596,6 +591,20 @@ create_hfsc_root_qdisc() {
     return 0
 }
 
+# ========== 检测内核是否支持特定 CAKE 参数 ==========
+check_cake_param_support() {
+    local param="$1"
+    # 临时删除 lo 的根 qdisc（如果存在）
+    tc qdisc del dev lo root 2>/dev/null
+    # 尝试添加测试 qdisc
+    if tc qdisc add dev lo root cake bandwidth 1mbit "$param" 2>/dev/null; then
+        tc qdisc del dev lo root 2>/dev/null
+        return 0  # 支持
+    else
+        return 1  # 不支持
+    fi
+}
+
 # 构建CAKE参数字符串
 build_cake_params() {
     local params=""
@@ -636,13 +645,18 @@ build_cake_params() {
     else
         params="$params no-split-gso"
     fi
-    
-    [ -n "$CAKE_LIMIT" ] && params="$params limit $CAKE_LIMIT"
+	
     [ -n "$CAKE_MEMLIMIT" ] && params="$params memlimit $CAKE_MEMLIMIT"
         
-    if [ "$CAKE_ECN" = "ecn" ]; then
-        params="$params ecn"
-    fi
+    # ECN 参数支持检测
+	if [ -n "$CAKE_ECN" ]; then
+		if check_cake_param_support "$CAKE_ECN"; then
+			params="$params $CAKE_ECN"
+		else
+			logger -t "qos_gargoyle" "CAKE警告: 内核不支持 $CAKE_ECN 参数，已忽略 ECN 设置"
+			CAKE_ECN=""
+		fi
+	fi
     
     echo "$params"
 }

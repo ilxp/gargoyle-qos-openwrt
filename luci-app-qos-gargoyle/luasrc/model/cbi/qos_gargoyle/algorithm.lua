@@ -106,12 +106,6 @@ if current_algo == "hfsc_cake" or current_algo == "htb_cake" then
 	flowmode.rmempty = false
 	flowmode.description = translate("Flow isolation mode")
 
-	local limit = s_cake:option(Value, "limit", translate("Queue Limit (packets)"))
-	limit.default = "10240"
-	limit.datatype = "uinteger"
-	limit.rmempty = false
-	limit.description = translate("Maximum number of packets in the queue")
-
 	local ecn = s_cake:option(ListValue, "ecn", translate("ECN"))
 	ecn:value("1", translate("Enable"))
 	ecn:value("0", translate("Disable"))

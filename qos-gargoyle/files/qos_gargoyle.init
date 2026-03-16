@@ -436,9 +436,9 @@ get_network_info() {
     # --- 获取 WAN IPv4 地址 ---
     wan_ip=""
     if ! network_get_ipaddr wan_ip "$qos_interface" 2>/dev/null; then
-        # 后备：使用 ip 命令手动获取
+        # 后备：使用 ip 命令手动获取，不使用 grep -P
         wan_ip=$(ip -4 addr show dev "$qos_interface" 2>/dev/null | \
-                 grep -oP '(?<=inet\s)\d+(\.\d+){3}' | head -1)
+                 awk '/inet / {split($2, a, "/"); print a[1]; exit}')
     fi
 
     # --- 获取 WAN IPv6 地址 ---
@@ -446,7 +446,7 @@ get_network_info() {
     if ! network_get_ipaddr6 wan_ip6 "$qos_interface" 2>/dev/null; then
         # 后备：使用 ip 命令，并过滤掉链路本地地址（fe80::/10）
         wan_ip6=$(ip -6 addr show dev "$qos_interface" 2>/dev/null | \
-                  grep -oP '(?<=inet6\s)[0-9a-f:]+' | grep -v '^fe80' | head -1)
+                  awk '/inet6 / && !/fe80/ {split($2, a, "/"); print a[1]; exit}')
     fi
 
     # --- 获取 LAN IPv4 地址 ---
@@ -458,7 +458,7 @@ get_network_info() {
         fi
         # 后备：使用 ip 命令
         local_ip=$(ip -4 addr show dev "$l_iface" 2>/dev/null | \
-                   grep -oP '(?<=inet\s)\d+(\.\d+){3}' | head -1)
+                   awk '/inet / {split($2, a, "/"); print a[1]; exit}')
         [ -n "$local_ip" ] && break
     done
 
@@ -469,7 +469,7 @@ get_network_info() {
             break
         fi
         local_ip6=$(ip -6 addr show dev "$l_iface" 2>/dev/null | \
-                    grep -oP '(?<=inet6\s)[0-9a-f:]+' | grep -v '^fe80' | head -1)
+                    awk '/inet6 / && !/fe80/ {split($2, a, "/"); print a[1]; exit}')
         [ -n "$local_ip6" ] && break
     done
 
@@ -849,7 +849,6 @@ initialize_qos() {
         nft flush chain inet gargoyle-qos-priority filter_qos_egress 2>/dev/null
         nft flush chain inet gargoyle-qos-priority filter_qos_ingress 2>/dev/null
     else
-        echo "调用分类规则应用..."
         apply_classification_rules
     fi
     
@@ -878,13 +877,15 @@ initialize_qos() {
         "cake")
             export RULES_ALREADY_APPLIED=1
             if type initialize_cake_qos >/dev/null 2>&1; then
-                initialize_cake_qos start
-            else
-                echo "CAKE initialization function not found"
-                stop_qos
-                release_lock
-                return 1
-            fi
+				initialize_cake_qos start
+				ALGO_RET=$?
+				echo "DEBUG: initialize_cake_qos start returned $ALGO_RET"
+			else
+				echo "CAKE initialization function not found"
+				stop_qos
+				release_lock
+				return 1
+			fi
             ;;
         "htb_fqcodel")
             export RULES_ALREADY_APPLIED=1
@@ -928,12 +929,12 @@ initialize_qos() {
     esac
     
     # 检查算法初始化是否成功（通过返回值）
-    if [ $? -ne 0 ]; then
-        echo "算法模块初始化失败"
-        stop_qos
-        release_lock
-        return 1
-    fi
+    if [ $ALGO_RET -ne 0 ]; then
+		echo "算法模块初始化失败 (返回值: $ALGO_RET)"
+		stop_qos
+		release_lock
+		return 1
+	fi
     
     start_qos_acc
     

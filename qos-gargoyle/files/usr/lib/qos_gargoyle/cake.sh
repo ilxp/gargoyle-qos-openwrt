@@ -297,9 +297,6 @@ load_cake_config() {
     val=$(uci -q get qos_gargoyle.cake.flowmode 2>/dev/null)
     [ -n "$val" ] && CAKE_FLOWMODE=$(sanitize_param "$val")
 
-    val=$(uci -q get qos_gargoyle.cake.limit 2>/dev/null)
-    [ -n "$val" ] && CAKE_LIMIT=$(sanitize_param "$val")
-
     val=$(uci -q get qos_gargoyle.cake.overhead 2>/dev/null)
     CAKE_OVERHEAD=$(sanitize_param "${val:-0}")
 
@@ -518,13 +515,9 @@ build_cake_params() {
     local bandwidth="$1"
     local direction="$2"
     local params="bandwidth ${bandwidth}kbit $CAKE_DIFFSERV_MODE"
-
-    # 新增参数
-    [ -n "$CAKE_FLOWMODE" ] && params="$params $CAKE_FLOWMODE"
-    [ -n "$CAKE_LIMIT" ] && params="$params limit $CAKE_LIMIT"
-    [ -n "$CAKE_ECN" ] && params="$params $CAKE_ECN"   # ecn 或 noecn
-
+	
     # 基础参数
+    [ -n "$CAKE_FLOWMODE" ] && params="$params $CAKE_FLOWMODE"
     [ "$CAKE_OVERHEAD" != "0" ] && params="$params overhead $CAKE_OVERHEAD"
     [ "$CAKE_MPU" != "0" ] && params="$params mpu $CAKE_MPU"
     [ -n "$CAKE_RTT" ] && params="$params rtt $CAKE_RTT"
@@ -532,6 +525,16 @@ build_cake_params() {
     [ "$CAKE_NAT" = "1" ] && params="$params nat"
     [ "$CAKE_WASH" = "1" ] && params="$params wash"
     [ -n "$CAKE_MEMORY_LIMIT" ] && params="$params memlimit $CAKE_MEMORY_LIMIT"
+	
+	# ECN 参数支持检测
+	if [ -n "$CAKE_ECN" ]; then
+		if check_cake_param_support "$CAKE_ECN"; then
+			params="$params $CAKE_ECN"
+		else
+			logger -t "qos_gargoyle" "CAKE警告: 内核不支持 $CAKE_ECN 参数，已忽略 ECN 设置"
+			CAKE_ECN=""
+		fi
+	fi
 
     # 高级参数：需要内核支持，检测后动态添加，并记录运行时标志
     # split-gso
@@ -882,7 +885,6 @@ show_cake_status() {
     echo -e "\n===== CAKE配置参数 ====="
     echo "DiffServ模式: $CAKE_DIFFSERV_MODE"
     echo "流模式: ${CAKE_FLOWMODE:-未配置}"
-    echo "队列限制: ${CAKE_LIMIT:-未配置}"
     echo "RTT: $CAKE_RTT"
     echo "Overhead: $CAKE_OVERHEAD"
     echo "MPU: $CAKE_MPU"
@@ -1081,6 +1083,7 @@ initialize_cake_qos() {
             
             log_info "CAKE QoS 启动成功"
             release_lock
+			return 0
             ;;
             
         stop)
