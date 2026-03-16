@@ -2,7 +2,7 @@
 #
 # QoS Gargoyle 初始化脚本 - 传统 init.d 版本
 # 支持多算法：HFSC, CAKE, FQ_CoDel, HTB
-# 版本：2.2.2（修复：锁机制、变量初始化、重试逻辑、无条件跳转等）
+# 版本：2.2.3（修复：grep 正则、回退逻辑、等待协议增强）
 #
 
 START=50
@@ -66,9 +66,10 @@ get_service_status() {
 }
 
 # 检查服务是否正在运行
+# 修复: 使用 grep -E 支持多模式匹配
 is_service_running() {
     # 检查是否有 TC 队列
-    if tc qdisc show 2>/dev/null | grep -q "qdisc hfsc\|qdisc cake\|qdisc fq_codel\|qdisc htb"; then
+    if tc qdisc show 2>/dev/null | grep -qE "qdisc hfsc|qdisc cake|qdisc fq_codel|qdisc htb"; then
         return 0
     fi
     return 1
@@ -132,7 +133,7 @@ stop_qos() {
     
     if [ -n "$qos_iface" ] && [ "$qos_iface" != "auto" ]; then
         # 清理出口队列
-        if tc qdisc show dev "$qos_iface" root 2>/dev/null | grep -q "hfsc\|cake\|fq_codel\|htb"; then
+        if tc qdisc show dev "$qos_iface" root 2>/dev/null | grep -qE "hfsc|cake|fq_codel|htb"; then
             echo "  Deleting root queue on $qos_iface..."
             tc qdisc del dev "$qos_iface" root 2>/dev/null
         fi
@@ -147,7 +148,7 @@ stop_qos() {
     # 清理 IFB 设备的队列
     echo "Cleaning IFB device queues..."
     if ip link show dev "$ifb_dev" >/dev/null 2>&1; then
-        if tc qdisc show dev "$ifb_dev" root 2>/dev/null | grep -q "hfsc\|cake\|fq_codel\|htb"; then
+        if tc qdisc show dev "$ifb_dev" root 2>/dev/null | grep -qE "hfsc|cake|fq_codel|htb"; then
             echo "  Deleting root queue on $ifb_dev..."
             tc qdisc del dev "$ifb_dev" root 2>/dev/null
         fi
@@ -320,7 +321,7 @@ load_common_libraries() {
 }
 
 # 加载算法模块
-# 修复: 未知算法时正确回退到 htb_cake，模块路径一致
+# 修复: 简化回退逻辑，移除不可达代码
 load_algorithm_module() {
     local algo="$1"
     local module=""
@@ -345,15 +346,8 @@ load_algorithm_module() {
         return 0
     else
         echo "Error: Algorithm module not found: $module"
-        # 尝试加载 HTB_CAKE 作为最终回退
-        if [ "$module" != "$HTB_CAKE_MODULE" ] && [ -f "$HTB_CAKE_MODULE" ]; then
-            . "$HTB_CAKE_MODULE"
-            algorithm="htb_cake"
-            echo "Falling back to HTB_CAKE module"
-            return 0
-        else
-            return 1
-        fi
+        # 如果默认模块不存在，返回失败
+        return 1
     fi
 }
 
@@ -814,8 +808,9 @@ initialize_qos() {
         return 1
     fi
     
-    if ! wait_interface "$qos_interface"; then
-        echo "WAN 接口未就绪，启动中止" >&2
+    # 增强: 等待接口同时具有 IPv4 和 IPv6 地址（使用 both）
+    if ! wait_interface "$qos_interface" 15 both; then
+        echo "WAN 接口未就绪（无 IP 地址），启动中止" >&2
         release_lock
         return 1
     fi
