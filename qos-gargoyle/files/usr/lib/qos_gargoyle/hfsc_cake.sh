@@ -11,7 +11,6 @@
 : ${LOCK_FILE:=/var/run/hfsc_cake.lock}            # 并发锁文件
 : ${RUNNING_FILE:=/var/run/hfsc_cake.running}      # 运行标记文件
 : ${MAX_PHYSICAL_BANDWIDTH:=10000000}               # 最大物理带宽10Gbps（单位kbit），实际会尽力检测
-: ${HFSC_MINRTT_DELAY:=1000us}                      # 最小RTT延迟默认值
 : ${UPLOAD_MASK:=0xFFFF}           					# 上传方向标记掩码，使用低 16 位
 : ${DOWNLOAD_MASK:=0xFFFF0000}    				 	# 下载方向标记掩码，使用高 16 位
 : ${DELETE_IFB_ON_STOP:=0}                           # 停止时是否删除IFB设备（默认0不删除）
@@ -362,6 +361,16 @@ load_hfsc_cake_config() {
     else
         qos_log "INFO" "HFSC最小RTT启用: ${HFSC_MINRTT_ENABLED}"
     fi
+	
+	# 读取minrtt_delay
+    HFSC_MINRTT_DELAY=$(uci -q get qos_gargoyle.hfsc.minrtt_delay 2>/dev/null)
+    # 如果未设置，则使用默认值 1000us
+    if [ -z "$HFSC_MINRTT_DELAY" ]; then
+        HFSC_MINRTT_DELAY=1000us
+        qos_log "INFO" "HFSC最小RTT延迟未配置，使用默认值: ${HFSC_MINRTT_DELAY}"
+    else
+        qos_log "INFO" "HFSC最小RTT延迟已配置: ${HFSC_MINRTT_DELAY}"
+    fi
     
     # 从UCI配置读取CAKE参数
     CAKE_BANDWIDTH=$(uci -q get qos_gargoyle.cake.bandwidth 2>/dev/null)   # 可选，HFSC场景下通常不应设置
@@ -408,7 +417,7 @@ load_hfsc_cake_config() {
                 qos_log "INFO" "CAKE ECN 已启用"
                 ;;
             no|0|disable|off|false|noecn)
-                CAKE_ECN=""   # 不传递任何参数
+                CAKE_ECN="noecn"   # 必须显式传递 noecn
                 qos_log "INFO" "CAKE ECN 已禁用"
                 ;;
             *)
@@ -421,7 +430,7 @@ load_hfsc_cake_config() {
         qos_log "INFO" "CAKE ECN 未配置，使用默认禁用"
     fi
     
-    qos_log "INFO" "HFSC配置: latency_mode=${HFSC_LATENCY_MODE}, minrtt_enabled=${HFSC_MINRTT_ENABLED}"
+    qos_log "INFO" "HFSC配置: latency_mode=${HFSC_LATENCY_MODE}, minrtt_enabled=${HFSC_MINRTT_ENABLED}, minrtt_delay=${HFSC_MINRTT_DELAY}"
     qos_log "INFO" "CAKE参数: bandwidth=${CAKE_BANDWIDTH:-未配置}, rtt=${CAKE_RTT:-未配置}, flowmode=${CAKE_FLOWMODE}, diffserv=${CAKE_DIFFSERV}, nat=${CAKE_NAT}, wash=${CAKE_WASH}, overhead=${CAKE_OVERHEAD:-未配置}, mpu=${CAKE_MPU:-未配置}, ack_filter=${CAKE_ACK_FILTER}, split_gso=${CAKE_SPLIT_GSO}, limit=${CAKE_LIMIT:-未配置}, memlimit=${CAKE_MEMLIMIT:-未配置}, ecn=${CAKE_ECN}"
     
     return 0
@@ -707,14 +716,24 @@ create_hfsc_upload_class() {
         m2="$ul_m2"
     fi
     
-    # 使用配置的HFSC_MINRTT_DELAY
-    local minrtt_delay="${HFSC_MINRTT_DELAY}"
-    case "${minRTT:-No}" in
-        [Yy]es|[Yy]|1|[Tt]rue)
-            d="$minrtt_delay"
-            qos_log "INFO" "类别 $class_name 启用最小延迟模式 (d=$d)"
-            ;;
-    esac
+    # 确定是否启用最小延迟
+	local enable_minrtt=0
+	if [ -n "$minRTT" ]; then
+		# 类别已显式配置 minRTT
+		case "$minRTT" in
+			[Yy]es|[Yy]|1|[Tt]rue) enable_minrtt=1 ;;
+			[Nn]o|[Nn]|0|[Ff]alse) enable_minrtt=0 ;;
+			*) enable_minrtt="${HFSC_MINRTT_ENABLED:-0}" ;;  # 无效值时回退全局
+		esac
+	else
+		# 类别未配置 minRTT，使用全局开关
+		enable_minrtt="${HFSC_MINRTT_ENABLED:-0}"
+	fi
+
+	if [ "$enable_minrtt" = "1" ]; then
+		d="${HFSC_MINRTT_DELAY:-1000us}"
+		qos_log "INFO" "类别 $class_name 启用最小延迟模式 (d=$d, 来源: $([ -n "$minRTT" ] && echo "类别配置" || echo "全局开关"))"
+	fi
     
     qos_log "INFO" "正在创建HFSC类别 1:$class_index (带宽: ls=$m2, ul=$ul_m2)"
     if ! tc class add dev "$qos_interface" parent 1:1 \
@@ -765,7 +784,7 @@ create_hfsc_upload_class() {
     return 0
 }
 
-# 创建单个下载类
+# 创建单个下载类（使用IFB设备）
 create_hfsc_download_class() {
     local class_name="$1"
     local class_index="$2"
@@ -843,13 +862,24 @@ create_hfsc_download_class() {
         m2="$ul_m2"
     fi
     
-    local minrtt_delay="${HFSC_MINRTT_DELAY}"
-    case "${minRTT:-No}" in
-        [Yy]es|[Yy]|1|[Tt]rue)
-            d="$minrtt_delay"
-            qos_log "INFO" "类别 $class_name 启用最小延迟模式 (d=$d)"
-            ;;
-    esac
+    # 确定是否启用最小延迟
+	local enable_minrtt=0
+	if [ -n "$minRTT" ]; then
+		# 类别已显式配置 minRTT
+		case "$minRTT" in
+			[Yy]es|[Yy]|1|[Tt]rue) enable_minrtt=1 ;;
+			[Nn]o|[Nn]|0|[Ff]alse) enable_minrtt=0 ;;
+			*) enable_minrtt="${HFSC_MINRTT_ENABLED:-0}" ;;  # 无效值时回退全局
+		esac
+	else
+		# 类别未配置 minRTT，使用全局开关
+		enable_minrtt="${HFSC_MINRTT_ENABLED:-0}"
+	fi
+
+	if [ "$enable_minrtt" = "1" ]; then
+		d="${HFSC_MINRTT_DELAY:-1000us}"
+		qos_log "INFO" "类别 $class_name 启用最小延迟模式 (d=$d, 来源: $([ -n "$minRTT" ] && echo "类别配置" || echo "全局开关"))"
+	fi
     
     qos_log "INFO" "正在创建下载HFSC类别 1:$class_index (带宽: ls=$m2, ul=$ul_m2)"
     if ! tc class add dev "$ifb_dev" parent 1:1 \
@@ -1027,22 +1057,39 @@ setup_ingress_redirect() {
         qos_log "INFO" "IPv4入口重定向规则添加成功"
     fi
     
-    # IPv6重定向：尝试全球单播匹配，失败则回退到无过滤规则
+    # ========== IPv6 重定向：三阶尝试 ==========
     local ipv6_success=false
+    
+    # 第一优先：flower 匹配全球单播地址 (2000::/3)
     if tc filter add dev "$qos_interface" parent ffff: protocol ipv6 \
-        u32 match u32 0x20000000 0xe0000000 at 24 \
+        flower ip6_dst 2000::/3 \
         action connmark \
         action mirred egress redirect dev "$IFB_DEVICE" 2>&1; then
         ipv6_success=true
+        qos_log "INFO" "IPv6入口重定向规则（flower 匹配全球单播）添加成功"
     else
-        qos_log "WARN" "IPv6入口重定向规则（全球单播）添加失败，尝试无过滤规则"
+        qos_log "WARN" "flower 规则添加失败，尝试 u32 全球单播匹配"
+        
+        # 第二优先：u32 匹配全球单播地址 (2000::/3)
         if tc filter add dev "$qos_interface" parent ffff: protocol ipv6 \
-            u32 match u32 0 0 \
+            u32 match u32 0x20000000 0xe0000000 at 24 \
             action connmark \
             action mirred egress redirect dev "$IFB_DEVICE" 2>&1; then
             ipv6_success=true
+            qos_log "INFO" "IPv6入口重定向规则（u32 全球单播）添加成功"
         else
-            qos_log "WARN" "IPv6入口重定向规则添加失败，IPv6流量将不会通过IFB"
+            qos_log "WARN" "u32 全球单播规则添加失败，尝试无过滤规则"
+            
+            # 第三优先：无过滤的 u32 全匹配
+            if tc filter add dev "$qos_interface" parent ffff: protocol ipv6 \
+                u32 match u32 0 0 \
+                action connmark \
+                action mirred egress redirect dev "$IFB_DEVICE" 2>&1; then
+                ipv6_success=true
+                qos_log "INFO" "IPv6入口重定向规则（无过滤）添加成功"
+            else
+                qos_log "WARN" "IPv6入口重定向规则添加失败，IPv6流量将不会通过IFB"
+            fi
         fi
     fi
     

@@ -1,7 +1,7 @@
 #!/bin/sh
-# version=5.5-mq
-# CAKE算法实现模块 - 多队列增强版 v5.5
-# 基于v5.4，改进带宽转换正则表达式，增加极低带宽多队列提示
+# version=5.6-mq
+# CAKE算法实现模块 - 多队列增强版 v5.6
+# 基于v5.5，增加对 flowmode、limit、ecn 参数的支持
 
 # ========== 变量初始化 ==========
 : ${total_upload_bandwidth:=50000}
@@ -18,7 +18,7 @@ if [ -z "$qos_interface" ]; then
     qos_interface="${qos_interface:-pppoe-wan}"
 fi
 
-echo "CAKE 模块初始化完成 (v5.5-mq)"
+echo "CAKE 模块初始化完成 (v5.6-mq)"
 echo "  网络接口: $qos_interface"
 echo "  IFB 设备: $IFB_DEVICE"
 echo "  上传带宽: ${total_upload_bandwidth}kbit/s"
@@ -26,6 +26,8 @@ echo "  下载带宽: ${total_download_bandwidth}kbit/s"
 
 # ========= CAKE专属常量 ==========
 CAKE_DIFFSERV_MODE="diffserv4"
+CAKE_FLOWMODE="srchost"          # 新增：流模式，默认 srchost
+CAKE_LIMIT=""                     # 新增：队列包数量限制
 CAKE_OVERHEAD="0"
 CAKE_MPU="0"
 CAKE_RTT="100ms"
@@ -36,6 +38,7 @@ CAKE_SPLIT_GSO="0"
 CAKE_INGRESS="0"          # 用户配置，决定是否附加 ingress 参数
 CAKE_AUTORATE_INGRESS="0"
 CAKE_MEMORY_LIMIT="32mb"
+CAKE_ECN=""               # 新增：ECN 启用标志
 ENABLE_AUTO_TUNE="1"
 CAKE_MQ_ENABLED="1"        # 是否启用多队列 CAKE-MQ
 CAKE_DELETE_IFB_ON_STOP="1" # 停止时是否删除 IFB 设备（默认删除）
@@ -291,6 +294,12 @@ load_cake_config() {
     val=$(uci -q get qos_gargoyle.cake.diffserv_mode 2>/dev/null)
     CAKE_DIFFSERV_MODE=$(sanitize_param "${val:-diffserv4}")
 
+    val=$(uci -q get qos_gargoyle.cake.flowmode 2>/dev/null)
+    [ -n "$val" ] && CAKE_FLOWMODE=$(sanitize_param "$val")
+
+    val=$(uci -q get qos_gargoyle.cake.limit 2>/dev/null)
+    [ -n "$val" ] && CAKE_LIMIT=$(sanitize_param "$val")
+
     val=$(uci -q get qos_gargoyle.cake.overhead 2>/dev/null)
     CAKE_OVERHEAD=$(sanitize_param "${val:-0}")
 
@@ -320,8 +329,26 @@ load_cake_config() {
 
     val=$(uci -q get qos_gargoyle.cake.memlimit 2>/dev/null)
     CAKE_MEMORY_LIMIT=$(sanitize_param "${val:-32mb}")
-    # 统一转换为小写，避免tc不识别大写单位
     CAKE_MEMORY_LIMIT=$(echo "$CAKE_MEMORY_LIMIT" | tr 'A-Z' 'a-z')
+
+    # ECN 参数
+    val=$(uci -q get qos_gargoyle.cake.ecn 2>/dev/null)
+    if [ -n "$val" ]; then
+        case "$val" in
+            yes|1|enable|on|true|ecn)
+                CAKE_ECN="ecn"
+                log_info "CAKE ECN 已启用"
+                ;;
+            no|0|disable|off|false|noecn)
+                CAKE_ECN="noecn"
+                log_info "CAKE ECN 已禁用"
+                ;;
+            *)
+                log_warn "无效的 ECN 配置值 '$val'，将忽略"
+                CAKE_ECN=""
+                ;;
+        esac
+    fi
 
     val=$(uci -q get qos_gargoyle.cake.enable_auto_tune 2>/dev/null)
     [ -n "$val" ] && ENABLE_AUTO_TUNE=$(sanitize_param "$val")
@@ -491,6 +518,11 @@ build_cake_params() {
     local bandwidth="$1"
     local direction="$2"
     local params="bandwidth ${bandwidth}kbit $CAKE_DIFFSERV_MODE"
+
+    # 新增参数
+    [ -n "$CAKE_FLOWMODE" ] && params="$params $CAKE_FLOWMODE"
+    [ -n "$CAKE_LIMIT" ] && params="$params limit $CAKE_LIMIT"
+    [ -n "$CAKE_ECN" ] && params="$params $CAKE_ECN"   # ecn 或 noecn
 
     # 基础参数
     [ "$CAKE_OVERHEAD" != "0" ] && params="$params overhead $CAKE_OVERHEAD"
@@ -771,7 +803,7 @@ health_check_cake() {
 
 # ========== 状态显示（原版+入口状态+多队列统计）==========
 show_cake_status() {
-    echo "===== CAKE QoS状态报告 (v5.5-mq) ====="
+    echo "===== CAKE QoS状态报告 (v5.6-mq) ====="
     echo "时间: $(date)"
     echo "网络接口: ${qos_interface:-未知}"
 
@@ -849,6 +881,8 @@ show_cake_status() {
     # ===== CAKE配置参数 =====
     echo -e "\n===== CAKE配置参数 ====="
     echo "DiffServ模式: $CAKE_DIFFSERV_MODE"
+    echo "流模式: ${CAKE_FLOWMODE:-未配置}"
+    echo "队列限制: ${CAKE_LIMIT:-未配置}"
     echo "RTT: $CAKE_RTT"
     echo "Overhead: $CAKE_OVERHEAD"
     echo "MPU: $CAKE_MPU"
@@ -859,6 +893,7 @@ show_cake_status() {
     echo "Split GSO: $([ "$CAKE_SPLIT_GSO" = "1" ] && echo "启用 ✅" || echo "禁用 ❌")"
     echo "Ingress模式: $([ "$CAKE_INGRESS" = "1" ] && echo "启用 ✅" || echo "禁用 ❌")"
     echo "AutoRate Ingress: $([ "$CAKE_AUTORATE_INGRESS" = "1" ] && echo "启用 ✅" || echo "禁用 ❌")"
+    echo "ECN: $([ -n "$CAKE_ECN" ] && echo "$CAKE_ECN" || echo "未配置")"
     echo "自动调优: $([ "$ENABLE_AUTO_TUNE" = "1" ] && echo "启用 ✅" || echo "禁用 ❌")"
 
     echo -e "\n===== CAKE-MQ 状态报告结束 ====="

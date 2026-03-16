@@ -1115,21 +1115,39 @@ setup_ingress_redirect() {
         qos_log "INFO" "IPv4入口重定向规则添加成功"
     fi
     
+    # ========== IPv6 重定向：三阶尝试 ==========
     local ipv6_success=false
+    
+    # 第一优先：flower 匹配全球单播地址 (2000::/3)
     if tc filter add dev "$qos_interface" parent ffff: protocol ipv6 \
-        u32 match u32 0x20000000 0xe0000000 at 24 \
+        flower ip6_dst 2000::/3 \
         action connmark \
         action mirred egress redirect dev "$IFB_DEVICE" 2>&1; then
         ipv6_success=true
+        qos_log "INFO" "IPv6入口重定向规则（flower 匹配全球单播）添加成功"
     else
-        qos_log "WARN" "IPv6入口重定向规则（全球单播）添加失败，尝试无过滤规则"
+        qos_log "WARN" "flower 规则添加失败，尝试 u32 全球单播匹配"
+        
+        # 第二优先：u32 匹配全球单播地址 (2000::/3)
         if tc filter add dev "$qos_interface" parent ffff: protocol ipv6 \
-            u32 match u32 0 0 \
+            u32 match u32 0x20000000 0xe0000000 at 24 \
             action connmark \
             action mirred egress redirect dev "$IFB_DEVICE" 2>&1; then
             ipv6_success=true
+            qos_log "INFO" "IPv6入口重定向规则（u32 全球单播）添加成功"
         else
-            qos_log "WARN" "IPv6入口重定向规则添加失败，IPv6流量将不会通过IFB"
+            qos_log "WARN" "u32 全球单播规则添加失败，尝试无过滤规则"
+            
+            # 第三优先：无过滤的 u32 全匹配
+            if tc filter add dev "$qos_interface" parent ffff: protocol ipv6 \
+                u32 match u32 0 0 \
+                action connmark \
+                action mirred egress redirect dev "$IFB_DEVICE" 2>&1; then
+                ipv6_success=true
+                qos_log "INFO" "IPv6入口重定向规则（无过滤）添加成功"
+            else
+                qos_log "WARN" "IPv6入口重定向规则添加失败，IPv6流量将不会通过IFB"
+            fi
         fi
     fi
     
