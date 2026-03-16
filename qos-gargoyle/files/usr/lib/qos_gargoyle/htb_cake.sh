@@ -3,14 +3,14 @@
 # 基于HTB与CAKE组合算法实现QoS流量控制。
 # 必要工具：tc, nft, conntrack, ethtool, sysctl
 # 内核模块：ifb, sch_htb, sch_cake
-# version=2.8 - 增强错误处理、允许优先级0、完善conntrack检查
+# version=2.10 - 增强错误处理、允许优先级0、完善conntrack检查，优化锁处理
 
 # ========== 全局配置常量 ==========
 : ${CONFIG_FILE:=qos_gargoyle}
 : ${LOCK_FILE:=/var/run/htb_cake.lock}      # 并发锁文件
 : ${MAX_PHYSICAL_BANDWIDTH:=10000000}       # 最大物理带宽10Gbps（单位kbit）
-: ${UPLOAD_MASK:=0x007F}                     # 上传方向标记掩码
-: ${DOWNLOAD_MASK:=0x7F00}                   # 下载方向标记掩码
+: ${UPLOAD_MASK:=0xFFFF}           					# 上传方向标记掩码，使用低 16 位
+: ${DOWNLOAD_MASK:=0xFFFF0000}    				 # 下载方向标记掩码，使用高 16 位
 : ${QOS_RUNNING_FILE:=/var/run/htb_cake.running} # 运行标记文件
 : ${DELETE_IFB_ON_STOP:=0}                    # 停止时是否删除IFB设备（默认0不删除）
 : ${DEBUG:=0}                                  # 调试开关，0关闭，1开启
@@ -39,6 +39,71 @@ fi
 include /lib/network
 
 # ========== 辅助函数 ==========
+# 带宽单位转换（支持 kbit, mbit, gbit, KB, MB 等）
+convert_bandwidth_to_kbit() {
+    local bw="$1"
+    local num unit result
+
+    [ -z "$bw" ] && { qos_log "ERROR" "带宽值为空"; return 1; }
+
+    # 纯数字直接返回
+    if echo "$bw" | grep -qE '^[0-9]+$'; then
+        echo "$bw"
+        return 0
+    fi
+
+    # 处理数字+单位格式
+    if echo "$bw" | grep -qiE '^[0-9]+(\.[0-9]+)?[a-zA-Z]+$'; then
+        num=$(echo "$bw" | grep -oE '^[0-9]+(\.[0-9]+)?')
+        unit=$(echo "$bw" | sed 's/[0-9.]//g' | tr '[:lower:]' '[:upper:]')
+
+        case "$unit" in
+            K|KB|KIB|Kbit|KBIT|KILOBIT)
+                result=$(awk "BEGIN {printf \"%.0f\", $num * 1}")
+                ;;
+            M|MB|MIB|Mbit|MBIT|MEGABIT)
+                result=$(awk "BEGIN {printf \"%.0f\", $num * 1000}")
+                ;;
+            G|GB|GIB|Gbit|GBIT|GIGABIT)
+                result=$(awk "BEGIN {printf \"%.0f\", $num * 1000000}")
+                ;;
+            *)
+                qos_log "ERROR" "未知带宽单位: $unit"
+                return 1
+                ;;
+        esac
+
+        if [ -z "$result" ] || ! echo "$result" | grep -qE '^[0-9]+$' || [ "$result" -lt 0 ] 2>/dev/null; then
+            qos_log "ERROR" "带宽转换结果无效: $result"
+            return 1
+        fi
+
+        echo "$result"
+        return 0
+    else
+        qos_log "ERROR" "无效带宽格式: $bw (应为数字或数字+单位，例如 100mbit、10M)"
+        return 1
+    fi
+}
+
+# 检查 tc 是否支持 action connmark
+check_tc_connmark_support() {
+    # 尝试在 lo 上添加临时 ingress 规则，使用 connmark 动作
+    tc qdisc del dev lo ingress 2>/dev/null
+    if ! tc qdisc add dev lo ingress 2>/dev/null; then
+        qos_log "WARN" "无法在 lo 上创建 ingress 队列，无法测试 connmark 支持"
+        return 1
+    fi
+    if tc filter add dev lo parent ffff: protocol ip u32 match u32 0 0 action connmark 2>/dev/null; then
+        tc filter del dev lo parent ffff: 2>/dev/null
+        tc qdisc del dev lo ingress 2>/dev/null
+        return 0
+    else
+        tc qdisc del dev lo ingress 2>/dev/null
+        return 1
+    fi
+}
+
 # 检查必需的命令是否存在
 check_required_commands() {
     local missing=0
@@ -127,7 +192,6 @@ acquire_lock() {
     return 1
 }
 
-# 释放锁
 release_lock() {
     rm -f "$LOCK_FILE" 2>/dev/null || {
         qos_log "WARN" "锁文件删除失败，尝试强制删除"
@@ -194,27 +258,38 @@ validate_bandwidth_config() {
     return 0
 }
 
-# 加载带宽配置
+# 加载带宽配置（支持带单位的值）
 load_bandwidth_from_config() {
     qos_log "INFO" "加载带宽配置"
     
     local max_physical_bw=$(get_physical_interface_max_bandwidth "$qos_interface")
     
     local config_upload_bw=$(uci -q get qos_gargoyle.upload.total_bandwidth 2>/dev/null)
-    if ! validated_bw=$(validate_bandwidth_config "$config_upload_bw" "upload.total_bandwidth" "$max_physical_bw"); then
+    if [ -z "$config_upload_bw" ]; then
+        qos_log "ERROR" "上传总带宽未配置，请检查UCI"
+        return 1
+    fi
+    # 转换带宽为 kbit
+    total_upload_bandwidth=$(convert_bandwidth_to_kbit "$config_upload_bw") || return 1
+    if ! validated_bw=$(validate_bandwidth_config "$total_upload_bandwidth" "upload.total_bandwidth" "$max_physical_bw"); then
         qos_log "ERROR" "上传总带宽配置无效"
         return 1
     fi
     total_upload_bandwidth="$validated_bw"
-    qos_log "INFO" "从配置文件读取上传总带宽: ${total_upload_bandwidth}kbit/s"
+    qos_log "INFO" "上传总带宽: ${total_upload_bandwidth}kbit/s"
 
     local config_download_bw=$(uci -q get qos_gargoyle.download.total_bandwidth 2>/dev/null)
-    if ! validated_bw=$(validate_bandwidth_config "$config_download_bw" "download.total_bandwidth" "$max_physical_bw"); then
+    if [ -z "$config_download_bw" ]; then
+        qos_log "ERROR" "下载总带宽未配置，请检查UCI"
+        return 1
+    fi
+    total_download_bandwidth=$(convert_bandwidth_to_kbit "$config_download_bw") || return 1
+    if ! validated_bw=$(validate_bandwidth_config "$total_download_bandwidth" "download.total_bandwidth" "$max_physical_bw"); then
         qos_log "ERROR" "下载总带宽配置无效"
         return 1
     fi
     total_download_bandwidth="$validated_bw"
-    qos_log "INFO" "从配置文件读取下载总带宽: ${total_download_bandwidth}kbit/s"
+    qos_log "INFO" "下载总带宽: ${total_download_bandwidth}kbit/s"
     
     return 0
 }
@@ -485,11 +560,11 @@ load_htb_class_config() {
     if [ -n "$per_min_bandwidth" ] && ! validate_number "$per_min_bandwidth" "$class_name.per_min_bandwidth" 0 100; then
         per_min_bandwidth=""
     fi
-    if [ -n "$per_max_bandwidth" ] && ! validate_number "$per_max_bandwidth" "$class_name.per_max_bandwidth" 0 1000; then
+    if [ -n "$per_max_bandwidth" ] && ! validate_number "$per_max_bandwidth" "$class_name.per_max_bandwidth" 0 1000; then  #允许借用
         per_max_bandwidth=""
     fi
     # 允许优先级0（最高）
-    if [ -n "$priority" ] && ! validate_number "$priority" "$class_name.priority" 0 7; then
+    if [ -n "$priority" ] && ! validate_number "$priority" "$class_name.priority" 0 7; then  #htb只支持0-7
         priority=""
     fi
     
@@ -1007,15 +1082,15 @@ create_default_download_class() {
 }
 
 # ========== 入口重定向（依赖conntrack恢复标记）==========
-# 注意：数据包处理顺序为 驱动 → tc ingress → nftables prerouting。
-# 本函数在 tc ingress 中使用 action connmark 恢复之前由 nftables 设置的 conntrack mark，
-# 从而实现对下行流量的正确分类。此机制依赖于：
-#   1. 上传方向在 nftables 中设置了 meta mark，并通过规则将 mark 同步到 conntrack（ct mark set meta mark）
-#   2. 下行方向在 tc ingress 中通过 action connmark 将 conntrack mark 恢复到数据包的 fw mark
-#   3. apply_htb_specific_rules 中已包含必要的 ct mark 同步规则（ct state established,related counter meta mark set ct mark）
 setup_ingress_redirect() {
     if [ -z "$qos_interface" ]; then
         qos_log "ERROR" "无法确定 WAN 接口"
+        return 1
+    fi
+    
+    # 检测 connmark 支持
+    if ! check_tc_connmark_support; then
+        qos_log "ERROR" "内核不支持 tc action connmark，无法实现下载方向QoS"
         return 1
     fi
     
@@ -1062,11 +1137,15 @@ setup_ingress_redirect() {
         qos_log "INFO" "IPv6入口重定向规则添加成功"
     fi
     
-    local ingress_rules=$(tc filter show dev "$qos_interface" parent ffff: 2>/dev/null | wc -l)
-    if [ "$ingress_rules" -ge 2 ]; then
-        qos_log "INFO" "入口重定向已成功设置: $qos_interface -> $IFB_DEVICE ($ingress_rules 条规则)"
+    # 检查是否有规则指向 IFB 设备
+    local ipv4_rule_count=$(tc filter show dev "$qos_interface" parent ffff: protocol ip 2>/dev/null | grep -c "mirred.*Redirect to device $IFB_DEVICE")
+    local ipv6_rule_count=$(tc filter show dev "$qos_interface" parent ffff: protocol ipv6 2>/dev/null | grep -c "mirred.*Redirect to device $IFB_DEVICE")
+    if [ "$ipv4_rule_count" -ge 1 ] && [ "$ipv6_rule_count" -ge 1 ]; then
+        qos_log "INFO" "入口重定向已成功设置: IPv4和IPv6规则均生效"
+    elif [ "$ipv4_rule_count" -ge 1 ]; then
+        qos_log "WARN" "入口重定向仅IPv4生效，IPv6未生效"
     else
-        qos_log "WARN" "入口重定向规则数量不足 ($ingress_rules 条)"
+        qos_log "ERROR" "入口重定向规则均未生效"
         return 1
     fi
     
@@ -1125,6 +1204,18 @@ initialize_htb_upload() {
         return 0
     fi
     
+    # 统计启用类数量（假设未设置 enabled 的默认为启用，与 rule.sh 中一致）
+    local class_count=0
+    for class in $upload_class_list; do
+        local enabled=$(uci -q get ${CONFIG_FILE}.${class}.enabled 2>/dev/null)
+        [ "$enabled" = "1" ] || [ -z "$enabled" ] && class_count=$((class_count + 1))
+    done
+    
+    if [ $class_count -gt 16 ]; then
+        qos_log "ERROR" "上传方向启用类数量为 $class_count，超过16个，将导致标记冲突，启动中止！"
+        return 1
+    fi
+    
     if ! create_htb_root_qdisc "$qos_interface" "upload" "1:0" "1:1"; then
         qos_log "ERROR" "创建上传根队列失败"
         return 1
@@ -1164,6 +1255,18 @@ initialize_htb_download() {
             return 1
         fi
         return 0
+    fi
+    
+    # 统计启用类数量
+    local class_count=0
+    for class in $download_class_list; do
+        local enabled=$(uci -q get ${CONFIG_FILE}.${class}.enabled 2>/dev/null)
+        [ "$enabled" = "1" ] || [ -z "$enabled" ] && class_count=$((class_count + 1))
+    done
+    
+    if [ $class_count -gt 16 ]; then
+        qos_log "ERROR" "下载方向启用类数量为 $class_count，超过16个，将导致标记冲突，启动中止！"
+        return 1
     fi
     
     if ! ip link show dev "$IFB_DEVICE" >/dev/null 2>&1; then
@@ -1375,27 +1478,32 @@ apply_htb_specific_rules() {
 initialize_htb_cake_qos() {
     qos_log "INFO" "开始初始化HTB+CAKE QoS系统"
     
-    # 检查必需命令
-    if ! check_required_commands; then
-        qos_log "ERROR" "缺少必需的命令，请安装对应软件包"
-        return 1
-    fi
-    
-    # 检查并加载内核模块
-    if ! load_required_modules; then
-        qos_log "ERROR" "无法加载必需的内核模块"
+    # 获取并发锁（先获取锁，再检查幂等性）
+    if ! acquire_lock; then
+        qos_log "ERROR" "无法获取并发锁，可能已有其他QoS进程在运行"
+        rm -f "$QOS_RUNNING_FILE"
         return 1
     fi
     
     # 幂等性检查
     if ! check_already_running; then
         qos_log "ERROR" "HTB+CAKE QoS 已经在运行中"
+        release_lock
         return 1
     fi
     
-    # 获取并发锁
-    if ! acquire_lock; then
-        qos_log "ERROR" "无法获取并发锁，可能已有其他QoS进程在运行"
+    # 检查必需命令
+    if ! check_required_commands; then
+        qos_log "ERROR" "缺少必需的命令，请安装对应软件包"
+        release_lock
+        rm -f "$QOS_RUNNING_FILE"
+        return 1
+    fi
+    
+    # 检查并加载内核模块
+    if ! load_required_modules; then
+        qos_log "ERROR" "无法加载必需的内核模块"
+        release_lock
         rm -f "$QOS_RUNNING_FILE"
         return 1
     fi
@@ -1476,15 +1584,29 @@ initialize_htb_cake_qos() {
     return 0
 }
 
-# ========== 停止函数 ==========
+# ========== 停止函数（改进锁处理，增加重试）==========
 stop_htb_cake_qos() {
     qos_log "INFO" "停止HTB+CAKE QoS"
     
-    rm -f "$QOS_RUNNING_FILE"
-    
-    if ! acquire_lock; then
-        qos_log "WARN" "无法获取并发锁，但将继续尝试停止QoS"
+    local got_lock=false
+    local retry=3
+    while [ $retry -gt 0 ]; do
+        if acquire_lock 2>/dev/null; then
+            got_lock=true
+            qos_log "DEBUG" "停止时获取锁成功"
+            break
+        else
+            retry=$((retry - 1))
+            [ $retry -gt 0 ] && sleep 1
+        fi
+    done
+
+    if ! $got_lock; then
+        qos_log "ERROR" "无法获取锁，停止操作退出，请稍后重试"
+        return 1
     fi
+
+    rm -f "$QOS_RUNNING_FILE"
     
     local tc_count_before=$(tc qdisc show 2>/dev/null | grep -c htb || echo 0)
     local nft_count_before=$(nft list ruleset 2>/dev/null | grep -c "gargoyle-qos-priority" || echo 0)
@@ -1531,7 +1653,9 @@ stop_htb_cake_qos() {
     
     qos_log "INFO" "HTB+CAKE QoS停止完成 (清理前: ${tc_count_before}队列/${nft_count_before}规则, 清理后: ${tc_count_after}队列/${nft_count_after}规则)"
     
-    release_lock
+    if $got_lock; then
+        release_lock
+    fi
 }
 
 # ========== 状态显示函数（增加conntrack命令检查）==========
@@ -1547,7 +1671,7 @@ show_htb_cake_status() {
         [ -z "$qos_interface" ] && qos_interface="未知"
     fi
     
-    echo "===== HTB-CAKE QoS 状态报告 (v2.8) ====="
+    echo "===== HTB-CAKE QoS 状态报告 (v2.10) ====="
     echo "时间: $(date)"
     echo "WAN接口: ${qos_interface}"
     

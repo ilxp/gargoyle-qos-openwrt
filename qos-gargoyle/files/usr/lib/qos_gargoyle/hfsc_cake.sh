@@ -1,5 +1,5 @@
 #!/bin/sh
-# version=2.18
+# version=2.20
 # HFSC_CAKE算法实现模块
 # 基于HFSC与CAKE组合算法实现QoS流量控制。
 # 必要工具：tc, nft, conntrack, ethtool, sysctl
@@ -12,11 +12,10 @@
 : ${RUNNING_FILE:=/var/run/hfsc_cake.running}      # 运行标记文件
 : ${MAX_PHYSICAL_BANDWIDTH:=10000000}               # 最大物理带宽10Gbps（单位kbit），实际会尽力检测
 : ${HFSC_MINRTT_DELAY:=1000us}                      # 最小RTT延迟默认值
-: ${UPLOAD_MASK:=0x007F}                             # 上传方向标记掩码
-: ${DOWNLOAD_MASK:=0x7F00}                           # 下载方向标记掩码
+: ${UPLOAD_MASK:=0xFFFF}           					# 上传方向标记掩码，使用低 16 位
+: ${DOWNLOAD_MASK:=0xFFFF0000}    				 	# 下载方向标记掩码，使用高 16 位
 : ${DELETE_IFB_ON_STOP:=0}                           # 停止时是否删除IFB设备（默认0不删除）
 : ${DEBUG:=0}                                         # 调试开关，0关闭，1开启
-
 # 全局变量
 upload_class_list=""
 download_class_list=""
@@ -41,6 +40,71 @@ fi
 include /lib/network
 
 # ========== 辅助函数 ==========
+# 带宽单位转换（支持 kbit, mbit, gbit, KB, MB 等）
+convert_bandwidth_to_kbit() {
+    local bw="$1"
+    local num unit result
+
+    [ -z "$bw" ] && { qos_log "ERROR" "带宽值为空"; return 1; }
+
+    # 纯数字直接返回
+    if echo "$bw" | grep -qE '^[0-9]+$'; then
+        echo "$bw"
+        return 0
+    fi
+
+    # 处理数字+单位格式
+    if echo "$bw" | grep -qiE '^[0-9]+(\.[0-9]+)?[a-zA-Z]+$'; then
+        num=$(echo "$bw" | grep -oE '^[0-9]+(\.[0-9]+)?')
+        unit=$(echo "$bw" | sed 's/[0-9.]//g' | tr '[:lower:]' '[:upper:]')
+
+        case "$unit" in
+            K|KB|KIB|Kbit|KBIT|KILOBIT)
+                result=$(awk "BEGIN {printf \"%.0f\", $num * 1}")
+                ;;
+            M|MB|MIB|Mbit|MBIT|MEGABIT)
+                result=$(awk "BEGIN {printf \"%.0f\", $num * 1000}")
+                ;;
+            G|GB|GIB|Gbit|GBIT|GIGABIT)
+                result=$(awk "BEGIN {printf \"%.0f\", $num * 1000000}")
+                ;;
+            *)
+                qos_log "ERROR" "未知带宽单位: $unit"
+                return 1
+                ;;
+        esac
+
+        if [ -z "$result" ] || ! echo "$result" | grep -qE '^[0-9]+$' || [ "$result" -lt 0 ] 2>/dev/null; then
+            qos_log "ERROR" "带宽转换结果无效: $result"
+            return 1
+        fi
+
+        echo "$result"
+        return 0
+    else
+        qos_log "ERROR" "无效带宽格式: $bw (应为数字或数字+单位，例如 100mbit、10M)"
+        return 1
+    fi
+}
+
+# 检查 tc 是否支持 action connmark
+check_tc_connmark_support() {
+    # 尝试在 lo 上添加临时 ingress 规则，使用 connmark 动作
+    tc qdisc del dev lo ingress 2>/dev/null
+    if ! tc qdisc add dev lo ingress 2>/dev/null; then
+        qos_log "WARN" "无法在 lo 上创建 ingress 队列，无法测试 connmark 支持"
+        return 1
+    fi
+    if tc filter add dev lo parent ffff: protocol ip u32 match u32 0 0 action connmark 2>/dev/null; then
+        tc filter del dev lo parent ffff: 2>/dev/null
+        tc qdisc del dev lo ingress 2>/dev/null
+        return 0
+    else
+        tc qdisc del dev lo ingress 2>/dev/null
+        return 1
+    fi
+}
+
 # 检查必需的命令是否存在
 check_required_commands() {
     local missing=0
@@ -181,22 +245,23 @@ load_bandwidth_from_config() {
         qos_log "ERROR" "上传总带宽未配置，请检查UCI"
         return 1
     fi
-    if ! validate_number "$config_upload_bw" "upload.total_bandwidth" 1 "$max_physical_bw"; then
+    # 转换带宽为 kbit
+    total_upload_bandwidth=$(convert_bandwidth_to_kbit "$config_upload_bw") || return 1
+    if ! validate_number "$total_upload_bandwidth" "upload.total_bandwidth" 1 "$max_physical_bw"; then
         return 1
     fi
-    total_upload_bandwidth="$config_upload_bw"
-    qos_log "INFO" "从配置文件读取上传总带宽: ${total_upload_bandwidth}kbit/s"
+    qos_log "INFO" "上传总带宽: ${total_upload_bandwidth}kbit/s"
 
     local config_download_bw=$(uci -q get qos_gargoyle.download.total_bandwidth 2>/dev/null)
     if [ -z "$config_download_bw" ]; then
         qos_log "ERROR" "下载总带宽未配置，请检查UCI"
         return 1
     fi
-    if ! validate_number "$config_download_bw" "download.total_bandwidth" 1 "$max_physical_bw"; then
+    total_download_bandwidth=$(convert_bandwidth_to_kbit "$config_download_bw") || return 1
+    if ! validate_number "$total_download_bandwidth" "download.total_bandwidth" 1 "$max_physical_bw"; then
         return 1
     fi
-    total_download_bandwidth="$config_download_bw"
-    qos_log "INFO" "从配置文件读取下载总带宽: ${total_download_bandwidth}kbit/s"
+    qos_log "INFO" "下载总带宽: ${total_download_bandwidth}kbit/s"
     
     return 0
 }
@@ -385,7 +450,8 @@ load_hfsc_class_config() {
     if [ -n "$per_max_bandwidth" ] && ! validate_number "$per_max_bandwidth" "$class_name.per_max_bandwidth" 0 1000; then  #允许借用
         per_max_bandwidth=""
     fi
-    if [ -n "$priority" ] && ! validate_number "$priority" "$class_name.priority" 1 255; then
+	# 允许优先级0（最高）
+    if [ -n "$priority" ] && ! validate_number "$priority" "$class_name.priority" 0 255; then
         priority=""
     fi
     
@@ -927,15 +993,15 @@ create_default_download_class() {
 }
 
 # ========== 入口重定向（依赖conntrack恢复标记）==========
-# 注意：数据包处理顺序为 驱动 → tc ingress → nftables prerouting。
-# 本函数在 tc ingress 中使用 action connmark 恢复之前由 nftables 设置的 conntrack mark，
-# 从而实现对下行流量的正确分类。此机制依赖于：
-#   1. 上传方向在 nftables 中设置了 meta mark，并通过规则将 mark 同步到 conntrack（ct mark set meta mark）
-#   2. 下行方向在 tc ingress 中通过 action connmark 将 conntrack mark 恢复到数据包的 fw mark
-#   3. apply_hfsc_specific_rules 中已包含必要的 ct mark 同步规则（ct state established,related counter meta mark set ct mark）
 setup_ingress_redirect() {
     if [ -z "$qos_interface" ]; then
         qos_log "ERROR" "无法确定 WAN 接口"
+        return 1
+    fi
+    
+    # 检测 connmark 支持
+    if ! check_tc_connmark_support; then
+        qos_log "ERROR" "内核不支持 tc action connmark，无法实现下载方向QoS"
         return 1
     fi
     
@@ -984,11 +1050,15 @@ setup_ingress_redirect() {
         qos_log "INFO" "IPv6入口重定向规则添加成功"
     fi
     
-    local ingress_rules=$(tc filter show dev "$qos_interface" parent ffff: 2>/dev/null | wc -l)
-    if [ "$ingress_rules" -ge 2 ]; then
-        qos_log "INFO" "入口重定向已成功设置: $qos_interface -> $IFB_DEVICE ($ingress_rules 条规则)"
+    # 检查是否有规则指向 IFB 设备
+    local ipv4_rule_count=$(tc filter show dev "$qos_interface" parent ffff: protocol ip 2>/dev/null | grep -c "mirred.*Redirect to device $IFB_DEVICE")
+    local ipv6_rule_count=$(tc filter show dev "$qos_interface" parent ffff: protocol ipv6 2>/dev/null | grep -c "mirred.*Redirect to device $IFB_DEVICE")
+    if [ "$ipv4_rule_count" -ge 1 ] && [ "$ipv6_rule_count" -ge 1 ]; then
+        qos_log "INFO" "入口重定向已成功设置: IPv4和IPv6规则均生效"
+    elif [ "$ipv4_rule_count" -ge 1 ]; then
+        qos_log "WARN" "入口重定向仅IPv4生效，IPv6未生效"
     else
-        qos_log "WARN" "入口重定向规则数量不足 ($ingress_rules 条)"
+        qos_log "ERROR" "入口重定向规则均未生效"
         return 1
     fi
     
@@ -1047,6 +1117,18 @@ initialize_hfsc_upload() {
         return 0
     fi
     
+    # 统计启用类数量（包括默认类？实际上默认类单独处理，但这里已有自定义类）
+    local class_count=0
+    for class in $upload_class_list; do
+        local enabled=$(uci -q get ${CONFIG_FILE}.${class}.enabled 2>/dev/null)
+        [ "$enabled" = "1" ] || [ -z "$enabled" ] && class_count=$((class_count + 1))
+    done
+    
+    if [ $class_count -gt 16 ]; then
+        qos_log "ERROR" "上传方向启用类数量为 $class_count，超过16个，将导致标记冲突，启动中止！"
+        return 1
+    fi
+    
     if ! create_hfsc_root_qdisc "$qos_interface" "upload" "1:0" "1:1"; then
         qos_log "ERROR" "创建上传根队列失败"
         return 1
@@ -1086,6 +1168,18 @@ initialize_hfsc_download() {
             return 1
         fi
         return 0
+    fi
+    
+    # 统计启用类数量
+    local class_count=0
+    for class in $download_class_list; do
+        local enabled=$(uci -q get ${CONFIG_FILE}.${class}.enabled 2>/dev/null)
+        [ "$enabled" = "1" ] || [ -z "$enabled" ] && class_count=$((class_count + 1))
+    done
+    
+    if [ $class_count -gt 16 ]; then
+        qos_log "ERROR" "下载方向启用类数量为 $class_count，超过16个，将导致标记冲突，启动中止！"
+        return 1
     fi
     
     # 确保IFB设备已存在并启用
@@ -1189,8 +1283,11 @@ set_default_upload_class() {
             qos_log "INFO" "无自定义类别，使用默认类ID 1:2"
         fi
     fi
-    
-    tc qdisc change dev "$qos_interface" root handle 1:0 hfsc default $found_index 2>/dev/null || true
+    #hfsc qdisc 不支持 default 参数（htb 支持），导致未匹配任何规则的流量可能被丢弃。
+    #tc qdisc change dev "$qos_interface" root handle 1:0 hfsc default $found_index 2>/dev/null || true 
+	#改为根 qdisc 上添加一条低优先级的全匹配规则，指向默认类
+	tc filter add dev "$qos_interface" parent 1:0 protocol all prio 999 u32 match u32 0 0 flowid 1:$found_index
+	
     qos_log "INFO" "上传默认类别设置为TC类ID: 1:$found_index"
 }
 
@@ -1251,7 +1348,11 @@ set_default_download_class() {
         fi
     fi
     
-    tc qdisc change dev "$IFB_DEVICE" root handle 1:0 hfsc default $found_index 2>/dev/null || true
+	#hfsc qdisc 不支持 default 参数（htb 支持），导致未匹配任何规则的流量可能被丢弃。
+    #tc qdisc change dev "$IFB_DEVICE" root handle 1:0 hfsc default $found_index 2>/dev/null || true 
+	#改为根 qdisc 上添加一条低优先级的全匹配规则，指向默认类
+	tc filter add dev "$IFB_DEVICE" parent 1:0 protocol all prio 999 u32 match u32 0 0 flowid 1:$found_index
+	
     qos_log "INFO" "下载默认类别设置为TC类ID: 1:$found_index"
 }
 
@@ -1401,13 +1502,28 @@ initialize_hfsc_cake_qos() {
     return 0
 }
 
-# ========== 停止函数 ==========
+# ========== 停止函数（改进锁处理，增加重试）==========
 stop_hfsc_cake_qos() {
     qos_log "INFO" "停止HFSC+CAKE QoS"
     
-    # 先获取锁
-    acquire_lock
-    
+    local got_lock=false
+    local retry=3
+    while [ $retry -gt 0 ]; do
+        if acquire_lock 2>/dev/null; then
+            got_lock=true
+            qos_log "DEBUG" "停止时获取锁成功"
+            break
+        else
+            retry=$((retry - 1))
+            [ $retry -gt 0 ] && sleep 1
+        fi
+    done
+
+    if ! $got_lock; then
+        qos_log "ERROR" "无法获取锁，停止操作退出，请稍后重试"
+        return 1
+    fi
+
     # 删除运行标记
     rm -f "$RUNNING_FILE"
     
@@ -1464,7 +1580,9 @@ stop_hfsc_cake_qos() {
     
     qos_log "INFO" "HFSC+CAKE QoS停止完成 (清理前: ${tc_count_before}队列/${nft_count_before}规则, 清理后: ${tc_count_after}队列/${nft_count_after}规则)"
     
-    release_lock
+    if $got_lock; then
+        release_lock
+    fi
 }
 
 # ========== 状态显示函数（增加 conntrack 命令检查）==========
@@ -1480,7 +1598,7 @@ show_hfsc_cake_status() {
         [ -z "$qos_interface" ] && qos_interface="未知"
     fi
     
-    echo "===== HFSC-CAKE QoS 状态报告 (v2.18) ====="
+    echo "===== HFSC-CAKE QoS 状态报告 (v2.20) ====="
     echo "时间: $(date)"
     echo "WAN接口: ${qos_interface}"
     

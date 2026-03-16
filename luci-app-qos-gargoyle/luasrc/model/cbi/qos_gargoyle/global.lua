@@ -105,6 +105,43 @@ o = s:option(Value, "total_bandwidth", translate("Total Download Bandwidth"),
     .. "in kbps, leave blank to disable download QoS. There are 8 kilobits per kilobyte."))
 o.datatype = "uinteger"
 
+-- ==================== IFB 设备选择 ====================
+-- 获取系统中所有 IFB 设备
+local function get_ifb_devices()
+    local devices = {}
+    local handle = io.popen("ls /sys/class/net/ 2>/dev/null | grep '^ifb'")
+    if handle then
+        for line in handle:lines() do
+            devices[#devices+1] = line
+        end
+        handle:close()
+    end
+    return devices
+end
+
+local ifb_devices_list = get_ifb_devices()
+
+o = s:option(Value, "ifb_device", translate("IFB Device"),
+    translate("Select or enter the IFB (Intermediate Functional Block) device used for ingress shaping. Typically ifb0."))
+
+-- 添加现有 IFB 设备作为建议值
+for _, ifb in ipairs(ifb_devices_list) do
+    o:value(ifb)
+end
+
+-- 设置默认值：优先使用当前 UCI 配置值，否则使用第一个存在的 IFB 设备，否则 ifb0
+local current_ifb = uci:get(qos_gargoyle, "download", "ifb_device")
+if current_ifb and current_ifb ~= "" then
+    o.default = current_ifb
+else
+    if #ifb_devices_list > 0 then
+        o.default = ifb_devices_list[1]
+    else
+        o.default = "ifb0"
+    end
+end
+o.placeholder = "ifb0"
+
 -- ==================== 自动调整分类百分比及 min/max ====================
 -- 上传分档表
 local upload_tiers = {

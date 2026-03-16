@@ -239,18 +239,12 @@ enable() {
     
     update_config_state "enable"
     
-    echo "Starting QoS service immediately..."
-    load_common_libraries
+    # 不立即启动服务，由用户通过 start 命令手动启动
+    save_service_status "stopped"
     
-    if initialize_qos; then
-        echo "✅ QoS Gargoyle enabled and started"
-        save_service_status "running"
-        return 0
-    else
-        echo "⚠️  QoS enabled but service may have failed to start"
-        save_service_status "error"
-        return 1
-    fi
+    echo "✅ QoS Gargoyle enabled (autostart at boot enabled, but service not started automatically)"
+    echo "Use 'start' command to start the service now."
+    return 0
 }
 
 disable() {
@@ -350,7 +344,7 @@ load_qos_config() {
     echo "尝试读取 UCI 配置..." >&2
     while [ $retries -gt 0 ]; do
         algorithm=$(uci -q get "$CONFIG_FILE.global.algorithm")
-        algorithm="${algorithm:-hfsc_cake}"          # 修改默认算法为 hfsc_cake
+        algorithm="${algorithm:-hfsc_cake}"          # 默认算法为 hfsc_cake
         
         total_upload_bandwidth=$(uci -q get "$CONFIG_FILE.upload.total_bandwidth")
         total_download_bandwidth=$(uci -q get "$CONFIG_FILE.download.total_bandwidth")
@@ -554,14 +548,56 @@ setup_nft_tables() {
     echo "NFT tables initialized"
 }
 
-# 创建 IFB 设备
+# 创建/检查 IFB 设备（与 ifb.init 配合，不破坏现有设备）
 create_ifb_device() {
-    echo "Creating IFB device..."
     local ifb="${IFB_DEVICE:-ifb0}"
-    ip link delete dev "$ifb" 2>/dev/null
-    ip link add "$ifb" type ifb
-    ip link set dev "$ifb" up
-    echo "IFB device $ifb created and enabled"
+    echo "Ensuring IFB device $ifb is available..."
+
+    # 1. 确保 IFB 内核模块已加载
+    if ! lsmod | grep -q "^ifb"; then
+        echo "Loading IFB kernel module..."
+        modprobe ifb 2>/dev/null || {
+            echo "Error: Failed to load IFB kernel module"
+            return 1
+        }
+    fi
+
+    # 2. 检查设备是否存在
+    if ip link show dev "$ifb" >/dev/null 2>&1; then
+        # 设备已存在，只需确保 UP
+        ip link set dev "$ifb" up 2>/dev/null || {
+            echo "Warning: Failed to bring $ifb up"
+        }
+        echo "IFB device $ifb already exists, using it."
+        return 0
+    fi
+
+    # 3. 设备不存在，创建并配置
+    echo "Creating IFB device $ifb..."
+    ip link add "$ifb" type ifb 2>/dev/null || {
+        echo "Error: Failed to create IFB device $ifb"
+        return 1
+    }
+
+    ip link set dev "$ifb" up 2>/dev/null || {
+        echo "Warning: Failed to bring $ifb up"
+    }
+
+    # 从 WAN 接口同步 MTU（若可用）
+    local wan_iface="$qos_interface"
+    if [ -n "$wan_iface" ] && [ -d "/sys/class/net/$wan_iface" ]; then
+        local wan_mtu=$(cat /sys/class/net/$wan_iface/mtu 2>/dev/null)
+        if [ -n "$wan_mtu" ] && [ "$wan_mtu" -gt 0 ]; then
+            ip link set dev "$ifb" mtu "$wan_mtu" 2>/dev/null
+            echo "Set $ifb MTU to $wan_mtu (from $wan_iface)"
+        fi
+    fi
+
+    # 设置队列长度（参考 ifb.init 的值）
+    echo 1000 > /sys/class/net/$ifb/tx_queue_len 2>/dev/null
+
+    echo "IFB device $ifb created and configured."
+    return 0
 }
 
 load_bandwidth_config() {

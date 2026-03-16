@@ -1,7 +1,7 @@
 #!/bin/sh
 # 规则辅助模块 (rule.sh)
 # 支持多样化端口、协议、IPv6双栈、连接字节数过滤和连接状态过滤
-# version=1.8.0 - 基于1.7.2，改进哈希计算可移植性，严格类数量限制
+# version=1.8.1 - 修复 sanitize_input 正则错误，替换不兼容的 %N 日期用法
 
 CONFIG_FILE="qos_gargoyle"
 TEMP_FILES=""
@@ -22,9 +22,9 @@ escape_for_eval() {
 }
 
 # 清理输入字符串，只允许安全字符，防止命令注入
+# 允许的字符：字母、数字、下划线、冒号、斜杠、点、逗号、空格、减号
 sanitize_input() {
-    local input="$1"
-    echo "$input" | sed 's/[^][a-zA-Z0-9_:/., -]//g' 2>/dev/null || echo "$input" | tr -cd 'a-zA-Z0-9_:/., -'
+    echo "$1" | sed 's/[^a-zA-Z0-9_:/., -]//g'
 }
 
 # 统一日志函数，同时输出到系统日志和控制台
@@ -371,24 +371,21 @@ get_class_mark_for_rule() {
     fi
 }
 
-# 计算类别的标记值（哈希取模 7 后左移）
+# 计算类别的标记值（哈希取模 16 后左移）
 calculate_class_mark() {
     local class="$1"
-    local mask="$2"   # 未使用，保留以兼容旧调用
     local chain_type="$3"
-    
     local index=$(calculate_hash_index "$class")
-    # 确保index是正数且进行模运算 (1..7)
-    index=$(( (index % 7) + 1 ))
-    
+    index=$(( (index % 16) + 1 ))   # 模 16，得到 1..16
+
     local base_value=0
     [ "$chain_type" = "upload" ] && base_value=$((0x1))
-    [ "$chain_type" = "download" ] && base_value=$((0x100))
-    [ $base_value -eq 0 ] && { log "ERROR" "未知链类型: $chain_type"; echo ""; return; }
-    
+    [ "$chain_type" = "download" ] && base_value=$((0x10000))   # 2^16
+    [ $base_value -eq 0 ] && { log "ERROR" "未知链类型: $chain_type"; return; }
+
     local mark_value=$((base_value << (index - 1)))
-    # 确保mark_value在有效范围内且为正数
-    mark_value=$((mark_value & 0x7FFF))
+    # 确保标记值在 32 位内
+    mark_value=$((mark_value & 0xFFFFFFFF))
     printf "0x%X" "$mark_value"
 }
 
@@ -396,8 +393,14 @@ calculate_class_mark() {
 # 根据规则配置文件和实时获取的类优先级排序规则
 sort_rules_by_priority_fast() {
     local config_file="$1"
+    local temp_sort
     
-    local temp_sort="/tmp/qos_sort_$$_$(date +%s%N | md5sum | cut -c1-8)"
+    # 使用 mktemp 创建临时文件，避免依赖 date %N
+    temp_sort=$(mktemp /tmp/qos_sort_XXXXXX 2>/dev/null)
+    if [ -z "$temp_sort" ]; then
+        # 降级方案：使用 PID 和时间戳（秒）
+        temp_sort="/tmp/qos_sort_$$_$(date +%s | md5sum | cut -c1-8)"
+    fi
     [ -z "$temp_sort" ] && { log "ERROR" "无法创建排序临时文件"; return 1; }
     TEMP_FILES="$TEMP_FILES $temp_sort"
     
@@ -490,7 +493,6 @@ build_nft_rule_fast() {
             if [ "$min_val" -le "$max_val" ] 2>/dev/null; then
                 local min_bytes=$((min_val * 1024))
                 local max_bytes=$((max_val * 1024))
-                # 修正：移除 and，直接用空格连接两个 ct bytes 条件
                 nft_cmd="$nft_cmd ct bytes >= $min_bytes ct bytes <= $max_bytes"
             else
                 log "WARN" "规则 $rule_name 的 connbytes_kb 范围无效: $connbytes_kb_clean (最小值大于最大值)，忽略此条件"
@@ -560,9 +562,9 @@ apply_enhanced_direction_rules() {
         class_count=$((class_count + 1))
     done
     
-    # 类数量严格检查：标记空间最多支持7个类，超过则无法继续
-    if [ $class_count -gt 7 ]; then
-        log "ERROR" "方向 $direction 的启用类数量为 $class_count，超过7个，将导致标记冲突，启动中止！"
+    # 类数量严格检查：标记空间最多支持16个类，超过则无法继续
+    if [ $class_count -gt 16 ]; then
+        log "ERROR" "方向 $direction 的启用类数量为 $class_count，超过16个，将导致标记冲突，启动中止！"
         rm -f "$temp_config" 2>/dev/null
         return 1
     fi

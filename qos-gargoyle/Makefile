@@ -60,7 +60,7 @@ define Package/qos-gargoyle/install
 	$(INSTALL_DIR) $(1)/usr/lib/qos_gargoyle/
 	$(INSTALL_DIR) $(1)/usr/share/qos_gargoyle/
 	
-	$(INSTALL_BIN) $(CURDIR)/files/ifb0.init $(1)/etc/init.d/ifb0
+	$(INSTALL_BIN) $(CURDIR)/files/ifb.init $(1)/etc/init.d/ifb
 	$(INSTALL_BIN) $(CURDIR)/files/qos_gargoyle.init $(1)/etc/init.d/qos_gargoyle
 	$(INSTALL_BIN) $(CURDIR)/files/qos_gargoyle.hotplug $(1)/etc/hotplug.d/iface/99-qos_gargoyle
 	$(INSTALL_CONF) $(CURDIR)/files/qos_gargoyle.conf $(1)/etc/config/qos_gargoyle

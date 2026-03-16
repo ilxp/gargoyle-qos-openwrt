@@ -4,8 +4,8 @@
 # 基于v5.4，改进带宽转换正则表达式，增加极低带宽多队列提示
 
 # ========== 变量初始化 ==========
-: ${total_upload_bandwidth:=40000}
-: ${total_download_bandwidth:=95000}
+: ${total_upload_bandwidth:=50000}
+: ${total_download_bandwidth:=100000}
 : ${IFB_DEVICE:=ifb0}
 LOCK_DIR="/var/run/cake_qos.lock"
 LOCK_PID_FILE="$LOCK_DIR/pid"
@@ -109,7 +109,7 @@ check_already_running() {
     return 0
 }
 
-# ========== 带宽单位转换（改进正则以支持多字母单位）==========
+# ========== 带宽单位转换（改进正则以支持多字母单位，增强结果验证）==========
 convert_bandwidth_to_kbit() {
     local bw="$1"
     local num unit result
@@ -147,8 +147,8 @@ convert_bandwidth_to_kbit() {
                 ;;
         esac
 
-        # 检查结果是否为有效数字
-        if [ -z "$result" ] || [ "$result" -lt 0 ] 2>/dev/null; then
+        # 严格检查结果是否为有效的非负整数
+        if [ -z "$result" ] || ! echo "$result" | grep -qE '^[0-9]+$' || [ "$result" -lt 0 ] 2>/dev/null; then
             log_error "带宽转换结果无效: $result"
             return 1
         fi
@@ -865,17 +865,26 @@ show_cake_status() {
     return 0
 }
 
-# ========== 停止清理（增强：按配置删除IFB设备，增加锁保护）==========
+# ========== 停止清理（增强：按配置删除IFB设备，增加锁保护和重试）==========
 stop_cake_qos() {
     log_info "停止CAKE QoS"
 
-    # 尝试获取锁，但不强制；若无法获取锁，记录警告并继续清理
     local got_lock=false
-    if acquire_lock 2>/dev/null; then
-        got_lock=true
-        log_debug "停止时获取锁成功"
-    else
-        log_warn "无法获取锁，但将继续尝试清理（可能与其他进程冲突）"
+    local retry=3
+    while [ $retry -gt 0 ]; do
+        if acquire_lock 2>/dev/null; then
+            got_lock=true
+            log_debug "停止时获取锁成功"
+            break
+        else
+            retry=$((retry - 1))
+            [ $retry -gt 0 ] && sleep 1
+        fi
+    done
+
+    if ! $got_lock; then
+        log_error "无法获取锁，停止操作退出，请稍后重试"
+        return 1
     fi
 
     # 清理上传队列
@@ -966,11 +975,11 @@ initialize_cake_qos() {
             # 依赖检查
             check_dependencies || exit 1
             
-            # 幂等性检查
-            check_already_running || exit 1
-            
             # 获取锁
-            acquire_lock || { rm -f "$QOS_RUNNING_FILE"; exit 1; }
+            acquire_lock || exit 1
+            
+            # 幂等性检查（此时已在锁保护下）
+            check_already_running || { release_lock; exit 1; }
 
             # 重置运行时标志
             RUNTIME_SPLIT_GSO=0
@@ -1041,7 +1050,7 @@ initialize_cake_qos() {
             
         stop)
             log_info "停止CAKE QoS"
-            stop_cake_qos
+            stop_cake_qos || exit 1
             ;;
             
         restart)
