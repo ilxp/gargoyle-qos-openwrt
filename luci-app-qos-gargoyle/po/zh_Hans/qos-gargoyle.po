@@ -121,7 +121,10 @@ msgstr "优先级映射"
 msgid "DRR Quantum"
 msgstr "DRR量子"
 
-msgid "Target Delay(microseconds)"
+msgid "Rate to quantum ratio (recommended: 10)"
+msgstr "费率与数量比（建议：10）"
+
+msgid "Target Delay (microseconds)"
 msgstr "目标延迟（微秒）"
 
 msgid "Queue Length Limit"
@@ -133,7 +136,7 @@ msgstr "量子（字节）"
 msgid "Number of Flows"
 msgstr "流量数"
 
-msgid "Interval(microseconds)"
+msgid "Interval (microseconds)"
 msgstr "间隔（微秒）"
 
 msgid "Memory Llimit"
@@ -142,11 +145,30 @@ msgstr "内存限制"
 msgid "CE Threshold"
 msgstr "CE阈值"
 
+msgid "Threshold for CE marking (e.g., 1ms)"
+msgstr "CE标志的阈值（例如，1毫秒）"
+
+
 msgid "Queue Length Limit"
 msgstr "最小往返延时"
 
 msgid "DiffServ Mode"
 msgstr "DiffServ 模型"
+
+msgid "Flow Mode"
+msgstr "流量模式"
+
+msgid "Flow isolation mode"
+msgstr "流量隔离模式"
+
+msgid "Explicit Congestion Notification"
+msgstr "显式拥塞通知"
+
+msgid "Enable Multi-Queue"
+msgstr "启用多队列"
+
+msgid "Enable CAKE-MQ for multi-queue devices"
+msgstr "为多队列设备启用CAKE-MQ"
 
 msgid "NAT Support"
 msgstr "NAT 支持"
@@ -192,7 +214,6 @@ msgstr "动态带宽调整"
 
 msgid "Enable dynamic bandwidth adjustment based on network latency"
 msgstr "根据网络延迟启用动态带宽调整"
-
 
 msgid "Disable"
 msgstr "禁用"
@@ -348,7 +369,14 @@ msgid "Max Packet"
 msgstr "最大数据包"
 
 msgid "Minimize RTT"
-msgstr "最小往返延时"
+msgstr "启用最小往返延迟"
+
+msgid "minRTT Delay"
+msgstr "最小往返延迟参数"
+
+msgid "Delay parameter for minRTT mode (e.g., 1000us, 10ms)"
+msgstr "minRTT模式的延迟参数（例如，1000微秒、10毫秒）"
+
 
 msgid "Min bandwidth(%)"
 msgstr "最小带宽(百分比)"
@@ -490,6 +518,12 @@ msgid ""
 msgstr ""
 "设置为你实际可用下载带宽的 95% 左右。应当在 QoS 关闭的情况下使用"
 "测速程序以确定可用的实际下载带宽，以 kbps 为单位，1M=1000kbps。"
+
+msgid "IFB Device"
+msgstr "IFB 设备"
+
+msgid "Select or enter the IFB (Intermediate Functional Block) device used for ingress shaping. Typically ifb0."
+msgstr "选择或输入用于入口的IFB设备。通常为ifb0。"
 
 msgid "The minimum percentage of bandwidth that can be allocated to this service type."
 msgstr "该服务类型可被分配的带宽最小百分比。"

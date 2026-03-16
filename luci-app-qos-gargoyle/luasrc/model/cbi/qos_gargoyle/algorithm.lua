@@ -311,11 +311,6 @@ elseif current_algo == "cake" then
 	flowmode.default = "srchost"
 	flowmode.rmempty = false
 
-	local limit = s_cake:option(Value, "limit", translate("Queue Limit (packets)"))
-	limit.default = "10240"
-	limit.datatype = "uinteger"
-	limit.rmempty = false
-
 	local ecn = s_cake:option(ListValue, "ecn", translate("ECN"))
 	ecn:value("1", translate("Enable"))
 	ecn:value("0", translate("Disable"))
