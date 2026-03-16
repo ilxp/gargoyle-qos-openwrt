@@ -310,9 +310,9 @@ load_algorithm_module() {
         "htb_fqcodel") module="$HTB_MODULE" ;;
     
         *)
-            echo "Unknown algorithm: $algo, using hfsc_cake as default"
+            echo "Unknown algorithm: $algo, using htb_cake as default"
             module="$HFSC_CAKE_MODULE"
-            algo="hfsc_cake"
+            algo="htb_cake"
             ;;
     esac
     
@@ -324,11 +324,11 @@ load_algorithm_module() {
         return 0
     else
         echo "Error: Algorithm module not found: $module"
-        # 尝试加载 HFSC_CAKE 作为默认
-        if [ -f "$HFSC_CAKE_MODULE" ] && [ "$algo" != "hfsc_cake" ]; then
-            . "$HFSC_CAKE_MODULE"
-            algorithm="hfsc_cake"
-            echo "Falling back to HFSC_CAKE module"
+        # 尝试加载 HTB_CAKE 作为默认
+        if [ -f "$HTB_CAKE_MODULE" ] && [ "$algo" != "htb_cake" ]; then
+            . "$HTB_CAKE_MODULE"
+            algorithm="htb_cake"
+            echo "Falling back to HTB_CAKE module"
             return 0
         else
             return 1
@@ -344,7 +344,7 @@ load_qos_config() {
     echo "尝试读取 UCI 配置..." >&2
     while [ $retries -gt 0 ]; do
         algorithm=$(uci -q get "$CONFIG_FILE.global.algorithm")
-        algorithm="${algorithm:-hfsc_cake}"          # 默认算法为 hfsc_cake
+        algorithm="${algorithm:-htb_cake}"          # 默认算法为 htb_cake
         
         total_upload_bandwidth=$(uci -q get "$CONFIG_FILE.upload.total_bandwidth")
         total_download_bandwidth=$(uci -q get "$CONFIG_FILE.download.total_bandwidth")

@@ -64,7 +64,7 @@ o:value("htb_cake", "HTB+CAKE (HTB With CAKE)")
 o:value("cake", "CAKE (Common Applications Kept Enhanced)")
 o:value("hfsc_fqcodel", "HFSC+Fq_Codel (HFSC With Fq_Codel)")
 o:value("htb_fqcodel", "HTB+Fq_Codel (HTB With Fq_Codel)")
-o.default = "hfsc_cake"
+o.default = "htb_cake"
 
 -- 链路类型
 o = s:option(ListValue, "linklayer", translate("Linklayer Type"), translate("Select linkelayer type"))
