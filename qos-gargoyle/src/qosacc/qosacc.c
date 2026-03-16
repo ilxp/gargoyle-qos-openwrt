@@ -84,6 +84,7 @@
 #define TC_OP_RETRY_COUNT 3      /* TC操作重试次数 */
 #define TC_OP_RETRY_DELAY_MS 100 /* TC操作重试间隔 */
 #define MAX_CLASSES 30            /* 最大类数量 */
+#define ICMP_DATA_SIZE 56   // 标准 ping 数据长度（含时间戳）
 
 #define MIN_PING_INTERVAL 100
 #define MAX_PING_INTERVAL 5000
@@ -780,29 +781,43 @@ int ping_manager_send(ping_manager_t* pm) {
     qosacc_context_t* ctx = pm->ctx;
     if (ctx->ping_socket < 0) return QACC_ERR_SOCKET;
     int cc = 0;
+
     if (ctx->target_addr.ss_family == AF_INET6) {
         struct icmp6_hdr* icp6 = (struct icmp6_hdr*)pm->packet;
         icp6->icmp6_type = ICMP6_ECHO_REQUEST;
         icp6->icmp6_code = 0;
         icp6->icmp6_id = htons(ctx->ident);
         icp6->icmp6_seq = htons(ctx->ntransmitted);
+
+        // 数据部分：时间戳 + 填充
         struct timeval* tv = (struct timeval*)(pm->packet + sizeof(struct icmp6_hdr));
         gettimeofday(tv, NULL);
-        cc = sizeof(struct icmp6_hdr) + sizeof(struct timeval);
-        // 不添加额外填充
+        char *data = (char*)tv;
+        for (int i = sizeof(struct timeval); i < ICMP_DATA_SIZE; i++) {
+            data[i] = i & 0xFF;
+        }
+
+        cc = sizeof(struct icmp6_hdr) + ICMP_DATA_SIZE;  // 总长度
         icp6->icmp6_cksum = 0;  // 内核自动填充
     } else {
         struct icmp* icp = (struct icmp*)pm->packet;
         icp->icmp_type = ICMP_ECHO;
         icp->icmp_code = 0;
-        icp->icmp_id = ctx->ident;
-        icp->icmp_seq = ctx->ntransmitted;
-        struct timeval* tv = (struct timeval*)(pm->packet + 8);
+        icp->icmp_id = htons(ctx->ident);          // 网络字节序
+        icp->icmp_seq = htons(ctx->ntransmitted);  // 网络字节序
+
+        // 数据部分：时间戳 + 填充
+        struct timeval* tv = (struct timeval*)icp->icmp_data;
         gettimeofday(tv, NULL);
-        cc = 8 + sizeof(struct timeval);
-        // 不添加额外填充
+        char *data = (char*)icp->icmp_data;
+        for (int i = sizeof(struct timeval); i < ICMP_DATA_SIZE; i++) {
+            data[i] = i & 0xFF;
+        }
+
+        cc = 8 + ICMP_DATA_SIZE;  // ICMP头8字节 + 数据56字节 = 64
         icp->icmp_cksum = icmp_checksum(icp, cc);
     }
+
     ctx->ntransmitted++;
     int ret = sendto(ctx->ping_socket, pm->packet, cc, 0,
                      (struct sockaddr*)&ctx->target_addr, ctx->target_addr_len);
@@ -811,9 +826,11 @@ int ping_manager_send(ping_manager_t* pm) {
         return QACC_ERR_SOCKET;
     }
     ctx->last_ping_time_ms = qosacc_time_ms();
-    qosacc_log(ctx, QACC_LOG_INFO, "成功发送ping seq=%d, ident=%d, 长度=%d\n", ctx->ntransmitted-1, ctx->ident, cc);
+    qosacc_log(ctx, QACC_LOG_INFO, "成功发送ping seq=%d, ident=%d, 长度=%d\n",
+               ctx->ntransmitted-1, ctx->ident, cc);
     return QACC_OK;
 }
+
 
 int ping_manager_receive(ping_manager_t* pm) {
     qosacc_context_t* ctx = pm->ctx;
@@ -839,6 +856,7 @@ int ping_manager_receive(ping_manager_t* pm) {
     int hlen, triptime = 0;
     uint16_t seq = 0;
     gettimeofday(&tv, NULL);
+
     if (from.ss_family == AF_INET6) {
         if (cc < (int)sizeof(struct icmp6_hdr)) {
             qosacc_log(ctx, QACC_LOG_WARN, "IPv6包太短，丢弃\n");
@@ -856,8 +874,8 @@ int ping_manager_receive(ping_manager_t* pm) {
         }
         // 由于设置了 IPV6_CHECKSUM，内核已处理校验和，无需手动检查
         seq = ntohs(icp6->icmp6_seq);
-        if (cc >= 8 + (int)sizeof(struct timeval))
-            tp = (struct timeval*)&icp6->icmp6_dataun.icmp6_un_data32[1];
+        if (cc >= (int)(sizeof(struct icmp6_hdr) + sizeof(struct timeval)))
+            tp = (struct timeval*)(buf + sizeof(struct icmp6_hdr));
     } else {
         ip = (struct ip*)buf;
         hlen = ip->ip_hl << 2;
@@ -870,28 +888,39 @@ int ping_manager_receive(ping_manager_t* pm) {
             qosacc_log(ctx, QACC_LOG_DEBUG, "忽略非ECHOREPLY IPv4包 type=%d\n", icp->icmp_type);
             return 0;
         }
-        if (icp->icmp_id != ctx->ident) {
-            qosacc_log(ctx, QACC_LOG_DEBUG, "忽略IPv4包：ident不匹配 (期待 %d, 收到 %d)\n", ctx->ident, icp->icmp_id);
+
+        // ========== 关键修复：转换网络字节序 ==========
+        uint16_t rcv_id = ntohs(icp->icmp_id);
+        if (rcv_id != ctx->ident) {
+            qosacc_log(ctx, QACC_LOG_DEBUG, "忽略IPv4包：ident不匹配 (期待 %d, 收到 %d)\n", ctx->ident, rcv_id);
             return 0;
         }
+
+        // 校验和验证（使用原始包中的校验和，计算前清零）
         uint16_t saved = icp->icmp_cksum;
         icp->icmp_cksum = 0;
         uint16_t calc = icmp_checksum(icp, cc - hlen);
         if (saved != calc) {
-            qosacc_log(ctx, QACC_LOG_WARN, "ICMP校验和不匹配，丢弃包 (seq=%d)\n", icp->icmp_seq);
+            // 注意：打印 seq 时也需转换
+            qosacc_log(ctx, QACC_LOG_WARN, "ICMP校验和不匹配，丢弃包 (seq=%d)\n", ntohs(icp->icmp_seq));
             return 0;
         }
-        seq = icp->icmp_seq;
+        // 恢复校验和（非必须，但可保持缓冲区原样）
+        icp->icmp_cksum = saved;
+
+        seq = ntohs(icp->icmp_seq);  // 转换序列号
         if (cc >= hlen + 8 + (int)sizeof(struct timeval))
             tp = (struct timeval*)&icp->icmp_data[0];
     }
-    // 修复：允许接收已发送窗口内的包，正确处理16位序号回绕
+
+    // 序号窗口检查（seq 已转为主机序）
     uint16_t expected = (uint16_t)(ctx->ntransmitted);
     uint16_t diff = (expected - seq) & 0xFFFF;
     if (diff == 0 || diff > PING_HISTORY_SIZE * 2) {
         qosacc_log(ctx, QACC_LOG_DEBUG, "忽略包：seq=%d 超出窗口 (当前发送=%d, diff=%u)\n", seq, ctx->ntransmitted, diff);
         return 0;
     }
+
     ctx->nreceived++;
     if (tp) {
         triptime = tv.tv_sec - tp->tv_sec;
@@ -899,20 +928,22 @@ int ping_manager_receive(ping_manager_t* pm) {
     }
     if (triptime < MIN_PING_TIME_MS) triptime = MIN_PING_TIME_MS;
     if (triptime > MAX_PING_TIME_MS) triptime = MAX_PING_TIME_MS;
+
     ctx->raw_ping_time_us = triptime * 1000;
     if (ctx->raw_ping_time_us > ctx->max_ping_time_us)
         ctx->max_ping_time_us = ctx->raw_ping_time_us;
+
+    // 更新历史平滑值
     ping_history_t* hist = &ctx->ping_history;
-    if (hist->count < PING_HISTORY_SIZE)
-        hist->times[hist->index] = ctx->raw_ping_time_us;
-    else
-        hist->times[hist->index] = ctx->raw_ping_time_us;
+    hist->times[hist->index] = ctx->raw_ping_time_us;
     hist->index = (hist->index + 1) % PING_HISTORY_SIZE;
     if (hist->count < PING_HISTORY_SIZE) hist->count++;
+
     if (hist->count == 1)
         hist->smoothed = ctx->raw_ping_time_us;
     else
         hist->smoothed = hist->smoothed * (1.0 - ctx->config.smoothing_factor) + ctx->raw_ping_time_us * ctx->config.smoothing_factor;
+
     ctx->filtered_ping_time_us = (int64_t)hist->smoothed;
     qosacc_log(ctx, QACC_LOG_INFO, "收到ping seq=%d, 时间=%dms, 平滑=%ldms\n", seq, triptime, ctx->filtered_ping_time_us / 1000);
     return 1;
