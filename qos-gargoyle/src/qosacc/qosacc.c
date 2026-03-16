@@ -1313,8 +1313,9 @@ static int update_class_cb(struct nlmsghdr *n, void *arg) {
 
     __u64 bytes = 0;
     if (tb[TCA_STATS2]) {
-        struct tc_stats2 *st2 = RTA_DATA(tb[TCA_STATS2]);
-        bytes = st2->stats.bytes;
+        // 修复：直接使用 struct tc_stats *，避免依赖未定义的 struct tc_stats2
+        struct tc_stats *st = (struct tc_stats *)RTA_DATA(tb[TCA_STATS2]);
+        bytes = st->bytes;
     } else if (tb[TCA_STATS]) {
         struct tc_stats *st = RTA_DATA(tb[TCA_STATS]);
         bytes = st->bytes;
