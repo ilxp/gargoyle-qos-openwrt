@@ -57,10 +57,10 @@
 #endif
 
 /* ==================== 宏定义 ==================== */
-#define QMON_LOG_ERROR 0
-#define QMON_LOG_WARN  1
-#define QMON_LOG_INFO  2
-#define QMON_LOG_DEBUG 3
+#define QACC_LOG_ERROR 0
+#define QACC_LOG_WARN  1
+#define QACC_LOG_INFO  2
+#define QACC_LOG_DEBUG 3
 #define MAX_PACKET_SIZE 4096
 #define PING_HISTORY_SIZE 10
 #define MIN_PING_TIME_MS 1
@@ -120,15 +120,15 @@
 
 /* ==================== 返回码 ==================== */
 typedef enum {
-    QMON_OK = 0,
-    QMON_ERR_MEMORY = -1,
-    QMON_ERR_SOCKET = -2,
-    QMON_ERR_FILE = -3,
-    QMON_ERR_CONFIG = -4,
-    QMON_ERR_SYSTEM = -5,
-    QMON_ERR_SIGNAL = -6,
-    QMON_ERR_TIMEOUT = -7,
-    QMON_HELP_REQUESTED = -99
+    QACC_OK = 0,
+    QACC_ERR_MEMORY = -1,
+    QACC_ERR_SOCKET = -2,
+    QACC_ERR_FILE = -3,
+    QACC_ERR_CONFIG = -4,
+    QACC_ERR_SYSTEM = -5,
+    QACC_ERR_SIGNAL = -6,
+    QACC_ERR_TIMEOUT = -7,
+    QACC_HELP_REQUESTED = -99
 } qosacc_result_t;
 
 /* ==================== 配置结构 ==================== */
@@ -165,22 +165,22 @@ typedef struct {
 
 /* ==================== 状态枚举 ==================== */
 typedef enum {
-    QMON_CHK,
-    QMON_INIT,
-    QMON_IDLE,
-    QMON_ACTIVE,
-    QMON_REALTIME,
-    QMON_EXIT
+    QACC_CHK,
+    QACC_INIT,
+    QACC_IDLE,
+    QACC_ACTIVE,
+    QACC_REALTIME,
+    QACC_EXIT
 } qosacc_state_t;
 
 /* 状态名称，用于输出到状态文件 */
 static const char *state_names[] = {
-    [QMON_CHK] = "CHK",
-    [QMON_INIT] = "INIT",
-    [QMON_IDLE] = "IDLE",
-    [QMON_ACTIVE] = "ACTIVE",
-    [QMON_REALTIME] = "REALTIME",
-    [QMON_EXIT] = "EXIT"
+    [QACC_CHK] = "CHK",
+    [QACC_INIT] = "INIT",
+    [QACC_IDLE] = "IDLE",
+    [QACC_ACTIVE] = "ACTIVE",
+    [QACC_REALTIME] = "REALTIME",
+    [QACC_EXIT] = "EXIT"
 };
 
 /* ==================== 类统计结构 ==================== */
@@ -405,7 +405,7 @@ int resolve_target(const char* target, struct sockaddr_storage* addr, socklen_t*
     int ret = getaddrinfo(target, NULL, &hints, &result);
     if (ret != 0) {
         snprintf(error, error_len, "无法解析地址 %s: %s", target, gai_strerror(ret));
-        return QMON_ERR_SYSTEM;
+        return QACC_ERR_SYSTEM;
     }
     if (result->ai_family == AF_INET) {
         struct sockaddr_in* sin = (struct sockaddr_in*)result->ai_addr;
@@ -418,16 +418,16 @@ int resolve_target(const char* target, struct sockaddr_storage* addr, socklen_t*
     } else {
         snprintf(error, error_len, "不支持的地址族: %d", result->ai_family);
         freeaddrinfo(result);
-        return QMON_ERR_SYSTEM;
+        return QACC_ERR_SYSTEM;
     }
     freeaddrinfo(result);
-    return QMON_OK;
+    return QACC_OK;
 }
 
 /* ==================== 日志系统 ==================== */
 void qosacc_log(qosacc_context_t* ctx, int level, const char* format, ...) {
     if (!ctx) return;
-    if (!ctx->config.verbose && level > QMON_LOG_INFO) return;
+    if (!ctx->config.verbose && level > QACC_LOG_INFO) return;
     static int64_t last_log_time = 0;
     static char cached_time_str[32] = {0};
     int64_t now_ms = qosacc_time_ms();
@@ -445,30 +445,30 @@ void qosacc_log(qosacc_context_t* ctx, int level, const char* format, ...) {
     if (ctx->config.background_mode) {
         int syslog_level = LOG_INFO;
         switch (level) {
-            case QMON_LOG_ERROR: syslog_level = LOG_ERR; break;
-            case QMON_LOG_WARN:  syslog_level = LOG_WARNING; break;
-            case QMON_LOG_INFO:  syslog_level = LOG_INFO; break;
-            case QMON_LOG_DEBUG: syslog_level = LOG_DEBUG; break;
+            case QACC_LOG_ERROR: syslog_level = LOG_ERR; break;
+            case QACC_LOG_WARN:  syslog_level = LOG_WARNING; break;
+            case QACC_LOG_INFO:  syslog_level = LOG_INFO; break;
+            case QACC_LOG_DEBUG: syslog_level = LOG_DEBUG; break;
         }
         syslog(syslog_level, "%s", buffer);
     } else {
         const char* level_str = "UNKNOWN";
         switch (level) {
-            case QMON_LOG_ERROR: level_str = "ERROR"; break;
-            case QMON_LOG_WARN:  level_str = "WARN"; break;
-            case QMON_LOG_INFO:  level_str = "INFO"; break;
-            case QMON_LOG_DEBUG: level_str = "DEBUG"; break;
+            case QACC_LOG_ERROR: level_str = "ERROR"; break;
+            case QACC_LOG_WARN:  level_str = "WARN"; break;
+            case QACC_LOG_INFO:  level_str = "INFO"; break;
+            case QACC_LOG_DEBUG: level_str = "DEBUG"; break;
         }
-        if (ctx->config.verbose || level <= QMON_LOG_INFO)
+        if (ctx->config.verbose || level <= QACC_LOG_INFO)
             fprintf(stderr, "[%s] [%s] %s", cached_time_str, level_str, buffer);
     }
-    if (ctx->debug_log_file && (ctx->config.verbose || level <= QMON_LOG_INFO)) {
+    if (ctx->debug_log_file && (ctx->config.verbose || level <= QACC_LOG_INFO)) {
         const char* level_str = "UNKNOWN";
         switch (level) {
-            case QMON_LOG_ERROR: level_str = "ERROR"; break;
-            case QMON_LOG_WARN:  level_str = "WARN"; break;
-            case QMON_LOG_INFO:  level_str = "INFO"; break;
-            case QMON_LOG_DEBUG: level_str = "DEBUG"; break;
+            case QACC_LOG_ERROR: level_str = "ERROR"; break;
+            case QACC_LOG_WARN:  level_str = "WARN"; break;
+            case QACC_LOG_INFO:  level_str = "INFO"; break;
+            case QACC_LOG_DEBUG: level_str = "DEBUG"; break;
         }
         fprintf(ctx->debug_log_file, "[%s] [%s] %s", cached_time_str, level_str, buffer);
         fflush(ctx->debug_log_file);
@@ -543,7 +543,7 @@ static int qosacc_config_parse_file(qosacc_config_t* cfg, const char* config_fil
     FILE* fp = fopen(config_file, "r");
     if (!fp) {
         fprintf(stderr, "错误：配置文件'%s'无法打开: %s\n", config_file, strerror(errno));
-        return QMON_ERR_FILE;
+        return QACC_ERR_FILE;
     }
     char line[256];
     int in_device_section = 0;
@@ -620,7 +620,7 @@ static int qosacc_config_parse_file(qosacc_config_t* cfg, const char* config_fil
                     if (version < MIN_CONFIG_VERSION || version > MAX_CONFIG_VERSION) {
                         fprintf(stderr, "配置版本不兼容: %d (支持 %d-%d)\n", version, MIN_CONFIG_VERSION, MAX_CONFIG_VERSION);
                         fclose(fp);
-                        return QMON_ERR_CONFIG;
+                        return QACC_ERR_CONFIG;
                     }
                 }
             }
@@ -628,13 +628,13 @@ static int qosacc_config_parse_file(qosacc_config_t* cfg, const char* config_fil
     }
     fclose(fp);
     if (!cfg->enabled) fprintf(stderr, "警告：未找到设备 '%s' 的启用配置。\n", cfg->device);
-    return QMON_OK;
+    return QACC_OK;
 }
 
 int qosacc_config_parse(qosacc_config_t* cfg, int argc, char* argv[]) {
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "-help") == 0 || strcmp(argv[i], "--help") == 0)
-            return QMON_HELP_REQUESTED;
+            return QACC_HELP_REQUESTED;
     }
     qosacc_config_init(cfg);
     int config_file_provided = 0;
@@ -643,7 +643,7 @@ int qosacc_config_parse(qosacc_config_t* cfg, int argc, char* argv[]) {
             char* config_file = argv[++i];
             strncpy(cfg->config_file, config_file, sizeof(cfg->config_file)-1);
             int ret = qosacc_config_parse_file(cfg, config_file);
-            if (ret != QMON_OK) return ret;
+            if (ret != QACC_OK) return ret;
             config_file_provided = 1;
             break;
         }
@@ -672,53 +672,53 @@ int qosacc_config_parse(qosacc_config_t* cfg, int argc, char* argv[]) {
     }
     // 将 check_interval 从秒转为毫秒，用于后续超时计算
     cfg->check_interval *= 1000;
-    return QMON_OK;
+    return QACC_OK;
 }
 
 int qosacc_config_validate(qosacc_config_t* cfg, int argc, char* argv[], char* error, int error_len) {
-    if (argc == 1) { snprintf(error, error_len, "未提供任何参数"); return QMON_ERR_CONFIG; }
-    if (!cfg->enabled) { snprintf(error, error_len, "设备 '%s' 未启用", cfg->device); return QMON_ERR_CONFIG; }
+    if (argc == 1) { snprintf(error, error_len, "未提供任何参数"); return QACC_ERR_CONFIG; }
+    if (!cfg->enabled) { snprintf(error, error_len, "设备 '%s' 未启用", cfg->device); return QACC_ERR_CONFIG; }
     if (cfg->ping_interval < MIN_PING_INTERVAL || cfg->ping_interval > MAX_PING_INTERVAL) {
         snprintf(error, error_len, "ping间隔 %d 超出范围 [%d,%d]", cfg->ping_interval, MIN_PING_INTERVAL, MAX_PING_INTERVAL);
-        return QMON_ERR_CONFIG;
+        return QACC_ERR_CONFIG;
     }
     if (cfg->max_bandwidth_kbps < MIN_BANDWIDTH_KBPS || cfg->max_bandwidth_kbps > MAX_BANDWIDTH_KBPS) {
         snprintf(error, error_len, "最大带宽 %d 超出范围 [%d,%d] kbps", cfg->max_bandwidth_kbps, MIN_BANDWIDTH_KBPS, MAX_BANDWIDTH_KBPS);
-        return QMON_ERR_CONFIG;
+        return QACC_ERR_CONFIG;
     }
     if (cfg->ping_limit_ms < MIN_PING_LIMIT_MS || cfg->ping_limit_ms > MAX_PING_LIMIT_MS) {
         snprintf(error, error_len, "ping限制 %d 超出范围 [%d,%d] ms", cfg->ping_limit_ms, MIN_PING_LIMIT_MS, MAX_PING_LIMIT_MS);
-        return QMON_ERR_CONFIG;
+        return QACC_ERR_CONFIG;
     }
     if (cfg->realtime_ping_limit_ms != 0 && (cfg->realtime_ping_limit_ms < MIN_PING_LIMIT_MS || cfg->realtime_ping_limit_ms > MAX_PING_LIMIT_MS)) {
         snprintf(error, error_len, "实时ping限制 %d 超出范围 [%d,%d] ms", cfg->realtime_ping_limit_ms, MIN_PING_LIMIT_MS, MAX_PING_LIMIT_MS);
-        return QMON_ERR_CONFIG;
+        return QACC_ERR_CONFIG;
     }
-    if (strlen(cfg->target) == 0) { snprintf(error, error_len, "目标地址不能为空"); return QMON_ERR_CONFIG; }
-    if (strlen(cfg->device) == 0) { snprintf(error, error_len, "设备名不能为空"); return QMON_ERR_CONFIG; }
+    if (strlen(cfg->target) == 0) { snprintf(error, error_len, "目标地址不能为空"); return QACC_ERR_CONFIG; }
+    if (strlen(cfg->device) == 0) { snprintf(error, error_len, "设备名不能为空"); return QACC_ERR_CONFIG; }
     if (cfg->min_bw_ratio < MIN_BW_RATIO || cfg->min_bw_ratio > MAX_BW_RATIO_MAX) {
         snprintf(error, error_len, "最小带宽比例 %.2f 超出范围 [%.2f,%.2f]", cfg->min_bw_ratio, MIN_BW_RATIO, MAX_BW_RATIO_MAX);
-        return QMON_ERR_CONFIG;
+        return QACC_ERR_CONFIG;
     }
     if (cfg->max_bw_ratio < MIN_BW_RATIO || cfg->max_bw_ratio > MAX_BW_RATIO_MAX) {
         snprintf(error, error_len, "最大带宽比例 %.2f 超出范围 [%.2f,%.2f]", cfg->max_bw_ratio, MIN_BW_RATIO, MAX_BW_RATIO_MAX);
-        return QMON_ERR_CONFIG;
+        return QACC_ERR_CONFIG;
     }
     if (cfg->smoothing_factor < SMOOTHING_FACTOR_MIN - EPSILON || cfg->smoothing_factor > SMOOTHING_FACTOR_MAX + EPSILON) {
         snprintf(error, error_len, "平滑因子 %.2f 超出范围 [%.1f,%.1f]", cfg->smoothing_factor, SMOOTHING_FACTOR_MIN, SMOOTHING_FACTOR_MAX);
-        return QMON_ERR_CONFIG;
+        return QACC_ERR_CONFIG;
     }
     float min_bw_kbps = cfg->max_bandwidth_kbps * cfg->min_bw_ratio;
     if (min_bw_kbps < MIN_BANDWIDTH_KBPS - EPSILON) {
         snprintf(error, error_len, "最小带宽 %.1f kbps 低于允许的最小值 %d kbps，请调整 min_bw_ratio", min_bw_kbps, MIN_BANDWIDTH_KBPS);
-        return QMON_ERR_CONFIG;
+        return QACC_ERR_CONFIG;
     }
     // 检查 root_classid 格式有效性
     if (parse_classid(cfg->root_classid) == 0) {
         snprintf(error, error_len, "无效的根类ID格式: %s (应为类似 1:1 或 0x1:0x1)", cfg->root_classid);
-        return QMON_ERR_CONFIG;
+        return QACC_ERR_CONFIG;
     }
-    return QMON_OK;
+    return QACC_OK;
 }
 
 /* ==================== Ping管理器 ==================== */
@@ -736,15 +736,15 @@ int ping_manager_init(ping_manager_t* pm, qosacc_context_t* ctx) {
     else if (af == AF_INET6)
         protocol = IPPROTO_ICMPV6;
     else {
-        qosacc_log(ctx, QMON_LOG_ERROR, "未知地址族 %d\n", af);
-        return QMON_ERR_SOCKET;
+        qosacc_log(ctx, QACC_LOG_ERROR, "未知地址族 %d\n", af);
+        return QACC_ERR_SOCKET;
     }
 
     ctx->ping_socket = socket(af, SOCK_RAW, protocol);
     if (ctx->ping_socket < 0) {
-        qosacc_log(ctx, QMON_LOG_ERROR, "创建ping套接字失败: %s\n", strerror(errno));
+        qosacc_log(ctx, QACC_LOG_ERROR, "创建ping套接字失败: %s\n", strerror(errno));
         ctx->ping_socket = -1;
-        return QMON_ERR_SOCKET;
+        return QACC_ERR_SOCKET;
     }
 
     int ttl = 64;
@@ -761,24 +761,24 @@ int ping_manager_init(ping_manager_t* pm, qosacc_context_t* ctx) {
     // 绑定套接字到指定设备
     if (setsockopt(ctx->ping_socket, SOL_SOCKET, SO_BINDTODEVICE,
                    ctx->config.device, strlen(ctx->config.device)) < 0) {
-        qosacc_log(ctx, QMON_LOG_WARN, "绑定设备失败: %s\n", strerror(errno));
+        qosacc_log(ctx, QACC_LOG_WARN, "绑定设备失败: %s\n", strerror(errno));
     } else {
-        qosacc_log(ctx, QMON_LOG_INFO, "成功绑定套接字到设备 %s\n", ctx->config.device);
+        qosacc_log(ctx, QACC_LOG_INFO, "成功绑定套接字到设备 %s\n", ctx->config.device);
     }
 
     // 对于IPv6，设置内核自动填充校验和
     if (af == AF_INET6) {
         int offset = 2; // ICMPv6校验和字段在头部偏移2字节
         if (setsockopt(ctx->ping_socket, IPPROTO_IPV6, IPV6_CHECKSUM, &offset, sizeof(offset)) < 0) {
-            qosacc_log(ctx, QMON_LOG_WARN, "设置IPV6_CHECKSUM失败: %s\n", strerror(errno));
+            qosacc_log(ctx, QACC_LOG_WARN, "设置IPV6_CHECKSUM失败: %s\n", strerror(errno));
         }
     }
-    return QMON_OK;
+    return QACC_OK;
 }
 
 int ping_manager_send(ping_manager_t* pm) {
     qosacc_context_t* ctx = pm->ctx;
-    if (ctx->ping_socket < 0) return QMON_ERR_SOCKET;
+    if (ctx->ping_socket < 0) return QACC_ERR_SOCKET;
     int cc = 0;
     if (ctx->target_addr.ss_family == AF_INET6) {
         struct icmp6_hdr* icp6 = (struct icmp6_hdr*)pm->packet;
@@ -788,10 +788,9 @@ int ping_manager_send(ping_manager_t* pm) {
         icp6->icmp6_seq = htons(ctx->ntransmitted);
         struct timeval* tv = (struct timeval*)(pm->packet + sizeof(struct icmp6_hdr));
         gettimeofday(tv, NULL);
-        cc = 8 + sizeof(struct timeval);
-        for (int i = 8; i < cc; i++) pm->packet[8 + sizeof(struct icmp6_hdr) + i] = i;
-        // 校验和由内核自动填充（因设置了IPV6_CHECKSUM）
-        icp6->icmp6_cksum = 0;
+        cc = sizeof(struct icmp6_hdr) + sizeof(struct timeval);
+        // 不添加额外填充
+        icp6->icmp6_cksum = 0;  // 内核自动填充
     } else {
         struct icmp* icp = (struct icmp*)pm->packet;
         icp->icmp_type = ICMP_ECHO;
@@ -801,18 +800,19 @@ int ping_manager_send(ping_manager_t* pm) {
         struct timeval* tv = (struct timeval*)(pm->packet + 8);
         gettimeofday(tv, NULL);
         cc = 8 + sizeof(struct timeval);
-        for (int i = 8; i < cc; i++) pm->packet[8 + sizeof(struct timeval) + i] = i;
+        // 不添加额外填充
         icp->icmp_cksum = icmp_checksum(icp, cc);
     }
     ctx->ntransmitted++;
-    int ret = sendto(ctx->ping_socket, pm->packet, cc, 0, (struct sockaddr*)&ctx->target_addr, ctx->target_addr_len);
+    int ret = sendto(ctx->ping_socket, pm->packet, cc, 0,
+                     (struct sockaddr*)&ctx->target_addr, ctx->target_addr_len);
     if (ret < 0) {
-        qosacc_log(ctx, QMON_LOG_ERROR, "发送ping失败: %s (errno=%d)\n", strerror(errno), errno);
-        return QMON_ERR_SOCKET;
+        qosacc_log(ctx, QACC_LOG_ERROR, "发送ping失败: %s (errno=%d)\n", strerror(errno), errno);
+        return QACC_ERR_SOCKET;
     }
     ctx->last_ping_time_ms = qosacc_time_ms();
-    qosacc_log(ctx, QMON_LOG_INFO, "成功发送ping seq=%d, ident=%d, 长度=%d\n", ctx->ntransmitted-1, ctx->ident, cc);
-    return QMON_OK;
+    qosacc_log(ctx, QACC_LOG_INFO, "成功发送ping seq=%d, ident=%d, 长度=%d\n", ctx->ntransmitted-1, ctx->ident, cc);
+    return QACC_OK;
 }
 
 int ping_manager_receive(ping_manager_t* pm) {
@@ -823,13 +823,13 @@ int ping_manager_receive(ping_manager_t* pm) {
     int cc = recvfrom(ctx->ping_socket, buf, sizeof(buf), 0, (struct sockaddr*)&from, &fromlen);
     if (cc < 0) {
         if (errno == EAGAIN || errno == EWOULDBLOCK) {
-            qosacc_log(ctx, QMON_LOG_DEBUG, "recvfrom返回EAGAIN，无数据\n");
+            qosacc_log(ctx, QACC_LOG_DEBUG, "recvfrom返回EAGAIN，无数据\n");
             return 0;
         }
-        qosacc_log(ctx, QMON_LOG_ERROR, "接收ping失败: %s (errno=%d)\n", strerror(errno), errno);
-        return QMON_ERR_SOCKET;
+        qosacc_log(ctx, QACC_LOG_ERROR, "接收ping失败: %s (errno=%d)\n", strerror(errno), errno);
+        return QACC_ERR_SOCKET;
     }
-    qosacc_log(ctx, QMON_LOG_INFO, "接收到 %d 字节，来自 %s\n", cc,
+    qosacc_log(ctx, QACC_LOG_INFO, "接收到 %d 字节，来自 %s\n", cc,
                from.ss_family == AF_INET ? "IPv4" : "IPv6");
 
     struct ip* ip = NULL;
@@ -841,17 +841,17 @@ int ping_manager_receive(ping_manager_t* pm) {
     gettimeofday(&tv, NULL);
     if (from.ss_family == AF_INET6) {
         if (cc < (int)sizeof(struct icmp6_hdr)) {
-            qosacc_log(ctx, QMON_LOG_WARN, "IPv6包太短，丢弃\n");
+            qosacc_log(ctx, QACC_LOG_WARN, "IPv6包太短，丢弃\n");
             return 0;
         }
         icp6 = (struct icmp6_hdr*)buf;
         if (icp6->icmp6_type != ICMP6_ECHO_REPLY) {
-            qosacc_log(ctx, QMON_LOG_DEBUG, "忽略非ECHO_REPLY IPv6包 type=%d\n", icp6->icmp6_type);
+            qosacc_log(ctx, QACC_LOG_DEBUG, "忽略非ECHO_REPLY IPv6包 type=%d\n", icp6->icmp6_type);
             return 0;
         }
         uint16_t rcv_id = ntohs(icp6->icmp6_id);
         if (rcv_id != ctx->ident) {
-            qosacc_log(ctx, QMON_LOG_DEBUG, "忽略IPv6包：ident不匹配 (期待 %d, 收到 %d)\n", ctx->ident, rcv_id);
+            qosacc_log(ctx, QACC_LOG_DEBUG, "忽略IPv6包：ident不匹配 (期待 %d, 收到 %d)\n", ctx->ident, rcv_id);
             return 0;
         }
         // 由于设置了 IPV6_CHECKSUM，内核已处理校验和，无需手动检查
@@ -862,23 +862,23 @@ int ping_manager_receive(ping_manager_t* pm) {
         ip = (struct ip*)buf;
         hlen = ip->ip_hl << 2;
         if (cc < hlen + 8) {
-            qosacc_log(ctx, QMON_LOG_WARN, "IPv4包太短，丢弃\n");
+            qosacc_log(ctx, QACC_LOG_WARN, "IPv4包太短，丢弃\n");
             return 0;
         }
         icp = (struct icmp*)(buf + hlen);
         if (icp->icmp_type != ICMP_ECHOREPLY) {
-            qosacc_log(ctx, QMON_LOG_DEBUG, "忽略非ECHOREPLY IPv4包 type=%d\n", icp->icmp_type);
+            qosacc_log(ctx, QACC_LOG_DEBUG, "忽略非ECHOREPLY IPv4包 type=%d\n", icp->icmp_type);
             return 0;
         }
         if (icp->icmp_id != ctx->ident) {
-            qosacc_log(ctx, QMON_LOG_DEBUG, "忽略IPv4包：ident不匹配 (期待 %d, 收到 %d)\n", ctx->ident, icp->icmp_id);
+            qosacc_log(ctx, QACC_LOG_DEBUG, "忽略IPv4包：ident不匹配 (期待 %d, 收到 %d)\n", ctx->ident, icp->icmp_id);
             return 0;
         }
         uint16_t saved = icp->icmp_cksum;
         icp->icmp_cksum = 0;
         uint16_t calc = icmp_checksum(icp, cc - hlen);
         if (saved != calc) {
-            qosacc_log(ctx, QMON_LOG_WARN, "ICMP校验和不匹配，丢弃包 (seq=%d)\n", icp->icmp_seq);
+            qosacc_log(ctx, QACC_LOG_WARN, "ICMP校验和不匹配，丢弃包 (seq=%d)\n", icp->icmp_seq);
             return 0;
         }
         seq = icp->icmp_seq;
@@ -889,7 +889,7 @@ int ping_manager_receive(ping_manager_t* pm) {
     uint16_t expected = (uint16_t)(ctx->ntransmitted);
     uint16_t diff = (expected - seq) & 0xFFFF;
     if (diff == 0 || diff > PING_HISTORY_SIZE * 2) {
-        qosacc_log(ctx, QMON_LOG_DEBUG, "忽略包：seq=%d 超出窗口 (当前发送=%d, diff=%u)\n", seq, ctx->ntransmitted, diff);
+        qosacc_log(ctx, QACC_LOG_DEBUG, "忽略包：seq=%d 超出窗口 (当前发送=%d, diff=%u)\n", seq, ctx->ntransmitted, diff);
         return 0;
     }
     ctx->nreceived++;
@@ -914,7 +914,7 @@ int ping_manager_receive(ping_manager_t* pm) {
     else
         hist->smoothed = hist->smoothed * (1.0 - ctx->config.smoothing_factor) + ctx->raw_ping_time_us * ctx->config.smoothing_factor;
     ctx->filtered_ping_time_us = (int64_t)hist->smoothed;
-    qosacc_log(ctx, QMON_LOG_INFO, "收到ping seq=%d, 时间=%dms, 平滑=%ldms\n", seq, triptime, ctx->filtered_ping_time_us / 1000);
+    qosacc_log(ctx, QACC_LOG_INFO, "收到ping seq=%d, 时间=%dms, 平滑=%ldms\n", seq, triptime, ctx->filtered_ping_time_us / 1000);
     return 1;
 }
 
@@ -934,8 +934,8 @@ int load_monitor_update(qosacc_context_t* ctx) {
     int found = 0;
     FILE* fp = fopen("/proc/net/dev", "r");
     if (!fp) {
-        qosacc_log(ctx, QMON_LOG_ERROR, "无法打开 /proc/net/dev: %s\n", strerror(errno));
-        return QMON_ERR_FILE;
+        qosacc_log(ctx, QACC_LOG_ERROR, "无法打开 /proc/net/dev: %s\n", strerror(errno));
+        return QACC_ERR_FILE;
     }
     for (int i = 0; i < 2; i++) if (!fgets(line, sizeof(line), fp)) break;
     while (fgets(line, sizeof(line), fp)) {
@@ -951,8 +951,8 @@ int load_monitor_update(qosacc_context_t* ctx) {
     }
     fclose(fp);
     if (!found) {
-        qosacc_log(ctx, QMON_LOG_ERROR, "接口 %s 未找到\n", ctx->config.device);
-        return QMON_ERR_SYSTEM;
+        qosacc_log(ctx, QACC_LOG_ERROR, "接口 %s 未找到\n", ctx->config.device);
+        return QACC_ERR_SYSTEM;
     }
     int64_t now = qosacc_time_ms();
     if (last_read_time > 0 && last_rx_bytes > 0 && rx_bytes >= last_rx_bytes) {
@@ -966,12 +966,12 @@ int load_monitor_update(qosacc_context_t* ctx) {
             int max_bps = ctx->config.max_bandwidth_kbps * 1000;
             if (ctx->filtered_total_load_bps < 0) ctx->filtered_total_load_bps = 0;
             else if (ctx->filtered_total_load_bps > max_bps) ctx->filtered_total_load_bps = max_bps;
-            qosacc_log(ctx, QMON_LOG_DEBUG, "流量: 原始=%d bps, 平滑=%d bps\n", bps, ctx->filtered_total_load_bps);
+            qosacc_log(ctx, QACC_LOG_DEBUG, "流量: 原始=%d bps, 平滑=%d bps\n", bps, ctx->filtered_total_load_bps);
         }
     }
     last_rx_bytes = rx_bytes;
     last_read_time = now;
-    return QMON_OK;
+    return QACC_OK;
 }
 
 /* ==================== TC控制器（使用TC库） ==================== */
@@ -1051,7 +1051,7 @@ static int detect_qdisc_cb(struct nlmsghdr *n, void *arg) {
     if (tb[TCA_KIND] == NULL) return 0;
     char* kind = (char*)RTA_DATA(tb[TCA_KIND]);
 
-    qosacc_log(dctx->ctx, QMON_LOG_DEBUG, "detect_qdisc_cb: ifindex=%d, kind=%s, parent=0x%x, handle=0x%x\n",
+    qosacc_log(dctx->ctx, QACC_LOG_DEBUG, "detect_qdisc_cb: ifindex=%d, kind=%s, parent=0x%x, handle=0x%x\n",
                t->tcm_ifindex, kind, t->tcm_parent, t->tcm_handle);
 
     // 记录第一个遇到的 qdisc（非类）
@@ -1068,7 +1068,7 @@ static int detect_qdisc_cb(struct nlmsghdr *n, void *arg) {
         is_root = 1;
 
     if (is_root) {
-        qosacc_log(dctx->ctx, QMON_LOG_DEBUG, "detect_qdisc_cb: Found root %s\n", kind);
+        qosacc_log(dctx->ctx, QACC_LOG_DEBUG, "detect_qdisc_cb: Found root %s\n", kind);
         if (n->nlmsg_type == RTM_NEWQDISC) {
             strcpy(dctx->detected_qdisc, kind);
             dctx->root_qdisc_handle = t->tcm_handle;
@@ -1166,16 +1166,16 @@ static int fetch_class_cb(struct nlmsghdr *n, void *arg) {
 static qosacc_result_t detect_qdisc_kind_tc(qosacc_context_t* ctx, int parse_realtime) {
     struct rtnl_handle rth;
     if (rtnl_open(&rth, 0) < 0) {
-        qosacc_log(ctx, QMON_LOG_ERROR, "无法打开rtnetlink\n");
-        return QMON_ERR_SYSTEM;
+        qosacc_log(ctx, QACC_LOG_ERROR, "无法打开rtnetlink\n");
+        return QACC_ERR_SYSTEM;
     }
 
     ll_init_map(&rth);
     int ifindex = ll_name_to_index(ctx->config.device);
     if (ifindex == 0) {
-        qosacc_log(ctx, QMON_LOG_ERROR, "找不到设备 %s\n", ctx->config.device);
+        qosacc_log(ctx, QACC_LOG_ERROR, "找不到设备 %s\n", ctx->config.device);
         rtnl_close(&rth);
-        return QMON_ERR_SYSTEM;
+        return QACC_ERR_SYSTEM;
     }
 
     detect_qdisc_ctx_t dctx;
@@ -1191,13 +1191,13 @@ static qosacc_result_t detect_qdisc_kind_tc(qosacc_context_t* ctx, int parse_rea
 
     // 先查询qdisc
     if (rtnl_dump_request(&rth, RTM_GETQDISC, &t, sizeof(t)) < 0) {
-        qosacc_log(ctx, QMON_LOG_ERROR, "无法发送qdisc dump请求\n");
+        qosacc_log(ctx, QACC_LOG_ERROR, "无法发送qdisc dump请求\n");
         rtnl_close(&rth);
-        return QMON_ERR_SYSTEM;
+        return QACC_ERR_SYSTEM;
     }
 
     if (dump_filter(&rth, detect_qdisc_cb, &dctx) < 0 && errno != EINTR) {
-        qosacc_log(ctx, QMON_LOG_DEBUG, "qdisc dump未找到根队列，尝试类dump\n");
+        qosacc_log(ctx, QACC_LOG_DEBUG, "qdisc dump未找到根队列，尝试类dump\n");
     }
 
     if (dctx.found_root_qdisc) {
@@ -1210,33 +1210,33 @@ static qosacc_result_t detect_qdisc_kind_tc(qosacc_context_t* ctx, int parse_rea
     if (!dctx.found_root_qdisc && dctx.found_any) {
         strcpy(ctx->detected_qdisc, dctx.first_qdisc);
         ctx->root_qdisc_handle = dctx.first_handle;
-        qosacc_log(ctx, QMON_LOG_INFO, "未找到根队列，使用第一个检测到的队列: %s (handle 0x%x)\n", ctx->detected_qdisc, ctx->root_qdisc_handle);
+        qosacc_log(ctx, QACC_LOG_INFO, "未找到根队列，使用第一个检测到的队列: %s (handle 0x%x)\n", ctx->detected_qdisc, ctx->root_qdisc_handle);
     }
 
     // 重新打开rtnl句柄，查询类
     rtnl_close(&rth);
     if (rtnl_open(&rth, 0) < 0) {
-        qosacc_log(ctx, QMON_LOG_ERROR, "无法重新打开rtnetlink\n");
-        return QMON_ERR_SYSTEM;
+        qosacc_log(ctx, QACC_LOG_ERROR, "无法重新打开rtnetlink\n");
+        return QACC_ERR_SYSTEM;
     }
     memset(&t, 0, sizeof(t));
     t.tcm_family = AF_UNSPEC;
     t.tcm_ifindex = ifindex;
     if (rtnl_dump_request(&rth, RTM_GETTCLASS, &t, sizeof(t)) < 0) {
-        qosacc_log(ctx, QMON_LOG_ERROR, "无法发送类dump请求\n");
+        qosacc_log(ctx, QACC_LOG_ERROR, "无法发送类dump请求\n");
         rtnl_close(&rth);
-        return QMON_ERR_SYSTEM;
+        return QACC_ERR_SYSTEM;
     }
 
     // 重用dctx，但不清空root_qdisc_handle
     dctx.found_root_class = 0;
     if (dump_filter(&rth, detect_qdisc_cb, &dctx) < 0 && errno != EINTR) {
-        qosacc_log(ctx, QMON_LOG_DEBUG, "类dump未找到根类\n");
+        qosacc_log(ctx, QACC_LOG_DEBUG, "类dump未找到根类\n");
     }
 
     if (dctx.found_root_class) {
         ctx->root_class_handle = dctx.root_class_handle;
-        qosacc_log(ctx, QMON_LOG_INFO, "检测到根类: handle 0x%x\n", ctx->root_class_handle);
+        qosacc_log(ctx, QACC_LOG_INFO, "检测到根类: handle 0x%x\n", ctx->root_class_handle);
     }
 
     rtnl_close(&rth);
@@ -1244,24 +1244,24 @@ static qosacc_result_t detect_qdisc_kind_tc(qosacc_context_t* ctx, int parse_rea
     // 确定最终检测到的队列类型
     if (ctx->detected_qdisc[0] == '\0') {
         strcpy(ctx->detected_qdisc, "unknown");
-        return QMON_ERR_SYSTEM;
+        return QACC_ERR_SYSTEM;
     }
-    return QMON_OK;
+    return QACC_OK;
 }
 
 static int fetch_hfsc_class_info(qosacc_context_t* ctx) {
     struct rtnl_handle rth;
     if (rtnl_open(&rth, 0) < 0) {
-        qosacc_log(ctx, QMON_LOG_ERROR, "无法打开rtnetlink获取HFSC类信息\n");
-        return QMON_ERR_SYSTEM;
+        qosacc_log(ctx, QACC_LOG_ERROR, "无法打开rtnetlink获取HFSC类信息\n");
+        return QACC_ERR_SYSTEM;
     }
 
     ll_init_map(&rth);
     int ifindex = ll_name_to_index(ctx->config.device);
     if (ifindex == 0) {
-        qosacc_log(ctx, QMON_LOG_ERROR, "找不到设备 %s\n", ctx->config.device);
+        qosacc_log(ctx, QACC_LOG_ERROR, "找不到设备 %s\n", ctx->config.device);
         rtnl_close(&rth);
-        return QMON_ERR_SYSTEM;
+        return QACC_ERR_SYSTEM;
     }
 
     struct tcmsg t;
@@ -1270,9 +1270,9 @@ static int fetch_hfsc_class_info(qosacc_context_t* ctx) {
     t.tcm_ifindex = ifindex;
 
     if (rtnl_dump_request(&rth, RTM_GETTCLASS, &t, sizeof(t)) < 0) {
-        qosacc_log(ctx, QMON_LOG_ERROR, "无法发送类dump请求\n");
+        qosacc_log(ctx, QACC_LOG_ERROR, "无法发送类dump请求\n");
         rtnl_close(&rth);
-        return QMON_ERR_SYSTEM;
+        return QACC_ERR_SYSTEM;
     }
 
     detect_qdisc_ctx_t dctx;
@@ -1280,12 +1280,12 @@ static int fetch_hfsc_class_info(qosacc_context_t* ctx) {
     dctx.ctx = ctx;
     dctx.parse_realtime = 1;  // 需要解析实时类
     if (dump_filter(&rth, fetch_class_cb, &dctx) < 0 && errno != EINTR) {
-        qosacc_log(ctx, QMON_LOG_WARN, "类dump解析HFSC类信息失败\n");
+        qosacc_log(ctx, QACC_LOG_WARN, "类dump解析HFSC类信息失败\n");
         rtnl_close(&rth);
-        return QMON_ERR_SYSTEM;
+        return QACC_ERR_SYSTEM;
     }
     rtnl_close(&rth);
-    return QMON_OK;
+    return QACC_OK;
 }
 
 /* 用于传递更新类统计所需数据的结构体 */
@@ -1333,21 +1333,21 @@ static int update_class_cb(struct nlmsghdr *n, void *arg) {
 
 int tc_controller_update_class_stats(qosacc_context_t* ctx) {
     if (strcmp(ctx->detected_qdisc, "hfsc") != 0) {
-        return QMON_OK;
+        return QACC_OK;
     }
 
     struct rtnl_handle rth;
     if (rtnl_open(&rth, 0) < 0) {
-        qosacc_log(ctx, QMON_LOG_ERROR, "无法打开rtnetlink更新类统计\n");
-        return QMON_ERR_SYSTEM;
+        qosacc_log(ctx, QACC_LOG_ERROR, "无法打开rtnetlink更新类统计\n");
+        return QACC_ERR_SYSTEM;
     }
 
     ll_init_map(&rth);
     int ifindex = ll_name_to_index(ctx->config.device);
     if (ifindex == 0) {
-        qosacc_log(ctx, QMON_LOG_ERROR, "找不到设备 %s\n", ctx->config.device);
+        qosacc_log(ctx, QACC_LOG_ERROR, "找不到设备 %s\n", ctx->config.device);
         rtnl_close(&rth);
-        return QMON_ERR_SYSTEM;
+        return QACC_ERR_SYSTEM;
     }
 
     struct tcmsg t;
@@ -1356,9 +1356,9 @@ int tc_controller_update_class_stats(qosacc_context_t* ctx) {
     t.tcm_ifindex = ifindex;
 
     if (rtnl_dump_request(&rth, RTM_GETTCLASS, &t, sizeof(t)) < 0) {
-        qosacc_log(ctx, QMON_LOG_ERROR, "无法发送类dump请求\n");
+        qosacc_log(ctx, QACC_LOG_ERROR, "无法发送类dump请求\n");
         rtnl_close(&rth);
-        return QMON_ERR_SYSTEM;
+        return QACC_ERR_SYSTEM;
     }
 
     class_stats_t tmp_stats[MAX_CLASSES];
@@ -1368,20 +1368,20 @@ int tc_controller_update_class_stats(qosacc_context_t* ctx) {
     update_class_ctx_t uctx = { .tmp_stats = tmp_stats, .tmp_count = &tmp_count, .now_ns = now_ns };
 
     if (dump_filter(&rth, update_class_cb, &uctx) < 0) {
-        qosacc_log(ctx, QMON_LOG_WARN, "类dump失败\n");
+        qosacc_log(ctx, QACC_LOG_WARN, "类dump失败\n");
         rtnl_close(&rth);
-        return QMON_ERR_SYSTEM;
+        return QACC_ERR_SYSTEM;
     }
     rtnl_close(&rth);
 
     // 如果类数量发生变化，重新获取类信息
     if (tmp_count != ctx->class_count) {
-        qosacc_log(ctx, QMON_LOG_INFO, "类数量变化 %d -> %d，重新获取HFSC类信息\n", ctx->class_count, tmp_count);
+        qosacc_log(ctx, QACC_LOG_INFO, "类数量变化 %d -> %d，重新获取HFSC类信息\n", ctx->class_count, tmp_count);
         ctx->class_count = 0;
-        if (fetch_hfsc_class_info(ctx) != QMON_OK) {
-            qosacc_log(ctx, QMON_LOG_ERROR, "重新获取HFSC类信息失败\n");
+        if (fetch_hfsc_class_info(ctx) != QACC_OK) {
+            qosacc_log(ctx, QACC_LOG_ERROR, "重新获取HFSC类信息失败\n");
         }
-        return QMON_OK;
+        return QACC_OK;
     }
 
     // 先将所有类标记为不活跃，避免残留
@@ -1415,7 +1415,7 @@ int tc_controller_update_class_stats(qosacc_context_t* ctx) {
         }
     }
 
-    return QMON_OK;
+    return QACC_OK;
 }
 
 static int modify_class_bandwidth(qosacc_context_t* ctx, __u32 rate_bps) {
@@ -1437,8 +1437,8 @@ static int modify_class_bandwidth(qosacc_context_t* ctx, __u32 rate_bps) {
 
         __u32 handle = parse_classid(ctx->config.root_classid);
         if (handle == 0) {
-            qosacc_log(ctx, QMON_LOG_ERROR, "无效的根类ID: %s\n", ctx->config.root_classid);
-            return QMON_ERR_CONFIG;
+            qosacc_log(ctx, QACC_LOG_ERROR, "无效的根类ID: %s\n", ctx->config.root_classid);
+            return QACC_ERR_CONFIG;
         }
         req.t.tcm_handle = handle;
         // 使用检测到的根 qdisc handle 作为 parent，若未找到则用 TC_H_ROOT
@@ -1447,8 +1447,8 @@ static int modify_class_bandwidth(qosacc_context_t* ctx, __u32 rate_bps) {
         ll_init_map(&ctx->rth);
         req.t.tcm_ifindex = ll_name_to_index(ctx->config.device);
         if (req.t.tcm_ifindex == 0) {
-            qosacc_log(ctx, QMON_LOG_ERROR, "找不到设备 %s\n", ctx->config.device);
-            return QMON_ERR_SYSTEM;
+            qosacc_log(ctx, QACC_LOG_ERROR, "找不到设备 %s\n", ctx->config.device);
+            return QACC_ERR_SYSTEM;
         }
 
         if (strcmp(ctx->detected_qdisc, "hfsc") == 0) {
@@ -1484,23 +1484,23 @@ static int modify_class_bandwidth(qosacc_context_t* ctx, __u32 rate_bps) {
             addattr_l(&req.n, sizeof(req), TCA_HTB_PARMS, &opt, sizeof(opt));
             tail->rta_len = (void*)NLMSG_TAIL(&req.n) - (void*)tail;
         } else {
-            qosacc_log(ctx, QMON_LOG_ERROR, "不支持的类类型: %s\n", ctx->detected_qdisc);
-            return QMON_ERR_SYSTEM;
+            qosacc_log(ctx, QACC_LOG_ERROR, "不支持的类类型: %s\n", ctx->detected_qdisc);
+            return QACC_ERR_SYSTEM;
         }
 
         int ret = talk(&ctx->rth, &req.n, NULL);
         if (ret == 0) {
-            qosacc_log(ctx, QMON_LOG_INFO, "TC类带宽设置成功: %d bps\n", rate_bps);
-            return QMON_OK;
+            qosacc_log(ctx, QACC_LOG_INFO, "TC类带宽设置成功: %d bps\n", rate_bps);
+            return QACC_OK;
         }
 
         last_ret = ret;
-        qosacc_log(ctx, QMON_LOG_WARN, "修改TC类失败 (ret=%d), 剩余重试次数 %d\n", last_ret, retries);
+        qosacc_log(ctx, QACC_LOG_WARN, "修改TC类失败 (ret=%d), 剩余重试次数 %d\n", last_ret, retries);
         if (retries > 0) usleep(TC_OP_RETRY_DELAY_MS * 1000);
     }
 
-    qosacc_log(ctx, QMON_LOG_ERROR, "修改TC类失败，已重试 %d 次，最后返回 %d\n", TC_OP_RETRY_COUNT, last_ret);
-    return QMON_ERR_SYSTEM;
+    qosacc_log(ctx, QACC_LOG_ERROR, "修改TC类失败，已重试 %d 次，最后返回 %d\n", TC_OP_RETRY_COUNT, last_ret);
+    return QACC_ERR_SYSTEM;
 }
 
 static int modify_qdisc_bandwidth(qosacc_context_t* ctx, __u32 rate_bps) {
@@ -1530,8 +1530,8 @@ static int modify_qdisc_bandwidth(qosacc_context_t* ctx, __u32 rate_bps) {
         ll_init_map(&ctx->rth);
         req.t.tcm_ifindex = ll_name_to_index(ctx->config.device);
         if (req.t.tcm_ifindex == 0) {
-            qosacc_log(ctx, QMON_LOG_ERROR, "找不到设备 %s\n", ctx->config.device);
-            return QMON_ERR_SYSTEM;
+            qosacc_log(ctx, QACC_LOG_ERROR, "找不到设备 %s\n", ctx->config.device);
+            return QACC_ERR_SYSTEM;
         }
 
         addattr_l(&req.n, sizeof(req), TCA_KIND, "cake", strlen("cake")+1);
@@ -1543,51 +1543,51 @@ static int modify_qdisc_bandwidth(qosacc_context_t* ctx, __u32 rate_bps) {
 
         int ret = talk(&ctx->rth, &req.n, NULL);
         if (ret == 0) {
-            qosacc_log(ctx, QMON_LOG_INFO, "CAKE带宽设置成功: %d bps\n", rate_bps);
-            return QMON_OK;
+            qosacc_log(ctx, QACC_LOG_INFO, "CAKE带宽设置成功: %d bps\n", rate_bps);
+            return QACC_OK;
         }
 
         last_ret = ret;
-        qosacc_log(ctx, QMON_LOG_WARN, "修改CAKE qdisc失败 (ret=%d), 剩余重试次数 %d\n", last_ret, retries);
+        qosacc_log(ctx, QACC_LOG_WARN, "修改CAKE qdisc失败 (ret=%d), 剩余重试次数 %d\n", last_ret, retries);
         if (retries > 0) usleep(TC_OP_RETRY_DELAY_MS * 1000);
     }
 
-    qosacc_log(ctx, QMON_LOG_ERROR, "修改CAKE qdisc失败，已重试 %d 次，最后返回 %d\n", TC_OP_RETRY_COUNT, last_ret);
-    return QMON_ERR_SYSTEM;
+    qosacc_log(ctx, QACC_LOG_ERROR, "修改CAKE qdisc失败，已重试 %d 次，最后返回 %d\n", TC_OP_RETRY_COUNT, last_ret);
+    return QACC_ERR_SYSTEM;
 }
 
 int tc_controller_init(tc_controller_t* tc, qosacc_context_t* ctx) {
     tc->ctx = ctx;
     if (rtnl_open(&ctx->rth, 0) < 0) {
-        qosacc_log(ctx, QMON_LOG_ERROR, "无法打开rtnetlink\n");
-        return QMON_ERR_SYSTEM;
+        qosacc_log(ctx, QACC_LOG_ERROR, "无法打开rtnetlink\n");
+        return QACC_ERR_SYSTEM;
     }
 
     int parse_realtime = 1;
-    if (detect_qdisc_kind_tc(ctx, parse_realtime) != QMON_OK) {
-        qosacc_log(ctx, QMON_LOG_ERROR, "队列检测失败，无法继续\n");
+    if (detect_qdisc_kind_tc(ctx, parse_realtime) != QACC_OK) {
+        qosacc_log(ctx, QACC_LOG_ERROR, "队列检测失败，无法继续\n");
         rtnl_close(&ctx->rth);
         tc->ctx = NULL;
-        return QMON_ERR_SYSTEM;
+        return QACC_ERR_SYSTEM;
     }
 
     // 检查队列是否支持动态带宽调整（包括 noqueue）
     if (strcmp(ctx->detected_qdisc, "fq_codel") == 0 || 
         strcmp(ctx->detected_qdisc, "pfifo_fast") == 0 ||
         strcmp(ctx->detected_qdisc, "noqueue") == 0) {
-        qosacc_log(ctx, QMON_LOG_ERROR, "队列 %s 不支持动态带宽调整，程序退出\n", ctx->detected_qdisc);
+        qosacc_log(ctx, QACC_LOG_ERROR, "队列 %s 不支持动态带宽调整，程序退出\n", ctx->detected_qdisc);
         rtnl_close(&ctx->rth);
         tc->ctx = NULL;
-        return QMON_ERR_CONFIG;
+        return QACC_ERR_CONFIG;
     }
 
     // 如果是HFSC，获取实时类信息
     if (strcmp(ctx->detected_qdisc, "hfsc") == 0) {
         ctx->class_count = 0;
-        if (fetch_hfsc_class_info(ctx) != QMON_OK) {
-            qosacc_log(ctx, QMON_LOG_ERROR, "无法获取HFSC类信息，实时类检测将失效\n");
+        if (fetch_hfsc_class_info(ctx) != QACC_OK) {
+            qosacc_log(ctx, QACC_LOG_ERROR, "无法获取HFSC类信息，实时类检测将失效\n");
         } else {
-            qosacc_log(ctx, QMON_LOG_INFO, "成功获取 %d 个HFSC类\n", ctx->class_count);
+            qosacc_log(ctx, QACC_LOG_INFO, "成功获取 %d 个HFSC类\n", ctx->class_count);
         }
     }
 
@@ -1595,23 +1595,23 @@ int tc_controller_init(tc_controller_t* tc, qosacc_context_t* ctx) {
     ctx->last_class_stats_ms = qosacc_time_ms();
     ctx->last_set_bps = 0;  // 初始化为0，确保第一次设置生效
 
-    qosacc_log(ctx, QMON_LOG_INFO, "TC控制器初始化成功 (队列: %s, 根qdisc handle: 0x%x, 类数量: %d)\n",
+    qosacc_log(ctx, QACC_LOG_INFO, "TC控制器初始化成功 (队列: %s, 根qdisc handle: 0x%x, 类数量: %d)\n",
                ctx->detected_qdisc, ctx->root_qdisc_handle, ctx->class_count);
-    return QMON_OK;
+    return QACC_OK;
 }
 
 int tc_controller_set_bandwidth(tc_controller_t* tc, int bandwidth_bps) {
-    if (!tc || !tc->ctx) return QMON_ERR_MEMORY;
+    if (!tc || !tc->ctx) return QACC_ERR_MEMORY;
     qosacc_context_t* ctx = tc->ctx;
     if (ctx->config.safe_mode) {
-        qosacc_log(ctx, QMON_LOG_INFO, "安全模式: 跳过带宽设置 (%d kbps)\n", bandwidth_bps/1000);
-        return QMON_OK;
+        qosacc_log(ctx, QACC_LOG_INFO, "安全模式: 跳过带宽设置 (%d kbps)\n", bandwidth_bps/1000);
+        return QACC_OK;
     }
     if (bandwidth_bps < 1) bandwidth_bps = 1;
 
     // 避免重复设置相同带宽
     if (bandwidth_bps == ctx->last_set_bps) {
-        return QMON_OK;
+        return QACC_OK;
     }
 
     int ret;
@@ -1620,11 +1620,11 @@ int tc_controller_set_bandwidth(tc_controller_t* tc, int bandwidth_bps) {
     } else if (strcmp(ctx->detected_qdisc, "hfsc") == 0 || strcmp(ctx->detected_qdisc, "htb") == 0) {
         ret = modify_class_bandwidth(ctx, bandwidth_bps);
     } else {
-        qosacc_log(ctx, QMON_LOG_ERROR, "不支持的队列类型: %s\n", ctx->detected_qdisc);
-        return QMON_ERR_SYSTEM;
+        qosacc_log(ctx, QACC_LOG_ERROR, "不支持的队列类型: %s\n", ctx->detected_qdisc);
+        return QACC_ERR_SYSTEM;
     }
 
-    if (ret == QMON_OK) {
+    if (ret == QACC_OK) {
         ctx->last_set_bps = bandwidth_bps;
     }
     return ret;
@@ -1639,7 +1639,7 @@ void tc_controller_cleanup(tc_controller_t* tc) {
             modify_qdisc_bandwidth(ctx, default_bw);
         else
             modify_class_bandwidth(ctx, default_bw);
-        qosacc_log(ctx, QMON_LOG_INFO, "恢复带宽到 %d kbps\n", ctx->config.max_bandwidth_kbps);
+        qosacc_log(ctx, QACC_LOG_INFO, "恢复带宽到 %d kbps\n", ctx->config.max_bandwidth_kbps);
     }
     rtnl_close(&ctx->rth);
 }
@@ -1661,7 +1661,7 @@ void update_runtime_stats(qosacc_context_t* ctx) {
     ctx->stats.uptime_seconds = (now - ctx->stats.start_time_ms) / 1000;
     static int64_t last = 0;
     if (now - last > 5000) {
-        qosacc_log(ctx, QMON_LOG_INFO,
+        qosacc_log(ctx, QACC_LOG_INFO,
             "统计: 运行%ld秒, 发送%ld, 接收%ld, 丢失%ld(%.1f%%), 调整%ld次, 最大ping%ldms, 最小ping%ldms, 实时类活跃: %d\n",
             ctx->stats.uptime_seconds,
             ctx->stats.total_ping_sent,
@@ -1678,7 +1678,7 @@ void update_runtime_stats(qosacc_context_t* ctx) {
 
 /* ==================== 状态机 ==================== */
 void state_machine_init(qosacc_context_t* ctx) {
-    ctx->state = QMON_CHK;
+    ctx->state = QACC_CHK;
     ctx->ident = getpid() & 0xFFFF;
     ctx->current_limit_bps = (int)(ctx->config.max_bandwidth_kbps * 1000 * ctx->config.safe_start_ratio);
     ctx->saved_active_limit = ctx->current_limit_bps;
@@ -1703,12 +1703,12 @@ void state_machine_check(qosacc_context_t* ctx, ping_manager_t* pm, tc_controlle
     if (ctx->nreceived >= 2) {
         if (ctx->config.ping_limit_ms > 0 && !ctx->config.auto_switch_mode) {
             // 进入IDLE，但不改变当前带宽
-            ctx->state = QMON_IDLE;
+            ctx->state = QACC_IDLE;
         } else {
             // 使用当前限制带宽作为初始值，而不是硬编码10000bps
             tc_controller_set_bandwidth(tc, ctx->current_limit_bps);
             ctx->nreceived = 0;
-            ctx->state = QMON_INIT;
+            ctx->state = QACC_INIT;
         }
     }
 }
@@ -1719,7 +1719,7 @@ void state_machine_init_state(qosacc_context_t* ctx, tc_controller_t* tc) {
     int needed_pings = ctx->config.init_duration_ms / ctx->config.ping_interval;
     if (needed_pings <= 0) needed_pings = 1;
     if (init_count > needed_pings) {
-        ctx->state = QMON_IDLE;
+        ctx->state = QACC_IDLE;
         tc_controller_set_bandwidth(tc, ctx->current_limit_bps);
         if (ctx->config.auto_switch_mode)
             ctx->config.ping_limit_ms = (int)(ctx->filtered_ping_time_us * 1.1f / 1000);
@@ -1729,7 +1729,7 @@ void state_machine_init_state(qosacc_context_t* ctx, tc_controller_t* tc) {
         if (ctx->config.ping_limit_ms > 800) ctx->config.ping_limit_ms = 800;
         ctx->max_ping_time_us = ctx->config.ping_limit_ms * 2 * 1000;
         init_count = 0;
-        qosacc_log(ctx, QMON_LOG_INFO, "初始化完成, ping限制=%dms\n", ctx->config.ping_limit_ms);
+        qosacc_log(ctx, QACC_LOG_INFO, "初始化完成, ping限制=%dms\n", ctx->config.ping_limit_ms);
     }
 }
 
@@ -1739,26 +1739,26 @@ void state_machine_idle(qosacc_context_t* ctx) {
     double util = (double)ctx->filtered_total_load_bps / (double)max_bps;
     if (util > ctx->config.active_threshold) {
         if (ctx->realtime_active > 0) {
-            ctx->state = QMON_REALTIME;
+            ctx->state = QACC_REALTIME;
             if (ctx->saved_realtime_limit == (int)(ctx->config.max_bandwidth_kbps * 1000 * ctx->config.safe_start_ratio)) {
                 ctx->saved_realtime_limit = ctx->current_limit_bps;
             }
             ctx->current_limit_bps = ctx->saved_realtime_limit;
         } else {
-            ctx->state = QMON_ACTIVE;
+            ctx->state = QACC_ACTIVE;
             if (ctx->saved_active_limit == (int)(ctx->config.max_bandwidth_kbps * 1000 * ctx->config.safe_start_ratio)) {
                 ctx->saved_active_limit = ctx->current_limit_bps;
             }
             ctx->current_limit_bps = ctx->saved_active_limit;
         }
-        qosacc_log(ctx, QMON_LOG_INFO, "进入%s状态, 利用率=%.1f%%, 实时类活跃=%d\n",
-                   (ctx->state == QMON_ACTIVE) ? "ACTIVE" : "REALTIME",
+        qosacc_log(ctx, QACC_LOG_INFO, "进入%s状态, 利用率=%.1f%%, 实时类活跃=%d\n",
+                   (ctx->state == QACC_ACTIVE) ? "ACTIVE" : "REALTIME",
                    util * 100.0, ctx->realtime_active);
     }
 }
 
 void state_machine_active_common(qosacc_context_t* ctx) {
-    if (ctx->state == QMON_ACTIVE) {
+    if (ctx->state == QACC_ACTIVE) {
         ctx->saved_active_limit = ctx->current_limit_bps;
     } else {
         ctx->saved_realtime_limit = ctx->current_limit_bps;
@@ -1769,31 +1769,31 @@ void state_machine_active_common(qosacc_context_t* ctx) {
 
     double util = (double)ctx->filtered_total_load_bps / (double)max_bps;
     if (util < ctx->config.idle_threshold - COMPARE_EPSILON) {
-        ctx->state = QMON_IDLE;
-        qosacc_log(ctx, QMON_LOG_INFO, "进入IDLE状态, 利用率=%.1f%%\n", util * 100.0);
+        ctx->state = QACC_IDLE;
+        qosacc_log(ctx, QACC_LOG_INFO, "进入IDLE状态, 利用率=%.1f%%\n", util * 100.0);
         return;
     }
 
-    if (ctx->state == QMON_ACTIVE && ctx->realtime_active > 0) {
+    if (ctx->state == QACC_ACTIVE && ctx->realtime_active > 0) {
         ctx->saved_active_limit = ctx->current_limit_bps;
-        ctx->state = QMON_REALTIME;
+        ctx->state = QACC_REALTIME;
         if (ctx->saved_realtime_limit == (int)(ctx->config.max_bandwidth_kbps * 1000 * ctx->config.safe_start_ratio)) {
             ctx->saved_realtime_limit = ctx->current_limit_bps;
         }
         ctx->current_limit_bps = ctx->saved_realtime_limit;
-        qosacc_log(ctx, QMON_LOG_INFO, "检测到实时类，切换到REALTIME模式\n");
-    } else if (ctx->state == QMON_REALTIME && ctx->realtime_active == 0) {
+        qosacc_log(ctx, QACC_LOG_INFO, "检测到实时类，切换到REALTIME模式\n");
+    } else if (ctx->state == QACC_REALTIME && ctx->realtime_active == 0) {
         ctx->saved_realtime_limit = ctx->current_limit_bps;
-        ctx->state = QMON_ACTIVE;
+        ctx->state = QACC_ACTIVE;
         if (ctx->saved_active_limit == (int)(ctx->config.max_bandwidth_kbps * 1000 * ctx->config.safe_start_ratio)) {
             ctx->saved_active_limit = ctx->current_limit_bps;
         }
         ctx->current_limit_bps = ctx->saved_active_limit;
-        qosacc_log(ctx, QMON_LOG_INFO, "实时类消失，切换回ACTIVE模式\n");
+        qosacc_log(ctx, QACC_LOG_INFO, "实时类消失，切换回ACTIVE模式\n");
     }
 
     int target_us;
-    if (ctx->state == QMON_REALTIME && ctx->config.realtime_ping_limit_ms > 0) {
+    if (ctx->state == QACC_REALTIME && ctx->config.realtime_ping_limit_ms > 0) {
         target_us = ctx->config.realtime_ping_limit_ms * 1000;
     } else {
         target_us = ctx->config.ping_limit_ms * 1000;
@@ -1818,9 +1818,9 @@ void state_machine_active_common(qosacc_context_t* ctx) {
     if (abs(new_limit - old_limit) >= ctx->config.min_bw_change_kbps * 1000) {
         ctx->current_limit_bps = new_limit;
         ctx->stats.total_bandwidth_adjustments++;
-        qosacc_log(ctx, QMON_LOG_INFO, "带宽调整: %d -> %d kbps (误差=%.3f, 模式=%s)\n",
+        qosacc_log(ctx, QACC_LOG_INFO, "带宽调整: %d -> %d kbps (误差=%.3f, 模式=%s)\n",
                    old_limit/1000, new_limit/1000, error_ratio,
-                   (ctx->state == QMON_ACTIVE) ? "ACTIVE" : "REALTIME");
+                   (ctx->state == QACC_ACTIVE) ? "ACTIVE" : "REALTIME");
     }
 }
 
@@ -1837,7 +1837,7 @@ void heart_beat_check(qosacc_context_t* ctx) {
     int64_t now = qosacc_time_ms();
     if (now - last > HEARTBEAT_INTERVAL_MS) {
         ctx->stats.total_heartbeat_checks++;
-        qosacc_log(ctx, QMON_LOG_DEBUG,
+        qosacc_log(ctx, QACC_LOG_DEBUG,
             "心跳: 状态=%d, 带宽=%d kbps, ping=%ld ms, 负载=%d kbps, 队列=%s, 实时类活跃=%d\n",
             ctx->state, ctx->current_limit_bps/1000, ctx->filtered_ping_time_us/1000,
             ctx->filtered_total_load_bps/1000, ctx->detected_qdisc, ctx->realtime_active);
@@ -1848,8 +1848,8 @@ void heart_beat_check(qosacc_context_t* ctx) {
 void state_machine_run(qosacc_context_t* ctx, ping_manager_t* pm, tc_controller_t* tc) {
     int64_t now = qosacc_time_ms();
     if (now - ctx->last_heartbeat_ms > HEARTBEAT_TIMEOUT_MS) {
-        qosacc_log(ctx, QMON_LOG_ERROR, "心跳超时，重置状态机\n");
-        ctx->state = QMON_CHK;
+        qosacc_log(ctx, QACC_LOG_ERROR, "心跳超时，重置状态机\n");
+        ctx->state = QACC_CHK;
         ctx->last_heartbeat_ms = now;
         ctx->stats.total_errors++;
         ctx->stats.total_heartbeat_timeouts++;
@@ -1858,20 +1858,20 @@ void state_machine_run(qosacc_context_t* ctx, ping_manager_t* pm, tc_controller_
             close(ctx->ping_socket);
             ctx->ping_socket = -1;
         }
-        if (ping_manager_init(pm, ctx) != QMON_OK) {
-            qosacc_log(ctx, QMON_LOG_ERROR, "网络重初始化失败，继续运行但可能无法接收ping\n");
+        if (ping_manager_init(pm, ctx) != QACC_OK) {
+            qosacc_log(ctx, QACC_LOG_ERROR, "网络重初始化失败，继续运行但可能无法接收ping\n");
             // 保持 ping_socket 为 -1，后续发送会失败，但不会崩溃
         } else {
-            qosacc_log(ctx, QMON_LOG_INFO, "网络重初始化成功\n");
+            qosacc_log(ctx, QACC_LOG_INFO, "网络重初始化成功\n");
         }
     }
     if (atomic_load(&ctx->reset_bw)) {
-        qosacc_log(ctx, QMON_LOG_INFO, "收到重置信号，恢复带宽到最大值\n");
+        qosacc_log(ctx, QACC_LOG_INFO, "收到重置信号，恢复带宽到最大值\n");
         int default_bw = ctx->config.max_bandwidth_kbps * 1000;
         tc_controller_set_bandwidth(tc, default_bw);
         atomic_store(&ctx->reset_bw, 0);
     }
-    if (ctx->state != QMON_EXIT) {
+    if (ctx->state != QACC_EXIT) {
         if (now - ctx->last_ping_time_ms >= ctx->config.ping_interval)
             ping_manager_send(pm);
     }
@@ -1884,10 +1884,10 @@ void state_machine_run(qosacc_context_t* ctx, ping_manager_t* pm, tc_controller_
         ctx->last_class_stats_ms = now;
     }
     if (now - ctx->last_tc_update_time_ms > CONTROL_INTERVAL_MS) {
-        if (tc_controller_set_bandwidth(tc, ctx->current_limit_bps) == QMON_OK)
+        if (tc_controller_set_bandwidth(tc, ctx->current_limit_bps) == QACC_OK)
             ctx->last_tc_update_time_ms = now;
         else
-            qosacc_log(ctx, QMON_LOG_WARN, "带宽设置失败，稍后重试\n");
+            qosacc_log(ctx, QACC_LOG_WARN, "带宽设置失败，稍后重试\n");
     }
     if (now - ctx->last_runtime_stats_ms > 5000) {
         update_runtime_stats(ctx);
@@ -1895,11 +1895,11 @@ void state_machine_run(qosacc_context_t* ctx, ping_manager_t* pm, tc_controller_
     }
     heart_beat_check(ctx);
     switch (ctx->state) {
-        case QMON_CHK:    state_machine_check(ctx, pm, tc); break;
-        case QMON_INIT:   state_machine_init_state(ctx, tc); break;
-        case QMON_IDLE:   state_machine_idle(ctx); break;
-        case QMON_ACTIVE: state_machine_active(ctx); break;
-        case QMON_REALTIME: state_machine_realtime(ctx); break;
+        case QACC_CHK:    state_machine_check(ctx, pm, tc); break;
+        case QACC_INIT:   state_machine_init_state(ctx, tc); break;
+        case QACC_IDLE:   state_machine_idle(ctx); break;
+        case QACC_ACTIVE: state_machine_active(ctx); break;
+        case QACC_REALTIME: state_machine_realtime(ctx); break;
         default: break;
     }
 }
@@ -1908,13 +1908,13 @@ void state_machine_run(qosacc_context_t* ctx, ping_manager_t* pm, tc_controller_
 int status_file_update(qosacc_context_t* ctx) {
     static int64_t last = 0;
     int64_t now = qosacc_time_ms();
-    if (now - last < 5000) return QMON_OK;
+    if (now - last < 5000) return QACC_OK;
     char temp[512];
     snprintf(temp, sizeof(temp), "%s.tmp", ctx->config.status_file);
     int fd = open(temp, O_WRONLY | O_CREAT | O_TRUNC, 0644);
     if (fd < 0) {
-        qosacc_log(ctx, QMON_LOG_ERROR, "无法创建临时状态文件: %s\n", strerror(errno));
-        return QMON_ERR_FILE;
+        qosacc_log(ctx, QACC_LOG_ERROR, "无法创建临时状态文件: %s\n", strerror(errno));
+        return QACC_ERR_FILE;
     }
     struct flock lock = { .l_type = F_WRLCK, .l_whence = SEEK_SET, .l_start = 0, .l_len = 0 };
     int locked = 0;
@@ -1923,17 +1923,17 @@ int status_file_update(qosacc_context_t* ctx) {
         usleep(LOCK_RETRY_DELAY_MS * 1000);
     }
     if (!locked) {
-        qosacc_log(ctx, QMON_LOG_ERROR, "无法锁定状态文件 (重试%d次)\n", LOCK_RETRY_COUNT);
+        qosacc_log(ctx, QACC_LOG_ERROR, "无法锁定状态文件 (重试%d次)\n", LOCK_RETRY_COUNT);
         close(fd);
-        return QMON_ERR_FILE;
+        return QACC_ERR_FILE;
     }
     FILE* fp = fdopen(fd, "w");
     if (!fp) {
-        qosacc_log(ctx, QMON_LOG_ERROR, "fdopen失败: %s\n", strerror(errno));
+        qosacc_log(ctx, QACC_LOG_ERROR, "fdopen失败: %s\n", strerror(errno));
         lock.l_type = F_UNLCK;
         fcntl(fd, F_SETLK, &lock);
         close(fd);
-        return QMON_ERR_FILE;
+        return QACC_ERR_FILE;
     }
     // 输出状态名称字符串，而非数字
     fprintf(fp, "状态: %s\n", state_names[ctx->state]);
@@ -1966,13 +1966,13 @@ int status_file_update(qosacc_context_t* ctx) {
         if (rename(temp, ctx->config.status_file) == 0) break;
         usleep(STATUS_FILE_RETRY_DELAY_MS * 1000);
         if (i == STATUS_FILE_RETRY_COUNT - 1) {
-            qosacc_log(ctx, QMON_LOG_ERROR, "重命名状态文件失败: %s\n", strerror(errno));
+            qosacc_log(ctx, QACC_LOG_ERROR, "重命名状态文件失败: %s\n", strerror(errno));
             unlink(temp);
-            return QMON_ERR_FILE;
+            return QACC_ERR_FILE;
         }
     }
     last = now;
-    return QMON_OK;
+    return QACC_OK;
 }
 
 /* ==================== 信号处理 ==================== */
@@ -1994,16 +1994,16 @@ int setup_signal_handlers(qosacc_context_t* ctx) {
     if (sigaction(SIGTERM, &sa, NULL) < 0 ||
         sigaction(SIGINT, &sa, NULL) < 0 ||
         sigaction(SIGUSR1, &sa, NULL) < 0) {
-        qosacc_log(ctx, QMON_LOG_ERROR, "信号处理设置失败\n");
-        return QMON_ERR_SIGNAL;
+        qosacc_log(ctx, QACC_LOG_ERROR, "信号处理设置失败\n");
+        return QACC_ERR_SIGNAL;
     }
     signal(SIGPIPE, SIG_IGN);
     signal(SIGCHLD, SIG_IGN);
-    return QMON_OK;
+    return QACC_OK;
 }
 
 void qosacc_cleanup(qosacc_context_t* ctx, ping_manager_t* pm, tc_controller_t* tc) {
-    qosacc_log(ctx, QMON_LOG_INFO, "清理资源...\n");
+    qosacc_log(ctx, QACC_LOG_INFO, "清理资源...\n");
     if (!ctx->config.safe_mode) {
         int default_bw = ctx->config.max_bandwidth_kbps * 1000;
         tc_controller_set_bandwidth(tc, default_bw);
@@ -2042,17 +2042,17 @@ int main(int argc, char* argv[]) {
 
     qosacc_config_init(&context.config);
     int config_result = qosacc_config_parse(&context.config, argc, argv);
-    if (config_result == QMON_HELP_REQUESTED) {
+    if (config_result == QACC_HELP_REQUESTED) {
         fprintf(stderr, "%s", qosacc_usage);
         return EXIT_SUCCESS;
     }
-    if (config_result != QMON_OK) {
+    if (config_result != QACC_OK) {
         fprintf(stderr, "配置解析失败\n");
         return EXIT_FAILURE;
     }
 
     char err[256];
-    if (qosacc_config_validate(&context.config, argc, argv, err, sizeof(err)) != QMON_OK) {
+    if (qosacc_config_validate(&context.config, argc, argv, err, sizeof(err)) != QACC_OK) {
         fprintf(stderr, "错误: %s\n", err);
         return EXIT_FAILURE;
     }
@@ -2065,27 +2065,27 @@ int main(int argc, char* argv[]) {
     if (strlen(context.config.debug_log) > 0) {
         context.debug_log_file = fopen(context.config.debug_log, "a");
         if (!context.debug_log_file)
-            qosacc_log(&context, QMON_LOG_WARN, "无法打开调试日志 %s\n", context.config.debug_log);
+            qosacc_log(&context, QACC_LOG_WARN, "无法打开调试日志 %s\n", context.config.debug_log);
     }
 
-    if (setup_signal_handlers(&context) != QMON_OK) goto cleanup;
+    if (setup_signal_handlers(&context) != QACC_OK) goto cleanup;
 
     state_machine_init(&context);
 
-    if (resolve_target(context.config.target, &context.target_addr, &context.target_addr_len, err, sizeof(err)) != QMON_OK) {
-        qosacc_log(&context, QMON_LOG_ERROR, "解析目标失败: %s\n", err);
+    if (resolve_target(context.config.target, &context.target_addr, &context.target_addr_len, err, sizeof(err)) != QACC_OK) {
+        qosacc_log(&context, QACC_LOG_ERROR, "解析目标失败: %s\n", err);
         goto cleanup;
     }
-    qosacc_log(&context, QMON_LOG_INFO, "目标地址解析为 %s\n",
+    qosacc_log(&context, QACC_LOG_INFO, "目标地址解析为 %s\n",
                context.target_addr.ss_family == AF_INET ? "IPv4" : "IPv6");
 
-    if (ping_manager_init(&ping_mgr, &context) != QMON_OK) goto cleanup;
-    if (tc_controller_init(&tc_mgr, &context) != QMON_OK) goto cleanup;
+    if (ping_manager_init(&ping_mgr, &context) != QACC_OK) goto cleanup;
+    if (tc_controller_init(&tc_mgr, &context) != QACC_OK) goto cleanup;
 
     if (setpriority(PRIO_PROCESS, 0, -10) < 0)
-        qosacc_log(&context, QMON_LOG_WARN, "无法设置进程优先级\n");
+        qosacc_log(&context, QACC_LOG_WARN, "无法设置进程优先级\n");
 
-    qosacc_log(&context, QMON_LOG_INFO,
+    qosacc_log(&context, QACC_LOG_INFO,
         "======== qosacc 启动 ========\n"
         "目标: %s\n设备: %s\n最大带宽: %d kbps\nping间隔: %d ms\nping限制: %d ms\n实时ping限制: %d ms\n队列: %s\n根qdisc handle: 0x%x\n安全模式: %s\n自动切换: %s\n",
         context.config.target, context.config.device,
@@ -2098,7 +2098,7 @@ int main(int argc, char* argv[]) {
         context.config.safe_mode ? "是" : "否",
         context.config.auto_switch_mode ? "是" : "否");
 
-    context.state = QMON_CHK;
+    context.state = QACC_CHK;
     context.last_heartbeat_ms = qosacc_time_ms();
 
     if (!context.config.skip_initial) {
@@ -2135,7 +2135,7 @@ int main(int argc, char* argv[]) {
             fds[0].fd = context.ping_socket;
             fds[0].events = POLLIN;
             poll_ret = poll(fds, 1, timeout);
-            qosacc_log(&context, QMON_LOG_DEBUG, "poll返回: %d, revents=0x%x\n", poll_ret, fds[0].revents);
+            qosacc_log(&context, QACC_LOG_DEBUG, "poll返回: %d, revents=0x%x\n", poll_ret, fds[0].revents);
         } else {
             usleep(timeout * 1000);
             poll_ret = 0;
@@ -2150,7 +2150,7 @@ int main(int argc, char* argv[]) {
                 atomic_fetch_add(&context.signal_counter, 1);
                 continue;
             }
-            qosacc_log(&context, QMON_LOG_ERROR, "poll失败: %s\n", strerror(errno));
+            qosacc_log(&context, QACC_LOG_ERROR, "poll失败: %s\n", strerror(errno));
             break;
         }
 
@@ -2158,7 +2158,7 @@ int main(int argc, char* argv[]) {
             ping_manager_receive(&ping_mgr);
         }
         if (fds[0].revents & (POLLERR | POLLHUP | POLLNVAL)) {
-            qosacc_log(&context, QMON_LOG_ERROR, "socket错误, revents=0x%x\n", fds[0].revents);
+            qosacc_log(&context, QACC_LOG_ERROR, "socket错误, revents=0x%x\n", fds[0].revents);
             break;
         }
 
@@ -2170,7 +2170,7 @@ int main(int argc, char* argv[]) {
         if (atomic_load(&context.sigterm)) break;
 
         if (poll_end - now > 50)
-            qosacc_log(&context, QMON_LOG_DEBUG, "循环耗时 %d ms\n", (int)(poll_end - now));
+            qosacc_log(&context, QACC_LOG_DEBUG, "循环耗时 %d ms\n", (int)(poll_end - now));
     }
 
     ret = EXIT_SUCCESS;
@@ -2178,7 +2178,7 @@ int main(int argc, char* argv[]) {
 cleanup:
     qosacc_cleanup(&context, &ping_mgr, &tc_mgr);
     int64_t uptime = (qosacc_time_ms() - context.stats.start_time_ms) / 1000;
-    qosacc_log(&context, QMON_LOG_INFO,
+    qosacc_log(&context, QACC_LOG_INFO,
         "最终统计: 运行%ld秒, 发送%ld, 接收%ld, 丢失%ld, 调整%ld次, 最大ping%ldms, 最小ping%ldms\n",
         uptime,
         context.stats.total_ping_sent,
@@ -2187,7 +2187,7 @@ cleanup:
         context.stats.total_bandwidth_adjustments,
         context.stats.max_ping_time_recorded / 1000,
         context.stats.min_ping_time_recorded / 1000);
-    qosacc_log(&context, QMON_LOG_INFO, "qosacc 退出\n");
+    qosacc_log(&context, QACC_LOG_INFO, "qosacc 退出\n");
 
     if (context.config.background_mode) closelog();
     return ret;
