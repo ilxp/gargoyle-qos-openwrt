@@ -39,7 +39,7 @@ function is_valid_ip(ipstr, ipv6)
     end
 end
 
--- 自动检测网关函数
+-- 自动检测网关函数（仅用于Ping目标）
 function detect_gateway(ipv6)
     if ipv6 then
         local cmd = "ip -6 route show default 2>/dev/null | awk '/default/ {print $3}' | head -1"
@@ -105,101 +105,80 @@ function get_qosacc_args()
     return args
 end
 
--- 生成qosacc启动参数（适配优化后的qosacc.c）
+-- 生成qosacc启动参数（适配优化后的qosacc.c，使用选项式参数）
 function generate_qosacc_args()
     local config = uci:get_all("qos_gargoyle", "qosacc") or {}
     local bandwidth = get_bandwidth_settings()
-    
-    local args = ""
-    
-    -- 1. 添加基本选项
-    -- 注意：qosacc可能不需要 -b 参数，后台运行由init脚本处理
-    -- 但我们保留它以防qosacc需要
-    if config.enabled == "1" then
-        args = args .. "-b "  -- 后台运行
+    local args = {}
+
+    -- 获取WAN接口：从global节的wan_interface读取（必须存在）
+    local wan_iface = uci:get("qos_gargoyle", "global", "wan_interface")
+    if not wan_iface or wan_iface == "" then
+        -- 如果配置中没有，则使用默认值（回退）
+        wan_iface = "pppoe-wan"
     end
-    
-    -- 2. 启用ACTIVE/MINRTT自动切换（如果有-a选项）
-    if config.enable_active_minrtt and config.enable_active_minrtt == "1" then
-        args = args .. "-a "
-    end
-    
-    -- 3. 跳过初始测量（如果需要）
-    if config.skip_initial_measurement and config.skip_initial_measurement == "1" then
-        args = args .. "-s "
-    end
-    
-    -- 4. 详细模式
-    if config.verbose == "1" then
-        args = args .. "-v "
-    end
-    
-    -- 5. 必需参数：ping间隔 (100-2000ms)
-    local ping_interval = config.ping_interval or "800"
-    if tonumber(ping_interval) >= 100 and tonumber(ping_interval) <= 2000 then
-        args = args .. ping_interval .. " "
-    else
-        args = args .. "800 "  -- 默认800ms
-    end
-    
-    -- 6. 必需参数：ping目标
-    local ping_target = config.ping_target or ""
-    local ping_target_v6 = config.ping_target_v6 or ""
+    table.insert(args, "-d " .. wan_iface)
+
+    -- Ping 目标
     local use_ipv6 = config.use_ipv6 or "0"
-    
     local target_ip = ""
-    if use_ipv6 == "1" and ping_target_v6 and ping_target_v6 ~= "" then
-        if is_valid_ip(ping_target_v6, true) then
-            target_ip = ping_target_v6
+    if use_ipv6 == "1" and config.ping_target_v6 and config.ping_target_v6 ~= "" then
+        if is_valid_ip(config.ping_target_v6, true) then
+            target_ip = config.ping_target_v6
         end
     else
-        if ping_target and ping_target ~= "" then
-            if is_valid_ip(ping_target, false) then
-                target_ip = ping_target
+        if config.ping_target and config.ping_target ~= "" then
+            if is_valid_ip(config.ping_target, false) then
+                target_ip = config.ping_target
             end
         end
     end
-    
-    -- 如果没有指定ping目标，则自动检测网关
     if target_ip == "" then
+        -- 用户未设置Ping目标，自动检测网关
         local gateway = detect_gateway(use_ipv6 == "1")
-        if gateway then
-            target_ip = gateway
-        else
-            -- 如果仍然没有目标，使用Google DNS
-            target_ip = (use_ipv6 == "1") and "2001:4860:4860::8888" or "8.8.8.8"
-        end
+        target_ip = gateway or (use_ipv6 == "1" and "2001:4860:4860::8888" or "8.8.8.8")
     end
-    
-    args = args .. target_ip .. " "
-    
-    -- 7. 必需参数：带宽 (kbps)
+    table.insert(args, "-t " .. target_ip)
+
+    -- Ping 间隔
+    local ping_interval = config.ping_interval or "800"
+    if tonumber(ping_interval) < 100 then ping_interval = "100" end
+    if tonumber(ping_interval) > 2000 then ping_interval = "2000" end
+    table.insert(args, "-p " .. ping_interval)
+
+    -- 最大带宽（下载带宽）
     local dl_kbps = tonumber(bandwidth.download_bandwidth) or 100000
-    args = args .. tostring(dl_kbps) .. " "
-    
-    -- 8. 可选参数：初始ping时间(ms) 与-s一起使用
-    if config.skip_initial_measurement and config.skip_initial_measurement == "1" then
-        if config.initial_ping_time and tonumber(config.initial_ping_time) > 0 then
-            args = args .. "-t " .. config.initial_ping_time .. " "
-        end
-    end
-    
-    -- 9. 可选参数：初始链路限制(kbps) 与-s一起使用
-    if config.skip_initial_measurement and config.skip_initial_measurement == "1" then
-        if config.initial_link_limit and tonumber(config.initial_link_limit) > 0 then
-            args = args .. "-l " .. config.initial_link_limit .. " "
-        end
-    end
-    
-    -- 10. 可选参数：自定义ping限制(ms) - 这是第四个参数
+    table.insert(args, "-m " .. tostring(dl_kbps))
+
+    -- Ping 限制（可选）
     if config.ping_limit and config.ping_limit ~= "" and tonumber(config.ping_limit) > 0 then
-        args = args .. config.ping_limit .. " "
+        local limit = tonumber(config.ping_limit)
+        if limit < 10 then limit = 10 end
+        if limit > 1000 then limit = 1000 end
+        table.insert(args, "-P " .. tostring(limit))
     end
-    
-    -- 清理多余的空白字符
-    args = args:gsub("%s+", " "):gsub("^%s*(.-)%s*$", "%1")
-    
-    return args
+
+    -- 后台运行（仅当启用时）
+    if config.enabled == "1" then
+        table.insert(args, "-b")
+    end
+
+    -- 自动切换模式（原 enable_active_minrtt 对应 -A）
+    if config.enable_active_minrtt == "1" then
+        table.insert(args, "-A")
+    end
+
+    -- 跳过初始测量
+    if config.skip_initial_measurement == "1" then
+        table.insert(args, "-I")
+    end
+
+    -- 详细日志
+    if config.verbose == "1" then
+        table.insert(args, "-v")
+    end
+
+    return table.concat(args, " ")
 end
 
 -- 生成启动脚本
@@ -446,16 +425,9 @@ function status_display.cfgvalue()
         local args = get_qosacc_args()
         if args and args ~= "" then
             -- 提取关键参数显示
-            local ping_interval = args:match("^(%-[a-z]%s+)*([0-9]+)")
-            if ping_interval then
-                ping_interval = ping_interval:match("([0-9]+)$")
-            end
-            if not ping_interval then
-                ping_interval = args:match("(%d+)%s+[^%s]+%s+%d+")
-            end
-            
-            local ping_target = args:match("[0-9]+%s+([^%s]+)")
-            local bandwidth = args:match("[0-9]+%s+[^%s]+%s+([0-9]+)")
+            local ping_interval = args:match("%-p%s+(%d+)")
+            local ping_target = args:match("%-t%s+([^%s]+)")
+            local bandwidth = args:match("%-m%s+(%d+)")
             
             if ping_interval then
                 info = info .. '<br><span style="color: blue;">Ping间隔: ' .. ping_interval .. 'ms</span>'

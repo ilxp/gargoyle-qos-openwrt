@@ -59,7 +59,7 @@
 #define STATS_INTERVAL_MS 1000
 #define CONTROL_INTERVAL_MS 1000
 #define HEARTBEAT_INTERVAL_MS 10000
-#define HEARTBEAT_TIMEOUT_MS 30000
+#define HEARTBEAT_TIMEOUT_MS 60000   //心跳超时阈值
 #define POLL_TIMEOUT_MS 10
 #define MIN_SLEEP_MS 1
 #define CONFIG_VERSION 1
@@ -72,8 +72,8 @@
 #define LOCK_RETRY_COUNT 3
 #define LOCK_RETRY_DELAY_MS 50
 #define COMPARE_EPSILON 1e-6
-#define TC_OP_RETRY_COUNT 3      /* TC操作重试次数 */
-#define TC_OP_RETRY_DELAY_MS 100 /* TC操作重试间隔 */
+#define TC_OP_RETRY_COUNT 2      /* TC操作重试次数 */
+#define TC_OP_RETRY_DELAY_MS 50 /* TC操作重试间隔 */
 #define MAX_CLASSES 30            /* 最大类数量 */
 #define ICMP_DATA_SIZE 56   // 标准 ping 数据长度（含时间戳）
 
@@ -1453,6 +1453,12 @@ static int modify_class_bandwidth(qosacc_context_t* ctx, __u32 rate_bps) {
     int last_ret = 0;
 
     while (retries-- > 0) {
+        // 如果收到退出信号，立即返回失败
+        if (atomic_load(&ctx->sigterm)) {
+            qosacc_log(ctx, QACC_LOG_INFO, "退出信号，中止TC操作\n");
+            return QACC_ERR_SYSTEM;
+        }
+
         memset(&req, 0, sizeof(req));
         req.n.nlmsg_len = NLMSG_LENGTH(sizeof(struct tcmsg));
         req.n.nlmsg_flags = NLM_F_REQUEST | NLM_F_REPLACE;
@@ -1465,7 +1471,6 @@ static int modify_class_bandwidth(qosacc_context_t* ctx, __u32 rate_bps) {
             return QACC_ERR_CONFIG;
         }
         req.t.tcm_handle = handle;
-        // 使用检测到的根 qdisc handle 作为 parent，若未找到则用 TC_H_ROOT
         req.t.tcm_parent = ctx->root_qdisc_handle ? ctx->root_qdisc_handle : TC_H_ROOT;
 
         ll_init_map(&ctx->rth);
@@ -1482,13 +1487,10 @@ static int modify_class_bandwidth(qosacc_context_t* ctx, __u32 rate_bps) {
             struct tc_service_curve sc;
             memset(&sc, 0, sizeof(sc));
             sc.m2 = rate_bps / 8;
-
 #ifdef TCA_HFSC_SC
-            /* 新版 iproute2 使用独立的 SC 和 UL 属性 */
             addattr_l(&req.n, sizeof(req), TCA_HFSC_SC, &sc, sizeof(sc));
             addattr_l(&req.n, sizeof(req), TCA_HFSC_UL, &sc, sizeof(sc));
 #else
-            /* 老版本仅支持 USC（上行曲线），效果等同于同时设置 SC 和 UL */
             addattr_l(&req.n, sizeof(req), TCA_HFSC_USC, &sc, sizeof(sc));
 #endif
             tail->rta_len = (void*)NLMSG_TAIL(&req.n) - (void*)tail;
@@ -1538,6 +1540,11 @@ static int modify_qdisc_bandwidth(qosacc_context_t* ctx, __u32 rate_bps) {
     int last_ret = 0;
 
     while (retries-- > 0) {
+        if (atomic_load(&ctx->sigterm)) {
+            qosacc_log(ctx, QACC_LOG_INFO, "退出信号，中止TC操作\n");
+            return QACC_ERR_SYSTEM;
+        }
+
         memset(&req, 0, sizeof(req));
         req.n.nlmsg_len = NLMSG_LENGTH(sizeof(struct tcmsg));
         req.n.nlmsg_flags = NLM_F_REQUEST | NLM_F_REPLACE;
