@@ -30,6 +30,7 @@ endef
 define Build/Prepare
 	mkdir -p $(PKG_BUILD_DIR)
 	$(CP) ./src/qosacc/* $(PKG_BUILD_DIR)/
+	$(CP) ./src/classifi/* $(PKG_BUILD_DIR)/
 endef
 
 
@@ -69,6 +70,8 @@ define Package/qos-gargoyle/install
 
 	$(INSTALL_DIR) $(1)/usr/sbin
 	$(INSTALL_BIN) $(PKG_BUILD_DIR)/qosacc $(1)/usr/sbin/qosacc
+	$(INSTALL_BIN) $(PKG_BUILD_DIR)/classifi $(1)/usr/sbin/classifi
+	
 endef
 
 define Package/qos-gargoyle/prerm
