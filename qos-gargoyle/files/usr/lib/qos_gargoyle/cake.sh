@@ -26,8 +26,7 @@ echo "  下载带宽: ${total_download_bandwidth}kbit/s"
 
 # ========= CAKE专属常量 ==========
 CAKE_DIFFSERV_MODE="diffserv4"
-CAKE_FLOWMODE="srchost"          # 新增：流模式，默认 srchost
-CAKE_LIMIT=""                     # 新增：队列包数量限制
+CAKE_FLOWMODE="srchost"          # 流模式，默认 srchost
 CAKE_OVERHEAD="0"
 CAKE_MPU="0"
 CAKE_RTT="100ms"
@@ -38,7 +37,7 @@ CAKE_SPLIT_GSO="0"
 CAKE_INGRESS="0"          # 用户配置，决定是否附加 ingress 参数
 CAKE_AUTORATE_INGRESS="0"
 CAKE_MEMORY_LIMIT="32mb"
-CAKE_ECN=""               # 新增：ECN 启用标志
+CAKE_ECN=""               # ECN 启用标志
 ENABLE_AUTO_TUNE="1"
 CAKE_MQ_ENABLED="1"        # 是否启用多队列 CAKE-MQ
 CAKE_DELETE_IFB_ON_STOP="1" # 停止时是否删除 IFB 设备（默认删除）
@@ -184,16 +183,51 @@ validate_cake_parameters() {
             ;;
 
         rtt)
+            # 格式检查
             if [ -n "$param_value" ] && ! echo "$param_value" | grep -qiE '^[0-9]*\.?[0-9]+(us|ms|s)$'; then
                 log_warn "无效的RTT格式: $param_value (应为数字+单位: us/ms/s)"
                 return 1
             fi
+            # 数值范围警告（近似转换为毫秒）
+            if [ -n "$param_value" ]; then
+                local num=$(echo "$param_value" | grep -oE '^[0-9]*\.?[0-9]+')
+                local unit=$(echo "$param_value" | grep -oiE '(us|ms|s)$' | tr 'A-Z' 'a-z')
+                local ms=""
+                case "$unit" in
+                    us) ms=$(( ${num%.*} / 1000 )) ;;   # 仅取整数部分近似
+                    ms) ms="${num%.*}" ;;
+                    s)  ms=$(( ${num%.*} * 1000 )) ;;
+                esac
+                if [ -n "$ms" ] && [ "$ms" -gt 10000 ] 2>/dev/null; then
+                    log_warn "RTT值过大 (>10秒): $param_value"
+                elif [ -n "$ms" ] && [ "$ms" -lt 1 ] 2>/dev/null && [ "$ms" != "0" ]; then
+                    log_warn "RTT值过小 (<1ms): $param_value"
+                fi
+            fi
             ;;
 
         memory_limit)
+            # 格式检查
             if [ -n "$param_value" ] && ! echo "$param_value" | grep -qiE '^[0-9]+(b|kb|mb|gb)$'; then
                 log_warn "无效的内存限制格式: $param_value"
                 return 1
+            fi
+            # 数值范围警告（近似转换为MB）
+            if [ -n "$param_value" ]; then
+                local num=$(echo "$param_value" | grep -oE '[0-9]+')
+                local unit=$(echo "$param_value" | grep -oiE '(b|kb|mb|gb)$' | tr 'A-Z' 'a-z')
+                local mb=0
+                case "$unit" in
+                    b)  mb=$((num / 1024 / 1024)) ;;
+                    kb) mb=$((num / 1024)) ;;
+                    mb) mb=$num ;;
+                    gb) mb=$((num * 1024)) ;;
+                esac
+                if [ "$mb" -gt 512 ] 2>/dev/null; then
+                    log_warn "内存限制过大 (>512MB): $param_value"
+                elif [ "$mb" -lt 1 ] 2>/dev/null && [ "$mb" -ne 0 ]; then
+                    log_warn "内存限制过小 (<1MB): $param_value"
+                fi
             fi
             ;;
     esac
@@ -427,8 +461,9 @@ validate_cake_config() {
     fi
 
     validate_diffserv_mode "$CAKE_DIFFSERV_MODE" || CAKE_DIFFSERV_MODE="diffserv4"
-    validate_cake_parameters "$CAKE_RTT" "rtt"
-    validate_cake_parameters "$CAKE_MEMORY_LIMIT" "memory_limit"
+    # 严格验证RTT和内存限制，若格式无效则中止
+    validate_cake_parameters "$CAKE_RTT" "rtt" || return 1
+    validate_cake_parameters "$CAKE_MEMORY_LIMIT" "memory_limit" || return 1
 
     log_info "✅ CAKE配置验证通过"
     return 0
@@ -636,7 +671,7 @@ create_cake_root_qdisc() {
             return 1
         fi
 
-        # 构建一次基础参数（不含 bandwidth）
+        # 优化：预先构建一次完整参数，获取基础参数部分（不含bandwidth）
         local full_params=$(build_cake_params "$bandwidth" "$direction")
         local base_params=$(echo "$full_params" | sed 's/bandwidth [0-9]*kbit //')
 
@@ -968,6 +1003,10 @@ acquire_lock() {
         if [ -f "$LOCK_PID_FILE" ]; then
             local old_pid=$(cat "$LOCK_PID_FILE" 2>/dev/null)
             if [ -n "$old_pid" ] && kill -0 "$old_pid" 2>/dev/null; then
+                if [ "$old_pid" -eq "$$" ]; then
+                    log_debug "已持有锁 (PID: $$)"
+                    return 0
+                fi
                 log_error "无法获取锁，进程 $old_pid 仍在运行"
                 return 1
             else
@@ -975,7 +1014,6 @@ acquire_lock() {
                 rm -rf "$LOCK_DIR"
             fi
         else
-            # 无PID文件，可能是不完整锁或意外文件
             log_warn "锁目录 $LOCK_DIR 存在但无PID文件，尝试强制清理"
             rm -rf "$LOCK_DIR" 2>/dev/null
             if [ -d "$LOCK_DIR" ]; then

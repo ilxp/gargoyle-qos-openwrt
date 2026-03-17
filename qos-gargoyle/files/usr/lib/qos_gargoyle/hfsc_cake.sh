@@ -156,6 +156,10 @@ acquire_lock() {
         if [ -f "$lock_file" ]; then
             local pid=$(cat "$lock_file" 2>/dev/null)
             if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+                if [ "$pid" -eq "$$" ]; then
+                    qos_log "DEBUG" "已持有锁 (PID: $$)"
+                    return 0
+                fi
                 sleep 1
                 count=$((count + 1))
                 continue

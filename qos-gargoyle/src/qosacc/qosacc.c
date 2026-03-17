@@ -1,16 +1,7 @@
 /* qosacc - 基于netlink的QoS主动拥塞控制（TC库版，支持HFSC/HTB/CAKE，含实时类检测）
- * version=1.9.2
+ * version=1.9.3
  * 功能：通过ping监控延迟，使用TC库直接调整根类的带宽，支持实时类检测（HFSC专用）
  * 状态文件目录：/tmp/qosacc.status
- *
- * 更新说明：
- * 1.9.2 - 修复ping序号检查的16位溢出漏洞，改用无符号模减
- *       - 修正TC类带宽修改时的parent字段，使用检测到的根qdisc句柄
- *       - 改进类统计读取方式，正确提取bytes字段，避免结构体版本问题
- *       - 添加上次设置带宽记录，避免重复发送netlink消息
- *       - 心跳重初始化失败时不再导致后续poll错误
- *       - 配置文件check_interval单位明确为秒（代码中乘以1000转为毫秒）
- *       - 其他健壮性改进
  */
  
 #define _GNU_SOURCE 1
@@ -780,8 +771,11 @@ int ping_manager_init(ping_manager_t* pm, qosacc_context_t* ctx) {
 int ping_manager_send(ping_manager_t* pm) {
     qosacc_context_t* ctx = pm->ctx;
     if (ctx->ping_socket < 0) return QACC_ERR_SOCKET;
-    int cc = 0;
 
+    // 清零缓冲区前64字节（ICMP头 + 数据）
+    memset(pm->packet, 0, 64);
+
+    int cc = 0;
     if (ctx->target_addr.ss_family == AF_INET6) {
         struct icmp6_hdr* icp6 = (struct icmp6_hdr*)pm->packet;
         icp6->icmp6_type = ICMP6_ECHO_REQUEST;
@@ -797,21 +791,21 @@ int ping_manager_send(ping_manager_t* pm) {
             data[i] = i & 0xFF;
         }
 
-        cc = sizeof(struct icmp6_hdr) + ICMP_DATA_SIZE;  // 总长度
+        cc = sizeof(struct icmp6_hdr) + ICMP_DATA_SIZE;  // 总长度 64
         icp6->icmp6_cksum = 0;  // 内核自动填充
     } else {
         struct icmp* icp = (struct icmp*)pm->packet;
         icp->icmp_type = ICMP_ECHO;
         icp->icmp_code = 0;
-        icp->icmp_id = htons(ctx->ident);          // 网络字节序
-        icp->icmp_seq = htons(ctx->ntransmitted);  // 网络字节序
+        icp->icmp_id = htons(ctx->ident);
+        icp->icmp_seq = htons(ctx->ntransmitted);
 
         // 数据部分：时间戳 + 填充
         struct timeval* tv = (struct timeval*)icp->icmp_data;
         gettimeofday(tv, NULL);
         char *data = (char*)icp->icmp_data;
         for (int i = sizeof(struct timeval); i < ICMP_DATA_SIZE; i++) {
-            data[i] = i & 0xFF;
+            data[i] = i & 0xFF;  // 填充剩余字节
         }
 
         cc = 8 + ICMP_DATA_SIZE;  // ICMP头8字节 + 数据56字节 = 64
@@ -830,7 +824,6 @@ int ping_manager_send(ping_manager_t* pm) {
                ctx->ntransmitted-1, ctx->ident, cc);
     return QACC_OK;
 }
-
 
 int ping_manager_receive(ping_manager_t* pm) {
     qosacc_context_t* ctx = pm->ctx;
