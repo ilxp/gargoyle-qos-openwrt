@@ -2,7 +2,7 @@
 #
 # QoS Gargoyle 初始化脚本 - 传统 init.d 版本
 # 支持多算法：HFSC, CAKE, FQ_CoDel, HTB
-# 版本：2.2.3（修复：grep 正则、回退逻辑、等待协议增强）
+# 版本：2.2.4（锁机制统一：目录锁 + PID 重入检查）
 #
 
 START=50
@@ -17,7 +17,8 @@ EXTRA_HELP="        show    显示当前 QoS 配置状态
 CONFIG_FILE="qos_gargoyle"
 UPLOAD_MASK="0xFFFF"
 DOWNLOAD_MASK="0xFFFF0000"
-LOCK_DIR="/var/run/qos_gargoyle.lock"          # 改用目录锁，原子性更好
+LOCK_DIR="/var/run/qos_gargoyle.lock"          # 锁目录
+LOCK_PID_FILE="$LOCK_DIR/pid"                  # PID 文件
 SERVICE_NAME="qos_gargoyle"
 
 # 算法模块路径
@@ -98,7 +99,6 @@ update_config_state() {
 }
 
 # ========== 核心清理函数 ==========
-# 修复: 确保 IFB_DEVICE 已初始化
 stop_qos() {
     echo "Stopping QoS system..."
     
@@ -772,25 +772,46 @@ start_qos_acc() {
     echo "QoS acc started"
 }
 
-# ========== 锁函数（使用目录锁）==========
+# ========== 锁函数（使用目录锁，支持 PID 重入）==========
 acquire_lock() {
-    local timeout=10
-    local count=0
-    while [ $count -lt $timeout ]; do
-        if mkdir "$LOCK_DIR" 2>/dev/null; then
-            trap 'release_lock' EXIT INT TERM HUP QUIT
-            return 0
+    if [ -d "$LOCK_DIR" ]; then
+        if [ -f "$LOCK_PID_FILE" ]; then
+            local old_pid=$(cat "$LOCK_PID_FILE" 2>/dev/null)
+            if [ -n "$old_pid" ] && kill -0 "$old_pid" 2>/dev/null; then
+                if [ "$old_pid" -eq "$$" ]; then
+                    echo "已持有锁 (PID: $$)"
+                    return 0
+                fi
+                echo "错误: 无法获取锁，进程 $old_pid 仍在运行" >&2
+                return 1
+            else
+                echo "警告: 发现残留锁目录，进程 $old_pid 已不存在，清理中" >&2
+                rm -rf "$LOCK_DIR"
+            fi
+        else
+            echo "警告: 锁目录 $LOCK_DIR 存在但无PID文件，尝试强制清理" >&2
+            rm -rf "$LOCK_DIR" 2>/dev/null
+            if [ -d "$LOCK_DIR" ]; then
+                echo "错误: 无法清理锁目录 $LOCK_DIR" >&2
+                return 1
+            fi
         fi
-        sleep 1
-        count=$((count + 1))
-    done
-    echo "错误: 无法获取锁 $LOCK_DIR (超时)" >&2
-    return 1
+    fi
+
+    mkdir "$LOCK_DIR" || {
+        echo "错误: 无法创建锁目录" >&2
+        return 1
+    }
+    echo "$$" > "$LOCK_PID_FILE"
+    trap 'release_lock' EXIT INT TERM HUP QUIT
+    echo "已获取锁: $LOCK_DIR (PID: $$)"
+    return 0
 }
 
 release_lock() {
-    rm -rf "$LOCK_DIR" 2>/dev/null
-    trap - EXIT INT TERM HUP QUIT
+    rm -f "$LOCK_PID_FILE"
+    rmdir "$LOCK_DIR" 2>/dev/null
+    echo "锁已释放"
 }
 
 # ========== 主初始化函数 ==========

@@ -7,13 +7,14 @@
 
 # ========== 全局配置常量 ==========
 : ${CONFIG_FILE:=qos_gargoyle}
-: ${LOCK_FILE:=/var/run/htb_cake.lock}      # 并发锁文件
-: ${MAX_PHYSICAL_BANDWIDTH:=10000000}       # 最大物理带宽10Gbps（单位kbit）
-: ${UPLOAD_MASK:=0xFFFF}           					# 上传方向标记掩码，使用低 16 位
-: ${DOWNLOAD_MASK:=0xFFFF0000}    				 # 下载方向标记掩码，使用高 16 位
-: ${QOS_RUNNING_FILE:=/var/run/htb_cake.running} # 运行标记文件
-: ${DELETE_IFB_ON_STOP:=0}                    # 停止时是否删除IFB设备（默认0不删除）
-: ${DEBUG:=0}                                  # 调试开关，0关闭，1开启
+: ${LOCK_DIR:=/var/run/htb_cake.lock}           # 并发锁目录
+: ${LOCK_PID_FILE:=$LOCK_DIR/pid}                 # 锁目录中的PID文件
+: ${MAX_PHYSICAL_BANDWIDTH:=10000000}              # 最大物理带宽10Gbps（单位kbit）
+: ${UPLOAD_MASK:=0xFFFF}                           # 上传方向标记掩码，使用低 16 位
+: ${DOWNLOAD_MASK:=0xFFFF0000}                     # 下载方向标记掩码，使用高 16 位
+: ${QOS_RUNNING_FILE:=/var/run/htb_cake.running}   # 运行标记文件
+: ${DELETE_IFB_ON_STOP:=0}                          # 停止时是否删除IFB设备（默认0不删除）
+: ${DEBUG:=0}                                        # 调试开关，0关闭，1开启
 
 # 全局变量声明
 upload_class_list=""
@@ -146,6 +147,48 @@ ensure_ifb_device() {
     return 0
 }
 
+# ========== 目录锁机制（支持重入）==========
+acquire_lock() {
+    if [ -d "$LOCK_DIR" ]; then
+        if [ -f "$LOCK_PID_FILE" ]; then
+            local old_pid=$(cat "$LOCK_PID_FILE" 2>/dev/null)
+            if [ -n "$old_pid" ] && kill -0 "$old_pid" 2>/dev/null; then
+                if [ "$old_pid" -eq "$$" ]; then
+                    qos_log "DEBUG" "已持有锁 (PID: $$)"
+                    return 0
+                fi
+                qos_log "ERROR" "无法获取锁，进程 $old_pid 仍在运行"
+                return 1
+            else
+                qos_log "WARN" "发现残留锁目录，进程 $old_pid 已不存在，清理中"
+                rm -rf "$LOCK_DIR"
+            fi
+        else
+            qos_log "WARN" "锁目录 $LOCK_DIR 存在但无PID文件，尝试强制清理"
+            rm -rf "$LOCK_DIR" 2>/dev/null
+            if [ -d "$LOCK_DIR" ]; then
+                qos_log "ERROR" "无法清理锁目录 $LOCK_DIR"
+                return 1
+            fi
+        fi
+    fi
+
+    mkdir "$LOCK_DIR" || {
+        qos_log "ERROR" "无法创建锁目录"
+        return 1
+    }
+    echo "$$" > "$LOCK_PID_FILE"
+    trap 'release_lock' EXIT INT TERM HUP QUIT
+    qos_log "DEBUG" "已获取锁: $LOCK_DIR (PID: $$)"
+    return 0
+}
+
+release_lock() {
+    rm -f "$LOCK_PID_FILE"
+    rmdir "$LOCK_DIR" 2>/dev/null
+    qos_log "DEBUG" "锁已释放"
+}
+
 # ========== 幂等性检查 ==========
 check_already_running() {
     if [ -f "$QOS_RUNNING_FILE" ]; then
@@ -159,49 +202,6 @@ check_already_running() {
         fi
     fi
     echo "$$" > "$QOS_RUNNING_FILE"
-    return 0
-}
-
-# ========== 并发安全锁机制（增强版） ==========
-acquire_lock() {
-    local lock_file="$LOCK_FILE"
-    local timeout=10
-    local count=0
-    
-    while [ $count -lt $timeout ]; do
-        if [ -f "$lock_file" ]; then
-            local pid=$(cat "$lock_file" 2>/dev/null)
-            if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
-                if [ "$pid" -eq "$$" ]; then
-                    qos_log "DEBUG" "已持有锁 (PID: $$)"
-                    return 0
-                fi
-                sleep 1
-                count=$((count + 1))
-                continue
-            else
-                rm -f "$lock_file" 2>/dev/null
-            fi
-        fi
-        
-        if ( set -o noclobber; echo "$$" > "$lock_file" ) 2>/dev/null; then
-            trap 'release_lock; exit 0' EXIT SIGINT SIGTERM SIGHUP
-            return 0
-        fi
-        sleep 1
-        count=$((count + 1))
-    done
-    
-    qos_log "ERROR" "无法获取锁 $lock_file，可能已有其他进程在运行"
-    return 1
-}
-
-release_lock() {
-    rm -f "$LOCK_FILE" 2>/dev/null || {
-        qos_log "WARN" "锁文件删除失败，尝试强制删除"
-        rm -rf "$LOCK_FILE" 2>/dev/null
-    }
-    qos_log "DEBUG" "锁已释放"
     return 0
 }
 
