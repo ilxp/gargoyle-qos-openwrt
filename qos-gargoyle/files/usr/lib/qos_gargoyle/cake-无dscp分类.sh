@@ -12,9 +12,6 @@ LOCK_PID_FILE="$LOCK_DIR/pid"
 RUNTIME_PARAMS_FILE="/tmp/cake_runtime_params"
 QOS_RUNNING_FILE="/var/run/cake_qos.running"
 
-# 加载 dscpclassify 核心库（用于智能分类）
-. /usr/lib/qos_gargoyle/dscpclassify_core.sh
-
 # 如果 qos_interface 未设置，尝试获取
 if [ -z "$qos_interface" ]; then
     qos_interface=$(uci -q get qos_gargoyle.global.wan_interface 2>/dev/null)
@@ -94,10 +91,6 @@ check_dependencies() {
     fi
     if ! command -v ethtool >/dev/null 2>&1; then
         log_warn "ethtool 命令未找到，队列数检测将回退到 sysfs"
-    fi
-    # 检查 ctinfo 内核模块（用于下载方向 DSCP 恢复）
-    if ! lsmod | grep -q sch_ctinfo && ! modprobe sch_ctinfo 2>/dev/null; then
-        log_warn "ctinfo 内核模块未加载，下载方向 DSCP 恢复可能失败，请安装 kmod-sched-ctinfo"
     fi
     return 0
 }
@@ -477,7 +470,6 @@ validate_cake_config() {
 }
 
 # ========== 入口重定向（IPv4必须成功，IPv6可选）==========
-# 修改：添加 ctinfo 动作，使下载数据包的 DSCP 从 conntrack 标记恢复
 setup_ingress_redirect() {
     log_info "设置入口重定向: $qos_interface -> $IFB_DEVICE"
 
@@ -494,7 +486,6 @@ setup_ingress_redirect() {
     # IPv4重定向（必须成功）
     if tc filter add dev "$qos_interface" parent ffff: protocol ip \
         u32 match u32 0 0 \
-        action ctinfo cpmark dscp 8 1 \
         action mirred egress redirect dev "$IFB_DEVICE" 2>/dev/null; then
         ipv4_success=true
     else
@@ -507,14 +498,12 @@ setup_ingress_redirect() {
     # IPv6重定向：限制全球单播地址 2000::/3（可选）
     if tc filter add dev "$qos_interface" parent ffff: protocol ipv6 \
         u32 match u32 0x20000000 0xe0000000 at 24 \
-        action ctinfo cpmark dscp 8 1 \
         action mirred egress redirect dev "$IFB_DEVICE" 2>/dev/null; then
         ipv6_success=true
     else
         log_warn "IPv6入口重定向规则（全球单播）添加失败，尝试无过滤规则"
         if tc filter add dev "$qos_interface" parent ffff: protocol ipv6 \
             u32 match u32 0 0 \
-            action ctinfo cpmark dscp 8 1 \
             action mirred egress redirect dev "$IFB_DEVICE" 2>/dev/null; then
             ipv6_success=true
         else
@@ -987,10 +976,6 @@ stop_cake_qos() {
     # 清理入口重定向队列
     tc qdisc del dev "$qos_interface" ingress 2>/dev/null && log_info "清理入口重定向队列" || true
 
-    # ---------- 卸载 dscpclassify ----------
-    dscpclassify_unload
-    # --------------------------------------------
-
     # 处理IFB设备
     if ip link show dev "$IFB_DEVICE" >/dev/null 2>&1; then
         ip link set dev "$IFB_DEVICE" down
@@ -1100,22 +1085,6 @@ initialize_cake_qos() {
                 rm -f "$QOS_RUNNING_FILE"
                 exit 1
             }
-
-            # ---------- 加载 dscpclassify 分类规则 ----------
-            # 获取 LAN 接口（默认 br-lan，可从 UCI 读取或根据实际情况修改）
-            local lan_iface="br-lan"
-            # 尝试从 qos_gargoyle 配置中获取 LAN 接口（如果有）
-            if uci -q get qos_gargoyle.global.lan_interface >/dev/null; then
-                lan_iface=$(uci -q get qos_gargoyle.global.lan_interface)
-            fi
-            local wan_iface="$qos_interface"
-            if ! dscpclassify_load "$lan_iface" "$wan_iface"; then
-                log_error "dscpclassify 加载失败"
-                release_lock
-                rm -f "$QOS_RUNNING_FILE"
-                exit 1
-            fi
-            # --------------------------------------------------------
 
             # 初始化上传和下载
             local upload_success=0

@@ -19,7 +19,7 @@ define Package/qos-gargoyle
 	CATEGORY:=Network
 	TITLE:=A set of QoS scripts designed for use with Gargoyle Web Interface
 	DEPENDS:=+tc-full +ip +bc +kmod-ifb +kmod-sched +kmod-sched-connmark +kmod-sched-prio +nftables \
-							+kmod-nf-conntrack +kmod-nf-conntrack6 +kmod-nf-nat +kmod-nf-nat6 +kmod-nf-nathelper +kmod-nf-nathelper-extra
+							+kmod-nf-conntrack +kmod-nf-conntrack6 +kmod-nf-nat +kmod-nf-nat6 +kmod-nf-nathelper +kmod-nf-nathelper-extra +kmod-sched-ctinfo
 	MAINTAINER:=Eric Bishop <eric@gargoyle-router.com>
 endef
 
@@ -59,6 +59,7 @@ define Package/qos-gargoyle/install
 	$(INSTALL_DIR) $(1)/etc/qos_gargoyle/
 	$(INSTALL_DIR) $(1)/usr/lib/qos_gargoyle/
 	$(INSTALL_DIR) $(1)/usr/share/qos_gargoyle/
+	$(INSTALL_DIR) $(1)/etc/dscpclassify.d
 	
 	$(INSTALL_BIN) $(CURDIR)/files/ifb.init $(1)/etc/init.d/ifb
 	$(INSTALL_BIN) $(CURDIR)/files/qos_gargoyle.init $(1)/etc/init.d/qos_gargoyle
@@ -66,6 +67,9 @@ define Package/qos-gargoyle/install
 	$(INSTALL_CONF) $(CURDIR)/files/qos_gargoyle.conf $(1)/etc/config/qos_gargoyle
 	$(INSTALL_BIN) $(CURDIR)/files/usr/lib/qos_gargoyle/* $(1)/usr/lib/qos_gargoyle/
 	$(INSTALL_BIN) $(CURDIR)/files/gargoyle_firewall.include $(1)/usr/share/qos_gargoyle/gargoyle_firewall.include
+	
+	$(INSTALL_CONF) $(CURDIR)/files/etc/config/dscpclassify $(1)/etc/config/dscpclassify
+	$(INSTALL_CONF) $(CURDIR)/files/etc/dscpclassify.d/*.nft $(1)/etc/dscpclassify.d/
 
 	$(INSTALL_DIR) $(1)/usr/sbin
 	$(INSTALL_BIN) $(PKG_BUILD_DIR)/qosacc $(1)/usr/sbin/qosacc
