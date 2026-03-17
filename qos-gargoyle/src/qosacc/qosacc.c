@@ -59,7 +59,7 @@
 #define STATS_INTERVAL_MS 1000
 #define CONTROL_INTERVAL_MS 1000
 #define HEARTBEAT_INTERVAL_MS 10000
-#define HEARTBEAT_TIMEOUT_MS 60000   //心跳超时阈值
+#define HEARTBEAT_TIMEOUT_MS 90000   //心跳超时阈值
 #define POLL_TIMEOUT_MS 10
 #define MIN_SLEEP_MS 1
 #define CONFIG_VERSION 1
@@ -1873,6 +1873,7 @@ void heart_beat_check(qosacc_context_t* ctx) {
             ctx->state, ctx->current_limit_bps/1000, ctx->filtered_ping_time_us/1000,
             ctx->filtered_total_load_bps/1000, ctx->detected_qdisc, ctx->realtime_active);
         last = now;
+        ctx->last_heartbeat_ms = now;   // 更新心跳时间戳，避免超时误报
     }
 }
 

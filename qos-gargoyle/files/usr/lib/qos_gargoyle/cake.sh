@@ -13,7 +13,7 @@ RUNTIME_PARAMS_FILE="/tmp/cake_runtime_params"
 QOS_RUNNING_FILE="/var/run/cake_qos.running"
 
 # 加载 dscpclassify 核心库（用于智能分类）
-. /usr/lib/qos_gargoyle/dscpclassify_core.sh
+. /usr/lib/qos_gargoyle/dscpclassify.sh
 
 # 如果 qos_interface 未设置，尝试获取
 if [ -z "$qos_interface" ]; then
@@ -95,10 +95,12 @@ check_dependencies() {
     if ! command -v ethtool >/dev/null 2>&1; then
         log_warn "ethtool 命令未找到，队列数检测将回退到 sysfs"
     fi
+	
     # 检查 ctinfo 内核模块（用于下载方向 DSCP 恢复）
-    if ! lsmod | grep -q sch_ctinfo && ! modprobe sch_ctinfo 2>/dev/null; then
-        log_warn "ctinfo 内核模块未加载，下载方向 DSCP 恢复可能失败，请安装 kmod-sched-ctinfo"
+    if ! lsmod | grep -q act_ctinfo && ! modprobe act_ctinfo 2>/dev/null; then
+        log_warn "act_ctinfo 内核模块未加载，下载方向 DSCP 恢复可能失败，请安装 kmod-sched-ctinfo"
     fi
+	
     return 0
 }
 
@@ -477,9 +479,12 @@ validate_cake_config() {
 }
 
 # ========== 入口重定向（IPv4必须成功，IPv6可选）==========
-# 修改：添加 ctinfo 动作，使下载数据包的 DSCP 从 conntrack 标记恢复
 setup_ingress_redirect() {
     log_info "设置入口重定向: $qos_interface -> $IFB_DEVICE"
+
+    # 检查是否启用 dscpclassify
+    local use_dscp=$(uci -q get qos_gargoyle.global.dscpclassify)
+    [ -z "$use_dscp" ] && use_dscp=0   # 默认未启用
 
     tc qdisc del dev "$qos_interface" ingress 2>/dev/null
 
@@ -491,34 +496,102 @@ setup_ingress_redirect() {
     local ipv4_success=false
     local ipv6_success=false
 
-    # IPv4重定向（必须成功）
-    if tc filter add dev "$qos_interface" parent ffff: protocol ip \
-        u32 match u32 0 0 \
-        action ctinfo cpmark dscp 8 1 \
-        action mirred egress redirect dev "$IFB_DEVICE" 2>/dev/null; then
-        ipv4_success=true
+    # ---------- IPv4 重定向 ----------
+    if [ "$use_dscp" = "1" ]; then
+        # 启用 dscpclassify：添加 ctinfo 动作
+        if tc filter add dev "$qos_interface" parent ffff: protocol ip \
+            u32 match u32 0 0 \
+            action ctinfo dscp 0x3f 0 pipe \
+            action mirred egress redirect dev "$IFB_DEVICE" 2>/dev/null; then
+            ipv4_success=true
+        else
+            log_error "IPv4入口重定向规则添加失败（含 ctinfo）"
+            tc qdisc del dev "$qos_interface" ingress 2>/dev/null
+            return 1
+        fi
     else
-        log_error "IPv4入口重定向规则添加失败"
-        # 清理已创建的队列
-        tc qdisc del dev "$qos_interface" ingress 2>/dev/null
-        return 1
+        # 未启用 dscpclassify：仅重定向
+        if tc filter add dev "$qos_interface" parent ffff: protocol ip \
+            u32 match u32 0 0 \
+            action mirred egress redirect dev "$IFB_DEVICE" 2>/dev/null; then
+            ipv4_success=true
+        else
+            log_error "IPv4入口重定向规则添加失败"
+            tc qdisc del dev "$qos_interface" ingress 2>/dev/null
+            return 1
+        fi
     fi
 
-    # IPv6重定向：限制全球单播地址 2000::/3（可选）
-    if tc filter add dev "$qos_interface" parent ffff: protocol ipv6 \
-        u32 match u32 0x20000000 0xe0000000 at 24 \
-        action ctinfo cpmark dscp 8 1 \
-        action mirred egress redirect dev "$IFB_DEVICE" 2>/dev/null; then
-        ipv6_success=true
-    else
-        log_warn "IPv6入口重定向规则（全球单播）添加失败，尝试无过滤规则"
+    # ---------- IPv6 重定向：三阶尝试 ----------
+    local ipv6_success=false
+
+    # 第一优先：flower 匹配全球单播地址 (2000::/3)
+    if [ "$use_dscp" = "1" ]; then
         if tc filter add dev "$qos_interface" parent ffff: protocol ipv6 \
-            u32 match u32 0 0 \
-            action ctinfo cpmark dscp 8 1 \
-            action mirred egress redirect dev "$IFB_DEVICE" 2>/dev/null; then
+            flower dst_ip 2000::/3 \
+            action ctinfo dscp 0x3f 0 pipe \
+            action mirred egress redirect dev "$IFB_DEVICE" 2>&1; then
             ipv6_success=true
+            log_info "IPv6入口重定向规则（flower + ctinfo）添加成功"
         else
-            log_warn "IPv6入口重定向规则添加失败，IPv6流量将不会通过IFB"
+            log_warn "flower + ctinfo 规则添加失败，尝试 u32 全球单播匹配"
+        fi
+    else
+        if tc filter add dev "$qos_interface" parent ffff: protocol ipv6 \
+            flower dst_ip 2000::/3 \
+            action mirred egress redirect dev "$IFB_DEVICE" 2>&1; then
+            ipv6_success=true
+            log_info "IPv6入口重定向规则（flower）添加成功"
+        else
+            log_warn "flower 规则添加失败，尝试 u32 全球单播匹配"
+        fi
+    fi
+
+    # 第二优先：u32 匹配全球单播地址 (2000::/3)
+    if [ "$ipv6_success" != "true" ]; then
+        if [ "$use_dscp" = "1" ]; then
+            if tc filter add dev "$qos_interface" parent ffff: protocol ipv6 \
+                u32 match u32 0x20000000 0xe0000000 at 24 \
+                action ctinfo dscp 0x3f 0 pipe \
+                action mirred egress redirect dev "$IFB_DEVICE" 2>&1; then
+                ipv6_success=true
+                log_info "IPv6入口重定向规则（u32全球单播 + ctinfo）添加成功"
+            else
+                log_warn "u32全球单播 + ctinfo 规则添加失败，尝试无过滤规则"
+            fi
+        else
+            if tc filter add dev "$qos_interface" parent ffff: protocol ipv6 \
+                u32 match u32 0x20000000 0xe0000000 at 24 \
+                action mirred egress redirect dev "$IFB_DEVICE" 2>&1; then
+                ipv6_success=true
+                log_info "IPv6入口重定向规则（u32全球单播）添加成功"
+            else
+                log_warn "u32全球单播规则添加失败，尝试无过滤规则"
+            fi
+        fi
+    fi
+
+    # 第三优先：无过滤的 u32 全匹配
+    if [ "$ipv6_success" != "true" ]; then
+        if [ "$use_dscp" = "1" ]; then
+            if tc filter add dev "$qos_interface" parent ffff: protocol ipv6 \
+                u32 match u32 0 0 \
+                action ctinfo dscp 0x3f 0 pipe \
+                action mirred egress redirect dev "$IFB_DEVICE" 2>&1; then
+                ipv6_success=true
+                log_info "IPv6入口重定向规则（无过滤 + ctinfo）添加成功"
+            else
+                log_warn "IPv6入口重定向规则（无过滤 + ctinfo）添加失败，IPv6流量将不会通过IFB"
+            fi
+        else
+            if tc filter add dev "$qos_interface" parent ffff: protocol ipv6 \
+                u32 match u32 0 0 \
+                action mirred egress redirect dev "$IFB_DEVICE" 2>&1; then
+                ipv6_success=true
+                log_info "IPv6入口重定向规则（无过滤）添加成功"
+            else
+                log_warn "IPv6入口重定向规则（无过滤）添加失败，IPv6流量将不会通过IFB"
+            fi
         fi
     fi
 
@@ -911,6 +984,52 @@ show_cake_status() {
     else
         echo "状态: IFB设备未创建"
     fi
+    
+	# 显示 conntrack 标记示例
+if command -v conntrack >/dev/null 2>&1; then
+    echo -e "\n===== conntrack 标记示例 (最近5条) ====="
+    # 获取最近5条带有 mark 的连接，排除 mark=0 和可能的高位干扰
+    conntrack -L 2>/dev/null | grep -E "mark=[1-9][0-9]*" | head -n 5 | while IFS= read -r line; do
+        # 提取关键信息：协议、源/目的IP、端口、mark
+        proto=$(echo "$line" | awk '{print $1}')
+        src=$(echo "$line" | awk '{print $4}' | cut -d= -f2)
+        dst=$(echo "$line" | awk '{print $6}' | cut -d= -f2)
+        sport=$(echo "$line" | awk '{print $5}' | cut -d= -f2)
+        dport=$(echo "$line" | awk '{print $7}' | cut -d= -f2)
+        mark=$(echo "$line" | grep -o "mark=[0-9]\+" | cut -d= -f2)
+        dscp=$((mark & 0x3F))
+        # 映射 DSCP 值到类名（可选）
+        case $dscp in
+            0) class="CS0/BE" ;;
+            8) class="CS1" ;;
+            10) class="AF11" ;;
+            12) class="AF12" ;;
+            14) class="AF13" ;;
+            16) class="CS2" ;;
+            18) class="AF21" ;;
+            20) class="AF22" ;;
+            22) class="AF23" ;;
+            24) class="CS3" ;;
+            26) class="AF31" ;;
+            28) class="AF32" ;;
+            30) class="AF33" ;;
+            32) class="CS4" ;;
+            34) class="AF41" ;;
+            36) class="AF42" ;;
+            38) class="AF43" ;;
+            40) class="CS5" ;;
+            44) class="VA" ;;
+            46) class="EF" ;;
+            48) class="CS6" ;;
+            56) class="CS7" ;;
+            *) class="Unknown" ;;
+        esac
+        printf "  %-5s %-30s:%-5s → %-30s:%-5s [mark=%-6s dscp=%2d (%s)]\n" \
+            "$proto" "${src:-N/A}" "${sport:-N/A}" "${dst:-N/A}" "${dport:-N/A}" "$mark" "$dscp" "$class"
+    done
+else
+    echo "  conntrack 工具未安装，无法显示连接标记"
+fi
 
     # ===== 入口重定向检查 =====
     echo -e "\n===== 入口重定向检查 ====="
@@ -988,7 +1107,10 @@ stop_cake_qos() {
     tc qdisc del dev "$qos_interface" ingress 2>/dev/null && log_info "清理入口重定向队列" || true
 
     # ---------- 卸载 dscpclassify ----------
-    dscpclassify_unload
+    if [ "$(uci -q get qos_gargoyle.global.dscpclassify)" = "1" ]; then
+		log_info "卸载 dscpclassify 分类规则..."
+		dscpclassify_unload
+	fi
     # --------------------------------------------
 
     # 处理IFB设备
@@ -1101,20 +1223,26 @@ initialize_cake_qos() {
                 exit 1
             }
 
-            # ---------- 加载 dscpclassify 分类规则 ----------
-            # 获取 LAN 接口（默认 br-lan，可从 UCI 读取或根据实际情况修改）
-            local lan_iface="br-lan"
-            # 尝试从 qos_gargoyle 配置中获取 LAN 接口（如果有）
-            if uci -q get qos_gargoyle.global.lan_interface >/dev/null; then
-                lan_iface=$(uci -q get qos_gargoyle.global.lan_interface)
-            fi
-            local wan_iface="$qos_interface"
-            if ! dscpclassify_load "$lan_iface" "$wan_iface"; then
-                log_error "dscpclassify 加载失败"
-                release_lock
-                rm -f "$QOS_RUNNING_FILE"
-                exit 1
-            fi
+			# ---------- 加载 dscpclassify 分类规则（如果启用） ----------
+			local dscp_enabled=$(uci -q get qos_gargoyle.global.dscpclassify)
+			if [ "$dscp_enabled" = "1" ]; then
+			log_info "dscpclassify 已启用，正在加载智能分类规则..."
+			local lan_iface="br-lan"
+			if uci -q get qos_gargoyle.global.lan_interface >/dev/null; then
+				lan_iface=$(uci -q get qos_gargoyle.global.lan_interface)
+			fi
+			local wan_iface="$qos_interface"
+			if dscpclassify_load "$lan_iface" "$wan_iface"; then
+				log_info "dscpclassify 智能分类规则加载成功"
+			else
+				log_error "dscpclassify 加载失败"
+				release_lock
+				rm -f "$QOS_RUNNING_FILE"
+				exit 1
+				fi
+			else
+				log_info "dscpclassify 未启用，将使用 CAKE 内置分类（无 DSCP 标记）"
+			fi
             # --------------------------------------------------------
 
             # 初始化上传和下载

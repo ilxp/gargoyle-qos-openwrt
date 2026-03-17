@@ -1138,7 +1138,7 @@ setup_ingress_redirect() {
     
     # 第一优先：flower 匹配全球单播地址 (2000::/3)
     if tc filter add dev "$qos_interface" parent ffff: protocol ipv6 \
-        flower ip6_dst 2000::/3 \
+        flower dst_ip 2000::/3 \
         action connmark \
         action mirred egress redirect dev "$IFB_DEVICE" 2>&1; then
         ipv6_success=true
