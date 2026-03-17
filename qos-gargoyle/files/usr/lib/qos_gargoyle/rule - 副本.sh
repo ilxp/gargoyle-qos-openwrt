@@ -8,7 +8,7 @@ TEMP_FILES=""
 trap 'rm -f $TEMP_FILES 2>/dev/null' EXIT INT TERM HUP
 
 # ========== 检测算法，若为CAKE则直接退出 ==========
-ALGORITHM=$(uci -q get ${CONFIG_FILE}.global.algorithm 2>/dev/null || echo "hfsc_fqcodel")
+ALGORITHM=$(uci -q get ${CONFIG_FILE}.global.algorithm 2>/dev/null || echo "htb_cake")
 if [ "$ALGORITHM" = "cake" ]; then
     echo "[$(date '+%H:%M:%S')] qos_gargoyle 信息: 当前算法为 CAKE，无需生成分类规则，退出" >&2
     logger -t "qos_gargoyle" "信息: 当前算法为 CAKE，无需生成分类规则，退出"
@@ -640,13 +640,6 @@ EOF
 
 # 应用所有规则（兼容旧版本调用）
 apply_all_rules() {
-    # 检查分类方式，仅在 legacy 模式下应用传统规则
-	classifier=$(uci -q get ${CONFIG_FILE}.global.classifier 2>/dev/null || echo "legacy")
-    if [ "$classifier" != "legacy" ]; then
-        log "INFO" "当前分类方式为 nDPI，跳过传统规则生成"
-        return 0
-    fi
-	
     local rule_type="$1"
     local mask="$2"
     local chain="$3"
