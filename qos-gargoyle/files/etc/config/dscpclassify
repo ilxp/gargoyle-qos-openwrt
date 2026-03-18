@@ -64,21 +64,7 @@ config set
 	list entry '100.114.0.0/16'     # 杭州、上海等 Region 内部网段
 	list entry '100.115.0.0/16'     # 北京、广州等 Region 内部网段
 	list entry '100.118.0.0/16'     # 上海、杭州、北京等 Region 内部网段
-	# 云安全中心新增 IP
-	list entry '47.117.157.227'
-	list entry '8.153.161.116'
-	list entry '8.153.86.12'
-	list entry '106.14.18.21'
-	list entry '106.14.97.100'
-	list entry '8.153.93.165'
-	list entry '139.196.179.111'
-	list entry '8.153.199.39'
-	list entry '47.236.237.121'
-	list entry '47.236.52.221'
-	list entry '47.245.118.16'
-	list entry '47.237.189.170'
-	list entry '43.106.19.196'
-	list entry '47.84.136.231'
+	# 注意：移除了所有具体 IP，因为它们已被上述 CIDR 覆盖
 
 # 华为云 (AS55990)
 config set
@@ -87,13 +73,19 @@ config set
 	list entry '119.3.0.0/16'        # 北京/上海/广州
 	list entry '139.159.0.0/16'      # 广州
 
-# 字节跳动（抖音、TikTok）(AS396986)
+# 字节跳动 IPv4 (抖音、TikTok) (AS396986)
 config set
 	option name 'bytedance'
+	option family 'ipv4'
 	list entry '101.227.0.0/16'
 	list entry '110.242.0.0/16'
 	list entry '180.163.0.0/16'
 	list entry '203.205.0.0/16'
+
+# 字节跳动 IPv6
+config set
+	option name 'bytedance6'
+	option family 'ipv6'
 	list entry '2605:340:f09c::/48'  # 海外段
 
 # 火山引擎 (AS137718) 字节跳动旗下云服务商
@@ -245,6 +237,7 @@ config rule
 	option proto 'udp'
 	option dest_port '8000-20000'
 	list dest_ip '@bytedance'
+	list dest_ip '@bytedance6'          # 新增 IPv6 集合
 	list dest_ip '@volcano_engine'
 	option class 'cs4'                  # 多媒体流
 	option description '抖音/快手实时视频流'
@@ -254,6 +247,7 @@ config rule
 	option proto 'tcp'
 	option dest_port '443'
 	list dest_ip '@bytedance'
+	list dest_ip '@bytedance6'          # 新增 IPv6 集合
 	list dest_ip '@volcano_engine'
 	option class 'af41'                 # 多媒体会议
 	option description '抖音/快手信令'
@@ -263,6 +257,7 @@ config rule
 	option proto 'udp'
 	option dest_port '8000-20000'
 	list dest_ip '@bytedance'
+	list dest_ip '@bytedance6'          # 新增 IPv6 集合
 	list dest_ip '@volcano_engine'
 	option class 'af11'                 # 批量数据
 	option description '短视频预缓存'
@@ -277,6 +272,7 @@ config rule
 	list dest_ip '@aliyun'              # 淘宝使用阿里云
 	list dest_ip '@jd_cloud'
 	list dest_ip '@bytedance'            # 抖音电商
+	list dest_ip '@bytedance6'           # 新增 IPv6 集合
 	option class 'af41'                  # 多媒体会议，适合交互式浏览
 	option description '购物App HTTPS'
 

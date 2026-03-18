@@ -883,13 +883,15 @@ initialize_qos() {
         return 1
     fi
     
-    # 调用算法特定的初始化
+    # 调用算法特定的初始化，并捕获返回值
+    local ALGO_RET=0
     case "$algorithm" in
         "hfsc_fqcodel")
             export RULES_ALREADY_APPLIED=1
             if type initialize_hfsc_qos >/dev/null 2>&1; then
                 echo "正在初始化 HFSC QoS..."
                 initialize_hfsc_qos start
+                ALGO_RET=$?
             else
                 echo "错误: HFSC 初始化函数未找到"
                 stop_qos
@@ -914,6 +916,7 @@ initialize_qos() {
             export RULES_ALREADY_APPLIED=1
             if type initialize_htb_qos >/dev/null 2>&1; then
                 initialize_htb_qos start
+                ALGO_RET=$?
             else
                 echo "HTB initialization function not found"
                 stop_qos
@@ -925,6 +928,7 @@ initialize_qos() {
             export RULES_ALREADY_APPLIED=1
             if type initialize_hfsc_cake_qos >/dev/null 2>&1; then
                 initialize_hfsc_cake_qos start
+                ALGO_RET=$?
             else
                 echo "HFSC+CAKE initialization function not found"
                 stop_qos
@@ -936,6 +940,7 @@ initialize_qos() {
             export RULES_ALREADY_APPLIED=1
             if type initialize_htb_cake_qos >/dev/null 2>&1; then
                 initialize_htb_cake_qos start
+                ALGO_RET=$?
             else
                 echo "HTB+CAKE initialization function not found"
                 stop_qos

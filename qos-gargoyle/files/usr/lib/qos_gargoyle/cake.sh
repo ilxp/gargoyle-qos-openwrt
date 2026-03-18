@@ -56,7 +56,7 @@ sanitize_param() {
 # ========== 日志函数 ==========
 log_info() {
     logger -t "qos_gargoyle" "CAKE: $1"
-    echo "[$(date '+%H:%M:%S')] CAKE: $1"
+    echo "[$(date '+%H:%M:%S')] CAKE: $1" >&2
 }
 
 log_error() {
@@ -66,13 +66,13 @@ log_error() {
 
 log_warn() {
     logger -t "qos_gargoyle" "CAKE警告: $1"
-    echo "[$(date '+%H:%M:%S')] ⚠️ CAKE警告: $1"
+    echo "[$(date '+%H:%M:%S')] ⚠️ CAKE警告: $1" >&2
 }
 
 log_debug() {
     [ "${DEBUG:-0}" = "1" ] && {
         logger -t "qos_gargoyle" "CAKE调试: $1"
-        echo "[$(date '+%H:%M:%S')] 🔍 CAKE调试: $1"
+        echo "[$(date '+%H:%M:%S')] 🔍 CAKE调试: $1" >&2
     }
 }
 
