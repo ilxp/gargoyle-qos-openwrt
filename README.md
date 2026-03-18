@@ -118,23 +118,23 @@ logread | grep qos_gargoyle
 [14:30:15] qos_gargoyle CAKE错误: 无法在 eth0 上创建入口队列
 
 ## 五、常见问题与限制
-分类数量上限
+- 分类数量上限
 基于 fwmark 的算法（HFSC/HTB）上传和下载方向各自最多 16 个类别。如需更多类别，需修改 fwmark 掩码（但不建议，可能导致标记冲突）。
 CAKE + DSCP 算法不受此限。
 
-IFB 设备管理
+- IFB 设备管理
 下载方向依赖 IFB 设备进行入口整形。停止 QoS 时，IFB 设备默认保留（DELETE_IFB_ON_STOP=0），可避免重复创建；如需彻底删除，请在 UCI 中设置 delete_ifb_on_stop=1。
 
-内核模块依赖
+- 内核模块依赖
 使用前请确认内核已加载相应模块：lsmod | grep -E "sch_(cake|hfsc|htb|fq_codel|act_ctinfo)"。如缺失，尝试 modprobe <模块名>。
 
-nftables 兼容性
+- nftables 兼容性
 规则生成需要 nftables 支持 ct state、ct bytes 等表达式。旧版内核可能缺少某些功能，请使用 OpenWrt 主线内核（≥4.14）。
 
-优先级范围
+- 优先级范围
 HFSC 支持优先级 0-255，HTB 只支持 0-7，配置时需注意避免与系统默认队列冲突。
 
-连接状态过滤
+- 连接状态过滤
 state 选项支持 new、established、related、untracked、invalid，多个状态用逗号分隔。invalid 状态需内核支持。
 
 --- 结束 ---
