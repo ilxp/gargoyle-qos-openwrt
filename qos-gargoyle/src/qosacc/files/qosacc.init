@@ -1,580 +1,203 @@
 #!/bin/sh
-# ============================================================================
-# qosacc 服务控制脚本
-# 版本: 2.0
-# 描述: 控制 qosacc QoS监控器服务
-# 规范: 符合LSB 4.1标准和OpenWrt init.d脚本规范
-# ============================================================================
+# qosacc 控制脚本
 
-### 脚本头部元信息
-# Provides:          qosacc
-# Required-Start:    $network $local_fs
-# Required-Stop:     $network $local_fs
-# Default-Start:     2 3 4 5
-# Default-Stop:      0 1 6
-# Short-Description: QoS延迟监控器
-# Description:       监控网络延迟，动态调整TC根队列带宽
-###
-
-## 配置参数
 qosacc_BIN="/usr/sbin/qosacc"
 PID_FILE="/var/run/qosacc.pid"
-LOCK_FILE="/var/lock/qosacc"
-CONFIG_FILE="/etc/qosacc.conf"
-LOG_FILE="/var/log/qosacc.log"
-STATUS_FILE="/tmp/qosacc.status"
+START_ARGS="%s"
+LOG_FILE="/tmp/qosacc_debug.log"
 
-# 默认启动参数（如果配置文件不存在）
-DEFAULT_ARGS="-b"  # 后台模式运行
-
-# 优先使用环境变量qosacc_ARGS，否则使用配置文件，最后使用默认参数
-if [ -f "$CONFIG_FILE" ]; then
-    START_ARGS="-c $CONFIG_FILE"
-else
-    START_ARGS="${qosacc_ARGS:-$DEFAULT_ARGS}"
-fi
-
-# 进程名（用于ps和pidof）
-PROCESS_NAME="qosacc"
-
-# 颜色定义
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-BLUE='\033[0;34m'
-NC='\033[0m' # No Color
-
-# 最大等待时间（秒）
-MAX_STOP_WAIT=10
-MAX_START_WAIT=5
-
-## 工具函数
-
-# 打印带颜色的消息
-print_status() {
-    local color="$1"
-    local msg="$2"
-    shift 2
-    printf "${color}%s${NC}\n" "$(printf "$msg" "$@")"
-}
-
-# 记录日志
-log_message() {
-    local level="$1"
-    local msg="$2"
-    shift 2
-    printf "[%s] [%s] %s\n" "$(date '+%Y-%m-%d %H:%M:%S')" "$level" "$(printf "$msg" "$@")" >> "$LOG_FILE"
-}
-
-# 检查qosacc二进制文件是否存在且可执行
+# 检查qosacc程序是否存在
 check_binary() {
     if [ ! -x "$qosacc_BIN" ]; then
-        if [ ! -f "$qosacc_BIN" ]; then
-            print_status "$RED" "错误: qosacc程序不存在: %s" "$qosacc_BIN"
-        else
-            print_status "$RED" "错误: qosacc程序不可执行: %s" "$qosacc_BIN"
-        fi
+        echo "错误: qosacc程序不存在: $qosacc_BIN" >> "$LOG_FILE"
+        echo "请确保已正确安装qosacc程序" >> "$LOG_FILE"
         return 1
     fi
     return 0
 }
 
-# 获取qosacc进程PID
-# 优先从PID文件读取，然后检查实际进程
-get_pid() {
-    # 1. 从PID文件读取
-    if [ -f "$PID_FILE" ]; then
-        local pid_from_file
-        pid_from_file=$(cat "$PID_FILE" 2>/dev/null)
-        if [ -n "$pid_from_file" ] && [ "$pid_from_file" -gt 0 ] 2>/dev/null; then
-            if check_pid "$pid_from_file"; then
-                echo "$pid_from_file"
-                return 0
-            fi
-        fi
-    fi
-    
-    # 2. 通过进程名查找
-    local pids
-    pids=$(pidof "$PROCESS_NAME" 2>/dev/null)
-    if [ -n "$pids" ]; then
-        # 只返回第一个PID
-        echo "$pids" | awk '{print $1}'
-        return 0
-    fi
-    
-    return 1
+# 获取 qosacc 进程的 PID
+get_qosacc_pid() {
+    pidof qosacc 2>/dev/null | awk '{print $1}'
 }
 
-# 检查PID是否有效且是qosacc进程
-check_pid() {
-    local pid="$1"
-    if [ -z "$pid" ] || [ "$pid" -le 0 ] 2>/dev/null; then
-        return 1
-    fi
+# 解析启动参数
+parse_args() {
+    local args="$START_ARGS"
+    echo "=== qosacc启动参数分析 ===" >> "$LOG_FILE"
+    echo "完整参数: $args" >> "$LOG_FILE"
     
-    # 检查进程是否存在
-    if ! kill -0 "$pid" 2>/dev/null; then
-        return 1
-    fi
+    # 显示解析后的参数
+    echo "原始参数: $args" >> "$LOG_FILE"
     
-    # 检查进程名是否为qosacc
-    if [ -f "/proc/$pid/comm" ]; then
-        local comm
-        comm=$(cat "/proc/$pid/comm" 2>/dev/null)
-        if [ "$comm" = "$PROCESS_NAME" ]; then
-            return 0
-        fi
-    fi
-    
-    # 检查cmdline
-    if [ -f "/proc/$pid/cmdline" ]; then
-        if grep -q "$PROCESS_NAME" "/proc/$pid/cmdline" 2>/dev/null; then
-            return 0
-        fi
-    fi
-    
-    return 1
+    return 0
 }
 
-# 验证配置文件
-validate_config() {
-    if [ -f "$CONFIG_FILE" ]; then
-        if [ ! -r "$CONFIG_FILE" ]; then
-            print_status "$RED" "错误: 配置文件不可读: %s" "$CONFIG_FILE"
-            return 1
-        fi
-        
-        # 检查配置文件基本语法
-        if grep -q "^\[" "$CONFIG_FILE" 2>/dev/null; then
-            print_status "$GREEN" "✓ 配置文件格式正确: %s" "$CONFIG_FILE"
-            return 0
-        else
-            print_status "$YELLOW" "⚠ 配置文件格式非标准，但仍可尝试使用" "$CONFIG_FILE"
-            return 0
-        fi
-    else
-        print_status "$YELLOW" "警告: 配置文件不存在: %s" "$CONFIG_FILE"
-        print_status "$YELLOW" "将使用默认参数运行"
-        return 0
-    fi
-}
-
-# 等待进程启动
-wait_for_pid() {
-    local pid="$1"
-    local timeout="$2"
-    local count=0
-    
-    while [ $count -lt "$timeout" ]; do
-        if check_pid "$pid"; then
-            return 0
-        fi
-        sleep 1
-        count=$((count + 1))
-    done
-    
-    return 1
-}
-
-# 等待进程停止
-wait_for_stop() {
-    local pid="$1"
-    local timeout="$2"
-    local count=0
-    
-    while [ $count -lt "$timeout" ]; do
-        if ! check_pid "$pid"; then
-            return 0
-        fi
-        sleep 1
-        count=$((count + 1))
-    done
-    
-    return 1
-}
-
-## 主要控制函数
-
-# 启动服务
 start() {
-    print_status "$BLUE" "正在启动 qosacc 服务..."
-    log_message "INFO" "启动 qosacc 服务"
+    echo "启动 qosacc 服务..." > "$LOG_FILE"
+    echo "启动时间: $(date)" >> "$LOG_FILE"
+    echo "启动参数: $qosacc_BIN $START_ARGS" >> "$LOG_FILE"
     
     # 检查二进制文件
     if ! check_binary; then
-        return 1
-    fi
-    
-    # 验证配置文件
-    if ! validate_config; then
+        echo "qosacc二进制文件检查失败" >&2
         return 1
     fi
     
     # 检查是否已在运行
-    local existing_pid
-    existing_pid=$(get_pid)
-    if [ -n "$existing_pid" ]; then
-        print_status "$YELLOW" "qosacc 已在运行 (PID: %d)" "$existing_pid"
-        
-        # 更新PID文件（如果不存在或不正确）
-        if [ ! -f "$PID_FILE" ] || [ "$(cat "$PID_FILE" 2>/dev/null)" != "$existing_pid" ]; then
-            echo "$existing_pid" > "$PID_FILE" 2>/dev/null
-        fi
-        
+    local qosacc_pid=$(get_qosacc_pid)
+    if [ -n "$qosacc_pid" ]; then
+        echo "qosacc 已在运行 (PID: $qosacc_pid)" >> "$LOG_FILE"
+        echo "$qosacc_pid" > "$PID_FILE" 2>/dev/null
         return 0
     fi
     
-    # 清理旧的PID文件
+    # 清理可能存在的旧 PID 文件
     rm -f "$PID_FILE" 2>/dev/null
     
-    # 启动qosacc
-    print_status "$BLUE" "执行命令: %s %s" "$qosacc_BIN" "$START_ARGS"
-    log_message "INFO" "执行命令: %s %s" "$qosacc_BIN" "$START_ARGS"
+    # 显示启动参数详情
+    parse_args
     
-    # 启动进程
-    if $qosacc_BIN $START_ARGS >/dev/null 2>&1 &
-    then
-        local pid=$!
-        echo "$pid" > "$PID_FILE" 2>/dev/null
-        print_status "$BLUE" "启动进程 (PID: %d)" "$pid"
-        log_message "INFO" "启动进程 (PID: %d)" "$pid"
-        
-        # 等待进程启动
-        if wait_for_pid "$pid" "$MAX_START_WAIT"; then
-            print_status "$GREEN" "✓ qosacc 启动成功 (PID: %d)" "$pid"
-            log_message "INFO" "qosacc 启动成功 (PID: %d)" "$pid"
-            
-            # 显示状态信息
-            sleep 1
-            status
-            
-            return 0
-        else
-            print_status "$RED" "✗ qosacc 启动失败，进程未运行"
-            log_message "ERROR" "qosacc 启动失败，进程未运行"
-            
-            # 清理失败的进程
-            if check_pid "$pid"; then
-                kill -9 "$pid" 2>/dev/null
-            fi
-            rm -f "$PID_FILE" 2>/dev/null
-            
-            return 1
-        fi
+    # 启动 qosacc - 使用直接调用，不加后台符号
+    echo "正在启动 qosacc..." >> "$LOG_FILE"
+    echo "执行命令: $qosacc_BIN $START_ARGS" >> "$LOG_FILE"
+    
+    # 先测试命令是否能运行
+    echo "测试命令输出:" >> "$LOG_FILE"
+    $qosacc_BIN --help 2>&1 | head -5 >> "$LOG_FILE"
+    
+    # 启动qosacc
+    $qosacc_BIN $START_ARGS >> "$LOG_FILE" 2>&1 &
+    local pid=$!
+    
+    # 写入PID到文件
+    echo $pid > "$PID_FILE" 2>/dev/null
+    
+    # 等待进程启动
+    sleep 2
+    
+    # 检查是否启动成功
+    if kill -0 $pid 2>/dev/null; then
+        echo "✓ qosacc 启动成功 (PID: $pid)" >> "$LOG_FILE"
+        echo "PID: $pid 已写入 $PID_FILE" >> "$LOG_FILE"
+        echo "启动参数: $START_ARGS" >> "$LOG_FILE"
+        return 0
     else
-        print_status "$RED" "✗ qosacc 启动失败"
-        log_message "ERROR" "qosacc 启动失败"
-        
-        rm -f "$PID_FILE" 2>/dev/null
+        echo "✗ qosacc 启动失败" >> "$LOG_FILE"
+        echo "最后10行日志输出:" >> "$LOG_FILE"
+        tail -10 "$LOG_FILE" >> "$LOG_FILE"
+        echo "检查命令是否存在: $(ls -la $qosacc_BIN 2>&1)" >> "$LOG_FILE"
         return 1
     fi
 }
 
-# 停止服务
 stop() {
-    print_status "$BLUE" "正在停止 qosacc 服务..."
-    log_message "INFO" "停止 qosacc 服务"
+    echo "停止 qosacc 服务..." > "$LOG_FILE"
     
-    # 获取进程PID
-    local pid
-    pid=$(get_pid)
-    
-    if [ -z "$pid" ]; then
-        print_status "$YELLOW" "qosacc 未运行"
-        log_message "INFO" "qosacc 未运行"
-        
-        # 清理可能的残留文件
-        rm -f "$PID_FILE" "$LOCK_FILE" 2>/dev/null
-        return 0
-    fi
-    
-    print_status "$BLUE" "停止进程 (PID: %d)" "$pid"
-    log_message "INFO" "停止进程 (PID: %d)" "$pid"
-    
-    # 发送TERM信号
-    if kill -TERM "$pid" 2>/dev/null; then
-        print_status "$BLUE" "已发送TERM信号，等待进程退出..."
-        
-        # 等待进程正常退出
-        if wait_for_stop "$pid" "$MAX_STOP_WAIT"; then
-            print_status "$GREEN" "✓ qosacc 已正常停止"
-            log_message "INFO" "qosacc 已正常停止"
-        else
-            # 发送KILL信号
-            print_status "$YELLOW" "进程未在超时时间内退出，发送KILL信号..."
-            kill -KILL "$pid" 2>/dev/null
-            sleep 1
-            
-            if ! check_pid "$pid"; then
-                print_status "$GREEN" "✓ qosacc 已强制停止"
-                log_message "INFO" "qosacc 已强制停止"
-            else
-                print_status "$RED" "✗ 无法停止 qosacc 进程"
-                log_message "ERROR" "无法停止 qosacc 进程"
-                return 1
+    # 停止所有qosacc进程
+    local all_pids=$(get_qosacc_pid)
+    if [ -n "$all_pids" ]; then
+        echo "找到进程: $all_pids" >> "$LOG_FILE"
+        for pid in $all_pids; do
+            if [ -n "$pid" ] && [ "$pid" -gt 1 ] 2>/dev/null; then
+                echo "停止进程 (PID: $pid)" >> "$LOG_FILE"
+                kill $pid 2>/dev/null
+                sleep 1
+                if kill -0 $pid 2>/dev/null; then
+                    echo "强制停止进程 (PID: $pid)" >> "$LOG_FILE"
+                    kill -9 $pid 2>/dev/null
+                fi
             fi
-        fi
-    else
-        print_status "$RED" "✗ 无法发送停止信号给进程 (PID: %d)" "$pid"
-        log_message "ERROR" "无法发送停止信号给进程 (PID: %d)" "$pid"
-        return 1
-    fi
-    
-    # 清理文件
-    rm -f "$PID_FILE" 2>/dev/null
-    
-    # 最终检查
-    if [ -n "$(get_pid)" ]; then
-        print_status "$RED" "⚠ 仍有残留进程"
-        log_message "WARN" "仍有残留进程"
-        
-        # 尝试清理所有残留进程
-        local pids
-        pids=$(pidof "$PROCESS_NAME" 2>/dev/null)
-        for p in $pids; do
-            kill -9 "$p" 2>/dev/null
         done
     fi
     
-    return 0
-}
-
-# 重启服务
-restart() {
-    print_status "$BLUE" "正在重启 qosacc 服务..."
-    log_message "INFO" "重启 qosacc 服务"
-    
-    if stop; then
-        sleep 2
-        start
-    else
-        print_status "$RED" "✗ 停止服务失败，无法重启"
-        return 1
-    fi
-}
-
-# 重新生成配置文件
-reload() {
-    print_status "$BLUE" "重新生成 qosacc 配置..."
-    log_message "INFO" "重新生成 qosacc 配置"
-    
-    # 检查配置生成脚本是否存在
-    if [ -x "/usr/lib/qos_gargoyle/mon_conf.sh" ]; then
-        if /usr/lib/qos_gargoyle/mon_conf.sh generate; then
-            print_status "$GREEN" "✓ 配置重新生成成功"
-            
-            # 如果qosacc正在运行，发送HUP信号重新加载配置
-            local pid
-            pid=$(get_pid)
-            if [ -n "$pid" ]; then
-                print_status "$BLUE" "重新加载运行中的qosacc配置..."
-                kill -HUP "$pid" 2>/dev/null
-                log_message "INFO" "已发送HUP信号给进程 (PID: %d)" "$pid"
-            fi
-            
-            return 0
-        else
-            print_status "$RED" "✗ 配置重新生成失败"
-            return 1
-        fi
-    else
-        print_status "$RED" "✗ 配置生成脚本不存在: /usr/lib/qos_gargoyle/mon_conf.sh"
-        return 1
-    fi
-}
-
-# 检查服务状态
-status() {
-    # 获取进程PID
-    local pid
-    pid=$(get_pid)
-    
-    echo "qosacc 服务状态:"
-    echo "================================"
-    
-    # 检查二进制文件
-    if ! check_binary 2>/dev/null; then
-        print_status "$RED" "✗ qosacc 程序不存在或不可执行"
-        return 1
-    fi
-    
-    if [ -n "$pid" ]; then
-        print_status "$GREEN" "✓ 正在运行 (PID: %d)" "$pid"
-        
-        # 显示进程信息
-        if [ -f "/proc/$pid/status" ]; then
-            local process_name
-            process_name=$(grep -i "^Name:" "/proc/$pid/status" 2>/dev/null | cut -f2)
-            local process_state
-            process_state=$(grep -i "^State:" "/proc/$pid/status" 2>/dev/null | cut -f2)
-            local memory_usage
-            memory_usage=$(grep -i "^VmRSS:" "/proc/$pid/status" 2>/dev/null | cut -f2)
-            
-            echo "  进程名: $process_name"
-            echo "  状态: $process_state"
-            if [ -n "$memory_usage" ]; then
-                echo "  内存使用: $memory_usage KB"
+    # 从 PID 文件获取 PID
+    if [ -f "$PID_FILE" ]; then
+        local pid=$(cat "$PID_FILE" 2>/dev/null)
+        if [ -n "$pid" ] && [ "$pid" -gt 1 ] 2>/dev/null && kill -0 "$pid" 2>/dev/null; then
+            echo "停止进程 (PID: $pid)" >> "$LOG_FILE"
+            kill "$pid" 2>/dev/null
+            sleep 1
+            if kill -0 "$pid" 2>/dev/null; then
+                echo "强制停止进程 (PID: $pid)" >> "$LOG_FILE"
+                kill -9 "$pid" 2>/dev/null
             fi
         fi
-        
-        # 显示启动时间
-        if [ -f "/proc/$pid" ]; then
-            local start_time
-            start_time=$(stat -c %Y "/proc/$pid" 2>/dev/null)
-            if [ -n "$start_time" ]; then
-                local uptime
-                uptime=$(( $(date +%s) - start_time ))
-                echo "  运行时间: $((uptime / 3600))小时$(( (uptime % 3600) / 60 ))分钟$((uptime % 60))秒"
-            fi
-        fi
-        
-        # 显示启动参数
-        if [ -f "/proc/$pid/cmdline" ]; then
-            echo "  启动参数: $(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null | sed 's/ $//')"
-        fi
-        
-        # 检查状态文件
-        if [ -f "$STATUS_FILE" ]; then
-            echo "  状态文件: $STATUS_FILE (存在)"
-            echo "  最后更新: $(stat -c %y "$STATUS_FILE" 2>/dev/null)"
-        fi
-        
+    fi
+    
+    # 清理 PID 文件
+    rm -f "$PID_FILE" 2>/dev/null
+    
+    # 最终检查
+    sleep 1
+    if [ -z "$(get_qosacc_pid)" ]; then
+        echo "✓ qosacc 已停止" >> "$LOG_FILE"
         return 0
     else
-        print_status "$RED" "✗ 未运行"
-        
-        # 检查是否有残留的PID文件
-        if [ -f "$PID_FILE" ]; then
-            local stale_pid
-            stale_pid=$(cat "$PID_FILE" 2>/dev/null)
-            print_status "$YELLOW" "⚠ 存在残留的PID文件 (PID: %s)" "$stale_pid"
-        fi
-        
+        echo "⚠ 可能有残留进程" >> "$LOG_FILE"
         return 1
     fi
 }
 
-# 启用开机自启动
+restart() {
+    echo "重启 qosacc 服务..." >> "$LOG_FILE"
+    stop
+    sleep 1
+    start
+}
+
+status() {
+    echo "qosacc 状态:"
+    
+    # 检查二进制文件
+    if ! check_binary; then
+        echo "✗ qosacc 程序不存在"
+        return 1
+    fi
+    
+    # 检查实际进程
+    local qosacc_pid=$(get_qosacc_pid)
+    if [ -n "$qosacc_pid" ]; then
+        echo "✓ 正在运行 (PID: $qosacc_pid)"
+        echo "  启动参数: $qosacc_BIN $START_ARGS"
+        return 0
+    else
+        echo "✗ 未运行"
+        return 1
+    fi
+}
+
 enable() {
-    print_status "$BLUE" "启用 qosacc 开机自启动..."
-    
-    if [ -d "/etc/rc.d" ]; then
-        # OpenWrt风格
-        ln -sf ../init.d/qosacc /etc/rc.d/S99qosacc 2>/dev/null
-        ln -sf ../init.d/qosacc /etc/rc.d/K10qosacc 2>/dev/null
-        print_status "$GREEN" "✓ 已启用开机自启动 (OpenWrt风格)"
-    elif command -v update-rc.d >/dev/null 2>&1; then
-        # Debian风格
-        update-rc.d qosacc defaults
-        print_status "$GREEN" "✓ 已启用开机自启动 (Debian风格)"
-    elif command -v chkconfig >/dev/null 2>&1; then
-        # RedHat风格
-        chkconfig --add qosacc
-        chkconfig qosacc on
-        print_status "$GREEN" "✓ 已启用开机自启动 (RedHat风格)"
-    else
-        print_status "$YELLOW" "⚠ 无法确定系统类型，请手动设置开机启动"
-        return 1
-    fi
-    
+    echo "启用开机自启动..."
+    ln -sf /etc/init.d/qosacc /etc/rc.d/S99qosacc 2>/dev/null
+    ln -sf /etc/init.d/qosacc /etc/rc.d/K10qosacc 2>/dev/null
+    echo "✓ 已启用开机自启动"
     return 0
 }
 
-# 禁用开机自启动
 disable() {
-    print_status "$BLUE" "禁用 qosacc 开机自启动..."
-    
-    if [ -d "/etc/rc.d" ]; then
-        # OpenWrt风格
-        rm -f /etc/rc.d/S??qosacc 2>/dev/null
-        rm -f /etc/rc.d/K??qosacc 2>/dev/null
-        print_status "$GREEN" "✓ 已禁用开机自启动 (OpenWrt风格)"
-    elif command -v update-rc.d >/dev/null 2>&1; then
-        # Debian风格
-        update-rc.d -f qosacc remove
-        print_status "$GREEN" "✓ 已禁用开机自启动 (Debian风格)"
-    elif command -v chkconfig >/dev/null 2>&1; then
-        # RedHat风格
-        chkconfig qosacc off
-        chkconfig --del qosacc
-        print_status "$GREEN" "✓ 已禁用开机自启动 (RedHat风格)"
-    else
-        print_status "$YELLOW" "⚠ 无法确定系统类型，请手动移除开机启动"
-        return 1
-    fi
-    
+    echo "禁用开机自启动..."
+    rm -f /etc/rc.d/S??qosacc 2>/dev/null
+    rm -f /etc/rc.d/K??qosacc 2>/dev/null
+    echo "✓ 已禁用开机自启动"
     return 0
 }
 
-# 显示版本信息
-version() {
-    echo "qosacc 服务控制脚本"
-    echo "版本: 2.0"
-    echo "描述: QoS延迟监控器服务管理"
-    echo ""
-    
-    if [ -x "$qosacc_BIN" ]; then
-        echo "qosacc 程序信息:"
-        echo "------------------------"
-        "$qosacc_BIN" --help 2>&1 | head -20
-    fi
-}
-
-## 主程序
 case "$1" in
-    start)
-        start
-        ;;
-    stop)
-        stop
-        ;;
-    restart)
-        restart
-        ;;
-    reload)
-        reload
-        ;;
-    status)
-        status
-        ;;
-    enable)
-        enable
-        ;;
-    disable)
-        disable
-        ;;
-    version)
-        version
-        ;;
+    start)   start   ;;
+    stop)    stop    ;;
+    restart) restart ;;
+    status)  status  ;;
+    enable)  enable  ;;
+    disable) disable ;;
     *)
-        echo "qosacc 服务控制脚本 (版本 2.0)"
-        echo "========================================"
+        echo "qosacc 服务控制脚本"
+        echo "版本: 1.0"
+        echo "当前启动参数: $START_ARGS"
         echo ""
-        echo "用法: $0 {start|stop|restart|reload|status|enable|disable|version}"
-        echo ""
-        echo "命令:"
-        echo "  start     启动 qosacc 服务"
-        echo "  stop      停止 qosacc 服务"
-        echo "  restart   重启 qosacc 服务"
-        echo "  reload    重新生成配置文件并重新加载"
-        echo "  status    查看服务状态"
-        echo "  enable    启用开机自启动"
-        echo "  disable   禁用开机自启动"
-        echo "  version   显示版本信息"
-        echo ""
-        echo "配置:"
-        echo "  二进制文件: $qosacc_BIN"
-        echo "  配置文件: $CONFIG_FILE"
-        echo "  日志文件: $LOG_FILE"
-        echo "  PID文件: $PID_FILE"
-        echo "  状态文件: $STATUS_FILE"
-        echo ""
-        echo "环境变量:"
-        echo "  qosacc_ARGS    覆盖启动参数 (当前: ${START_ARGS})"
-        echo ""
+        echo "用法: $0 {start|stop|restart|status|enable|disable}"
         exit 1
         ;;
 esac
 
-exit $?
+exit 0

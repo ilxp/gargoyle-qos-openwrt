@@ -1,4 +1,6 @@
 BINDIR = /usr/sbin
+INITDIR = /etc/init.d
+CONFDIR = /etc
 #TCDIR:=$(BUILD_DIR)/iproute2-tc*/ip*
 TCDIR:=$(shell if [ -e "${BUILD_DIR}/iproute2-tcfull" ] ; then echo "${BUILD_DIR}/iproute2-tcfull"/ip* ; else echo "${BUILD_DIR}/iproute2-tctiny"/ip* ; fi ; )
 #The ncurses library only needed if we remove the ONLYBG switch
@@ -26,10 +28,17 @@ qosacc.o: qosacc.c
 
 install: all uninstall
 	-mkdir -p $(BINDIR)
-	cp qosacc  $(BINDIR)
+	cp qosacc $(BINDIR)
+	-mkdir -p $(INITDIR)
+	cp files/qosacc.init $(INITDIR)/qosacc
+	chmod 755 $(INITDIR)/qosacc
+	-mkdir -p $(CONFDIR)
+	cp files/qosacc.conf $(CONFDIR)/qosacc.conf
 
 uninstall:
 	rm -f $(BINDIR)/qosacc
+	rm -f $(INITDIR)/qosacc
+	rm -f $(CONFDIR)/qosacc.conf
 
 clean:
 	rm -rf *.o *~ .*sw* qosacc

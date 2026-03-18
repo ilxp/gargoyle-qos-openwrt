@@ -1,6 +1,7 @@
 /* qosacc - 基于netlink的QoS主动拥塞控制（TC库版，支持HFSC/HTB/CAKE，含实时类检测）
- * version=1.9.3
+ * version=1.0
  * 功能：通过ping监控延迟，使用TC库直接调整根类的带宽，支持实时类检测（HFSC专用）
+ * 命令：qosacc -d pppoe-wan -t 223.5.5.5 -p 1000 -m 10000 -P 20
  * 状态文件目录：/tmp/qosacc.status
  */
  
@@ -283,14 +284,14 @@ const char qosacc_usage[] =
 "  qosacc [选项]\n\n"
 "位置参数（传统用法）:\n"
 "  ping间隔        100-5000 ms (默认: 200)\n"
-"  目标地址        默认: 8.8.8.8\n"
+"  目标地址        默认: 223.5.5.5\n"
 "  最大带宽        100-1000000 kbps (默认: 10000)\n"
 "  ping限制        5-1000 ms (默认: 20)\n\n"
 "选项:\n"
 "  -h, --help      显示此帮助信息\n"
 "  -c <文件>       配置文件路径\n"
 "  -d <设备>       网络设备名称 (默认: ifb0)\n"
-"  -t <地址/域名>  ping目标 (默认: 8.8.8.8)\n"
+"  -t <地址/域名>  ping目标 (默认: 223.5.5.5)\n"
 "  -s <文件>       状态文件 (默认: /tmp/qosacc.status)\n"
 "  -l <文件>       调试日志文件 (默认: /var/log/qosacc.log)\n"
 "  -v              详细输出\n"
@@ -526,7 +527,7 @@ void qosacc_config_init(qosacc_config_t* cfg) {
     strcpy(cfg->root_classid, "1:1");
     cfg->check_interval = 1;      // 默认1秒
     strcpy(cfg->device, "ifb0");
-    strcpy(cfg->target, "8.8.8.8");
+    strcpy(cfg->target, "223.5.5.5");
     strcpy(cfg->status_file, "/tmp/qosacc.status");
     strcpy(cfg->debug_log, "/var/log/qosacc.log");
 }

@@ -1,7 +1,7 @@
 #!/bin/sh
 # version=5.6-mq
-# CAKE算法实现模块 - 多队列增强版 v5.6
-# 基于v5.5，增加对 flowmode、limit、ecn 参数的支持
+# CAKE_DSCP算法实现模块 - 多队列增强版 v5.6
+# 基于CAKE算法，集成了dscpclassify智能分类，无需UCI开关
 
 # ========== 变量初始化 ==========
 : ${total_upload_bandwidth:=50000}
@@ -12,13 +12,16 @@ LOCK_PID_FILE="$LOCK_DIR/pid"
 RUNTIME_PARAMS_FILE="/tmp/cake_runtime_params"
 QOS_RUNNING_FILE="/var/run/cake_qos.running"
 
+# 加载 dscpclassify 核心库（用于智能分类）
+. /usr/lib/qos_gargoyle/dscpclassify.sh
+
 # 如果 qos_interface 未设置，尝试获取
 if [ -z "$qos_interface" ]; then
     qos_interface=$(uci -q get qos_gargoyle.global.wan_interface 2>/dev/null)
     qos_interface="${qos_interface:-pppoe-wan}"
 fi
 
-echo "CAKE 模块初始化完成 (v5.6-mq)"
+echo "CAKE_DSCP 模块初始化完成 (v5.6-mq)"
 echo "  网络接口: $qos_interface"
 echo "  IFB 设备: $IFB_DEVICE"
 echo "  上传带宽: ${total_upload_bandwidth}kbit/s"
@@ -54,24 +57,24 @@ sanitize_param() {
 
 # ========== 日志函数 ==========
 log_info() {
-    logger -t "qos_gargoyle" "CAKE: $1"
-    echo "[$(date '+%H:%M:%S')] CAKE: $1"
+    logger -t "qos_gargoyle" "CAKE_DSCP: $1"
+    echo "[$(date '+%H:%M:%S')] CAKE_DSCP: $1"
 }
 
 log_error() {
-    logger -t "qos_gargoyle" "CAKE错误: $1"
-    echo "[$(date '+%H:%M:%S')] ❌ CAKE错误: $1" >&2
+    logger -t "qos_gargoyle" "CAKE_DSCP错误: $1"
+    echo "[$(date '+%H:%M:%S')] ❌ CAKE_DSCP错误: $1" >&2
 }
 
 log_warn() {
-    logger -t "qos_gargoyle" "CAKE警告: $1"
-    echo "[$(date '+%H:%M:%S')] ⚠️ CAKE警告: $1"
+    logger -t "qos_gargoyle" "CAKE_DSCP警告: $1"
+    echo "[$(date '+%H:%M:%S')] ⚠️ CAKE_DSCP警告: $1"
 }
 
 log_debug() {
     [ "${DEBUG:-0}" = "1" ] && {
-        logger -t "qos_gargoyle" "CAKE调试: $1"
-        echo "[$(date '+%H:%M:%S')] 🔍 CAKE调试: $1"
+        logger -t "qos_gargoyle" "CAKE_DSCP调试: $1"
+        echo "[$(date '+%H:%M:%S')] 🔍 CAKE_DSCP调试: $1"
     }
 }
 
@@ -92,6 +95,12 @@ check_dependencies() {
     if ! command -v ethtool >/dev/null 2>&1; then
         log_warn "ethtool 命令未找到，队列数检测将回退到 sysfs"
     fi
+	
+    # 检查 ctinfo 内核模块（用于下载方向 DSCP 恢复）
+    if ! lsmod | grep -q act_ctinfo && ! modprobe act_ctinfo 2>/dev/null; then
+        log_warn "act_ctinfo 内核模块未加载，下载方向 DSCP 恢复可能失败，请安装 kmod-sched-ctinfo"
+    fi
+	
     return 0
 }
 
@@ -100,7 +109,7 @@ check_already_running() {
     if [ -f "$QOS_RUNNING_FILE" ]; then
         local pid=$(cat "$QOS_RUNNING_FILE" 2>/dev/null)
         if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
-            log_error "CAKE QoS 已经在运行中 (PID: $pid)"
+            log_error "CAKE_DSCP QoS 已经在运行中 (PID: $pid)"
             return 1
         else
             log_warn "发现残留的运行标记文件，清理中"
@@ -470,6 +479,7 @@ validate_cake_config() {
 }
 
 # ========== 入口重定向（IPv4必须成功，IPv6可选）==========
+# 固定使用 ctinfo 动作，使下载数据包的 DSCP 从 conntrack 标记恢复
 setup_ingress_redirect() {
     log_info "设置入口重定向: $qos_interface -> $IFB_DEVICE"
 
@@ -483,51 +493,55 @@ setup_ingress_redirect() {
     local ipv4_success=false
     local ipv6_success=false
 
-    # IPv4重定向（必须成功）
+    # ---------- IPv4 重定向 ----------
     if tc filter add dev "$qos_interface" parent ffff: protocol ip \
         u32 match u32 0 0 \
+        action ctinfo dscp 0x3f 0 pipe \
         action mirred egress redirect dev "$IFB_DEVICE" 2>/dev/null; then
         ipv4_success=true
     else
-        log_error "IPv4入口重定向规则添加失败"
-        # 清理已创建的队列
+        log_error "IPv4入口重定向规则添加失败（含 ctinfo）"
         tc qdisc del dev "$qos_interface" ingress 2>/dev/null
         return 1
     fi
 
-    # ========== IPv6 重定向：三阶尝试 ==========
+    # ---------- IPv6 重定向：三阶尝试 ----------
     local ipv6_success=false
-    
+
     # 第一优先：flower 匹配全球单播地址 (2000::/3)
     if tc filter add dev "$qos_interface" parent ffff: protocol ipv6 \
         flower dst_ip 2000::/3 \
-        action connmark \
+        action ctinfo dscp 0x3f 0 pipe \
         action mirred egress redirect dev "$IFB_DEVICE" 2>&1; then
         ipv6_success=true
-        qos_log "INFO" "IPv6入口重定向规则（flower 匹配全球单播）添加成功"
+        log_info "IPv6入口重定向规则（flower + ctinfo）添加成功"
     else
-        qos_log "WARN" "flower 规则添加失败，尝试 u32 全球单播匹配"
-        
-        # 第二优先：u32 匹配全球单播地址 (2000::/3)
+        log_warn "flower + ctinfo 规则添加失败，尝试 u32 全球单播匹配"
+    fi
+
+    # 第二优先：u32 匹配全球单播地址 (2000::/3)
+    if [ "$ipv6_success" != "true" ]; then
         if tc filter add dev "$qos_interface" parent ffff: protocol ipv6 \
             u32 match u32 0x20000000 0xe0000000 at 24 \
-            action connmark \
+            action ctinfo dscp 0x3f 0 pipe \
             action mirred egress redirect dev "$IFB_DEVICE" 2>&1; then
             ipv6_success=true
-            qos_log "INFO" "IPv6入口重定向规则（u32 全球单播）添加成功"
+            log_info "IPv6入口重定向规则（u32全球单播 + ctinfo）添加成功"
         else
-            qos_log "WARN" "u32 全球单播规则添加失败，尝试无过滤规则"
-            
-            # 第三优先：无过滤的 u32 全匹配
-            if tc filter add dev "$qos_interface" parent ffff: protocol ipv6 \
-                u32 match u32 0 0 \
-                action connmark \
-                action mirred egress redirect dev "$IFB_DEVICE" 2>&1; then
-                ipv6_success=true
-                qos_log "INFO" "IPv6入口重定向规则（无过滤）添加成功"
-            else
-                qos_log "WARN" "IPv6入口重定向规则添加失败，IPv6流量将不会通过IFB"
-            fi
+            log_warn "u32全球单播 + ctinfo 规则添加失败，尝试无过滤规则"
+        fi
+    fi
+
+    # 第三优先：无过滤的 u32 全匹配
+    if [ "$ipv6_success" != "true" ]; then
+        if tc filter add dev "$qos_interface" parent ffff: protocol ipv6 \
+            u32 match u32 0 0 \
+            action ctinfo dscp 0x3f 0 pipe \
+            action mirred egress redirect dev "$IFB_DEVICE" 2>&1; then
+            ipv6_success=true
+            log_info "IPv6入口重定向规则（无过滤 + ctinfo）添加成功"
+        else
+            log_warn "IPv6入口重定向规则（无过滤 + ctinfo）添加失败，IPv6流量将不会通过IFB"
         fi
     fi
 
@@ -861,7 +875,7 @@ health_check_cake() {
 
 # ========== 状态显示（原版+入口状态+多队列统计）==========
 show_cake_status() {
-    echo "===== CAKE QoS状态报告 (v5.6-mq) ====="
+    echo "===== CAKE_DSCP QoS状态报告 (v5.6-mq) ====="
     echo "时间: $(date)"
     echo "网络接口: ${qos_interface:-未知}"
 
@@ -920,6 +934,52 @@ show_cake_status() {
     else
         echo "状态: IFB设备未创建"
     fi
+    
+    # 显示 conntrack 标记
+    if command -v conntrack >/dev/null 2>&1; then
+        echo -e "\n===== conntrack 标记示例 (最近5条) ====="
+        # 获取最近10条带有 mark 的连接，排除 mark=0 和可能的高位干扰
+        conntrack -L 2>/dev/null | grep -E "mark=[1-9][0-9]*" | head -n 10 | while IFS= read -r line; do
+            # 提取关键信息：协议、源/目的IP、端口、mark
+            proto=$(echo "$line" | awk '{print $1}')
+            src=$(echo "$line" | awk '{print $4}' | cut -d= -f2)
+            dst=$(echo "$line" | awk '{print $6}' | cut -d= -f2)
+            sport=$(echo "$line" | awk '{print $5}' | cut -d= -f2)
+            dport=$(echo "$line" | awk '{print $7}' | cut -d= -f2)
+            mark=$(echo "$line" | grep -o "mark=[0-9]\+" | cut -d= -f2)
+            dscp=$((mark & 0x3F))
+            # 映射 DSCP 值到类名（可选）
+            case $dscp in
+                0) class="CS0/BE" ;;
+                8) class="CS1" ;;
+                10) class="AF11" ;;
+                12) class="AF12" ;;
+                14) class="AF13" ;;
+                16) class="CS2" ;;
+                18) class="AF21" ;;
+                20) class="AF22" ;;
+                22) class="AF23" ;;
+                24) class="CS3" ;;
+                26) class="AF31" ;;
+                28) class="AF32" ;;
+                30) class="AF33" ;;
+                32) class="CS4" ;;
+                34) class="AF41" ;;
+                36) class="AF42" ;;
+                38) class="AF43" ;;
+                40) class="CS5" ;;
+                44) class="VA" ;;
+                46) class="EF" ;;
+                48) class="CS6" ;;
+                56) class="CS7" ;;
+                *) class="Unknown" ;;
+            esac
+            printf "  %-5s %-30s:%-5s → %-30s:%-5s [mark=%-6s dscp=%2d (%s)]\n" \
+                "$proto" "${src:-N/A}" "${sport:-N/A}" "${dst:-N/A}" "${dport:-N/A}" "$mark" "$dscp" "$class"
+        done
+    else
+        echo "  conntrack 工具未安装，无法显示连接标记"
+    fi
 
     # ===== 入口重定向检查 =====
     echo -e "\n===== 入口重定向检查 ====="
@@ -953,13 +1013,13 @@ show_cake_status() {
     echo "ECN: $([ -n "$CAKE_ECN" ] && echo "$CAKE_ECN" || echo "未配置")"
     echo "自动调优: $([ "$ENABLE_AUTO_TUNE" = "1" ] && echo "启用 ✅" || echo "禁用 ❌")"
 
-    echo -e "\n===== CAKE-MQ 状态报告结束 ====="
+    echo -e "\n===== CAKE-DSCP 状态报告结束 ====="
     return 0
 }
 
 # ========== 停止清理（增强：按配置删除IFB设备，增加锁保护和重试）==========
 stop_cake_qos() {
-    log_info "停止CAKE QoS"
+    log_info "停止CAKE_DSCP QoS"
 
     local got_lock=false
     local retry=3
@@ -996,6 +1056,11 @@ stop_cake_qos() {
     # 清理入口重定向队列
     tc qdisc del dev "$qos_interface" ingress 2>/dev/null && log_info "清理入口重定向队列" || true
 
+    # ---------- 卸载 dscpclassify ----------
+    log_info "卸载 dscpclassify 分类规则..."
+    dscpclassify_unload
+    # --------------------------------------------
+
     # 处理IFB设备
     if ip link show dev "$IFB_DEVICE" >/dev/null 2>&1; then
         ip link set dev "$IFB_DEVICE" down
@@ -1014,7 +1079,7 @@ stop_cake_qos() {
         release_lock
     fi
 
-    log_info "CAKE QoS停止完成"
+    log_info "CAKE_DSCP QoS停止完成"
 }
 
 # ========== 锁函数（增强清理）==========
@@ -1065,7 +1130,7 @@ initialize_cake_qos() {
 
     case "$action" in
         start)
-            log_info "启动CAKE QoS"
+            log_info "启动CAKE_DSCP QoS"
             
             # 依赖检查
             check_dependencies || exit 1
@@ -1106,6 +1171,23 @@ initialize_cake_qos() {
                 exit 1
             }
 
+			# ---------- 加载 dscpclassify 分类规则 ----------
+			log_info "dscpclassify 正在加载智能分类规则..."
+			local lan_iface="br-lan"
+			if uci -q get qos_gargoyle.global.lan_interface >/dev/null; then
+				lan_iface=$(uci -q get qos_gargoyle.global.lan_interface)
+			fi
+			local wan_iface="$qos_interface"
+			if dscpclassify_load "$lan_iface" "$wan_iface"; then
+				log_info "dscpclassify 智能分类规则加载成功"
+			else
+				log_error "dscpclassify 加载失败"
+				release_lock
+				rm -f "$QOS_RUNNING_FILE"
+				exit 1
+			fi
+            # --------------------------------------------------------
+
             # 初始化上传和下载
             local upload_success=0
             local download_success=0
@@ -1114,7 +1196,7 @@ initialize_cake_qos() {
             initialize_cake_download || download_success=1
             
             if [ $upload_success -eq 1 ] || [ $download_success -eq 1 ]; then
-                log_error "CAKE QoS 初始化部分失败"
+                log_error "CAKE_DSCP QoS 初始化部分失败"
                 # 清理已配置的部分
                 stop_cake_qos
                 release_lock
@@ -1139,18 +1221,18 @@ initialize_cake_qos() {
             # 健康检查
             health_check_cake
             
-            log_info "CAKE QoS 启动成功"
+            log_info "CAKE_DSCP QoS 启动成功"
             release_lock
 			return 0
             ;;
             
         stop)
-            log_info "停止CAKE QoS"
+            log_info "停止CAKE_DSCP QoS"
             stop_cake_qos || exit 1
             ;;
             
         restart)
-            log_info "重启CAKE QoS"
+            log_info "重启CAKE_DSCP QoS"
             stop_cake_qos
             sleep 2
             initialize_cake_qos start
@@ -1176,10 +1258,10 @@ initialize_cake_qos() {
             echo "用法: $0 {start|stop|restart|status|health|validate|help}"
             echo ""
             echo "命令:"
-            echo "  start    启动CAKE QoS"
-            echo "  stop     停止CAKE QoS"
-            echo "  restart  重启CAKE QoS"
-            echo "  status   显示CAKE状态"
+            echo "  start    启动CAKE_DSCP QoS"
+            echo "  stop     停止CAKE_DSCP QoS"
+            echo "  restart  重启CAKE_DSCP QoS"
+            echo "  status   显示CAKE_DSCP状态"
             echo "  health   执行健康检查"
             echo "  validate 验证CAKE配置"
             echo "  help     显示此帮助信息"
@@ -1195,7 +1277,7 @@ initialize_cake_qos() {
 }
 
 # 脚本入口
-if [ "$(basename "$0")" = "cake.sh" ]; then
+if [ "$(basename "$0")" = "cake_dscp.sh" ]; then
     if [ $# -eq 0 ]; then
         echo "错误: 缺少参数"
         echo ""
@@ -1205,4 +1287,4 @@ if [ "$(basename "$0")" = "cake.sh" ]; then
     initialize_cake_qos "$@"
 fi
 
-log_info "CAKE模块加载完成"
+log_info "CAKE_DSCP模块加载完成"

@@ -7,11 +7,11 @@ CONFIG_FILE="qos_gargoyle"
 TEMP_FILES=""
 trap 'rm -f $TEMP_FILES 2>/dev/null' EXIT INT TERM HUP
 
-# ========== 检测算法，若为CAKE则直接退出 ==========
+# ========== 检测算法，若为CAKE或CAKE_DSCP则直接退出 ==========
 ALGORITHM=$(uci -q get ${CONFIG_FILE}.global.algorithm 2>/dev/null || echo "htb_cake")
-if [ "$ALGORITHM" = "cake" ]; then
-    echo "[$(date '+%H:%M:%S')] qos_gargoyle 信息: 当前算法为 CAKE，无需生成分类规则，退出" >&2
-    logger -t "qos_gargoyle" "信息: 当前算法为 CAKE，无需生成分类规则，退出"
+if [ "$ALGORITHM" = "cake" ] || [ "$ALGORITHM" = "cake_dscp" ]; then
+    echo "[$(date '+%H:%M:%S')] qos_gargoyle 信息: 当前算法为 $ALGORITHM，无需生成分类规则，退出" >&2
+    logger -t "qos_gargoyle" "信息: 当前算法为 $ALGORITHM，无需生成分类规则，退出"
     return 0
 fi
 

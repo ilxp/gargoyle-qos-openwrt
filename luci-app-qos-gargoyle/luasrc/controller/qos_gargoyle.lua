@@ -45,11 +45,25 @@ function index()
     entry({"admin", "qos", "qos_gargoyle", "acc"},
         cbi("qos_gargoyle/acc"), _("Active Congestion Control"), 50)
 		
-    entry({"admin", "qos", "qos_gargoyle", "troubleshooting"},
-        template("qos_gargoyle/troubleshooting"), _("Troubleshooting"), 60)
+    -- 检查算法是否为 cake_dscp，动态添加 DSCP Classify 菜单
+    local cursor = uci.cursor()
+    local algorithm = cursor:get("qos_gargoyle", "global", "algorithm")
+    if algorithm == "cake_dscp" then
+        entry({"admin", "qos", "qos_gargoyle", "dscpclassify"},
+            firstchild(), _("DSCP Classify"), 60)
+        entry({"admin", "qos", "qos_gargoyle", "dscpclassify", "general"},
+            cbi("qos_gargoyle/dscpclassify_general"), _("General"), 10)
+        entry({"admin", "qos", "qos_gargoyle", "dscpclassify", "sets"},
+            cbi("qos_gargoyle/dscpclassify_sets"), _("IP Sets"), 20)
+        entry({"admin", "qos", "qos_gargoyle", "dscpclassify", "rules"},
+            cbi("qos_gargoyle/dscpclassify_rules"), _("Rules"), 30)
+    end
 
-    entry({"admin", "qos", "qos_gargoyle", "troubleshooting", "data"},
-        call("action_troubleshooting_data"))
+    entry({"admin", "qos", "qos_gargoyle", "showstatus"},
+        template("qos_gargoyle/showstatus"), _("Show Status"), 70)
+
+    entry({"admin", "qos", "qos_gargoyle", "showstatus", "data"},
+        call("action_showstatus_data"))
 
     entry({"admin", "qos", "qos_gargoyle", "load_data"},
         call("action_load_data")).leaf = true
@@ -73,14 +87,13 @@ function action_status()
     })
 end
 
-function action_troubleshooting_data()
+function action_showstatus_data()
     local cursor = uci.cursor()
     local i18n = require "luci.i18n"
 
     local data = {}
 
-    --local monenabled = cursor:get("qos_gargoyle", "download", "acc_monenabled") or "false"
-    local monenabled = cursor:get("qos_gargoyle", "qosacc", "enabled") or "0"
+    local accenabled = cursor:get("qos_gargoyle", "qosacc", "enabled") or "0"
 	
     local show_data = util.trim(util.exec("/etc/init.d/qos_gargoyle show 2>/dev/null"))
     if show_data == "" then
@@ -89,19 +102,18 @@ function action_troubleshooting_data()
 
     data.show = show_data
 
-    local mon_data
-    --if monenabled == "true" then
-	if monenabled == "1" then
-        mon_data = util.trim(util.exec("cat /tmp/qosacc.status 2>/dev/null"))
+    local acc_data
+	if accenabled == "1" then
+        acc_data = util.trim(util.exec("cat /tmp/qosacc.status 2>/dev/null"))
 
-        if mon_data == "" then
-            mon_data = i18n.translate("No data found")
+        if acc_data == "" then
+            acc_data = i18n.translate("No data found")
         end
     else
-        mon_data = i18n.translate("\"Active Congestion Control\" not enabled")
+        acc_data = i18n.translate("\"Active Congestion Control\" not enabled")
     end
 
-    data.mon = mon_data
+    data.acc = acc_data
 
     http.prepare_content("application/json")
     http.write_json(data)

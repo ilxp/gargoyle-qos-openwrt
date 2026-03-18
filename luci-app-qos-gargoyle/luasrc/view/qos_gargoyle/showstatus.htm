@@ -6,11 +6,11 @@
 
 <% css = [[
 
-	#troubleshoot_text {
+	#showstatus_text {
 		padding: 20px;
 		text-align: left;
 	}
-	#troubleshoot_text pre {
+	#showstatus_text pre {
 		word-break: break-all;
 		margin: 0;
 	}
@@ -25,11 +25,11 @@
 
 <script type="text/javascript" src="<%=resource%>/cbi.js"></script>
 <script type="text/javascript">//<![CDATA[
-	XHR.poll(15, '<%=url("admin/qos/qos_gargoyle/troubleshooting/data")%>', null,
+	XHR.poll(15, '<%=url("admin/qos/qos_gargoyle/showstatus/data")%>', null,
 		function(x, data) {
-			var tshoot = document.getElementById('troubleshoot_text');
+			var status = document.getElementById('showstatus_text');
 			if (data.hasOwnProperty("show")) {
-				tshoot.innerHTML = String.format(
+				status.innerHTML = String.format(
 					'<pre>%s%s%s%s</pre>',
 					'<span class="description">Output of &#34;/etc/init.d/qos_gargoyle show&#34; : </span><br /><br />',
 					data.show,
@@ -37,7 +37,7 @@
 					data.mon
 				);
 			} else {
-				tshoot.innerHTML = '<strong><%:Error collecting troubleshooting information%></strong>';
+				status.innerHTML = '<strong><%:Error collecting showstatus information%></strong>';
 			}
 		}
 	);
@@ -45,8 +45,8 @@
 
 <div id="troubleshoot">
 	<fieldset class="cbi-section">
-		<legend><%:Troubleshooting Data%></legend>
-		<div id="troubleshoot_text"><img src="<%=resource%>/icons/loading.gif" alt="<%:Loading%>" style="vertical-align:middle" /><%:Collecting data...%></div>
+		<legend><%:Showstatus Data%></legend>
+		<div id="showstatus_text"><img src="<%=resource%>/icons/loading.gif" alt="<%:Loading%>" style="vertical-align:middle" /><%:Collecting data...%></div>
 	</fieldset>
 </div>
 

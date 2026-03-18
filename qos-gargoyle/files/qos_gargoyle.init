@@ -1,8 +1,8 @@
 #!/bin/sh /etc/rc.common
 #
 # QoS Gargoyle 初始化脚本 - 传统 init.d 版本
-# 支持多算法：HFSC, CAKE, FQ_CoDel, HTB
-# 版本：2.2.4（锁机制统一：目录锁 + PID 重入检查）
+# 支持多算法：HFSC, CAKE, FQ_CoDel, HTB, CAKE with DSCPclassify
+# 版本：2.3.0（新增 cake_dscp 算法）
 #
 
 START=50
@@ -24,6 +24,7 @@ SERVICE_NAME="qos_gargoyle"
 # 算法模块路径
 QOS_MODULES_DIR="/usr/lib/qos_gargoyle"
 CAKE_MODULE="$QOS_MODULES_DIR/cake.sh"
+CAKE_DSCP_MODULE="$QOS_MODULES_DIR/cake_dscp.sh"    # 新增 cake_dscp 模块
 HFSC_CAKE_MODULE="$QOS_MODULES_DIR/hfsc_cake.sh"      
 HTB_CAKE_MODULE="$QOS_MODULES_DIR/htb_cake.sh" 
 HFSC_MODULE="$QOS_MODULES_DIR/hfsc_fqcodel.sh"
@@ -321,7 +322,7 @@ load_common_libraries() {
 }
 
 # 加载算法模块
-# 修复: 简化回退逻辑，移除不可达代码
+# 新增 cake_dscp 分支
 load_algorithm_module() {
     local algo="$1"
     local module=""
@@ -330,6 +331,7 @@ load_algorithm_module() {
         "hfsc_cake") module="$HFSC_CAKE_MODULE" ;;   
         "htb_cake") module="$HTB_CAKE_MODULE" ;; 
         "cake") module="$CAKE_MODULE" ;;
+        "cake_dscp") module="$CAKE_DSCP_MODULE" ;;    # 新增
         "hfsc_fqcodel") module="$HFSC_MODULE" ;;
         "htb_fqcodel") module="$HTB_MODULE" ;;
         *)
@@ -862,10 +864,10 @@ initialize_qos() {
     
     load_bandwidth_config
     
-    # 应用分类规则（cake 算法跳过）
+    # 应用分类规则（cake 和 cake_dscp 算法跳过）
     echo "调用分类规则应用..."    
-    if [ "$algorithm" = "cake" ]; then
-        echo "CAKE算法，跳过外部分类规则加载"
+    if [ "$algorithm" = "cake" ] || [ "$algorithm" = "cake_dscp" ]; then
+        echo "CAKE/Cake_DSCP算法，跳过外部分类规则加载"
         echo "CAKE使用内置DiffServ分类机制，无需NFTables分类规则"
         nft flush chain inet gargoyle-qos-priority filter_qos_egress 2>/dev/null
         nft flush chain inet gargoyle-qos-priority filter_qos_ingress 2>/dev/null
@@ -895,18 +897,18 @@ initialize_qos() {
                 return 1
             fi
             ;;
-        "cake")
+        "cake"|"cake_dscp")                     # 新增 cake_dscp 分支
             export RULES_ALREADY_APPLIED=1
             if type initialize_cake_qos >/dev/null 2>&1; then
-				initialize_cake_qos start
-				ALGO_RET=$?
-				echo "DEBUG: initialize_cake_qos start returned $ALGO_RET"
-			else
-				echo "CAKE initialization function not found"
-				stop_qos
-				release_lock
-				return 1
-			fi
+                initialize_cake_qos start
+                ALGO_RET=$?
+                echo "DEBUG: initialize_cake_qos start returned $ALGO_RET"
+            else
+                echo "CAKE initialization function not found"
+                stop_qos
+                release_lock
+                return 1
+            fi
             ;;
         "htb_fqcodel")
             export RULES_ALREADY_APPLIED=1
@@ -951,11 +953,11 @@ initialize_qos() {
     
     # 检查算法初始化是否成功（通过返回值）
     if [ $ALGO_RET -ne 0 ]; then
-		echo "算法模块初始化失败 (返回值: $ALGO_RET)"
-		stop_qos
-		release_lock
-		return 1
-	fi
+        echo "算法模块初始化失败 (返回值: $ALGO_RET)"
+        stop_qos
+        release_lock
+        return 1
+    fi
     
     start_qos_acc
     
@@ -1011,7 +1013,7 @@ display_algorithm_specific_status() {
                 show_basic_status
             fi
             ;;
-        "cake")
+        "cake"|"cake_dscp")                     # 新增 cake_dscp 分支
             if type show_cake_status >/dev/null 2>&1; then
                 show_cake_status
             else
