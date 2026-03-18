@@ -23,6 +23,7 @@ upload_class_mark_list=""
 download_class_mark_list=""
 qos_interface=""
 IFB_DEVICE=""
+CLASS_MARKS_FILE="" 
 
 # 加载规则辅助模块（必须）
 if [ -f "/usr/lib/qos_gargoyle/rule.sh" ]; then
@@ -41,13 +42,14 @@ include /lib/network
 
 # ========== 辅助函数 ==========
 # 带宽单位转换（支持 kbit, mbit, gbit, KB, MB 等）
+# 带宽单位转换（严格区分字节与比特）
 convert_bandwidth_to_kbit() {
     local bw="$1"
     local num unit result
 
     [ -z "$bw" ] && { qos_log "ERROR" "带宽值为空"; return 1; }
 
-    # 纯数字直接返回
+    # 纯数字视为 kbit
     if echo "$bw" | grep -qE '^[0-9]+$'; then
         echo "$bw"
         return 0
@@ -59,14 +61,28 @@ convert_bandwidth_to_kbit() {
         unit=$(echo "$bw" | sed 's/[0-9.]//g' | tr '[:lower:]' '[:upper:]')
 
         case "$unit" in
-            K|KB|KIB|Kbit|KBIT|KILOBIT)
+            # 比特单位
+            K|KBIT|KILOBIT)
                 result=$(awk "BEGIN {printf \"%.0f\", $num * 1}")
                 ;;
-            M|MB|MIB|Mbit|MBIT|MEGABIT)
+            M|MBIT|MEGABIT)
                 result=$(awk "BEGIN {printf \"%.0f\", $num * 1000}")
                 ;;
-            G|GB|GIB|Gbit|GBIT|GIGABIT)
+            G|GBIT|GIGABIT)
                 result=$(awk "BEGIN {printf \"%.0f\", $num * 1000000}")
+                ;;
+            # 字节单位 → 乘以 8 转换为比特
+            KB|KIB)
+                qos_log "WARN" "检测到字节单位 '$unit'，将自动乘以 8 转换为 kbit"
+                result=$(awk "BEGIN {printf \"%.0f\", $num * 8}")
+                ;;
+            MB|MIB)
+                qos_log "WARN" "检测到字节单位 '$unit'，将自动乘以 8 转换为 kbit"
+                result=$(awk "BEGIN {printf \"%.0f\", $num * 8000}")
+                ;;
+            GB|GIB)
+                qos_log "WARN" "检测到字节单位 '$unit'，将自动乘以 8 转换为 kbit"
+                result=$(awk "BEGIN {printf \"%.0f\", $num * 8000000}")
                 ;;
             *)
                 qos_log "ERROR" "未知带宽单位: $unit"
@@ -82,7 +98,7 @@ convert_bandwidth_to_kbit() {
         echo "$result"
         return 0
     else
-        qos_log "ERROR" "无效带宽格式: $bw (应为数字或数字+单位，例如 100mbit、10M)"
+        qos_log "ERROR" "无效带宽格式: $bw (应为数字或数字+单位，例如 100mbit、10MB)"
         return 1
     fi
 }
@@ -656,27 +672,37 @@ setup_htb_enhance_chains() {
 allocate_class_marks() {
     local direction="$1"
     local class_list="$2"
-    local mask base_value mark_dict i class mark
+    local mask base_value i class mark
 
     if [ "$direction" = "upload" ]; then
         base_value=1
         mask="$UPLOAD_MASK"
     else
-        base_value=65536  # 0x10000
+        base_value=65536
         mask="$DOWNLOAD_MASK"
     fi
 
-    # 使用一个简单的数组记录已分配的索引（1-16）
-    # 由于ash不支持关联数组，我们用16个变量来模拟，使用POSIX兼容的while循环代替seq
+    # 初始化标记使用数组（16个独立变量）
     i=1
     while [ $i -le 16 ]; do
         eval "mark_used_${i}=0"
         i=$((i + 1))
     done
 
+    # 创建临时文件存储类名到标记值的映射
+    CLASS_MARKS_FILE=$(mktemp /tmp/qos_class_marks_XXXXXX) || {
+        qos_log "ERROR" "无法创建类标记临时文件"
+        return 1
+    }
+    TEMP_FILES="$TEMP_FILES $CLASS_MARKS_FILE"
+
     for class in $class_list; do
-        # 计算原始索引（1-16）
-        local index=$(calculate_hash_index "$class")
+        # 计算原始索引，并检查哈希计算是否成功
+        local index
+        index=$(calculate_hash_index "$class") || {
+            qos_log "ERROR" "无法计算类别 $class 的哈希值"
+            return 1
+        }
         index=$(( (index % 16) + 1 ))
         local original_index=$index
         local found=0
@@ -690,8 +716,10 @@ allocate_class_marks() {
                 # 计算标记值
                 local mark_value=$((base_value << (index - 1)))
                 mark_value=$((mark_value & 0xFFFFFFFF))
-                # 存储到全局变量，供后续创建类使用
-                eval "${direction}_mark_${class}=$mark_value"
+
+                # 将类名和标记值写入临时文件，格式：方向:类名:标记值
+                echo "$direction:$class:$mark_value" >> "$CLASS_MARKS_FILE"
+
                 qos_log "INFO" "类别 $class 分配标记索引 $index (原始哈希: $original_index, 探测次数: $probe)"
                 found=1
                 break
@@ -709,11 +737,20 @@ allocate_class_marks() {
     return 0
 }
 
-# 获取已分配的标记值（供创建类时使用）
-get_class_mark_value() {
+get_class_mark_by_class() {
     local direction="$1"
     local class="$2"
-    eval "echo \${${direction}_mark_${class}}"
+    local mark_line
+
+    [ -z "$CLASS_MARKS_FILE" ] && { qos_log "ERROR" "类标记文件未定义"; return 1; }
+    mark_line=$(grep "^$direction:$class:" "$CLASS_MARKS_FILE" 2>/dev/null | head -1)
+    if [ -n "$mark_line" ]; then
+        echo "${mark_line##*:}"
+        return 0
+    else
+        qos_log "ERROR" "类别 $class 的标记值未找到"
+        return 1
+    fi
 }
 
 # ========== HTB核心队列函数 ==========
@@ -781,7 +818,7 @@ create_htb_upload_class() {
     eval "$class_config"
     
     local class_mark
-    class_mark=$(get_class_mark_value "upload" "$class_name")
+    class_mark=$(get_class_mark_by_class "upload" "$class_name")
     if [ -z "$class_mark" ]; then
         qos_log "ERROR" "无法获取类别 $class_name 的标记"
         return 1
@@ -932,7 +969,7 @@ create_htb_download_class() {
     eval "$class_config"
     
     local class_mark
-    class_mark=$(get_class_mark_value "download" "$class_name")
+    class_mark=$(get_class_mark_by_class "download" "$class_name")
     if [ -z "$class_mark" ]; then
         qos_log "ERROR" "无法获取类别 $class_name 的标记"
         return 1
@@ -1384,7 +1421,7 @@ initialize_htb_upload() {
     
     for class_name in $upload_class_list; do
         if create_htb_upload_class "$class_name" "$class_index"; then
-            local class_mark_hex=$(get_class_mark_value "upload" "$class_name")
+            local class_mark_hex=$(get_class_mark_by_class "upload" "$class_name")
             upload_class_mark_list="$upload_class_mark_list$class_name:0x$(printf '%X' $class_mark_hex) "
         else
             qos_log "ERROR" "创建上传类别 $class_name 失败，停止初始化"
@@ -1454,7 +1491,7 @@ initialize_htb_download() {
     
     for class_name in $download_class_list; do
         if create_htb_download_class "$class_name" "$class_index" "$filter_prio"; then
-            local class_mark_hex=$(get_class_mark_value "download" "$class_name")
+            local class_mark_hex=$(get_class_mark_by_class "download" "$class_name")
             download_class_mark_list="$download_class_mark_list$class_name:0x$(printf '%X' $class_mark_hex) "
         else
             qos_log "ERROR" "创建下载类别 $class_name 失败，停止初始化"

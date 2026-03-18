@@ -1,7 +1,8 @@
 #!/bin/sh
 # version=5.6-mq
 # CAKE算法实现模块 - 多队列增强版 v5.6
-# 优化：带宽单位转换区分字节/比特；IPv6重定向循环简化；锁机制强化（含僵尸进程检测）；变量作用域限定
+# 优化：带宽单位转换区分字节/比特；IPv6重定向循环简化并增加全局地址检测；
+#       锁机制强化（含僵尸进程检测）；变量作用域限定
 
 # ========== 变量初始化 ==========
 : ${total_upload_bandwidth:=50000}
@@ -458,12 +459,12 @@ validate_cake_config() {
     return 0
 }
 
-# ========== 入口重定向（IPv4必须成功，IPv6三阶尝试）==========
+# ========== 入口重定向（IPv4必须成功，IPv6按优先级尝试，并增加全局地址检测）==========
 setup_ingress_redirect() {
     log_info "设置入口重定向: $qos_interface -> $IFB_DEVICE"
     local ipv4_success=false
     local ipv6_success=false
-    local match_cmds
+    local match_cmd
 
     tc qdisc del dev "$qos_interface" ingress 2>/dev/null
 
@@ -472,7 +473,7 @@ setup_ingress_redirect() {
         return 1
     fi
 
-    # IPv4 重定向
+    # IPv4 重定向（必须成功）
     if tc filter add dev "$qos_interface" parent ffff: protocol ip \
         u32 match u32 0 0 \
         action mirred egress redirect dev "$IFB_DEVICE" 2>/dev/null; then
@@ -481,6 +482,15 @@ setup_ingress_redirect() {
         log_error "IPv4入口重定向规则添加失败"
         tc qdisc del dev "$qos_interface" ingress 2>/dev/null
         return 1
+    fi
+
+    # 检测接口是否有全局 IPv6 地址，以决定是否强制 IPv6 必须成功
+    local has_ipv6_global=0
+    if ip -6 addr show dev "$qos_interface" scope global 2>/dev/null | grep -q "inet6"; then
+        has_ipv6_global=1
+        log_info "接口 $qos_interface 拥有全局 IPv6 地址，将强制 IPv6 重定向必须成功"
+    else
+        log_info "接口 $qos_interface 无全局 IPv6 地址，IPv6 重定向失败仅警告"
     fi
 
     # IPv6 重定向：按优先级尝试三种匹配方式
@@ -499,8 +509,21 @@ setup_ingress_redirect() {
         fi
     done
 
-    if [ "$ipv6_success" != "true" ]; then
-        log_warn "所有IPv6重定向规则均失败，IPv6流量将不会通过IFB"
+    # 根据是否有全局 IPv6 地址决定是否必须成功
+    if [ "$has_ipv6_global" = "1" ]; then
+        if [ "$ipv6_success" != "true" ]; then
+            log_error "接口存在全局 IPv6 地址，但 IPv6 入口重定向配置失败，QoS 无法正常工作"
+            tc qdisc del dev "$qos_interface" ingress 2>/dev/null
+            return 1
+        else
+            log_info "IPv6 入口重定向成功（强制）"
+        fi
+    else
+        if [ "$ipv6_success" = "true" ]; then
+            log_info "IPv6 入口重定向成功（尽管无全局 IPv6 地址，仍添加了规则）"
+        else
+            log_warn "所有IPv6重定向规则均失败，IPv6流量将不会通过IFB"
+        fi
     fi
 
     log_info "入口重定向设置完成 (IPv4: ${ipv4_success}, IPv6: ${ipv6_success})"

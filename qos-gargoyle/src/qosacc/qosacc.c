@@ -1,5 +1,5 @@
 /* qosacc - 基于netlink的QoS主动拥塞控制（TC库版，支持HFSC/HTB/CAKE，含实时类检测）
- * version=1.0
+ * version=1.0.0
  * 功能：通过ping监控延迟，使用TC库直接调整根类的带宽，支持实时类检测（HFSC专用）
  * 命令：qosacc -d pppoe-wan -t 223.5.5.5 -p 1000 -m 10000 -P 20
  * 状态文件目录：/tmp/qosacc.status
@@ -278,7 +278,7 @@ static atomic_int g_reset_bw = ATOMIC_VAR_INIT(0);
 /* ==================== 帮助信息 ==================== */
 const char qosacc_usage[] =
 "qosacc - 基于ping延迟的动态QoS带宽调整器（TC库版，支持实时类检测）\n"
-"版本: 1.9.2\n\n"
+"版本: 1.0.0\n\n"
 "用法:\n"
 "  qosacc [ping间隔(ms)] [目标地址] [最大带宽(kbps)] [ping限制(ms)]\n"
 "  qosacc [选项]\n\n"
@@ -1275,6 +1275,7 @@ static qosacc_result_t detect_qdisc_kind_tc(qosacc_context_t* ctx, int parse_rea
 }
 
 static int fetch_hfsc_class_info(qosacc_context_t* ctx) {
+	ctx->class_count = 0;  // 强制清零
     struct rtnl_handle rth;
     if (rtnl_open(&rth, 0) < 0) {
         qosacc_log(ctx, QACC_LOG_ERROR, "无法打开rtnetlink获取HFSC类信息\n");
@@ -1595,7 +1596,7 @@ int tc_controller_init(tc_controller_t* tc, qosacc_context_t* ctx) {
         return QACC_ERR_SYSTEM;
     }
 
-    int parse_realtime = 1;
+    int parse_realtime = 0;  // 检测时只获取队列类型和根句柄，不记录类
     if (detect_qdisc_kind_tc(ctx, parse_realtime) != QACC_OK) {
         qosacc_log(ctx, QACC_LOG_ERROR, "队列检测失败，无法继续\n");
         rtnl_close(&ctx->rth);
