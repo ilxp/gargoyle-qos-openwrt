@@ -5,7 +5,6 @@
 
 CONFIG_FILE="qos_gargoyle"
 TEMP_FILES=""
-trap 'rm -f $TEMP_FILES 2>/dev/null' EXIT INT TERM HUP
 
 # ========== 检测算法，若为CAKE或CAKE_DSCP则直接退出 ==========
 ALGORITHM=$(uci -q get ${CONFIG_FILE}.global.algorithm 2>/dev/null || echo "htb_cake")

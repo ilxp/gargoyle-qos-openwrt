@@ -36,6 +36,18 @@ else
     exit 1
 fi
 
+# 锁持有标志
+HAVE_LOCK=0
+
+# 统一清理函数：删除临时文件 + 释放锁（如果持有）
+main_cleanup() {
+    rm -f $TEMP_FILES 2>/dev/null
+    if [ "$HAVE_LOCK" = "1" ]; then
+        release_lock
+    fi
+}
+trap main_cleanup EXIT INT TERM HUP QUIT
+
 # 加载必要的库
 . /lib/functions.sh
 . /lib/functions/network.sh
@@ -205,19 +217,22 @@ acquire_lock() {
     fi
 
     mkdir "$LOCK_DIR" || {
-        qos_log "ERROR" "无法创建锁目录"
+        log_error "无法创建锁目录"
         return 1
     }
     echo "$$" > "$LOCK_PID_FILE"
-    trap 'release_lock' EXIT INT TERM HUP QUIT
-    qos_log "DEBUG" "已获取锁: $LOCK_DIR (PID: $$)"
+    # 移除原有的 trap 设置
+    # trap 'release_lock' EXIT INT TERM HUP QUIT   <-- 删除此行
+    HAVE_LOCK=1
+    log_debug "已获取锁: $LOCK_DIR (PID: $$)"
     return 0
 }
 
 release_lock() {
     rm -f "$LOCK_PID_FILE"
     rmdir "$LOCK_DIR" 2>/dev/null
-    qos_log "DEBUG" "锁已释放"
+    HAVE_LOCK=0
+    log_debug "锁已释放"
 }
 
 # ========== 幂等性检查 ==========

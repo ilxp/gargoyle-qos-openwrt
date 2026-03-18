@@ -877,6 +877,49 @@ show_cake_status() {
     else
         echo "状态: IFB设备未创建"
     fi
+	
+	 # conntrack 标记显示
+    if command -v conntrack >/dev/null 2>&1; then
+        echo -e "\n===== conntrack 标记示例 (最近5条) ====="
+        conntrack -L 2>/dev/null | grep -E "mark=[1-9][0-9]*" | head -n 10 | while IFS= read -r line; do
+            proto=$(echo "$line" | awk '{print $1}')
+            src=$(echo "$line" | awk '{print $4}' | cut -d= -f2)
+            dst=$(echo "$line" | awk '{print $6}' | cut -d= -f2)
+            sport=$(echo "$line" | awk '{print $5}' | cut -d= -f2)
+            dport=$(echo "$line" | awk '{print $7}' | cut -d= -f2)
+            mark=$(echo "$line" | grep -o "mark=[0-9]\+" | cut -d= -f2)
+            dscp=$((mark & 0x3F))
+            case $dscp in
+                0) class="CS0/BE" ;;
+                8) class="CS1" ;;
+                10) class="AF11" ;;
+                12) class="AF12" ;;
+                14) class="AF13" ;;
+                16) class="CS2" ;;
+                18) class="AF21" ;;
+                20) class="AF22" ;;
+                22) class="AF23" ;;
+                24) class="CS3" ;;
+                26) class="AF31" ;;
+                28) class="AF32" ;;
+                30) class="AF33" ;;
+                32) class="CS4" ;;
+                34) class="AF41" ;;
+                36) class="AF42" ;;
+                38) class="AF43" ;;
+                40) class="CS5" ;;
+                44) class="VA" ;;
+                46) class="EF" ;;
+                48) class="CS6" ;;
+                56) class="CS7" ;;
+                *) class="Unknown" ;;
+            esac
+            printf "  %-5s %-30s:%-5s → %-30s:%-5s [mark=%-6s dscp=%2d (%s)]\n" \
+                "$proto" "${src:-N/A}" "${sport:-N/A}" "${dst:-N/A}" "${dport:-N/A}" "$mark" "$dscp" "$class"
+        done
+    else
+        echo "  conntrack 工具未安装，无法显示连接标记"
+    fi
 
     echo -e "\n===== 入口重定向检查 ====="
     if tc filter show dev "$qos_interface" parent ffff: 2>/dev/null | grep -q "$IFB_DEVICE"; then
