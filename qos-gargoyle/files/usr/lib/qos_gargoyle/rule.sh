@@ -1,7 +1,7 @@
 #!/bin/sh
 # 规则辅助模块 (rule.sh)
 # 支持多样化端口、协议、IPv6双栈、连接字节数过滤和连接状态过滤
-# version=1.8.3 - 移除 mktemp 降级方案，失败直接报错
+# version=1.8.4 - 修复哈希算法，移除自实现；移除缓存；参数简化
 
 CONFIG_FILE="qos_gargoyle"
 TEMP_FILES=""
@@ -239,7 +239,7 @@ load_all_config_options() {
     val=$(echo "$config_data" | grep "^${config_name}\\.${escaped_section_id}\\.class=" | cut -d= -f2-)
     if [ -n "$val" ]; then
         val=$(echo "$val" | sed "s/^'//; s/'$//; s/^\"//; s/\"$//")
-        val=$(sanitize_input "$val")   # 消毒后再使用
+        val=$(sanitize_input "$val")
         val=$(escape_for_eval "$val")
         eval "${prefix}class=\"$val\""
     fi
@@ -325,45 +325,33 @@ load_all_config_options() {
 }
 
 # ========== 类别标记计算函数 ==========
-# 计算类名的哈希索引（优先使用 cksum，其次 sha1sum/sha1，最后自实现）
+# 计算类名的哈希索引（优先使用 cksum，其次 sha1sum/sha1）
 calculate_hash_index() {
     local class="$1"
     local hash_val
-    
+
     if command -v cksum >/dev/null 2>&1; then
         hash_val=$(printf "%s" "$class" | cksum | cut -d' ' -f1)
         echo "$hash_val"
-        return
     elif command -v sha1sum >/dev/null 2>&1; then
         hash_val=$(printf "%s" "$class" | sha1sum | cut -c1-8)
+        # 转换为无符号32位整数
         printf "%u" "0x$hash_val" 2>/dev/null || echo "$((0x$hash_val & 0x7FFFFFFF))"
     elif command -v sha1 >/dev/null 2>&1; then
         hash_val=$(printf "%s" "$class" | sha1 | cut -c1-8)
         printf "%u" "0x$hash_val" 2>/dev/null || echo "$((0x$hash_val & 0x7FFFFFFF))"
     else
-        local sum=0 i=0
-        while [ $i -lt ${#class} ]; do
-            local char_val=$(printf "%d" "'${class:$i:1}" 2>/dev/null || echo 0)
-            sum=$(( ( (sum << 5) - sum + char_val ) & 0x7FFFFFFF ))
-            i=$((i + 1))
-        done
-        echo $((sum & 0x7FFFFFFF))
+        log "ERROR" "没有可用的哈希工具 (cksum, sha1sum, sha1)，无法计算类标记"
+        return 1
     fi
 }
 
-# 获取类别的标记值，强制使用计算标记，忽略文件和 UCI 配置
+# 获取类别的标记值（直接计算，无缓存）
 get_class_mark_for_rule() {
     local class="$1"
     local direction="$2"
-    
-    local cache_var="__mark_calculated_${class}_${direction}"
-    if eval [ -z \"\${$cache_var+x}\" ]; then
-        log "INFO" "类别 $class ($direction) 标记将使用计算值"
-        eval "$cache_var=1"
-    fi
-    
     local calculated_mark
-    calculated_mark=$(calculate_class_mark "$class" "0x0" "$direction")
+    calculated_mark=$(calculate_class_mark "$class" "$direction") || return 1
     if [ -n "$calculated_mark" ] && echo "$calculated_mark" | grep -qE '^0x[0-9A-Fa-f]+$'; then
         echo "$calculated_mark"
         return 0
@@ -376,14 +364,15 @@ get_class_mark_for_rule() {
 # 计算类别的标记值（哈希取模 16 后左移）
 calculate_class_mark() {
     local class="$1"
-    local chain_type="$3"
-    local index=$(calculate_hash_index "$class")
+    local chain_type="$2"
+    local index
+    index=$(calculate_hash_index "$class") || return 1
     index=$(( (index % 16) + 1 ))
 
     local base_value=0
     [ "$chain_type" = "upload" ] && base_value=$((0x1))
     [ "$chain_type" = "download" ] && base_value=$((0x10000))
-    [ $base_value -eq 0 ] && { log "ERROR" "未知链类型: $chain_type"; return; }
+    [ $base_value -eq 0 ] && { log "ERROR" "未知链类型: $chain_type"; return 1; }
 
     local mark_value=$((base_value << (index - 1)))
     mark_value=$((mark_value & 0xFFFFFFFF))
@@ -395,7 +384,6 @@ sort_rules_by_priority_fast() {
     local config_file="$1"
     local temp_sort
     
-    # 移除降级方案，强制 mktemp 成功
     temp_sort=$(mktemp /tmp/qos_sort_XXXXXX) || {
         log "ERROR" "无法创建排序临时文件"
         return 1
@@ -634,7 +622,7 @@ process_single_rule() {
     
     [ -z "$class" ] && { log "ERROR" "规则 $rule_id 缺少 class 参数"; return 1; }
     
-    local mark=$(calculate_class_mark "$class" "$mask" "$chain_type")
+    local mark=$(calculate_class_mark "$class" "$chain_type")
     [ -z "$mark" ] && { log "ERROR" "无法计算类别 $class 的标记值"; return 1; }
     
     log "INFO" "类别 $class 的标记: $mark"
