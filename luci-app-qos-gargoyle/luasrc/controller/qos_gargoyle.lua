@@ -44,23 +44,9 @@ function index()
 
     entry({"admin", "qos", "qos_gargoyle", "acc"},
         cbi("qos_gargoyle/acc"), _("Active Congestion Control"), 50)
-		
-    -- 检查算法是否为 cake_dscp，动态添加 DSCP Classify 菜单
-    local cursor = uci.cursor()
-    local algorithm = cursor:get("qos_gargoyle", "global", "algorithm")
-    if algorithm == "cake_dscp" then
-        entry({"admin", "qos", "qos_gargoyle", "dscpclassify"},
-            firstchild(), _("DSCP Classify"), 60)
-        entry({"admin", "qos", "qos_gargoyle", "dscpclassify", "general"},
-            cbi("qos_gargoyle/dscpclassify_general"), _("General"), 10)
-        entry({"admin", "qos", "qos_gargoyle", "dscpclassify", "sets"},
-            cbi("qos_gargoyle/dscpclassify_sets"), _("IP Sets"), 20)
-        entry({"admin", "qos", "qos_gargoyle", "dscpclassify", "rules"},
-            cbi("qos_gargoyle/dscpclassify_rules"), _("Rules"), 30)
-    end
 
     entry({"admin", "qos", "qos_gargoyle", "show_status"},
-        template("qos_gargoyle/show_status"), _("Show Status"), 70)
+        template("qos_gargoyle/show_status"), _("Show Status"), 60)
 
     entry({"admin", "qos", "qos_gargoyle", "show_status", "data"},
         call("action_show_status_data"))

@@ -65,6 +65,12 @@ msgstr "自动检测（网关）"
 msgid "AutoRate Ingress"
 msgstr "自适应入口带宽"
 
+msgid "Auto Adjust Percentages"
+msgstr "自适应百分比"
+
+msgid "Automatically adjust class percentages and min/max bandwidth based on total bandwidth and linklayer type."
+msgstr "根据总带宽和链路层类型自动调整上传和下载类别的百分比以及最小/最大带宽。"
+
 msgid "Automatically adjust ingress bandwidth based on measured throughput"
 msgstr "根据测量的吞吐量自动调整入口带宽"
 
@@ -293,7 +299,7 @@ msgstr "启用或禁用 QoS 服务"
 msgid "Entries"
 msgstr "条目"
 
-msgid "Error collecting showstatus information"
+msgid "Error collecting show_status information"
 msgstr "收集状态信息时出错"
 
 msgid "Error: qosacc binary not found. Please ensure it is installed correctly."
@@ -705,9 +711,9 @@ msgid "Should be set to around 98% of your available upload bandwidth. Entering 
 msgstr "应设置为您实际可用上传带宽的 98% 左右。输入的数字过高将导致 QoS 无法满足其类别要求。输入的数字过低会不必要地降低您的上传速度。您应该使用测速程序（关闭 QoS）来确定可用的上传带宽。请注意，带宽以 kbps 为单位，留空则禁用更新 QoS。1 千字节 = 8 千比特。"
 
 msgid "Show Status"
-msgstr "显示状态"
+msgstr "运行状态"
 
-msgid "Showstatus Data"
+msgid "Show_status Data"
 msgstr "状态数据"
 
 msgid "Skip Initial Measurement"

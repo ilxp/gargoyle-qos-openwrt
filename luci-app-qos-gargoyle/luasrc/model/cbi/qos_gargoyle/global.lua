@@ -67,6 +67,12 @@ o:value("hfsc_fqcodel", "HFSC+Fq_Codel (HFSC With Fq_Codel)")
 o:value("htb_fqcodel", "HTB+Fq_Codel (HTB With Fq_Codel)")
 o.default = "htb_cake"
 
+-- 调整百分比开关
+o = s:option(Flag, "auto_adjust_percentages", translate("Auto Adjust Percentages"),
+             translate("Automatically adjust class percentages and min/max bandwidth based on total bandwidth and linklayer type."))
+o.default = "1"
+o.rmempty = false
+
 -- 链路类型
 o = s:option(ListValue, "linklayer", translate("Linklayer Type"), translate("Select linkelayer type"))
 o:value("ethernet", translate("Ethernet"))
@@ -196,15 +202,14 @@ local function get_percentages(direction, bw, linklayer)
     return percents
 end
 
--- 应用百分比及 min/max（通过分类名称直接查找 section）
--- adjust_minmax: 是否同时更新最小/最大带宽
-local function apply_class_percentages(direction, bw, linklayer, adjust_minmax)
+-- 修改后的应用百分比函数，接受 UCI 游标作为参数
+local function apply_class_percentages(cursor, direction, bw, linklayer, adjust_minmax)
     local percents = get_percentages(direction, bw, linklayer)
     local class_names = { "realtime", "normal", "bulk" }
     
     for idx, class_name in ipairs(class_names) do
         local section = nil
-        uci:foreach(qos_gargoyle, direction .. "_class", function(s)
+        cursor:foreach(qos_gargoyle, direction .. "_class", function(s)
             if s.name == class_name then
                 section = s[".name"]
                 return false -- 找到后停止遍历
@@ -212,26 +217,26 @@ local function apply_class_percentages(direction, bw, linklayer, adjust_minmax)
         end)
         if section then
             -- 设置百分比
-            uci:set(qos_gargoyle, section, "percent_bandwidth", tostring(percents[idx]))
+            cursor:set(qos_gargoyle, section, "percent_bandwidth", tostring(percents[idx]))
             
             if adjust_minmax then
                 local min_pct, max_pct
                 if class_name == "realtime" then
                     min_pct = 60    -- 保证带宽占分类带宽的 60%
-                    max_pct = 200   -- nil 表示删除（无限制）
+                    max_pct = 200   -- 最大带宽占分类带宽的 200%
                 elseif class_name == "normal" then
                     min_pct = 0
-                    max_pct = 200   -- 最大带宽占分类带宽的 200%
+                    max_pct = 200
                 else -- bulk
                     min_pct = 0
-                    max_pct = 100   -- 最大带宽占分类带宽的 100%
+                    max_pct = 100
                 end
                 
-                uci:set(qos_gargoyle, section, "per_min_bandwidth", tostring(min_pct))
+                cursor:set(qos_gargoyle, section, "per_min_bandwidth", tostring(min_pct))
                 if max_pct then
-                    uci:set(qos_gargoyle, section, "per_max_bandwidth", tostring(max_pct))
+                    cursor:set(qos_gargoyle, section, "per_max_bandwidth", tostring(max_pct))
                 else
-                    uci:delete(qos_gargoyle, section, "per_max_bandwidth")  -- 留空表示无限制
+                    cursor:delete(qos_gargoyle, section, "per_max_bandwidth")  -- 留空表示无限制
                 end
             end
         else
@@ -270,26 +275,26 @@ local function before_apply(self)
     return true
 end
 
--- 保存配置后的钩子函数
+-- 保存配置后的钩子函数（修改版，使用开关）
 local function after_apply(self)
     sys.call("logger -t qos_gargoyle '配置已应用，正在处理服务启停'")
-    
-    -- 等待一小段时间，确保配置已保存
     os.execute("sleep 0.5")
-    
-    -- 处理服务控制
     handle_service_control()
     
-    -- ===== 自动调整分类百分比 =====
-    local upload_bw = tonumber(uci:get(qos_gargoyle, "upload", "total_bandwidth")) or 50000
-    local download_bw = tonumber(uci:get(qos_gargoyle, "download", "total_bandwidth")) or 100000
-    local linklayer = uci:get(qos_gargoyle, "global", "linklayer") or "atm"
-    
-    apply_class_percentages("upload", upload_bw, linklayer, true)
-    apply_class_percentages("download", download_bw, linklayer, true)
-    
-    uci:commit(qos_gargoyle)
-    -- ===== 结束 =====
+    -- 检查自动调整开关
+    local auto_adjust = self.uci:get(qos_gargoyle, "global", "auto_adjust_percentages") or "1"
+    if auto_adjust == "1" then
+        local upload_bw = tonumber(self.uci:get(qos_gargoyle, "upload", "total_bandwidth")) or 50000
+        local download_bw = tonumber(self.uci:get(qos_gargoyle, "download", "total_bandwidth")) or 100000
+        local linklayer = self.uci:get(qos_gargoyle, "global", "linklayer") or "atm"
+        
+        apply_class_percentages(self.uci, "upload", upload_bw, linklayer, true)
+        apply_class_percentages(self.uci, "download", download_bw, linklayer, true)
+        
+        self.uci:commit(qos_gargoyle)
+    else
+        sys.call("logger -t qos_gargoyle '自动调整已禁用'")
+    end
     
     return true
 end
