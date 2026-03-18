@@ -1979,22 +1979,29 @@ int status_file_update(qosacc_context_t* ctx) {
     fprintf(fp, "已接收ping: %d\n", ctx->nreceived);
     fprintf(fp, "队列算法: %s\n", ctx->detected_qdisc);
     fprintf(fp, "实时类活跃: %d\n", ctx->realtime_active);
-    fprintf(fp, "运行时间: %ld秒\n", ctx->stats.uptime_seconds);
     fprintf(fp, "总带宽调整: %ld次\n", ctx->stats.total_bandwidth_adjustments);
     fprintf(fp, "总错误数: %ld\n", ctx->stats.total_errors);
     fprintf(fp, "心跳检查: %ld次\n", ctx->stats.total_heartbeat_checks);
     fprintf(fp, "心跳超时: %ld次\n", ctx->stats.total_heartbeat_timeouts);
-    // 使用系统时间（带毫秒）
-    struct timespec ts;
-    clock_gettime(CLOCK_REALTIME, &ts);
-    struct tm* tm_info = localtime(&ts.tv_sec);
-    char time_buf[26];
-    strftime(time_buf, sizeof(time_buf), "%Y-%m-%d %H:%M:%S", tm_info);
-    fprintf(fp, "最后更新: %s.%03ld\n", time_buf, ts.tv_nsec / 1000000);
-    fflush(fp);
-    lock.l_type = F_UNLCK;
-    fcntl(fd, F_SETLK, &lock);
-    fclose(fp);
+	int64_t t = ctx->stats.uptime_seconds;
+	if (t < 60) {
+		fprintf(fp, "运行时间: %ld秒\n", t);
+	} else if (t < 3600) {
+		fprintf(fp, "运行时间: %ld分钟 %ld秒\n", t / 60, t % 60);
+	} else {
+		fprintf(fp, "运行时间: %ld小时 %ld分钟\n", t / 3600, (t % 3600) / 60);
+	}
+    // 使用系统时间:YYYY-MM-DD HH:MM:SS
+	struct timespec ts;
+	clock_gettime(CLOCK_REALTIME, &ts);
+	struct tm* tm_info = localtime(&ts.tv_sec);
+	char time_buf[26];
+	strftime(time_buf, sizeof(time_buf), "%Y-%m-%d %H:%M:%S", tm_info);
+	fprintf(fp, "最后更新: %s\n", time_buf);   // 去掉毫秒
+	fflush(fp);
+	lock.l_type = F_UNLCK;
+	fcntl(fd, F_SETLK, &lock);
+	fclose(fp);
     
     for (int i = 0; i < STATUS_FILE_RETRY_COUNT; i++) {
         if (rename(temp, ctx->config.status_file) == 0) break;
