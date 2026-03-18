@@ -86,6 +86,7 @@ jobs:
           ./scripts/feeds clean
           ./scripts/feeds update -a
           ./scripts/feeds install -a   
+          ./scripts/feeds install conntrack-tools
   
     - name: import config
       working-directory: ${{ github.workspace }}/openwrt
