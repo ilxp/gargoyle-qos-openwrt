@@ -25,7 +25,7 @@
 
 <script type="text/javascript" src="<%=resource%>/cbi.js"></script>
 <script type="text/javascript">//<![CDATA[
-	XHR.poll(15, '<%=url("admin/qos/qos_gargoyle/troubleshooting/data")%>', null,
+	XHR.poll(15, '<%=url("admin/qos/qos_gargoyle/show_status/data")%>', null,
 		function(x, data) {
 			var tshoot = document.getElementById('troubleshoot_text');
 			if (data.hasOwnProperty("show")) {

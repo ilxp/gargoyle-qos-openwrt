@@ -59,11 +59,11 @@ function index()
             cbi("qos_gargoyle/dscpclassify_rules"), _("Rules"), 30)
     end
 
-    entry({"admin", "qos", "qos_gargoyle", "troubleshooting"},
-        template("qos_gargoyle/troubleshooting"), _("troubleshooting"), 70)
+    entry({"admin", "qos", "qos_gargoyle", "show_status"},
+        template("qos_gargoyle/show_status"), _("Show Status"), 70)
 
-    entry({"admin", "qos", "qos_gargoyle", "troubleshooting", "data"},
-        call("action_showstatus_data"))
+    entry({"admin", "qos", "qos_gargoyle", "show_status", "data"},
+        call("action_show_status_data"))
 
     entry({"admin", "qos", "qos_gargoyle", "load_data"},
         call("action_load_data")).leaf = true
@@ -87,7 +87,7 @@ function action_status()
     })
 end
 
-function action_showstatus_data()
+function action_show_status_data()
     local cursor = uci.cursor()
     local i18n = require "luci.i18n"
 
