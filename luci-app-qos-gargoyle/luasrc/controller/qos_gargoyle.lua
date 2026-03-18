@@ -59,10 +59,10 @@ function index()
             cbi("qos_gargoyle/dscpclassify_rules"), _("Rules"), 30)
     end
 
-    entry({"admin", "qos", "qos_gargoyle", "showstatus"},
-        template("qos_gargoyle/showstatus"), _("Show Status"), 70)
+    entry({"admin", "qos", "qos_gargoyle", "troubleshooting"},
+        template("qos_gargoyle/troubleshooting"), _("troubleshooting"), 70)
 
-    entry({"admin", "qos", "qos_gargoyle", "showstatus", "data"},
+    entry({"admin", "qos", "qos_gargoyle", "troubleshooting", "data"},
         call("action_showstatus_data"))
 
     entry({"admin", "qos", "qos_gargoyle", "load_data"},

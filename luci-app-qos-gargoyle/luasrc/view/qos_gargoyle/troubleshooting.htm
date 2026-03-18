@@ -25,7 +25,7 @@
 
 <script type="text/javascript" src="<%=resource%>/cbi.js"></script>
 <script type="text/javascript">//<![CDATA[
-	XHR.poll(15, '<%=url("admin/qos/qos_gargoyle/showstatus/data")%>', null,
+	XHR.poll(15, '<%=url("admin/qos/qos_gargoyle/troubleshooting/data")%>', null,
 		function(x, data) {
 			var tshoot = document.getElementById('troubleshoot_text');
 			if (data.hasOwnProperty("show")) {
@@ -34,10 +34,10 @@
 					'<span class="description">Output of &#34;/etc/init.d/qos_gargoyle show&#34; : </span><br /><br />',
 					data.show,
 					'<br /><br /><span class="description">Output of &#34;cat /tmp/qosacc.status&#34; : </span><br /><br />',
-					data.mon
+					data.acc
 				);
 			} else {
-				tshoot.innerHTML = '<strong><%:Error collecting status information%></strong>';
+				tshoot.innerHTML = '<strong><%:Error collecting troubleshooting information%></strong>';
 			}
 		}
 	);
