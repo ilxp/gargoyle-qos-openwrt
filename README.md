@@ -113,7 +113,6 @@
 ## 四、日志查看
 
 所有模块使用 `logger` 记录关键信息到系统日志，可通过以下命令查看：
-``bash
 logread | grep qos_gargoyle
 错误信息通常以 ❌ 或 ERROR 标记，例如：
 [14:30:15] qos_gargoyle CAKE错误: 无法在 eth0 上创建入口队列
