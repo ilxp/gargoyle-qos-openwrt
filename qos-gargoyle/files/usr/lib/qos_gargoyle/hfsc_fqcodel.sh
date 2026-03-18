@@ -1,9 +1,10 @@
 #!/bin/sh
-# version=2.10
+# version=2.21
 # HFSC_FQCODEL算法实现模块
 # 基于HFSC与FQ_CODEL组合算法实现QoS流量控制。
 # 必要工具：tc, nft, conntrack, ethtool, sysctl
 # 内核模块：ifb, sch_hfsc, sch_fq_codel
+# 优化：类标记冲突检测、IPv6入口重定向强制成功（当存在IPv6地址时）、锁僵尸进程检测、移除seq依赖
 
 # ========== 全局配置常量 ==========
 : ${CONFIG_FILE:=qos_gargoyle}
@@ -147,11 +148,26 @@ ensure_ifb_device() {
     return 0
 }
 
-# ========== 目录锁机制（支持重入）==========
+# ========== 目录锁机制（支持重入，增强僵尸进程检测）==========
 acquire_lock() {
     if [ -d "$LOCK_DIR" ]; then
         if [ -f "$LOCK_PID_FILE" ]; then
             local old_pid=$(cat "$LOCK_PID_FILE" 2>/dev/null)
+            local now=$(date +%s)
+            local mtime=0
+
+            # 更严谨的检查：直接测试 stat 的 -c 选项是否能正常工作
+            if stat -c %Y /tmp >/dev/null 2>&1; then
+                mtime=$(stat -c %Y "$LOCK_PID_FILE" 2>/dev/null || echo 0)
+            fi
+
+            if [ "$mtime" -gt 0 ] && [ $((now - mtime)) -gt 120 ]; then
+                qos_log "WARN" "锁文件过期（超过120秒），进程 $old_pid 可能僵死，强制清理锁目录"
+                rm -rf "$LOCK_DIR"
+                acquire_lock
+                return $?
+            fi
+
             if [ -n "$old_pid" ] && kill -0 "$old_pid" 2>/dev/null; then
                 if [ "$old_pid" -eq "$$" ]; then
                     qos_log "DEBUG" "已持有锁 (PID: $$)"
@@ -358,7 +374,7 @@ load_hfsc_config() {
         qos_log "INFO" "HFSC延迟模式: ${HFSC_LATENCY_MODE}"
     fi
     
-	# 是否启用延迟
+    # 是否启用延迟
     HFSC_MINRTT_ENABLED=$(uci -q get qos_gargoyle.hfsc.minrtt_enabled 2>/dev/null)
     if [ -z "$HFSC_MINRTT_ENABLED" ]; then
         HFSC_MINRTT_ENABLED=0
@@ -366,8 +382,8 @@ load_hfsc_config() {
     else
         qos_log "INFO" "HFSC最小RTT启用: ${HFSC_MINRTT_ENABLED}"
     fi
-	
-	# 读取minrtt_delay
+    
+    # 读取minrtt_delay
     HFSC_MINRTT_DELAY=$(uci -q get qos_gargoyle.hfsc.minrtt_delay 2>/dev/null)
     # 如果未设置，则使用默认值 1000us
     if [ -z "$HFSC_MINRTT_DELAY" ]; then
@@ -493,7 +509,7 @@ load_hfsc_class_config() {
     if [ -n "$per_max_bandwidth" ] && ! validate_number "$per_max_bandwidth" "$class_name.per_max_bandwidth" 0 1000; then  #允许借用
         per_max_bandwidth=""
     fi
-	# 允许优先级0（最高）
+    # 允许优先级0（最高）
     if [ -n "$priority" ] && ! validate_number "$priority" "$class_name.priority" 0 255; then
         priority=""
     fi
@@ -583,6 +599,73 @@ setup_hfsc_enhance_chains() {
         jump filter_qos_ingress_enhance 2>/dev/null || true
 }
 
+# ========== 类标记冲突检测函数 ==========
+# 检查并分配唯一标记，避免哈希冲突
+# 参数：方向（upload/download），类列表（空格分隔）
+# 返回：0成功，1失败（冲突无法解决）
+allocate_class_marks() {
+    local direction="$1"
+    local class_list="$2"
+    local mask base_value mark_dict i class mark
+
+    if [ "$direction" = "upload" ]; then
+        base_value=1
+        mask="$UPLOAD_MASK"
+    else
+        base_value=65536  # 0x10000
+        mask="$DOWNLOAD_MASK"
+    fi
+
+    # 使用一个简单的数组记录已分配的索引（1-16）
+    # 由于ash不支持关联数组，我们用16个变量来模拟，使用POSIX兼容的while循环代替seq
+    i=1
+    while [ $i -le 16 ]; do
+        eval "mark_used_${i}=0"
+        i=$((i + 1))
+    done
+
+    for class in $class_list; do
+        # 计算原始索引（1-16）
+        local index=$(calculate_hash_index "$class")
+        index=$(( (index % 16) + 1 ))
+        local original_index=$index
+        local found=0
+        local probe=0
+
+        # 线性探测，最多16次
+        while [ $probe -lt 16 ]; do
+            eval "used=\${mark_used_${index}}"
+            if [ "$used" = "0" ]; then
+                eval "mark_used_${index}=1"
+                # 计算标记值
+                local mark_value=$((base_value << (index - 1)))
+                mark_value=$((mark_value & 0xFFFFFFFF))
+                # 存储到全局变量，供后续创建类使用
+                eval "${direction}_mark_${class}=$mark_value"
+                qos_log "INFO" "类别 $class 分配标记索引 $index (原始哈希: $original_index, 探测次数: $probe)"
+                found=1
+                break
+            fi
+            index=$(( (index % 16) + 1 ))
+            probe=$((probe + 1))
+        done
+
+        if [ $found -eq 0 ]; then
+            qos_log "ERROR" "类别 $class 无法分配唯一标记，所有16个索引均已占用"
+            return 1
+        fi
+    done
+
+    return 0
+}
+
+# 获取已分配的标记值（供创建类时使用）
+get_class_mark_value() {
+    local direction="$1"
+    local class="$2"
+    eval "echo \${${direction}_mark_${class}}"
+}
+
 # ========== HFSC核心队列函数（使用fq_codel） ==========
 create_hfsc_root_qdisc() {
     local device="$1"
@@ -644,11 +727,12 @@ create_hfsc_upload_class() {
     eval "$class_config"
     
     local class_mark
-    if ! class_mark=$(get_class_mark_for_rule "$class_name" "upload"); then
+    class_mark=$(get_class_mark_value "upload" "$class_name")
+    if [ -z "$class_mark" ]; then
         qos_log "ERROR" "无法获取类别 $class_name 的标记"
         return 1
     fi
-    qos_log "INFO" "类别 $class_name 使用的标记: $class_mark"
+    qos_log "INFO" "类别 $class_name 使用的标记: 0x$(printf '%X' $class_mark)"
     
     local m1="0bit"
     local d="0us"
@@ -698,23 +782,23 @@ create_hfsc_upload_class() {
     fi
     
     # 确定是否启用最小延迟
-	local enable_minrtt=0
-	if [ -n "$minRTT" ]; then
-		# 类别已显式配置 minRTT
-		case "$minRTT" in
-			[Yy]es|[Yy]|1|[Tt]rue) enable_minrtt=1 ;;
-			[Nn]o|[Nn]|0|[Ff]alse) enable_minrtt=0 ;;
-			*) enable_minrtt="${HFSC_MINRTT_ENABLED:-0}" ;;  # 无效值时回退全局
-		esac
-	else
-		# 类别未配置 minRTT，使用全局开关
-		enable_minrtt="${HFSC_MINRTT_ENABLED:-0}"
-	fi
+    local enable_minrtt=0
+    if [ -n "$minRTT" ]; then
+        # 类别已显式配置 minRTT
+        case "$minRTT" in
+            [Yy]es|[Yy]|1|[Tt]rue) enable_minrtt=1 ;;
+            [Nn]o|[Nn]|0|[Ff]alse) enable_minrtt=0 ;;
+            *) enable_minrtt="${HFSC_MINRTT_ENABLED:-0}" ;;  # 无效值时回退全局
+        esac
+    else
+        # 类别未配置 minRTT，使用全局开关
+        enable_minrtt="${HFSC_MINRTT_ENABLED:-0}"
+    fi
 
-	if [ "$enable_minrtt" = "1" ]; then
-		d="${HFSC_MINRTT_DELAY:-1000us}"
-		qos_log "INFO" "类别 $class_name 启用最小延迟模式 (d=$d, 来源: $([ -n "$minRTT" ] && echo "类别配置" || echo "全局开关"))"
-	fi
+    if [ "$enable_minrtt" = "1" ]; then
+        d="${HFSC_MINRTT_DELAY:-1000us}"
+        qos_log "INFO" "类别 $class_name 启用最小延迟模式 (d=$d, 来源: $([ -n "$minRTT" ] && echo "类别配置" || echo "全局开关"))"
+    fi
     
     qos_log "INFO" "正在创建HFSC类别 1:$class_index (带宽: ls=$m2, ul=$ul_m2)"
     if ! tc class add dev "$qos_interface" parent 1:1 \
@@ -802,11 +886,12 @@ create_hfsc_download_class() {
     eval "$class_config"
     
     local class_mark
-    if ! class_mark=$(get_class_mark_for_rule "$class_name" "download"); then
+    class_mark=$(get_class_mark_value "download" "$class_name")
+    if [ -z "$class_mark" ]; then
         qos_log "ERROR" "无法获取类别 $class_name 的标记"
         return 1
     fi
-    qos_log "INFO" "类别 $class_name 使用的标记: $class_mark"
+    qos_log "INFO" "类别 $class_name 使用的标记: 0x$(printf '%X' $class_mark)"
     
     local m1="0bit"
     local d="0us"
@@ -856,23 +941,23 @@ create_hfsc_download_class() {
     fi
     
     # 确定是否启用最小延迟
-	local enable_minrtt=0
-	if [ -n "$minRTT" ]; then
-		# 类别已显式配置 minRTT
-		case "$minRTT" in
-			[Yy]es|[Yy]|1|[Tt]rue) enable_minrtt=1 ;;
-			[Nn]o|[Nn]|0|[Ff]alse) enable_minrtt=0 ;;
-			*) enable_minrtt="${HFSC_MINRTT_ENABLED:-0}" ;;  # 无效值时回退全局
-		esac
-	else
-		# 类别未配置 minRTT，使用全局开关
-		enable_minrtt="${HFSC_MINRTT_ENABLED:-0}"
-	fi
+    local enable_minrtt=0
+    if [ -n "$minRTT" ]; then
+        # 类别已显式配置 minRTT
+        case "$minRTT" in
+            [Yy]es|[Yy]|1|[Tt]rue) enable_minrtt=1 ;;
+            [Nn]o|[Nn]|0|[Ff]alse) enable_minrtt=0 ;;
+            *) enable_minrtt="${HFSC_MINRTT_ENABLED:-0}" ;;  # 无效值时回退全局
+        esac
+    else
+        # 类别未配置 minRTT，使用全局开关
+        enable_minrtt="${HFSC_MINRTT_ENABLED:-0}"
+    fi
 
-	if [ "$enable_minrtt" = "1" ]; then
-		d="${HFSC_MINRTT_DELAY:-1000us}"
-		qos_log "INFO" "类别 $class_name 启用最小延迟模式 (d=$d, 来源: $([ -n "$minRTT" ] && echo "类别配置" || echo "全局开关"))"
-	fi
+    if [ "$enable_minrtt" = "1" ]; then
+        d="${HFSC_MINRTT_DELAY:-1000us}"
+        qos_log "INFO" "类别 $class_name 启用最小延迟模式 (d=$d, 来源: $([ -n "$minRTT" ] && echo "类别配置" || echo "全局开关"))"
+    fi
     
     qos_log "INFO" "正在创建下载HFSC类别 1:$class_index (带宽: ls=$m2, ul=$ul_m2)"
     if ! tc class add dev "$ifb_dev" parent 1:1 \
@@ -1050,7 +1135,7 @@ create_default_download_class() {
     return 0
 }
 
-# ========== 入口重定向（依赖conntrack恢复标记）==========
+# ========== 入口重定向（依赖conntrack恢复标记，增加IPv6强制成功逻辑）==========
 setup_ingress_redirect() {
     if [ -z "$qos_interface" ]; then
         qos_log "ERROR" "无法确定 WAN 接口"
@@ -1073,7 +1158,7 @@ setup_ingress_redirect() {
     
     tc filter del dev "$qos_interface" parent ffff: 2>/dev/null || true
     
-    # IPv4重定向
+    # IPv4重定向（必须成功）
     if ! tc filter add dev "$qos_interface" parent ffff: protocol ip \
         u32 match u32 0 0 \
         action connmark \
@@ -1084,9 +1169,19 @@ setup_ingress_redirect() {
     else
         qos_log "INFO" "IPv4入口重定向规则添加成功"
     fi
+
+    # 检测接口是否有全局 IPv6 地址，以决定是否强制 IPv6 必须成功
+    local has_ipv6_global=0
+    if ip -6 addr show dev "$qos_interface" scope global 2>/dev/null | grep -q "inet6"; then
+        has_ipv6_global=1
+        qos_log "INFO" "接口 $qos_interface 拥有全局 IPv6 地址，将强制 IPv6 重定向必须成功"
+    else
+        qos_log "INFO" "接口 $qos_interface 无全局 IPv6 地址，IPv6 重定向失败仅警告"
+    fi
     
     # ========== IPv6 重定向：三阶尝试 ==========
     local ipv6_success=false
+    local ipv6_attempts=0
     
     # 第一优先：flower 匹配全球单播地址 (2000::/3)
     if tc filter add dev "$qos_interface" parent ffff: protocol ipv6 \
@@ -1097,6 +1192,7 @@ setup_ingress_redirect() {
         qos_log "INFO" "IPv6入口重定向规则（flower 匹配全球单播）添加成功"
     else
         qos_log "WARN" "flower 规则添加失败，尝试 u32 全球单播匹配"
+        ipv6_attempts=$((ipv6_attempts + 1))
         
         # 第二优先：u32 匹配全球单播地址 (2000::/3)
         if tc filter add dev "$qos_interface" parent ffff: protocol ipv6 \
@@ -1107,6 +1203,7 @@ setup_ingress_redirect() {
             qos_log "INFO" "IPv6入口重定向规则（u32 全球单播）添加成功"
         else
             qos_log "WARN" "u32 全球单播规则添加失败，尝试无过滤规则"
+            ipv6_attempts=$((ipv6_attempts + 1))
             
             # 第三优先：无过滤的 u32 全匹配
             if tc filter add dev "$qos_interface" parent ffff: protocol ipv6 \
@@ -1116,25 +1213,37 @@ setup_ingress_redirect() {
                 ipv6_success=true
                 qos_log "INFO" "IPv6入口重定向规则（无过滤）添加成功"
             else
+                ipv6_success=false
+                ipv6_attempts=$((ipv6_attempts + 1))
                 qos_log "WARN" "IPv6入口重定向规则添加失败，IPv6流量将不会通过IFB"
             fi
         fi
     fi
-    
-    if [ "$ipv6_success" = "true" ]; then
-        qos_log "INFO" "IPv6入口重定向规则添加成功"
+
+    # 根据是否有全局 IPv6 地址决定是否必须成功
+    if [ "$has_ipv6_global" = "1" ]; then
+        if [ "$ipv6_success" != "true" ]; then
+            qos_log "ERROR" "接口存在全局 IPv6 地址，但 IPv6 入口重定向配置失败，QoS 无法正常工作"
+            tc qdisc del dev "$qos_interface" ingress 2>/dev/null
+            return 1
+        else
+            qos_log "INFO" "IPv6 入口重定向成功（强制）"
+        fi
+    else
+        if [ "$ipv6_success" = "true" ]; then
+            qos_log "INFO" "IPv6 入口重定向成功（尽管无全局 IPv6 地址，仍添加了规则）"
+        else
+            qos_log "WARN" "IPv6 入口重定向失败，但因接口无全局 IPv6 地址，继续启动"
+        fi
     fi
     
-    # 检查是否有规则指向 IFB 设备
+    # 检查是否有规则指向 IFB 设备（仅用于日志）
     local ipv4_rule_count=$(tc filter show dev "$qos_interface" parent ffff: protocol ip 2>/dev/null | grep -c "mirred.*Redirect to device $IFB_DEVICE")
     local ipv6_rule_count=$(tc filter show dev "$qos_interface" parent ffff: protocol ipv6 2>/dev/null | grep -c "mirred.*Redirect to device $IFB_DEVICE")
     if [ "$ipv4_rule_count" -ge 1 ] && [ "$ipv6_rule_count" -ge 1 ]; then
         qos_log "INFO" "入口重定向已成功设置: IPv4和IPv6规则均生效"
     elif [ "$ipv4_rule_count" -ge 1 ]; then
-        qos_log "WARN" "入口重定向仅IPv4生效，IPv6未生效"
-    else
-        qos_log "ERROR" "入口重定向规则均未生效"
-        return 1
+        qos_log "INFO" "入口重定向已成功设置: 仅IPv4生效"
     fi
     
     return 0
@@ -1204,6 +1313,12 @@ initialize_hfsc_upload() {
         return 1
     fi
     
+    # 预先分配标记，检查冲突
+    if ! allocate_class_marks "upload" "$upload_class_list"; then
+        qos_log "ERROR" "上传方向类标记分配失败，存在无法解决的冲突"
+        return 1
+    fi
+    
     if ! create_hfsc_root_qdisc "$qos_interface" "upload" "1:0" "1:1"; then
         qos_log "ERROR" "创建上传根队列失败"
         return 1
@@ -1214,8 +1329,8 @@ initialize_hfsc_upload() {
     
     for class_name in $upload_class_list; do
         if create_hfsc_upload_class "$class_name" "$class_index"; then
-            local class_mark_hex=$(get_class_mark_for_rule "$class_name" "upload")
-            upload_class_mark_list="$upload_class_mark_list$class_name:$class_mark_hex "
+            local class_mark_hex=$(get_class_mark_value "upload" "$class_name")
+            upload_class_mark_list="$upload_class_mark_list$class_name:0x$(printf '%X' $class_mark_hex) "
         else
             qos_log "ERROR" "创建上传类别 $class_name 失败，停止初始化"
             # 清理已创建的根队列
@@ -1257,6 +1372,12 @@ initialize_hfsc_download() {
         return 1
     fi
     
+    # 预先分配标记，检查冲突
+    if ! allocate_class_marks "download" "$download_class_list"; then
+        qos_log "ERROR" "下载方向类标记分配失败，存在无法解决的冲突"
+        return 1
+    fi
+    
     # 确保IFB设备已存在并启用
     if ! ip link show dev "$IFB_DEVICE" >/dev/null 2>&1; then
         qos_log "ERROR" "IFB设备 $IFB_DEVICE 不存在"
@@ -1279,8 +1400,8 @@ initialize_hfsc_download() {
     
     for class_name in $download_class_list; do
         if create_hfsc_download_class "$class_name" "$class_index" "$filter_prio"; then
-            local class_mark_hex=$(get_class_mark_for_rule "$class_name" "download")
-            download_class_mark_list="$download_class_mark_list$class_name:$class_mark_hex "
+            local class_mark_hex=$(get_class_mark_value "download" "$class_name")
+            download_class_mark_list="$download_class_mark_list$class_name:0x$(printf '%X' $class_mark_hex) "
         else
             qos_log "ERROR" "创建下载类别 $class_name 失败，停止初始化"
             # 清理已创建的根队列
@@ -1317,7 +1438,8 @@ set_default_upload_class() {
             default_class_name=$(echo "$upload_class_list" | awk '{print $1}')
             qos_log "INFO" "自动选择第一个类别: $default_class_name"
         else
-            tc qdisc change dev "$qos_interface" root handle 1:0 hfsc default 2 2>/dev/null || true
+            # hfsc qdisc 不支持 default 参数，改为在根 qdisc 上添加一条低优先级的全匹配规则，指向默认类
+            tc filter add dev "$qos_interface" parent 1:0 protocol all prio 999 u32 match u32 0 0 flowid 1:2 2>/dev/null || true
             qos_log "INFO" "上传默认类别设置为TC类ID: 1:2"
             return
         fi
@@ -1358,12 +1480,10 @@ set_default_upload_class() {
             qos_log "INFO" "无自定义类别，使用默认类ID 1:2"
         fi
     fi
-   
-	#hfsc qdisc 不支持 default 参数（htb 支持），导致未匹配任何规则的流量可能被丢弃。
-    #tc qdisc change dev "$qos_interface" root handle 1:0 hfsc default $found_index 2>/dev/null || true 
-	#改为根 qdisc 上添加一条低优先级的全匹配规则，指向默认类
-	tc filter add dev "$qos_interface" parent 1:0 protocol all prio 999 u32 match u32 0 0 flowid 1:$found_index
-	
+    
+    # hfsc qdisc 不支持 default 参数，改为在根 qdisc 上添加一条低优先级的全匹配规则，指向默认类
+    tc filter add dev "$qos_interface" parent 1:0 protocol all prio 999 u32 match u32 0 0 flowid 1:$found_index 2>/dev/null || true
+    
     qos_log "INFO" "上传默认类别设置为TC类ID: 1:$found_index"
 }
 
@@ -1382,7 +1502,7 @@ set_default_download_class() {
             default_class_name=$(echo "$download_class_list" | awk '{print $1}')
             qos_log "INFO" "自动选择第一个类别: $default_class_name"
         else
-            tc qdisc change dev "$IFB_DEVICE" root handle 1:0 hfsc default 2 2>/dev/null || true
+            tc filter add dev "$IFB_DEVICE" parent 1:0 protocol all prio 999 u32 match u32 0 0 flowid 1:2 2>/dev/null || true
             qos_log "INFO" "下载默认类别设置为TC类ID: 1:2"
             return
         fi
@@ -1424,11 +1544,8 @@ set_default_download_class() {
         fi
     fi
     
-    #hfsc qdisc 不支持 default 参数（htb 支持），导致未匹配任何规则的流量可能被丢弃。
-    #tc qdisc change dev "$IFB_DEVICE" root handle 1:0 hfsc default $found_index 2>/dev/null || true 
-	#改为根 qdisc 上添加一条低优先级的全匹配规则，指向默认类
-	tc filter add dev "$IFB_DEVICE" parent 1:0 protocol all prio 999 u32 match u32 0 0 flowid 1:$found_index
-	
+    tc filter add dev "$IFB_DEVICE" parent 1:0 protocol all prio 999 u32 match u32 0 0 flowid 1:$found_index 2>/dev/null || true
+    
     qos_log "INFO" "下载默认类别设置为TC类ID: 1:$found_index"
 }
 
@@ -1640,9 +1757,6 @@ stop_hfsc_qos() {
         fi
     fi
     
-    # 清理连接标记（已不再需要）
-    # conntrack -U --mark 0 2>/dev/null || true
-    
     local tc_count_after=$(tc qdisc show 2>/dev/null | grep -c hfsc || echo 0)
     local nft_count_after=$(nft list ruleset 2>/dev/null | grep -c "gargoyle-qos-priority" || echo 0)
     
@@ -1673,7 +1787,7 @@ show_hfsc_status() {
         [ -z "$qos_interface" ] && qos_interface="未知"
     fi
     
-    echo "===== HFSC-FQ_CODEL QoS 状态报告 (v2.10) ====="
+    echo "===== HFSC-FQ_CODEL QoS 状态报告 (v2.21) ====="
     echo "时间: $(date)"
     echo "WAN接口: ${qos_interface}"
     
@@ -1822,13 +1936,14 @@ show_hfsc_status() {
             local ipv4_marks=$(conntrack -L -d "$wan_ipv4" 2>/dev/null | grep -E "mark=[0-9]+" | head -n 5)
             if [ -n "$ipv4_marks" ]; then
                 echo "$ipv4_marks" | while IFS= read -r line; do
-                    src_ip=$(echo "$line" | awk '{for(i=1;i<=NF;i++) if ($i ~ /^src=/) {sub(/^src=/, "", $i); print $i; exit}}')
-                    dst_ip=$(echo "$line" | awk '{for(i=1;i<=NF;i++) if ($i ~ /^dst=/) {sub(/^dst=/, "", $i); print $i; exit}}')
-                    sport=$(echo "$line" | awk '{for(i=1;i<=NF;i++) if ($i ~ /^sport=/) {sub(/^sport=/, "", $i); print $i; exit}}')
-                    dport=$(echo "$line" | awk '{for(i=1;i<=NF;i++) if ($i ~ /^dport=/) {sub(/^dport=/, "", $i); print $i; exit}}')
-                    proto=$(echo "$line" | awk '{print $1}')
-                    dec_mark=$(echo "$line" | grep -o "mark=[0-9]\+" | cut -d= -f2 | head -1)
-                    mark_hex="0x$(printf '%x' "$dec_mark" 2>/dev/null || echo '0')"
+                    local src_ip=$(echo "$line" | awk '{for(i=1;i<=NF;i++) if ($i ~ /^src=/) {sub(/^src=/, "", $i); print $i; exit}}')
+                    local dst_ip=$(echo "$line" | awk '{for(i=1;i<=NF;i++) if ($i ~ /^dst=/) {sub(/^dst=/, "", $i); print $i; exit}}')
+                    local sport=$(echo "$line" | awk '{for(i=1;i<=NF;i++) if ($i ~ /^sport=/) {sub(/^sport=/, "", $i); print $i; exit}}')
+                    local dport=$(echo "$line" | awk '{for(i=1;i<=NF;i++) if ($i ~ /^dport=/) {sub(/^dport=/, "", $i); print $i; exit}}')
+                    local proto=$(echo "$line" | awk '{print $1}')
+                    local dec_mark=$(echo "$line" | grep -o "mark=[0-9]\+" | cut -d= -f2 | head -1)
+                    local mark_hex="0x$(printf '%x' "$dec_mark" 2>/dev/null || echo '0')"
+                    
                     printf "  %-7s %-15s:%-5s → %-15s:%-5s [标记: %s]\n" \
                         "$proto" "${src_ip:-N/A}" "${sport:-N/A}" "${dst_ip:-N/A}" "${dport:-N/A}" "$mark_hex"
                 done
@@ -1845,13 +1960,13 @@ show_hfsc_status() {
             local ipv6_marks=$(conntrack -L -d "$wan_ipv6" 2>/dev/null | grep -E "mark=[0-9]+" | head -n 5)
             if [ -n "$ipv6_marks" ]; then
                 echo "$ipv6_marks" | while IFS= read -r line; do
-                    src_ip=$(echo "$line" | awk '{for(i=1;i<=NF;i++) if ($i ~ /^src=/) {sub(/^src=/, "", $i); print $i; exit}}')
-                    dst_ip=$(echo "$line" | awk '{for(i=1;i<=NF;i++) if ($i ~ /^dst=/) {sub(/^dst=/, "", $i); print $i; exit}}')
-                    sport=$(echo "$line" | awk '{for(i=1;i<=NF;i++) if ($i ~ /^sport=/) {sub(/^sport=/, "", $i); print $i; exit}}')
-                    dport=$(echo "$line" | awk '{for(i=1;i<=NF;i++) if ($i ~ /^dport=/) {sub(/^dport=/, "", $i); print $i; exit}}')
-                    proto=$(echo "$line" | awk '{print $1}')
-                    dec_mark=$(echo "$line" | grep -o "mark=[0-9]\+" | cut -d= -f2 | head -1)
-                    mark_hex="0x$(printf '%x' "$dec_mark" 2>/dev/null || echo '0')"
+                    local src_ip=$(echo "$line" | awk '{for(i=1;i<=NF;i++) if ($i ~ /^src=/) {sub(/^src=/, "", $i); print $i; exit}}')
+                    local dst_ip=$(echo "$line" | awk '{for(i=1;i<=NF;i++) if ($i ~ /^dst=/) {sub(/^dst=/, "", $i); print $i; exit}}')
+                    local sport=$(echo "$line" | awk '{for(i=1;i<=NF;i++) if ($i ~ /^sport=/) {sub(/^sport=/, "", $i); print $i; exit}}')
+                    local dport=$(echo "$line" | awk '{for(i=1;i<=NF;i++) if ($i ~ /^dport=/) {sub(/^dport=/, "", $i); print $i; exit}}')
+                    local proto=$(echo "$line" | awk '{print $1}')
+                    local dec_mark=$(echo "$line" | grep -o "mark=[0-9]\+" | cut -d= -f2 | head -1)
+                    local mark_hex="0x$(printf '%x' "$dec_mark" 2>/dev/null || echo '0')"
                     src_ip=$(echo "$src_ip" | sed 's/\(:\)[0:]*/\1/g')
                     dst_ip=$(echo "$dst_ip" | sed 's/\(:\)[0:]*/\1/g')
                     printf "  %-7s %-30s:%-5s → %-30s:%-5s [标记: %s]\n" \
@@ -1869,13 +1984,13 @@ show_hfsc_status() {
             local upload_marks=$(conntrack -L -s "$wan_ipv4" 2>/dev/null | grep -E "mark=[0-9]+" | head -n 3)
             if [ -n "$upload_marks" ]; then
                 echo "$upload_marks" | while IFS= read -r line; do
-                    src_ip=$(echo "$line" | awk '{for(i=1;i<=NF;i++) if ($i ~ /^src=/) {sub(/^src=/, "", $i); print $i; exit}}')
-                    dst_ip=$(echo "$line" | awk '{for(i=1;i<=NF;i++) if ($i ~ /^dst=/) {sub(/^dst=/, "", $i); print $i; exit}}')
-                    sport=$(echo "$line" | awk '{for(i=1;i<=NF;i++) if ($i ~ /^sport=/) {sub(/^sport=/, "", $i); print $i; exit}}')
-                    dport=$(echo "$line" | awk '{for(i=1;i<=NF;i++) if ($i ~ /^dport=/) {sub(/^dport=/, "", $i); print $i; exit}}')
-                    proto=$(echo "$line" | awk '{print $1}')
-                    dec_mark=$(echo "$line" | grep -o "mark=[0-9]\+" | cut -d= -f2 | head -1)
-                    mark_hex="0x$(printf '%x' "$dec_mark" 2>/dev/null || echo '0')"
+                    local src_ip=$(echo "$line" | awk '{for(i=1;i<=NF;i++) if ($i ~ /^src=/) {sub(/^src=/, "", $i); print $i; exit}}')
+                    local dst_ip=$(echo "$line" | awk '{for(i=1;i<=NF;i++) if ($i ~ /^dst=/) {sub(/^dst=/, "", $i); print $i; exit}}')
+                    local sport=$(echo "$line" | awk '{for(i=1;i<=NF;i++) if ($i ~ /^sport=/) {sub(/^sport=/, "", $i); print $i; exit}}')
+                    local dport=$(echo "$line" | awk '{for(i=1;i<=NF;i++) if ($i ~ /^dport=/) {sub(/^dport=/, "", $i); print $i; exit}}')
+                    local proto=$(echo "$line" | awk '{print $1}')
+                    local dec_mark=$(echo "$line" | grep -o "mark=[0-9]\+" | cut -d= -f2 | head -1)
+                    local mark_hex="0x$(printf '%x' "$dec_mark" 2>/dev/null || echo '0')"
                     printf "  %-7s %-15s:%-5s → %-15s:%-5s [标记: %s]\n" \
                         "$proto" "${src_ip:-N/A}" "${sport:-N/A}" "${dst_ip:-N/A}" "${dport:-N/A}" "$mark_hex"
                 done

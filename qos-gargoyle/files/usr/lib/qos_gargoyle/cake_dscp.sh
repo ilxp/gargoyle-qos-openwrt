@@ -1,7 +1,8 @@
 #!/bin/sh
 # version=5.6-mq
 # CAKE_DSCP算法实现模块 - 多队列增强版 v5.6
-# 基于CAKE算法，集成了dscpclassify智能分类，无需UCI开关
+# 集成 dscpclassify 智能分类，无需UCI开关
+# 优化：带宽单位转换区分字节/比特；IPv6重定向循环简化；锁机制强化（含僵尸进程检测）；变量作用域限定；dscpclassify加载前检查
 
 # ========== 变量初始化 ==========
 : ${total_upload_bandwidth:=50000}
@@ -12,8 +13,13 @@ LOCK_PID_FILE="$LOCK_DIR/pid"
 RUNTIME_PARAMS_FILE="/tmp/cake_runtime_params"
 QOS_RUNNING_FILE="/var/run/cake_qos.running"
 
-# 加载 dscpclassify 核心库（用于智能分类）
-. /usr/lib/qos_gargoyle/dscpclassify.sh
+# 加载 dscpclassify 核心库（用于智能分类）- 先检查文件是否存在
+DSCPCLASSIFY_LIB="/usr/lib/qos_gargoyle/dscpclassify.sh"
+if [ ! -f "$DSCPCLASSIFY_LIB" ]; then
+    echo "错误: dscpclassify 库文件 $DSCPCLASSIFY_LIB 不存在，请安装 qos-gargoyle-dscpclassify 包"
+    exit 1
+fi
+. "$DSCPCLASSIFY_LIB"
 
 # 如果 qos_interface 未设置，尝试获取
 if [ -z "$qos_interface" ]; then
@@ -95,12 +101,11 @@ check_dependencies() {
     if ! command -v ethtool >/dev/null 2>&1; then
         log_warn "ethtool 命令未找到，队列数检测将回退到 sysfs"
     fi
-	
-    # 检查 ctinfo 内核模块（用于下载方向 DSCP 恢复）
+
     if ! lsmod | grep -q act_ctinfo && ! modprobe act_ctinfo 2>/dev/null; then
         log_warn "act_ctinfo 内核模块未加载，下载方向 DSCP 恢复可能失败，请安装 kmod-sched-ctinfo"
     fi
-	
+
     return 0
 }
 
@@ -120,37 +125,43 @@ check_already_running() {
     return 0
 }
 
-# ========== 带宽单位转换（改进正则以支持多字母单位，增强结果验证）==========
+# ========== 带宽单位转换（严格区分字节与比特）==========
 convert_bandwidth_to_kbit() {
     local bw="$1"
     local num unit result
 
-    # 空值检查
     [ -z "$bw" ] && { log_error "带宽值为空"; return 1; }
 
-    # 处理纯数字（无单位）
     if echo "$bw" | grep -qE '^[0-9]+$'; then
         echo "$bw"
         return 0
     fi
 
-    # 处理带单位的带宽：允许数字后跟任意字母组合（如 kbit, mbit, KB, MB 等）
     if echo "$bw" | grep -qiE '^[0-9]+(\.[0-9]+)?[a-zA-Z]+$'; then
-        # 提取数字部分（支持小数）
         num=$(echo "$bw" | grep -oE '^[0-9]+(\.[0-9]+)?')
-        # 提取单位部分（去除数字和小数点后的所有字母）
         unit=$(echo "$bw" | sed 's/[0-9.]//g' | tr '[:lower:]' '[:upper:]')
 
-        # 根据单位转换（处理常见单位缩写）
         case "$unit" in
-            K|KB|KIB|Kbit|KBIT|KILOBIT)
+            K|KBIT|KILOBIT)
                 result=$(echo "$num * 1" | awk '{printf "%.0f", $1}')
                 ;;
-            M|MB|MIB|Mbit|MBIT|MEGABIT)
+            M|MBIT|MEGABIT)
                 result=$(echo "$num * 1000" | awk '{printf "%.0f", $1}')
                 ;;
-            G|GB|GIB|Gbit|GBIT|GIGABIT)
+            G|GBIT|GIGABIT)
                 result=$(echo "$num * 1000000" | awk '{printf "%.0f", $1}')
+                ;;
+            KB|KIB)
+                log_warn "检测到字节单位 '$unit'，将自动乘以 8 转换为 kbit"
+                result=$(echo "$num * 8" | awk '{printf "%.0f", $1}')
+                ;;
+            MB|MIB)
+                log_warn "检测到字节单位 '$unit'，将自动乘以 8 转换为 kbit"
+                result=$(echo "$num * 8000" | awk '{printf "%.0f", $1}')
+                ;;
+            GB|GIB)
+                log_warn "检测到字节单位 '$unit'，将自动乘以 8 转换为 kbit"
+                result=$(echo "$num * 8000000" | awk '{printf "%.0f", $1}')
                 ;;
             *)
                 log_error "未知带宽单位: $unit"
@@ -158,7 +169,6 @@ convert_bandwidth_to_kbit() {
                 ;;
         esac
 
-        # 严格检查结果是否为有效的非负整数
         if [ -z "$result" ] || ! echo "$result" | grep -qE '^[0-9]+$' || [ "$result" -lt 0 ] 2>/dev/null; then
             log_error "带宽转换结果无效: $result"
             return 1
@@ -167,7 +177,7 @@ convert_bandwidth_to_kbit() {
         echo "$result"
         return 0
     else
-        log_error "无效带宽格式: $bw (应为数字或数字+单位，例如 100mbit、10M)"
+        log_error "无效带宽格式: $bw (应为数字或数字+单位，例如 100mbit、10MB)"
         return 1
     fi
 }
@@ -176,6 +186,7 @@ convert_bandwidth_to_kbit() {
 validate_cake_parameters() {
     local param_value="$1"
     local param_name="$2"
+    local num unit ms mb
 
     case "$param_name" in
         bandwidth)
@@ -192,18 +203,15 @@ validate_cake_parameters() {
             ;;
 
         rtt)
-            # 格式检查
             if [ -n "$param_value" ] && ! echo "$param_value" | grep -qiE '^[0-9]*\.?[0-9]+(us|ms|s)$'; then
                 log_warn "无效的RTT格式: $param_value (应为数字+单位: us/ms/s)"
                 return 1
             fi
-            # 数值范围警告（近似转换为毫秒）
             if [ -n "$param_value" ]; then
-                local num=$(echo "$param_value" | grep -oE '^[0-9]*\.?[0-9]+')
-                local unit=$(echo "$param_value" | grep -oiE '(us|ms|s)$' | tr 'A-Z' 'a-z')
-                local ms=""
+                num=$(echo "$param_value" | grep -oE '^[0-9]*\.?[0-9]+')
+                unit=$(echo "$param_value" | grep -oiE '(us|ms|s)$' | tr 'A-Z' 'a-z')
                 case "$unit" in
-                    us) ms=$(( ${num%.*} / 1000 )) ;;   # 仅取整数部分近似
+                    us) ms=$(( ${num%.*} / 1000 )) ;;
                     ms) ms="${num%.*}" ;;
                     s)  ms=$(( ${num%.*} * 1000 )) ;;
                 esac
@@ -216,16 +224,13 @@ validate_cake_parameters() {
             ;;
 
         memory_limit)
-            # 格式检查
             if [ -n "$param_value" ] && ! echo "$param_value" | grep -qiE '^[0-9]+(b|kb|mb|gb)$'; then
                 log_warn "无效的内存限制格式: $param_value"
                 return 1
             fi
-            # 数值范围警告（近似转换为MB）
             if [ -n "$param_value" ]; then
-                local num=$(echo "$param_value" | grep -oE '[0-9]+')
-                local unit=$(echo "$param_value" | grep -oiE '(b|kb|mb|gb)$' | tr 'A-Z' 'a-z')
-                local mb=0
+                num=$(echo "$param_value" | grep -oE '[0-9]+')
+                unit=$(echo "$param_value" | grep -oiE '(b|kb|mb|gb)$' | tr 'A-Z' 'a-z')
                 case "$unit" in
                     b)  mb=$((num / 1024 / 1024)) ;;
                     kb) mb=$((num / 1024)) ;;
@@ -257,18 +262,15 @@ validate_diffserv_mode() {
 get_tx_queues() {
     local dev="$1"
     local queues=1
+    local ethtool_out
 
-    # 验证设备存在
     if ! ip link show dev "$dev" >/dev/null 2>&1; then
         log_warn "设备 $dev 不存在，返回默认队列数 1"
         echo "1"
         return
     fi
 
-    # 优先使用 ethtool 获取 Combined 值（硬件队列数）
     if command -v ethtool >/dev/null 2>&1; then
-        local ethtool_out
-        # 尝试从 Current hardware settings 块中提取 Combined
         ethtool_out=$(ethtool -l "$dev" 2>/dev/null | awk '
             /^Current hardware settings:/ { in_current=1; next }
             /^[^ ]/ { in_current=0 }
@@ -280,7 +282,6 @@ get_tx_queues() {
             echo "$queues"
             return
         fi
-        # 若无 Current 块，则取所有 Combined 行的最后一个值
         ethtool_out=$(ethtool -l "$dev" 2>/dev/null | grep "Combined:" | tail -1 | awk '{print $2}')
         if [ -n "$ethtool_out" ] && [ "$ethtool_out" -gt 0 ] 2>/dev/null; then
             queues=$ethtool_out
@@ -290,13 +291,11 @@ get_tx_queues() {
         fi
     fi
 
-    # 回退到 sysfs 检测
     if [ -d "/sys/class/net/$dev/queues" ]; then
         queues=$(ls -d /sys/class/net/$dev/queues/tx-* 2>/dev/null | wc -l)
         log_debug "sysfs 获取 $dev 队列数: $queues"
     fi
 
-    # 若队列数为0或无效，则默认为1
     if [ -z "$queues" ] || [ "$queues" -eq 0 ] 2>/dev/null; then
         queues=1
     fi
@@ -307,33 +306,28 @@ get_tx_queues() {
 # ========== 检测内核是否支持特定 CAKE 参数 ==========
 check_cake_param_support() {
     local param="$1"
-    # 临时删除 lo 的根 qdisc（如果存在）
     tc qdisc del dev lo root 2>/dev/null
-    # 尝试添加测试 qdisc
     if tc qdisc add dev lo root cake bandwidth 1mbit "$param" 2>/dev/null; then
         tc qdisc del dev lo root 2>/dev/null
-        return 0  # 支持
+        return 0
     else
-        return 1  # 不支持
+        return 1
     fi
 }
 
 # ========== 配置加载（带消毒）==========
 load_cake_config() {
     log_info "加载CAKE配置"
+    local uci_upload uci_download uci_ifb val
 
-    # 全局带宽
-    local uci_upload=$(uci -q get qos_gargoyle.global.upload_bandwidth 2>/dev/null)
-    local uci_download=$(uci -q get qos_gargoyle.global.download_bandwidth 2>/dev/null)
+    uci_upload=$(uci -q get qos_gargoyle.global.upload_bandwidth 2>/dev/null)
+    uci_download=$(uci -q get qos_gargoyle.global.download_bandwidth 2>/dev/null)
     [ -n "$uci_upload" ] && total_upload_bandwidth=$(sanitize_param "$uci_upload")
     [ -n "$uci_download" ] && total_download_bandwidth=$(sanitize_param "$uci_download")
 
-    # IFB设备
-    local uci_ifb=$(uci -q get qos_gargoyle.download.ifb_device 2>/dev/null)
+    uci_ifb=$(uci -q get qos_gargoyle.download.ifb_device 2>/dev/null)
     [ -n "$uci_ifb" ] && IFB_DEVICE=$(sanitize_param "$uci_ifb")
 
-    # CAKE参数（所有值均消毒，内存限制转换为小写）
-    local val
     val=$(uci -q get qos_gargoyle.cake.diffserv_mode 2>/dev/null)
     CAKE_DIFFSERV_MODE=$(sanitize_param "${val:-diffserv4}")
 
@@ -371,7 +365,6 @@ load_cake_config() {
     CAKE_MEMORY_LIMIT=$(sanitize_param "${val:-32mb}")
     CAKE_MEMORY_LIMIT=$(echo "$CAKE_MEMORY_LIMIT" | tr 'A-Z' 'a-z')
 
-    # ECN 参数
     val=$(uci -q get qos_gargoyle.cake.ecn 2>/dev/null)
     if [ -n "$val" ]; then
         case "$val" in
@@ -393,11 +386,9 @@ load_cake_config() {
     val=$(uci -q get qos_gargoyle.cake.enable_auto_tune 2>/dev/null)
     [ -n "$val" ] && ENABLE_AUTO_TUNE=$(sanitize_param "$val")
 
-    # 多队列CAKE-MQ开关
     val=$(uci -q get qos_gargoyle.cake.enable_mq 2>/dev/null)
     [ -n "$val" ] && CAKE_MQ_ENABLED=$(sanitize_param "$val")
 
-    # 停止时是否删除IFB设备
     val=$(uci -q get qos_gargoyle.cake.delete_ifb_on_stop 2>/dev/null)
     [ -n "$val" ] && CAKE_DELETE_IFB_ON_STOP=$(sanitize_param "$val")
 
@@ -407,8 +398,9 @@ load_cake_config() {
 # ========== 自动调优 ==========
 auto_tune_cake() {
     log_info "自动调整CAKE参数"
-
     local total_bw=0
+    local user_set_rtt user_set_mem
+
     if [ "$total_upload_bandwidth" -gt 0 ] && [ "$total_download_bandwidth" -gt 0 ]; then
         total_bw=$((total_upload_bandwidth + total_download_bandwidth))
     elif [ "$total_upload_bandwidth" -gt 0 ]; then
@@ -417,9 +409,8 @@ auto_tune_cake() {
         total_bw=$total_download_bandwidth
     fi
 
-    # 检查用户是否显式设置了RTT和内存限制
-    local user_set_rtt=$(uci -q get qos_gargoyle.cake.rtt 2>/dev/null)
-    local user_set_mem=$(uci -q get qos_gargoyle.cake.memlimit 2>/dev/null)
+    user_set_rtt=$(uci -q get qos_gargoyle.cake.rtt 2>/dev/null)
+    user_set_mem=$(uci -q get qos_gargoyle.cake.memlimit 2>/dev/null)
 
     if [ "$total_bw" -gt 200000 ]; then
         [ -z "$user_set_mem" ] && CAKE_MEMORY_LIMIT="128mb"
@@ -470,7 +461,6 @@ validate_cake_config() {
     fi
 
     validate_diffserv_mode "$CAKE_DIFFSERV_MODE" || CAKE_DIFFSERV_MODE="diffserv4"
-    # 严格验证RTT和内存限制，若格式无效则中止
     validate_cake_parameters "$CAKE_RTT" "rtt" || return 1
     validate_cake_parameters "$CAKE_MEMORY_LIMIT" "memory_limit" || return 1
 
@@ -478,10 +468,12 @@ validate_cake_config() {
     return 0
 }
 
-# ========== 入口重定向（IPv4必须成功，IPv6可选）==========
-# 固定使用 ctinfo 动作，使下载数据包的 DSCP 从 conntrack 标记恢复
+# ========== 入口重定向（IPv4必须成功，IPv6三阶尝试，带ctinfo）==========
 setup_ingress_redirect() {
     log_info "设置入口重定向: $qos_interface -> $IFB_DEVICE"
+    local ipv4_success=false
+    local ipv6_success=false
+    local match_cmd
 
     tc qdisc del dev "$qos_interface" ingress 2>/dev/null
 
@@ -490,10 +482,7 @@ setup_ingress_redirect() {
         return 1
     fi
 
-    local ipv4_success=false
-    local ipv6_success=false
-
-    # ---------- IPv4 重定向 ----------
+    # IPv4 重定向（带 ctinfo）
     if tc filter add dev "$qos_interface" parent ffff: protocol ip \
         u32 match u32 0 0 \
         action ctinfo dscp 0x3f 0 pipe \
@@ -505,44 +494,25 @@ setup_ingress_redirect() {
         return 1
     fi
 
-    # ---------- IPv6 重定向：三阶尝试 ----------
-    local ipv6_success=false
-
-    # 第一优先：flower 匹配全球单播地址 (2000::/3)
-    if tc filter add dev "$qos_interface" parent ffff: protocol ipv6 \
-        flower dst_ip 2000::/3 \
-        action ctinfo dscp 0x3f 0 pipe \
-        action mirred egress redirect dev "$IFB_DEVICE" 2>&1; then
-        ipv6_success=true
-        log_info "IPv6入口重定向规则（flower + ctinfo）添加成功"
-    else
-        log_warn "flower + ctinfo 规则添加失败，尝试 u32 全球单播匹配"
-    fi
-
-    # 第二优先：u32 匹配全球单播地址 (2000::/3)
-    if [ "$ipv6_success" != "true" ]; then
+    # IPv6 重定向：按优先级尝试三种匹配方式
+    for match_cmd in \
+        "flower dst_ip 2000::/3" \
+        "u32 match u32 0x20000000 0xe0000000 at 24" \
+        "u32 match u32 0 0"; do
         if tc filter add dev "$qos_interface" parent ffff: protocol ipv6 \
-            u32 match u32 0x20000000 0xe0000000 at 24 \
+            $match_cmd \
             action ctinfo dscp 0x3f 0 pipe \
-            action mirred egress redirect dev "$IFB_DEVICE" 2>&1; then
+            action mirred egress redirect dev "$IFB_DEVICE" 2>/dev/null; then
             ipv6_success=true
-            log_info "IPv6入口重定向规则（u32全球单播 + ctinfo）添加成功"
+            log_info "IPv6入口重定向规则 ($match_cmd + ctinfo) 添加成功"
+            break
         else
-            log_warn "u32全球单播 + ctinfo 规则添加失败，尝试无过滤规则"
+            log_warn "IPv6规则 ($match_cmd + ctinfo) 添加失败"
         fi
-    fi
+    done
 
-    # 第三优先：无过滤的 u32 全匹配
     if [ "$ipv6_success" != "true" ]; then
-        if tc filter add dev "$qos_interface" parent ffff: protocol ipv6 \
-            u32 match u32 0 0 \
-            action ctinfo dscp 0x3f 0 pipe \
-            action mirred egress redirect dev "$IFB_DEVICE" 2>&1; then
-            ipv6_success=true
-            log_info "IPv6入口重定向规则（无过滤 + ctinfo）添加成功"
-        else
-            log_warn "IPv6入口重定向规则（无过滤 + ctinfo）添加失败，IPv6流量将不会通过IFB"
-        fi
+        log_warn "所有IPv6重定向规则均失败，IPv6流量将不会通过IFB"
     fi
 
     log_info "入口重定向设置完成 (IPv4: ${ipv4_success}, IPv6: ${ipv6_success})"
@@ -579,13 +549,12 @@ cleanup_existing_queues() {
     fi
 }
 
-# ========== 构建CAKE参数串（并记录运行时生效的参数）==========
+# ========== 构建CAKE参数串（同 cake.sh）==========
 build_cake_params() {
     local bandwidth="$1"
     local direction="$2"
     local params="bandwidth ${bandwidth}kbit $CAKE_DIFFSERV_MODE"
-	
-    # 基础参数
+
     [ -n "$CAKE_FLOWMODE" ] && params="$params $CAKE_FLOWMODE"
     [ "$CAKE_OVERHEAD" != "0" ] && params="$params overhead $CAKE_OVERHEAD"
     [ "$CAKE_MPU" != "0" ] && params="$params mpu $CAKE_MPU"
@@ -594,19 +563,16 @@ build_cake_params() {
     [ "$CAKE_NAT" = "1" ] && params="$params nat"
     [ "$CAKE_WASH" = "1" ] && params="$params wash"
     [ -n "$CAKE_MEMORY_LIMIT" ] && params="$params memlimit $CAKE_MEMORY_LIMIT"
-	
-	# ECN 参数支持检测
-	if [ -n "$CAKE_ECN" ]; then
-		if check_cake_param_support "$CAKE_ECN"; then
-			params="$params $CAKE_ECN"
-		else
-			logger -t "qos_gargoyle" "CAKE警告: 内核不支持 $CAKE_ECN 参数，已忽略 ECN 设置"
-			CAKE_ECN=""
-		fi
-	fi
 
-    # 高级参数：需要内核支持，检测后动态添加，并记录运行时标志
-    # split-gso
+    if [ -n "$CAKE_ECN" ]; then
+        if check_cake_param_support "$CAKE_ECN"; then
+            params="$params $CAKE_ECN"
+        else
+            log_warn "内核不支持 $CAKE_ECN 参数，已忽略 ECN 设置"
+            CAKE_ECN=""
+        fi
+    fi
+
     if [ "$CAKE_SPLIT_GSO" = "1" ]; then
         if check_cake_param_support "split-gso"; then
             params="$params split-gso"
@@ -616,12 +582,10 @@ build_cake_params() {
         fi
     fi
 
-    # ingress 相关参数（仅下载方向）
     if [ "$direction" = "download" ] && [ "$CAKE_INGRESS" = "1" ]; then
         if check_cake_param_support "ingress"; then
             params="$params ingress"
             RUNTIME_INGRESS=1
-            # autorate-ingress 依赖于 ingress
             if [ "$CAKE_AUTORATE_INGRESS" = "1" ]; then
                 if check_cake_param_support "autorate-ingress"; then
                     params="$params autorate-ingress"
@@ -638,11 +602,12 @@ build_cake_params() {
     echo "$params"
 }
 
-# ========== 创建CAKE队列（支持多队列，增加极低带宽提示）==========
+# ========== 创建CAKE队列（支持多队列）同 cake.sh==========
 create_cake_root_qdisc() {
     local device="$1"
     local direction="$2"
     local bandwidth="$3"
+    local queues=1 use_mq=0 base_bw remainder full_params base_params i queue_bw success=0
 
     log_info "为$device创建$direction方向CAKE队列 (带宽: ${bandwidth}kbit)"
 
@@ -652,17 +617,12 @@ create_cake_root_qdisc() {
 
     cleanup_existing_queues "$device" "$direction"
 
-    # 获取设备队列数
-    local queues=1
-    local use_mq=0
     if [ "$CAKE_MQ_ENABLED" = "1" ]; then
         queues=$(get_tx_queues "$device")
-        # 确保queues是正整数
         if ! echo "$queues" | grep -qE '^[0-9]+$' || [ "$queues" -lt 1 ]; then
             log_warn "获取到的队列数无效: $queues，使用默认值1"
             queues=1
         fi
-
         if [ "$queues" -gt 1 ]; then
             use_mq=1
             log_info "设备 $device 支持 $queues 个发送队列，启用 CAKE-MQ"
@@ -673,49 +633,36 @@ create_cake_root_qdisc() {
         log_info "CAKE-MQ 已被禁用，使用普通 CAKE"
     fi
 
-    # 检查：带宽不足时自动降级
     if [ "$use_mq" = "1" ] && [ "$bandwidth" -lt "$queues" ] 2>/dev/null; then
         log_warn "总带宽 ${bandwidth}kbit 小于队列数 $queues，多队列可能导致部分队列带宽为0，已自动回退到单队列模式。"
         use_mq=0
     fi
 
     if [ "$use_mq" = "1" ]; then
-        # 多队列模式：创建 mq 根 qdisc，然后为每个队列添加 CAKE 子 qdisc
-        # 精确带宽分配：向下取整，余数分配给第一个队列
-        local base_bw=$(( bandwidth / queues ))
-        local remainder=$(( bandwidth % queues ))
-
-        # 确保 base_bw 至少为1
+        base_bw=$(( bandwidth / queues ))
+        remainder=$(( bandwidth % queues ))
         if [ "$base_bw" -lt 1 ]; then
             base_bw=1
             remainder=0
             log_warn "带宽分配后基础带宽为0，已调整为1kbit/队列"
         fi
-
-        # 极低带宽提示：当基础带宽 ≤5kbit 时提醒用户
         if [ "$base_bw" -le 5 ] 2>/dev/null; then
             log_warn "带宽分配后每个队列的基础带宽仅为 ${base_bw}kbit，可能导致部分队列性能不佳。建议关闭多队列或增加总带宽。"
         fi
-
         log_info "带宽分配: 基础 ${base_bw}kbit/队列，余数 ${remainder}kbit 给队列1"
 
-        # 添加 mq 根
         if ! tc qdisc add dev "$device" root handle 1: mq; then
             log_error "无法在$device上创建 mq 根队列"
             return 1
         fi
 
-        # 优化：预先构建一次完整参数，获取基础参数部分（不含bandwidth）
-        local full_params=$(build_cake_params "$bandwidth" "$direction")
-        local base_params=$(echo "$full_params" | sed 's/bandwidth [0-9]*kbit //')
+        full_params=$(build_cake_params "$bandwidth" "$direction")
+        base_params=$(echo "$full_params" | sed 's/bandwidth [0-9]*kbit //')
 
-        # 为每个队列添加 CAKE 子 qdisc
-        local success=0
-        local i=1
+        i=1
         while [ $i -le $queues ]; do
-            local queue_bw=$base_bw
+            queue_bw=$base_bw
             [ $i -eq 1 ] && queue_bw=$((queue_bw + remainder))
-
             echo "正在为 $device 队列 $i 创建 CAKE 子队列 (带宽: ${queue_bw}kbit)..."
             if ! tc qdisc add dev "$device" parent 1:$i cake bandwidth ${queue_bw}kbit $base_params; then
                 log_error "无法在$device队列$i上创建CAKE子队列"
@@ -726,7 +673,6 @@ create_cake_root_qdisc() {
         done
 
         if [ "$success" -ne 0 ]; then
-            # 清理已添加的队列
             tc qdisc del dev "$device" root 2>/dev/null
             return 1
         fi
@@ -734,7 +680,6 @@ create_cake_root_qdisc() {
         log_info "$device 的 $direction 方向 CAKE-MQ 队列创建完成 (共 $queues 个队列)"
         echo "✅ $device 的 $direction 方向 CAKE-MQ 队列创建完成 (队列数: $queues)"
     else
-        # 单队列模式：直接创建 CAKE
         local cake_params=$(build_cake_params "$bandwidth" "$direction")
         echo "正在为 $device 创建普通CAKE队列..."
         echo "  参数: $cake_params"
@@ -752,40 +697,35 @@ create_cake_root_qdisc() {
 # ========== 上传初始化 ==========
 initialize_cake_upload() {
     log_info "初始化上传方向CAKE"
-
     if [ -z "$total_upload_bandwidth" ] || [ "$total_upload_bandwidth" -le 0 ] 2>/dev/null; then
         log_info "上传带宽未配置，跳过上传方向初始化"
         return 0
     fi
-
     echo "为 $qos_interface 创建上传CAKE队列 (带宽: ${total_upload_bandwidth}kbit/s)"
     create_cake_root_qdisc "$qos_interface" "upload" "$total_upload_bandwidth"
 }
 
-# ========== 下载初始化（增强：检查IFB队列数一致性 + 避免冗余up）==========
+# ========== 下载初始化 ==========
 initialize_cake_download() {
     log_info "初始化下载方向CAKE"
+    local expected_queues=1 current_queues
 
     if [ -z "$total_download_bandwidth" ] || [ "$total_download_bandwidth" -le 0 ] 2>/dev/null; then
         log_info "下载带宽未配置，跳过下载方向初始化"
         return 0
     fi
 
-    # 确定期望的队列数（主接口的队列数）
-    local expected_queues=1
     if [ "$CAKE_MQ_ENABLED" = "1" ]; then
         expected_queues=$(get_tx_queues "$qos_interface")
-        # 确保期望队列数为正整数
         if ! echo "$expected_queues" | grep -qE '^[0-9]+$' || [ "$expected_queues" -lt 1 ]; then
             log_warn "获取到的期望队列数无效: $expected_queues，使用默认值1"
             expected_queues=1
         fi
     fi
 
-    # 检查 IFB 设备是否存在，若存在则验证队列数
     if ip link show dev "$IFB_DEVICE" >/dev/null 2>&1; then
         log_info "IFB设备 $IFB_DEVICE 已存在，检查队列数一致性"
-        local current_queues=$(get_tx_queues "$IFB_DEVICE")
+        current_queues=$(get_tx_queues "$IFB_DEVICE")
         if ! echo "$current_queues" | grep -qE '^[0-9]+$' || [ "$current_queues" -lt 1 ]; then
             log_warn "获取到的当前队列数无效: $current_queues，将重建IFB设备"
             ip link set dev "$IFB_DEVICE" down
@@ -805,7 +745,6 @@ initialize_cake_download() {
         fi
     fi
 
-    # 如果 IFB 设备不存在（或已被删除），则创建
     if ! ip link show dev "$IFB_DEVICE" >/dev/null 2>&1; then
         log_info "创建IFB设备 $IFB_DEVICE，队列数: $expected_queues"
         if ! ip link add "$IFB_DEVICE" numtxqueues "$expected_queues" numrxqueues "$expected_queues" type ifb; then
@@ -814,7 +753,6 @@ initialize_cake_download() {
         fi
     fi
 
-    # 检查设备是否已 up，若未 up 则启动
     if ! ip link show dev "$IFB_DEVICE" | grep -q "UP"; then
         ip link set dev "$IFB_DEVICE" up || {
             log_error "无法启动IFB设备 $IFB_DEVICE"
@@ -831,9 +769,7 @@ initialize_cake_download() {
 # ========== 健康检查 ==========
 health_check_cake() {
     echo "执行CAKE健康检查..."
-
-    local health_score=100
-    local issues=""
+    local health_score=100 issues=""
 
     if ! ip link show dev "$qos_interface" >/dev/null 2>&1; then
         health_score=$((health_score - 30))
@@ -873,13 +809,12 @@ health_check_cake() {
     return $((health_score >= 70 ? 0 : 1))
 }
 
-# ========== 状态显示（原版+入口状态+多队列统计）==========
+# ========== 状态显示（含 conntrack 标记）==========
 show_cake_status() {
     echo "===== CAKE_DSCP QoS状态报告 (v5.6-mq) ====="
     echo "时间: $(date)"
     echo "网络接口: ${qos_interface:-未知}"
 
-    # 加载UCI配置
     load_cake_config
 
     if [ -f "$RUNTIME_PARAMS_FILE" ]; then
@@ -894,11 +829,9 @@ show_cake_status() {
         return 1
     fi
 
-    # ===== 出口队列 =====
     echo -e "\n===== 出口CAKE队列 ($qos_interface) ====="
     if tc qdisc show dev "$qos_interface" root 2>/dev/null | grep -q "cake"; then
         echo "状态: 已启用 ✅"
-        # 统计所有出口队列数量
         local egress_count=$(tc qdisc show dev "$qos_interface" 2>/dev/null | grep -c "qdisc cake")
         if [ "$egress_count" -gt 1 ]; then
             echo "多队列模式: 共 $egress_count 个队列"
@@ -913,7 +846,6 @@ show_cake_status() {
         echo "状态: 未启用 ❌"
     fi
 
-    # ===== 入口队列 =====
     echo -e "\n===== 入口CAKE队列 ($IFB_DEVICE) ====="
     if ip link show "$IFB_DEVICE" >/dev/null 2>&1; then
         if tc qdisc show dev "$IFB_DEVICE" root 2>/dev/null | grep -q "cake"; then
@@ -934,13 +866,11 @@ show_cake_status() {
     else
         echo "状态: IFB设备未创建"
     fi
-    
-    # 显示 conntrack 标记
+
+    # conntrack 标记显示
     if command -v conntrack >/dev/null 2>&1; then
         echo -e "\n===== conntrack 标记示例 (最近5条) ====="
-        # 获取最近10条带有 mark 的连接，排除 mark=0 和可能的高位干扰
         conntrack -L 2>/dev/null | grep -E "mark=[1-9][0-9]*" | head -n 10 | while IFS= read -r line; do
-            # 提取关键信息：协议、源/目的IP、端口、mark
             proto=$(echo "$line" | awk '{print $1}')
             src=$(echo "$line" | awk '{print $4}' | cut -d= -f2)
             dst=$(echo "$line" | awk '{print $6}' | cut -d= -f2)
@@ -948,7 +878,6 @@ show_cake_status() {
             dport=$(echo "$line" | awk '{print $7}' | cut -d= -f2)
             mark=$(echo "$line" | grep -o "mark=[0-9]\+" | cut -d= -f2)
             dscp=$((mark & 0x3F))
-            # 映射 DSCP 值到类名（可选）
             case $dscp in
                 0) class="CS0/BE" ;;
                 8) class="CS1" ;;
@@ -981,14 +910,12 @@ show_cake_status() {
         echo "  conntrack 工具未安装，无法显示连接标记"
     fi
 
-    # ===== 入口重定向检查 =====
     echo -e "\n===== 入口重定向检查 ====="
     if tc filter show dev "$qos_interface" parent ffff: 2>/dev/null | grep -q "$IFB_DEVICE"; then
         echo "✅ 入口重定向: 已生效"
     else
         echo "❌ 入口重定向: 未生效"
     fi
-    # 列出规则详情
     if tc qdisc show dev "$qos_interface" 2>/dev/null | grep -q "ingress"; then
         echo "入口队列状态: 已配置"
         tc filter show dev "$qos_interface" parent ffff: 2>/dev/null | sed 's/^/  /' || echo "  无过滤器规则"
@@ -996,7 +923,6 @@ show_cake_status() {
         echo "入口队列状态: 未配置"
     fi
 
-    # ===== CAKE配置参数 =====
     echo -e "\n===== CAKE配置参数 ====="
     echo "DiffServ模式: $CAKE_DIFFSERV_MODE"
     echo "流模式: ${CAKE_FLOWMODE:-未配置}"
@@ -1017,12 +943,12 @@ show_cake_status() {
     return 0
 }
 
-# ========== 停止清理（增强：按配置删除IFB设备，增加锁保护和重试）==========
+# ========== 停止清理（同 cake.sh，增加 dscpclassify 卸载）==========
 stop_cake_qos() {
     log_info "停止CAKE_DSCP QoS"
-
     local got_lock=false
     local retry=3
+
     while [ $retry -gt 0 ]; do
         if acquire_lock 2>/dev/null; then
             got_lock=true
@@ -1039,13 +965,11 @@ stop_cake_qos() {
         return 1
     fi
 
-    # 清理上传队列
     if tc qdisc show dev "$qos_interface" root 2>/dev/null | grep -q "cake"; then
         tc qdisc del dev "$qos_interface" root 2>/dev/null && \
             log_info "清理上传方向CAKE队列" || log_warn "上传队列清理可能未完全成功"
     fi
 
-    # 清理IFB设备上的队列
     if ip link show dev "$IFB_DEVICE" >/dev/null 2>&1; then
         if tc qdisc show dev "$IFB_DEVICE" root 2>/dev/null | grep -q "cake"; then
             tc qdisc del dev "$IFB_DEVICE" root 2>/dev/null && \
@@ -1053,15 +977,12 @@ stop_cake_qos() {
         fi
     fi
 
-    # 清理入口重定向队列
     tc qdisc del dev "$qos_interface" ingress 2>/dev/null && log_info "清理入口重定向队列" || true
 
-    # ---------- 卸载 dscpclassify ----------
+    # 卸载 dscpclassify
     log_info "卸载 dscpclassify 分类规则..."
     dscpclassify_unload
-    # --------------------------------------------
 
-    # 处理IFB设备
     if ip link show dev "$IFB_DEVICE" >/dev/null 2>&1; then
         ip link set dev "$IFB_DEVICE" down
         if [ "$CAKE_DELETE_IFB_ON_STOP" = "1" ]; then
@@ -1071,22 +992,33 @@ stop_cake_qos() {
         fi
     fi
 
-    # 清理运行时参数文件和运行标记
     rm -f "$RUNTIME_PARAMS_FILE"
     rm -f "$QOS_RUNNING_FILE"
 
-    if $got_lock; then
-        release_lock
-    fi
-
+    release_lock
     log_info "CAKE_DSCP QoS停止完成"
 }
 
-# ========== 锁函数（增强清理）==========
+# ========== 锁函数（增强：支持僵尸进程检测，使用更严谨的 stat 检查）==========
 acquire_lock() {
     if [ -d "$LOCK_DIR" ]; then
         if [ -f "$LOCK_PID_FILE" ]; then
             local old_pid=$(cat "$LOCK_PID_FILE" 2>/dev/null)
+            local now=$(date +%s)
+            local mtime=0
+
+            # 更严谨的检查：直接测试 stat 的 -c 选项是否能正常工作
+            if stat -c %Y /tmp >/dev/null 2>&1; then
+                mtime=$(stat -c %Y "$LOCK_PID_FILE" 2>/dev/null || echo 0)
+            fi
+
+            if [ "$mtime" -gt 0 ] && [ $((now - mtime)) -gt 120 ]; then
+                log_warn "锁文件过期（超过120秒），进程 $old_pid 可能僵死，强制清理锁目录"
+                rm -rf "$LOCK_DIR"
+                acquire_lock
+                return $?
+            fi
+
             if [ -n "$old_pid" ] && kill -0 "$old_pid" 2>/dev/null; then
                 if [ "$old_pid" -eq "$$" ]; then
                     log_debug "已持有锁 (PID: $$)"
@@ -1131,85 +1063,65 @@ initialize_cake_qos() {
     case "$action" in
         start)
             log_info "启动CAKE_DSCP QoS"
-            
-            # 依赖检查
             check_dependencies || exit 1
-            
-            # 获取锁
             acquire_lock || exit 1
-            
-            # 幂等性检查（此时已在锁保护下）
             check_already_running || { release_lock; exit 1; }
 
-            # 重置运行时标志
             RUNTIME_SPLIT_GSO=0
             RUNTIME_INGRESS=0
             RUNTIME_AUTORATE_INGRESS=0
 
-            # 加载配置
             load_cake_config
-            
-            # 带宽转换
-            total_upload_bandwidth=$(convert_bandwidth_to_kbit "$total_upload_bandwidth") || { 
+
+            total_upload_bandwidth=$(convert_bandwidth_to_kbit "$total_upload_bandwidth") || {
                 release_lock
                 rm -f "$QOS_RUNNING_FILE"
                 exit 1
             }
-            total_download_bandwidth=$(convert_bandwidth_to_kbit "$total_download_bandwidth") || { 
+            total_download_bandwidth=$(convert_bandwidth_to_kbit "$total_download_bandwidth") || {
                 release_lock
                 rm -f "$QOS_RUNNING_FILE"
                 exit 1
             }
 
-            # 自动调优
             [ "$ENABLE_AUTO_TUNE" = "1" ] && auto_tune_cake
-
-            # 验证配置
-            validate_cake_config || { 
+            validate_cake_config || {
                 release_lock
                 rm -f "$QOS_RUNNING_FILE"
                 exit 1
             }
 
-			# ---------- 加载 dscpclassify 分类规则 ----------
-			log_info "dscpclassify 正在加载智能分类规则..."
-			local lan_iface="br-lan"
-			if uci -q get qos_gargoyle.global.lan_interface >/dev/null; then
-				lan_iface=$(uci -q get qos_gargoyle.global.lan_interface)
-			fi
-			local wan_iface="$qos_interface"
-			if dscpclassify_load "$lan_iface" "$wan_iface"; then
-				log_info "dscpclassify 智能分类规则加载成功"
-			else
-				log_error "dscpclassify 加载失败"
-				release_lock
-				rm -f "$QOS_RUNNING_FILE"
-				exit 1
-			fi
-            # --------------------------------------------------------
+            # 加载 dscpclassify
+            log_info "dscpclassify 正在加载智能分类规则..."
+            local lan_iface="br-lan"
+            if uci -q get qos_gargoyle.global.lan_interface >/dev/null; then
+                lan_iface=$(uci -q get qos_gargoyle.global.lan_interface)
+            fi
+            if dscpclassify_load "$lan_iface" "$qos_interface"; then
+                log_info "dscpclassify 智能分类规则加载成功"
+            else
+                log_error "dscpclassify 加载失败"
+                release_lock
+                rm -f "$QOS_RUNNING_FILE"
+                exit 1
+            fi
 
-            # 初始化上传和下载
-            local upload_success=0
-            local download_success=0
-            
+            local upload_success=0 download_success=0
             initialize_cake_upload || upload_success=1
             initialize_cake_download || download_success=1
-            
+
             if [ $upload_success -eq 1 ] || [ $download_success -eq 1 ]; then
                 log_error "CAKE_DSCP QoS 初始化部分失败"
-                # 清理已配置的部分
                 stop_cake_qos
                 release_lock
                 rm -f "$QOS_RUNNING_FILE"
                 exit 1
             fi
 
-            # 检查入口重定向
             if [ "$total_download_bandwidth" -gt 0 ] 2>/dev/null; then
                 check_ingress_redirect
             fi
 
-            # 保存最终运行时参数（包括高级参数标志）
             {
                 echo "CAKE_RTT='$CAKE_RTT'"
                 echo "CAKE_MEMORY_LIMIT='$CAKE_MEMORY_LIMIT'"
@@ -1218,34 +1130,32 @@ initialize_cake_qos() {
                 echo "RUNTIME_AUTORATE_INGRESS='$RUNTIME_AUTORATE_INGRESS'"
             } > "$RUNTIME_PARAMS_FILE"
 
-            # 健康检查
             health_check_cake
-            
             log_info "CAKE_DSCP QoS 启动成功"
             release_lock
-			return 0
+            return 0
             ;;
-            
+
         stop)
             log_info "停止CAKE_DSCP QoS"
             stop_cake_qos || exit 1
             ;;
-            
+
         restart)
             log_info "重启CAKE_DSCP QoS"
             stop_cake_qos
             sleep 2
             initialize_cake_qos start
             ;;
-            
+
         status|show)
             show_cake_status
             ;;
-            
+
         health)
             health_check_cake
             ;;
-            
+
         validate)
             check_dependencies || exit 1
             load_cake_config
@@ -1253,7 +1163,7 @@ initialize_cake_qos() {
             total_download_bandwidth=$(convert_bandwidth_to_kbit "$total_download_bandwidth") || exit 1
             validate_cake_config
             ;;
-            
+
         help)
             echo "用法: $0 {start|stop|restart|status|health|validate|help}"
             echo ""
@@ -1266,7 +1176,7 @@ initialize_cake_qos() {
             echo "  validate 验证CAKE配置"
             echo "  help     显示此帮助信息"
             ;;
-            
+
         *)
             echo "错误: 未知操作 '$action'"
             echo ""
@@ -1276,7 +1186,6 @@ initialize_cake_qos() {
     esac
 }
 
-# 脚本入口
 if [ "$(basename "$0")" = "cake_dscp.sh" ]; then
     if [ $# -eq 0 ]; then
         echo "错误: 缺少参数"

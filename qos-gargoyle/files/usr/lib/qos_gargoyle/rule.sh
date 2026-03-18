@@ -1,7 +1,7 @@
 #!/bin/sh
 # 规则辅助模块 (rule.sh)
 # 支持多样化端口、协议、IPv6双栈、连接字节数过滤和连接状态过滤
-# version=1.8.1 - 修复 sanitize_input 正则错误，替换不兼容的 %N 日期用法
+# version=1.8.3 - 移除 mktemp 降级方案，失败直接报错
 
 CONFIG_FILE="qos_gargoyle"
 TEMP_FILES=""
@@ -174,7 +174,6 @@ validate_protocol() {
 }
 
 # 验证连接状态值，只接受 nftables 支持的关键字（单个或逗号分隔）
-# 注：invalid 状态在 nftables 中通常可用，但某些内核版本可能有限制
 validate_state() {
     local state="$1"
     local param_name="$2"
@@ -222,6 +221,7 @@ load_all_config_sections() {
 }
 
 # 加载指定配置节的所有选项，并赋值给带前缀的变量
+# 安全性增强：从 UCI 读取的值先经过 sanitize_input 过滤
 load_all_config_options() {
     local config_name="$1"
     local section_id="$2"
@@ -239,6 +239,7 @@ load_all_config_options() {
     val=$(echo "$config_data" | grep "^${config_name}\\.${escaped_section_id}\\.class=" | cut -d= -f2-)
     if [ -n "$val" ]; then
         val=$(echo "$val" | sed "s/^'//; s/'$//; s/^\"//; s/\"$//")
+        val=$(sanitize_input "$val")   # 消毒后再使用
         val=$(escape_for_eval "$val")
         eval "${prefix}class=\"$val\""
     fi
@@ -246,6 +247,7 @@ load_all_config_options() {
     val=$(echo "$config_data" | grep "^${config_name}\\.${escaped_section_id}\\.order=" | cut -d= -f2-)
     if [ -n "$val" ]; then
         val=$(echo "$val" | sed "s/^'//; s/'$//; s/^\"//; s/\"$//")
+        val=$(sanitize_input "$val")
         val=$(escape_for_eval "$val")
         eval "${prefix}order=\"$val\""
     fi
@@ -253,6 +255,7 @@ load_all_config_options() {
     val=$(echo "$config_data" | grep "^${config_name}\\.${escaped_section_id}\\.enabled=" | cut -d= -f2-)
     if [ -n "$val" ]; then
         val=$(echo "$val" | sed "s/^'//; s/'$//; s/^\"//; s/\"$//")
+        val=$(sanitize_input "$val")
         val=$(escape_for_eval "$val")
         eval "${prefix}enabled=\"$val\""
     fi
@@ -260,6 +263,7 @@ load_all_config_options() {
     val=$(echo "$config_data" | grep "^${config_name}\\.${escaped_section_id}\\.proto=" | cut -d= -f2-)
     if [ -n "$val" ]; then
         val=$(echo "$val" | sed "s/^'//; s/'$//; s/^\"//; s/\"$//")
+        val=$(sanitize_input "$val")
         val=$(escape_for_eval "$val")
         eval "${prefix}proto=\"$val\""
     fi
@@ -268,6 +272,7 @@ load_all_config_options() {
     if [ -n "$val" ]; then
         val=$(echo "$val" | sed "s/^'//; s/'$//; s/^\"//; s/\"$//")
         if validate_port "$val" "${section_id}.srcport"; then
+            val=$(sanitize_input "$val")
             val=$(escape_for_eval "$val")
             eval "${prefix}srcport=\"$val\""
         else
@@ -280,6 +285,7 @@ load_all_config_options() {
     if [ -n "$val" ]; then
         val=$(echo "$val" | sed "s/^'//; s/'$//; s/^\"//; s/\"$//")
         if validate_port "$val" "${section_id}.dstport"; then
+            val=$(sanitize_input "$val")
             val=$(escape_for_eval "$val")
             eval "${prefix}dstport=\"$val\""
         else
@@ -291,6 +297,7 @@ load_all_config_options() {
     val=$(echo "$config_data" | grep "^${config_name}\\.${escaped_section_id}\\.connbytes_kb=" | cut -d= -f2-)
     if [ -n "$val" ]; then
         val=$(echo "$val" | sed "s/^'//; s/'$//; s/^\"//; s/\"$//")
+        val=$(sanitize_input "$val")
         val=$(escape_for_eval "$val")
         eval "${prefix}connbytes_kb=\"$val\""
     fi
@@ -298,15 +305,16 @@ load_all_config_options() {
     val=$(echo "$config_data" | grep "^${config_name}\\.${escaped_section_id}\\.family=" | cut -d= -f2-)
     if [ -n "$val" ]; then
         val=$(echo "$val" | sed "s/^'//; s/'$//; s/^\"//; s/\"$//")
+        val=$(sanitize_input "$val")
         val=$(escape_for_eval "$val")
         eval "${prefix}family=\"$val\""
     fi
     
-    # state 选项
     val=$(echo "$config_data" | grep "^${config_name}\\.${escaped_section_id}\\.state=" | cut -d= -f2-)
     if [ -n "$val" ]; then
         val=$(echo "$val" | sed "s/^'//; s/'$//; s/^\"//; s/\"$//")
         if validate_state "$val" "${section_id}.state"; then
+            val=$(sanitize_input "$val")
             val=$(escape_for_eval "$val")
             eval "${prefix}state=\"$val\""
         else
@@ -322,25 +330,20 @@ calculate_hash_index() {
     local class="$1"
     local hash_val
     
-    # 优先使用 cksum（BusyBox 常用，输出 32 位校验和）
     if command -v cksum >/dev/null 2>&1; then
         hash_val=$(printf "%s" "$class" | cksum | cut -d' ' -f1)
         echo "$hash_val"
         return
     elif command -v sha1sum >/dev/null 2>&1; then
         hash_val=$(printf "%s" "$class" | sha1sum | cut -c1-8)
-        # 转换为无符号32位整数
         printf "%u" "0x$hash_val" 2>/dev/null || echo "$((0x$hash_val & 0x7FFFFFFF))"
     elif command -v sha1 >/dev/null 2>&1; then
         hash_val=$(printf "%s" "$class" | sha1 | cut -c1-8)
         printf "%u" "0x$hash_val" 2>/dev/null || echo "$((0x$hash_val & 0x7FFFFFFF))"
     else
-        # 降级算法：使用类似 Jenkins 的哈希
         local sum=0 i=0
         while [ $i -lt ${#class} ]; do
-            # 获取字符的ASCII值，使用 ord 技巧（在 ash 中可能有限，但作为最后的备选）
             local char_val=$(printf "%d" "'${class:$i:1}" 2>/dev/null || echo 0)
-            # 使用无符号32位运算，防止溢出为负数
             sum=$(( ( (sum << 5) - sum + char_val ) & 0x7FFFFFFF ))
             i=$((i + 1))
         done
@@ -353,7 +356,6 @@ get_class_mark_for_rule() {
     local class="$1"
     local direction="$2"
     
-    # 首次调用时记录一次（避免刷屏）
     local cache_var="__mark_calculated_${class}_${direction}"
     if eval [ -z \"\${$cache_var+x}\" ]; then
         log "INFO" "类别 $class ($direction) 标记将使用计算值"
@@ -376,37 +378,32 @@ calculate_class_mark() {
     local class="$1"
     local chain_type="$3"
     local index=$(calculate_hash_index "$class")
-    index=$(( (index % 16) + 1 ))   # 模 16，得到 1..16
+    index=$(( (index % 16) + 1 ))
 
     local base_value=0
     [ "$chain_type" = "upload" ] && base_value=$((0x1))
-    [ "$chain_type" = "download" ] && base_value=$((0x10000))   # 2^16
+    [ "$chain_type" = "download" ] && base_value=$((0x10000))
     [ $base_value -eq 0 ] && { log "ERROR" "未知链类型: $chain_type"; return; }
 
     local mark_value=$((base_value << (index - 1)))
-    # 确保标记值在 32 位内
     mark_value=$((mark_value & 0xFFFFFFFF))
     printf "0x%X" "$mark_value"
 }
 
 # ========== 快速排序（实时获取类优先级，并立即清理临时文件）==========
-# 根据规则配置文件和实时获取的类优先级排序规则
 sort_rules_by_priority_fast() {
     local config_file="$1"
     local temp_sort
     
-    # 使用 mktemp 创建临时文件，避免依赖 date %N
-    temp_sort=$(mktemp /tmp/qos_sort_XXXXXX 2>/dev/null)
-    if [ -z "$temp_sort" ]; then
-        # 降级方案：使用 PID 和时间戳（秒）
-        temp_sort="/tmp/qos_sort_$$_$(date +%s | md5sum | cut -c1-8)"
-    fi
-    [ -z "$temp_sort" ] && { log "ERROR" "无法创建排序临时文件"; return 1; }
+    # 移除降级方案，强制 mktemp 成功
+    temp_sort=$(mktemp /tmp/qos_sort_XXXXXX) || {
+        log "ERROR" "无法创建排序临时文件"
+        return 1
+    }
     TEMP_FILES="$TEMP_FILES $temp_sort"
     
     while IFS= read -r line; do
         [ -z "$line" ] && continue
-        # 注意：现在有10个字段，增加了state
         IFS=':' read -r r_name r_class r_order r_enabled r_proto r_srcport r_dstport r_connbytes r_family r_state <<EOF
 $line
 EOF
@@ -416,23 +413,18 @@ EOF
         class_priority=${class_priority:-999}
         local rule_order=${r_order:-100}
         
-        # 综合分数：类优先级*1000 + 规则顺序
         local composite=$(( class_priority * 1000 + rule_order ))
         echo "$composite:$r_name" >> "$temp_sort"
     done < "$config_file"
     
-    # 排序输出
     local result=$(sort -t ':' -k1,1n "$temp_sort" 2>/dev/null | cut -d: -f2- | tr '\n' ' ' | sed 's/ $//')
     
-    # 立即删除临时文件
     rm -f "$temp_sort" 2>/dev/null
     
     echo "$result"
 }
 
 # ========== 快速构建nft规则 ==========
-# 构建单条 nft 规则命令并输出到标准输出
-# 增加 state 参数作为第10个参数
 build_nft_rule_fast() {
     local rule_name="$1"
     local chain="$2"
@@ -472,7 +464,6 @@ build_nft_rule_fast() {
             ;;
     esac
     
-    # 新增 state 条件处理
     if [ -n "$state" ]; then
         local state_value=$(echo "$state" | tr -d '{}')
         if echo "$state_value" | grep -q ','; then
@@ -482,11 +473,9 @@ build_nft_rule_fast() {
         fi
     fi
     
-    # 处理连接字节数条件（增加范围支持）
     if [ -n "$connbytes_kb" ] && [ "$connbytes_kb" != "0" ]; then
         local connbytes_kb_clean=$(echo "$connbytes_kb" | tr -d ' ')
         
-        # 处理范围 min-max 格式
         if echo "$connbytes_kb_clean" | grep -qE '^[0-9]+-[0-9]+$'; then
             local min_val=$(echo "$connbytes_kb_clean" | cut -d- -f1)
             local max_val=$(echo "$connbytes_kb_clean" | cut -d- -f2)
@@ -495,19 +484,12 @@ build_nft_rule_fast() {
                 local max_bytes=$((max_val * 1024))
                 nft_cmd="$nft_cmd ct bytes >= $min_bytes ct bytes <= $max_bytes"
             else
-                log "WARN" "规则 $rule_name 的 connbytes_kb 范围无效: $connbytes_kb_clean (最小值大于最大值)，忽略此条件"
+                log "WARN" "规则 $rule_name 的 connbytes_kb 范围无效: $connbytes_kb_clean，忽略此条件"
             fi
-        # 处理操作符格式
         elif echo "$connbytes_kb_clean" | grep -qE '^([<>]?=?|!=)[0-9]+$'; then
-            # 提取操作符：去除末尾数字部分
             local operator=$(echo "$connbytes_kb_clean" | sed 's/[0-9]*$//')
             local value=$(echo "$connbytes_kb_clean" | grep -o '[0-9]\+')
-            
-            # 如果没有显式操作符，默认使用 >=（与tc的connbytes行为一致）
-            if [ -z "$operator" ]; then
-                operator=">="
-            fi
-            
+            [ -z "$operator" ] && operator=">="
             local bytes_value=$((value * 1024))
             nft_cmd="$nft_cmd ct bytes $operator $bytes_value"
         else
@@ -520,7 +502,6 @@ build_nft_rule_fast() {
 }
 
 # ========== 增强规则应用函数 ==========
-# 应用指定方向的所有规则（上传或下载），支持优先级排序和批量提交
 apply_enhanced_direction_rules() {
     local rule_type="$1"
     local chain="$2"
@@ -537,7 +518,6 @@ apply_enhanced_direction_rules() {
     
     log "INFO" "找到$rule_type规则: $rule_list"
     
-    # 预加载规则配置到临时文件
     local temp_config=$(mktemp /tmp/qos_rule_config_XXXXXX 2>/dev/null)
     if [ -z "$temp_config" ]; then
         log "ERROR" "无法创建配置临时文件"
@@ -550,11 +530,9 @@ apply_enhanced_direction_rules() {
     for rule; do
         [ -n "$rule" ] || continue
         load_all_config_options "$CONFIG_FILE" "$rule" "tmp_"
-        # 增加state字段
         echo "$rule:$tmp_class:$tmp_order:$tmp_enabled:$tmp_proto:$tmp_srcport:$tmp_dstport:$tmp_connbytes_kb:$tmp_family:$tmp_state" >> "$temp_config"
     done
     
-    # 提取所有用到的类（用于后续数量检查）
     local class_list=$(cut -d: -f2 "$temp_config" | sort -u)
     local class_count=0
     for class in $class_list; do
@@ -562,14 +540,12 @@ apply_enhanced_direction_rules() {
         class_count=$((class_count + 1))
     done
     
-    # 类数量严格检查：标记空间最多支持16个类，超过则无法继续
     if [ $class_count -gt 16 ]; then
         log "ERROR" "方向 $direction 的启用类数量为 $class_count，超过16个，将导致标记冲突，启动中止！"
         rm -f "$temp_config" 2>/dev/null
         return 1
     fi
     
-    # 快速排序（实时获取类优先级）
     local sorted_rule_list=$(sort_rules_by_priority_fast "$temp_config")
     if [ -z "$sorted_rule_list" ]; then
         log "INFO" "没有可用的启用规则"
@@ -577,7 +553,6 @@ apply_enhanced_direction_rules() {
         return
     fi
     
-    # 批量生成nft规则（实时获取标记）
     local nft_batch_file=$(mktemp /tmp/qos_nft_batch_XXXXXX 2>/dev/null)
     if [ -z "$nft_batch_file" ]; then
         log "ERROR" "无法创建nft批处理文件"
@@ -603,7 +578,6 @@ EOF
         
         [ -z "$r_family" ] && r_family="inet"
         
-        # 调用构建函数，传入所有参数（包括state）
         build_nft_rule_fast "$rule_name" "$chain" "$class_mark" "$mask" "$r_family" "$r_proto" "$r_srcport" "$r_dstport" "$r_connbytes" "$r_state" >> "$nft_batch_file"
         rule_count=$((rule_count + 1))
     done
@@ -631,14 +605,12 @@ EOF
         done
     fi
     
-    # 清理所有临时文件
     rm -f "$nft_batch_file" 2>/dev/null
     rm -f "$temp_config" 2>/dev/null
     
     return $batch_success
 }
 
-# 应用所有规则（兼容旧版本调用）
 apply_all_rules() {
     local rule_type="$1"
     local mask="$2"
@@ -647,7 +619,6 @@ apply_all_rules() {
     apply_enhanced_direction_rules "$rule_type" "$chain" "$mask"
 }
 
-# 处理单个规则（兼容旧版本调用）
 process_single_rule() {
     local rule_id="$1"
     local chain="$2"
@@ -714,7 +685,6 @@ process_single_rule() {
     fi
 }
 
-# 处理协议为 all 的规则，分别创建 TCP 和 UDP 规则（兼容旧版本）
 apply_all_protocol_rule() {
     local chain="$1"
     local mark="$2"
@@ -822,7 +792,6 @@ apply_all_protocol_rule() {
 }
 
 # ========== 双栈过滤器函数 ==========
-# 创建双栈（IPv4/IPv6）fwmark 过滤器
 create_dualstack_filter() {
     local dev="$1"
     local parent="$2"
@@ -836,7 +805,6 @@ create_dualstack_filter() {
         handle ${mark}/$mask fw flowid "$class_id" 2>/dev/null || true
 }
 
-# 创建带优先级的双栈 fwmark 过滤器
 create_priority_dualstack_filter() {
     local dev="$1"
     local parent="$2"

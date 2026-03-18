@@ -1,10 +1,10 @@
 #!/bin/sh
-# version=2.20
+# version=2.21
 # HFSC_CAKE算法实现模块
 # 基于HFSC与CAKE组合算法实现QoS流量控制。
 # 必要工具：tc, nft, conntrack, ethtool, sysctl
 # 内核模块：ifb, sch_hfsc, sch_cake
-# 注意：规则应用由外部init.d脚本负责，本脚本仅创建队列和基础nftables链。
+# 优化：类标记冲突检测、IPv6入口重定向强制成功（当存在IPv6地址时）、锁僵尸进程检测、移除seq依赖
 
 # ========== 全局配置常量 ==========
 : ${CONFIG_FILE:=qos_gargoyle}
@@ -90,7 +90,6 @@ convert_bandwidth_to_kbit() {
 
 # 检查 tc 是否支持 action connmark
 check_tc_connmark_support() {
-    # 尝试在 lo 上添加临时 ingress 规则，使用 connmark 动作
     tc qdisc del dev lo ingress 2>/dev/null
     if ! tc qdisc add dev lo ingress 2>/dev/null; then
         qos_log "WARN" "无法在 lo 上创建 ingress 队列，无法测试 connmark 支持"
@@ -148,11 +147,26 @@ ensure_ifb_device() {
     return 0
 }
 
-# ========== 目录锁机制（支持重入）==========
+# ========== 目录锁机制（支持重入，增强僵尸进程检测）==========
 acquire_lock() {
     if [ -d "$LOCK_DIR" ]; then
         if [ -f "$LOCK_PID_FILE" ]; then
             local old_pid=$(cat "$LOCK_PID_FILE" 2>/dev/null)
+            local now=$(date +%s)
+            local mtime=0
+
+            # 更严谨的检查：直接测试 stat 的 -c 选项是否能正常工作
+            if stat -c %Y /tmp >/dev/null 2>&1; then
+                mtime=$(stat -c %Y "$LOCK_PID_FILE" 2>/dev/null || echo 0)
+            fi
+
+            if [ "$mtime" -gt 0 ] && [ $((now - mtime)) -gt 120 ]; then
+                qos_log "WARN" "锁文件过期（超过120秒），进程 $old_pid 可能僵死，强制清理锁目录"
+                rm -rf "$LOCK_DIR"
+                acquire_lock
+                return $?
+            fi
+
             if [ -n "$old_pid" ] && kill -0 "$old_pid" 2>/dev/null; then
                 if [ "$old_pid" -eq "$$" ]; then
                     qos_log "DEBUG" "已持有锁 (PID: $$)"
@@ -549,6 +563,73 @@ setup_hfsc_enhance_chains() {
         jump filter_qos_ingress_enhance 2>/dev/null || true
 }
 
+# ========== 类标记冲突检测函数 ==========
+# 检查并分配唯一标记，避免哈希冲突
+# 参数：方向（upload/download），类列表（空格分隔）
+# 返回：0成功，1失败（冲突无法解决）
+allocate_class_marks() {
+    local direction="$1"
+    local class_list="$2"
+    local mask base_value mark_dict i class mark
+
+    if [ "$direction" = "upload" ]; then
+        base_value=1
+        mask="$UPLOAD_MASK"
+    else
+        base_value=65536  # 0x10000
+        mask="$DOWNLOAD_MASK"
+    fi
+
+    # 使用一个简单的数组记录已分配的索引（1-16）
+    # 由于ash不支持关联数组，我们用16个变量来模拟，使用POSIX兼容的while循环代替seq
+    i=1
+    while [ $i -le 16 ]; do
+        eval "mark_used_${i}=0"
+        i=$((i + 1))
+    done
+
+    for class in $class_list; do
+        # 计算原始索引（1-16）
+        local index=$(calculate_hash_index "$class")
+        index=$(( (index % 16) + 1 ))
+        local original_index=$index
+        local found=0
+        local probe=0
+
+        # 线性探测，最多16次
+        while [ $probe -lt 16 ]; do
+            eval "used=\${mark_used_${index}}"
+            if [ "$used" = "0" ]; then
+                eval "mark_used_${index}=1"
+                # 计算标记值
+                local mark_value=$((base_value << (index - 1)))
+                mark_value=$((mark_value & 0xFFFFFFFF))
+                # 存储到全局变量，供后续创建类使用
+                eval "${direction}_mark_${class}=$mark_value"
+                qos_log "INFO" "类别 $class 分配标记索引 $index (原始哈希: $original_index, 探测次数: $probe)"
+                found=1
+                break
+            fi
+            index=$(( (index % 16) + 1 ))
+            probe=$((probe + 1))
+        done
+
+        if [ $found -eq 0 ]; then
+            qos_log "ERROR" "类别 $class 无法分配唯一标记，所有16个索引均已占用"
+            return 1
+        fi
+    done
+
+    return 0
+}
+
+# 获取已分配的标记值（供创建类时使用）
+get_class_mark_value() {
+    local direction="$1"
+    local class="$2"
+    eval "echo \${${direction}_mark_${class}}"
+}
+
 # ========== HFSC核心队列函数（使用CAKE） ==========
 create_hfsc_root_qdisc() {
     local device="$1"
@@ -681,11 +762,12 @@ create_hfsc_upload_class() {
     eval "$class_config"
     
     local class_mark
-    if ! class_mark=$(get_class_mark_for_rule "$class_name" "upload"); then
+    class_mark=$(get_class_mark_value "upload" "$class_name")
+    if [ -z "$class_mark" ]; then
         qos_log "ERROR" "无法获取类别 $class_name 的标记"
         return 1
     fi
-    qos_log "INFO" "类别 $class_name 使用的标记: $class_mark"
+    qos_log "INFO" "类别 $class_name 使用的标记: 0x$(printf '%X' $class_mark)"
     
     local m1="0bit"
     local d="0us"
@@ -827,11 +909,12 @@ create_hfsc_download_class() {
     eval "$class_config"
     
     local class_mark
-    if ! class_mark=$(get_class_mark_for_rule "$class_name" "download"); then
+    class_mark=$(get_class_mark_value "download" "$class_name")
+    if [ -z "$class_mark" ]; then
         qos_log "ERROR" "无法获取类别 $class_name 的标记"
         return 1
     fi
-    qos_log "INFO" "类别 $class_name 使用的标记: $class_mark"
+    qos_log "INFO" "类别 $class_name 使用的标记: 0x$(printf '%X' $class_mark)"
     
     local m1="0bit"
     local d="0us"
@@ -1040,7 +1123,7 @@ create_default_download_class() {
     return 0
 }
 
-# ========== 入口重定向（依赖conntrack恢复标记）==========
+# ========== 入口重定向（依赖conntrack恢复标记，增加IPv6强制成功逻辑）==========
 setup_ingress_redirect() {
     if [ -z "$qos_interface" ]; then
         qos_log "ERROR" "无法确定 WAN 接口"
@@ -1074,9 +1157,19 @@ setup_ingress_redirect() {
     else
         qos_log "INFO" "IPv4入口重定向规则添加成功"
     fi
+
+    # 检测接口是否有全局 IPv6 地址，以决定是否强制 IPv6 必须成功
+    local has_ipv6_global=0
+    if ip -6 addr show dev "$qos_interface" scope global 2>/dev/null | grep -q "inet6"; then
+        has_ipv6_global=1
+        qos_log "INFO" "接口 $qos_interface 拥有全局 IPv6 地址，将强制 IPv6 重定向必须成功"
+    else
+        qos_log "INFO" "接口 $qos_interface 无全局 IPv6 地址，IPv6 重定向失败仅警告"
+    fi
     
     # ========== IPv6 重定向：三阶尝试 ==========
     local ipv6_success=false
+    local ipv6_attempts=0
     
     # 第一优先：flower 匹配全球单播地址 (2000::/3)
     if tc filter add dev "$qos_interface" parent ffff: protocol ipv6 \
@@ -1087,6 +1180,7 @@ setup_ingress_redirect() {
         qos_log "INFO" "IPv6入口重定向规则（flower 匹配全球单播）添加成功"
     else
         qos_log "WARN" "flower 规则添加失败，尝试 u32 全球单播匹配"
+        ipv6_attempts=$((ipv6_attempts + 1))
         
         # 第二优先：u32 匹配全球单播地址 (2000::/3)
         if tc filter add dev "$qos_interface" parent ffff: protocol ipv6 \
@@ -1097,6 +1191,7 @@ setup_ingress_redirect() {
             qos_log "INFO" "IPv6入口重定向规则（u32 全球单播）添加成功"
         else
             qos_log "WARN" "u32 全球单播规则添加失败，尝试无过滤规则"
+            ipv6_attempts=$((ipv6_attempts + 1))
             
             # 第三优先：无过滤的 u32 全匹配
             if tc filter add dev "$qos_interface" parent ffff: protocol ipv6 \
@@ -1106,25 +1201,37 @@ setup_ingress_redirect() {
                 ipv6_success=true
                 qos_log "INFO" "IPv6入口重定向规则（无过滤）添加成功"
             else
+                ipv6_success=false
+                ipv6_attempts=$((ipv6_attempts + 1))
                 qos_log "WARN" "IPv6入口重定向规则添加失败，IPv6流量将不会通过IFB"
             fi
         fi
     fi
-    
-    if [ "$ipv6_success" = "true" ]; then
-        qos_log "INFO" "IPv6入口重定向规则添加成功"
+
+    # 根据是否有全局 IPv6 地址决定是否必须成功
+    if [ "$has_ipv6_global" = "1" ]; then
+        if [ "$ipv6_success" != "true" ]; then
+            qos_log "ERROR" "接口存在全局 IPv6 地址，但 IPv6 入口重定向配置失败，QoS 无法正常工作"
+            tc qdisc del dev "$qos_interface" ingress 2>/dev/null
+            return 1
+        else
+            qos_log "INFO" "IPv6 入口重定向成功（强制）"
+        fi
+    else
+        if [ "$ipv6_success" = "true" ]; then
+            qos_log "INFO" "IPv6 入口重定向成功（尽管无全局 IPv6 地址，仍添加了规则）"
+        else
+            qos_log "WARN" "IPv6 入口重定向失败，但因接口无全局 IPv6 地址，继续启动"
+        fi
     fi
     
-    # 检查是否有规则指向 IFB 设备
+    # 检查是否有规则指向 IFB 设备（仅用于日志）
     local ipv4_rule_count=$(tc filter show dev "$qos_interface" parent ffff: protocol ip 2>/dev/null | grep -c "mirred.*Redirect to device $IFB_DEVICE")
     local ipv6_rule_count=$(tc filter show dev "$qos_interface" parent ffff: protocol ipv6 2>/dev/null | grep -c "mirred.*Redirect to device $IFB_DEVICE")
     if [ "$ipv4_rule_count" -ge 1 ] && [ "$ipv6_rule_count" -ge 1 ]; then
         qos_log "INFO" "入口重定向已成功设置: IPv4和IPv6规则均生效"
     elif [ "$ipv4_rule_count" -ge 1 ]; then
-        qos_log "WARN" "入口重定向仅IPv4生效，IPv6未生效"
-    else
-        qos_log "ERROR" "入口重定向规则均未生效"
-        return 1
+        qos_log "INFO" "入口重定向已成功设置: 仅IPv4生效"
     fi
     
     return 0
@@ -1194,6 +1301,12 @@ initialize_hfsc_upload() {
         return 1
     fi
     
+    # 预先分配标记，检查冲突
+    if ! allocate_class_marks "upload" "$upload_class_list"; then
+        qos_log "ERROR" "上传方向类标记分配失败，存在无法解决的冲突"
+        return 1
+    fi
+    
     if ! create_hfsc_root_qdisc "$qos_interface" "upload" "1:0" "1:1"; then
         qos_log "ERROR" "创建上传根队列失败"
         return 1
@@ -1204,8 +1317,8 @@ initialize_hfsc_upload() {
     
     for class_name in $upload_class_list; do
         if create_hfsc_upload_class "$class_name" "$class_index"; then
-            local class_mark_hex=$(get_class_mark_for_rule "$class_name" "upload")
-            upload_class_mark_list="$upload_class_mark_list$class_name:$class_mark_hex "
+            local class_mark_hex=$(get_class_mark_value "upload" "$class_name")
+            upload_class_mark_list="$upload_class_mark_list$class_name:0x$(printf '%X' $class_mark_hex) "
         else
             qos_log "ERROR" "创建上传类别 $class_name 失败，停止初始化"
             # 清理已创建的根队列
@@ -1247,6 +1360,12 @@ initialize_hfsc_download() {
         return 1
     fi
     
+    # 预先分配标记，检查冲突
+    if ! allocate_class_marks "download" "$download_class_list"; then
+        qos_log "ERROR" "下载方向类标记分配失败，存在无法解决的冲突"
+        return 1
+    fi
+    
     # 确保IFB设备已存在并启用
     if ! ip link show dev "$IFB_DEVICE" >/dev/null 2>&1; then
         qos_log "ERROR" "IFB设备 $IFB_DEVICE 不存在"
@@ -1269,8 +1388,8 @@ initialize_hfsc_download() {
     
     for class_name in $download_class_list; do
         if create_hfsc_download_class "$class_name" "$class_index" "$filter_prio"; then
-            local class_mark_hex=$(get_class_mark_for_rule "$class_name" "download")
-            download_class_mark_list="$download_class_mark_list$class_name:$class_mark_hex "
+            local class_mark_hex=$(get_class_mark_value "download" "$class_name")
+            download_class_mark_list="$download_class_mark_list$class_name:0x$(printf '%X' $class_mark_hex) "
         else
             qos_log "ERROR" "创建下载类别 $class_name 失败，停止初始化"
             # 清理已创建的根队列
@@ -1663,7 +1782,7 @@ show_hfsc_cake_status() {
         [ -z "$qos_interface" ] && qos_interface="未知"
     fi
     
-    echo "===== HFSC-CAKE QoS 状态报告 (v2.20) ====="
+    echo "===== HFSC-CAKE QoS 状态报告 (v2.21) ====="
     echo "时间: $(date)"
     echo "WAN接口: ${qos_interface}"
     
