@@ -6,6 +6,9 @@ on:
   workflow_dispatch:
   #watch:
     #types: started
+  #push:
+    #tags:
+      #- "*"
     
 env:
   REPO_TOKEN: ${{ secrets.workflow_token }}
