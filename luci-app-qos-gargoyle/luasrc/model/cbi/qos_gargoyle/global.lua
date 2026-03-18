@@ -67,12 +67,6 @@ o:value("hfsc_fqcodel", "HFSC+Fq_Codel (HFSC With Fq_Codel)")
 o:value("htb_fqcodel", "HTB+Fq_Codel (HTB With Fq_Codel)")
 o.default = "htb_cake"
 
--- 调整百分比开关
-o = s:option(Flag, "auto_adjust_percentages", translate("Auto Adjust Percentages"),
-             translate("Automatically adjust class percentages and min/max bandwidth based on total bandwidth and linklayer type."))
-o.default = "1"
-o.rmempty = false
-
 -- 链路类型
 o = s:option(ListValue, "linklayer", translate("Linklayer Type"), translate("Select linkelayer type"))
 o:value("ethernet", translate("Ethernet"))
@@ -85,6 +79,13 @@ o = s:option(Value, "overhead", translate("Linklayer Overhead"), translate("Set 
 o.datatype = "uinteger"
 o.default="32"
 
+-- 调整百分比开关
+o = s:option(Flag, "auto_adjust_percentages", translate("Auto Adjust Percentages"),
+             translate("Automatically adjust class percentages and min/max bandwidth based on total bandwidth and linklayer type."))
+o.default = "1"
+o.rmempty = false
+
+-- 上传带宽配置
 s = m:section(NamedSection, "upload", "upload", translate("Upload Settings"))
 s.anonymous = true
 
@@ -100,6 +101,7 @@ o = s:option(Value, "total_bandwidth", translate("Total Upload Bandwidth"),
     .. "specified in kbps, leave blank to disable update QoS. There are 8 kilobits per kilobyte."))
 o.datatype = "uinteger"
 
+-- 下载带宽配置
 s = m:section(NamedSection, "download", "download", translate("Download Settings"))
 s.anonymous = true
 
@@ -112,8 +114,7 @@ o = s:option(Value, "total_bandwidth", translate("Total Download Bandwidth"),
     .. "in kbps, leave blank to disable download QoS. There are 8 kilobits per kilobyte."))
 o.datatype = "uinteger"
 
--- ==================== IFB 设备选择 ====================
--- 获取系统中所有 IFB 设备
+-- 配置IFB设备
 local function get_ifb_devices()
     local devices = {}
     local handle = io.popen("ls /sys/class/net/ 2>/dev/null | grep '^ifb'")
