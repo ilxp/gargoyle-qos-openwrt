@@ -10,7 +10,7 @@
 : ${CONFIG_FILE:=qos_gargoyle}
 : ${LOCK_DIR:=/var/run/hfsc_cake.lock}           # 并发锁目录
 : ${LOCK_PID_FILE:=$LOCK_DIR/pid}                 # 锁目录中的PID文件
-: ${RUNNING_FILE:=/var/run/hfsc_cake.running}     # 运行标记文件
+: ${QOS_RUNNING_FILE:=/var/run/hfsc_cake.running}     # 运行标记文件
 : ${MAX_PHYSICAL_BANDWIDTH:=10000000}              # 最大物理带宽10Gbps（单位kbit），实际会尽力检测
 : ${UPLOAD_MASK:=0xFFFF}                           # 上传方向标记掩码，使用低 16 位
 : ${DOWNLOAD_MASK:=0xFFFF0000}                     # 下载方向标记掩码，使用高 16 位
@@ -237,17 +237,17 @@ release_lock() {
 
 # ========== 幂等性检查 ==========
 check_already_running() {
-    if [ -f "$RUNNING_FILE" ]; then
-        local pid=$(cat "$RUNNING_FILE" 2>/dev/null)
+    if [ -f "$QOS_RUNNING_FILE" ]; then
+        local pid=$(cat "$QOS_RUNNING_FILE" 2>/dev/null)
         if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
             qos_log "ERROR" "HFSC+CAKE QoS 已经在运行中 (PID: $pid)"
             return 1
         else
             qos_log "WARN" "发现残留的运行标记文件，清理中"
-            rm -f "$RUNNING_FILE"
+            rm -f "$QOS_RUNNING_FILE"
         fi
     fi
-    echo "$$" > "$RUNNING_FILE"
+    echo "$$" > "$QOS_RUNNING_FILE"
     return 0
 }
 
@@ -1635,7 +1635,7 @@ initialize_hfsc_cake_qos() {
     # 获取并发锁
     if ! acquire_lock; then
         qos_log "ERROR" "无法获取并发锁，可能已有其他QoS进程在运行"
-        rm -f "$RUNNING_FILE"
+        rm -f "$QOS_RUNNING_FILE"
         return 1
     fi
     
@@ -1643,7 +1643,7 @@ initialize_hfsc_cake_qos() {
     if ! check_required_commands; then
         qos_log "ERROR" "缺少必需的命令，请安装对应软件包"
         release_lock
-        rm -f "$RUNNING_FILE"
+        rm -f "$QOS_RUNNING_FILE"
         return 1
     fi
     
@@ -1651,7 +1651,7 @@ initialize_hfsc_cake_qos() {
     if ! load_required_modules; then
         qos_log "ERROR" "无法加载必需的内核模块"
         release_lock
-        rm -f "$RUNNING_FILE"
+        rm -f "$QOS_RUNNING_FILE"
         return 1
     fi
     
@@ -1675,7 +1675,7 @@ initialize_hfsc_cake_qos() {
         if [ -z "$qos_interface" ]; then
             qos_log "ERROR" "无法确定 WAN 接口，请检查配置"
             release_lock
-            rm -f "$RUNNING_FILE"
+            rm -f "$QOS_RUNNING_FILE"
             return 1
         fi
     fi
@@ -1685,7 +1685,7 @@ initialize_hfsc_cake_qos() {
     if ! load_hfsc_cake_config; then
         qos_log "ERROR" "加载HFSC+CAKE配置失败"
         release_lock
-        rm -f "$RUNNING_FILE"
+        rm -f "$QOS_RUNNING_FILE"
         return 1
     fi
     
@@ -1693,7 +1693,7 @@ initialize_hfsc_cake_qos() {
     if ! ensure_ifb_device "$IFB_DEVICE"; then
         qos_log "ERROR" "IFB设备 $IFB_DEVICE 无法使用，请检查配置或启动IFB管理脚本"
         release_lock
-        rm -f "$RUNNING_FILE"
+        rm -f "$QOS_RUNNING_FILE"
         return 1
     fi
     
@@ -1726,7 +1726,7 @@ initialize_hfsc_cake_qos() {
         qos_log "ERROR" "HFSC+CAKE QoS 初始化部分失败"
         stop_hfsc_cake_qos
         release_lock
-        rm -f "$RUNNING_FILE"
+        rm -f "$QOS_RUNNING_FILE"
         return 1
     fi
     
@@ -1760,8 +1760,8 @@ stop_hfsc_cake_qos() {
         return 1
     fi
 
-    # 删除运行标记
-    rm -f "$RUNNING_FILE"
+    # 成功获取锁后再删除运行标记文件
+    rm -f "$QOS_QOS_RUNNING_FILE"
     
     local tc_count_before=$(tc qdisc show 2>/dev/null | grep -c hfsc || echo 0)
     local nft_count_before=$(nft list ruleset 2>/dev/null | grep -c "gargoyle-qos-priority" || echo 0)

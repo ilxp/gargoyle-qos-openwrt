@@ -1814,6 +1814,7 @@ stop_htb_cake_qos() {
         return 1
     fi
 
+    # 成功获取锁后再删除运行标记文件
     rm -f "$QOS_RUNNING_FILE"
     
     local tc_count_before=$(tc qdisc show 2>/dev/null | grep -c htb || echo 0)
