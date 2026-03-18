@@ -1761,7 +1761,7 @@ stop_hfsc_cake_qos() {
     fi
 
     # 成功获取锁后再删除运行标记文件
-    rm -f "$QOS_QOS_RUNNING_FILE"
+    rm -f "$QOS_RUNNING_FILE"
     
     local tc_count_before=$(tc qdisc show 2>/dev/null | grep -c hfsc || echo 0)
     local nft_count_before=$(nft list ruleset 2>/dev/null | grep -c "gargoyle-qos-priority" || echo 0)
