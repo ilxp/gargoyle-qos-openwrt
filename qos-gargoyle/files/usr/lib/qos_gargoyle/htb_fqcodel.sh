@@ -1809,6 +1809,7 @@ initialize_htb_qos() {
 }
 
 # ========== 停止函数（改进锁处理，增加重试）==========
+# ========== 停止函数 ==========
 stop_htb_fqcodel_qos() {
     qos_log "INFO" "停止HTB QoS"
     
@@ -1833,13 +1834,16 @@ stop_htb_fqcodel_qos() {
     # 成功获取锁后再删除运行标记文件
     rm -f "$QOS_RUNNING_FILE"
     
-    local tc_count_before=$(tc qdisc show 2>/dev/null | grep -c htb || echo 0)
-    local nft_count_before=$(nft list ruleset 2>/dev/null | grep -c "gargoyle-qos-priority" || echo 0)
+    # 获取清理前的计数，去除所有非数字字符
+    local tc_count_before=$(tc qdisc show 2>/dev/null | grep -c htb 2>/dev/null | tr -cd '0-9')
+    local nft_count_before=$(nft list ruleset 2>/dev/null | grep -c "gargoyle-qos-priority" 2>/dev/null | tr -cd '0-9')
+    tc_count_before=${tc_count_before:-0}
+    nft_count_before=${nft_count_before:-0}
     
-    if [ "$tc_count_before" -gt 0 ]; then
+    if [ "$tc_count_before" -gt 0 ] 2>/dev/null; then
         qos_log "INFO" "检测到 $tc_count_before 个HTB队列，开始清理"
     fi
-    if [ "$nft_count_before" -gt 0 ]; then
+    if [ "$nft_count_before" -gt 0 ] 2>/dev/null; then
         qos_log "INFO" "检测到 $nft_count_before 个NFTables规则，开始清理"
     fi
     
@@ -1866,20 +1870,22 @@ stop_htb_fqcodel_qos() {
         fi
     fi
     
-    local tc_count_after=$(tc qdisc show 2>/dev/null | grep -c htb || echo 0)
-    local nft_count_after=$(nft list ruleset 2>/dev/null | grep -c "gargoyle-qos-priority" || echo 0)
+    local tc_count_after=$(tc qdisc show 2>/dev/null | grep -c htb 2>/dev/null | tr -cd '0-9')
+    local nft_count_after=$(nft list ruleset 2>/dev/null | grep -c "gargoyle-qos-priority" 2>/dev/null | tr -cd '0-9')
+    tc_count_after=${tc_count_after:-0}
+    nft_count_after=${nft_count_after:-0}
     
-    if [ "$tc_count_after" -gt 0 ]; then
+    if [ "$tc_count_after" -gt 0 ] 2>/dev/null; then
         qos_log "WARN" "清理后仍有 $tc_count_after 个HTB队列残留"
     fi
-    if [ "$nft_count_after" -gt 0 ]; then
+    if [ "$nft_count_after" -gt 0 ] 2>/dev/null; then
         qos_log "WARN" "清理后仍有 $nft_count_after 个NFTables规则残留"
     fi
     
     qos_log "INFO" "HTB QoS停止完成 (清理前: ${tc_count_before}队列/${nft_count_before}规则, 清理后: ${tc_count_after}队列/${nft_count_after}规则)"
     
-    # 清理规则集
-    cleanup_ruleset
+    # 恢复备份的主配置
+    restore_main_config
 
     if $got_lock; then
         release_lock
