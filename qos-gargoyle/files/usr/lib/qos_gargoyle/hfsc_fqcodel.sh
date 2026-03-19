@@ -1756,7 +1756,7 @@ initialize_hfsc_qos() {
 }
 
 # ========== 停止函数（改进锁处理，增加重试）==========
-stop_hfsc_qos() {
+stop_hfsc_fqcodel_qos() {
     qos_log "INFO" "停止HFSC QoS"
     
     local got_lock=false

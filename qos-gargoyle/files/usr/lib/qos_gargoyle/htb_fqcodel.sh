@@ -1809,7 +1809,7 @@ initialize_htb_qos() {
 }
 
 # ========== 停止函数（改进锁处理，增加重试）==========
-stop_htb_qos() {
+stop_htb_fqcodel_qos() {
     qos_log "INFO" "停止HTB QoS"
     
     local got_lock=false

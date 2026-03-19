@@ -16,7 +16,7 @@ USER_OBJS = $(USER_SRCS:.c=.o)
 
 all: $(TARGET)
 
-$(BPF_OBJ): idclass_bpf.c idclass.h
+$(BPF_OBJ): idclass-bpf.c idclass.h
 	clang -target bpf -g -O2 -c $< -o $@
 
 $(SKEL): $(BPF_OBJ)

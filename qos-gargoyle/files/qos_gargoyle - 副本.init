@@ -217,26 +217,13 @@ start() {
 stop() {
     echo "Stopping QoS Gargoyle service..."
     
-    # 获取当前算法
-    local algo=$(uci -q get qos_gargoyle.global.algorithm 2>/dev/null)
-    algo=${algo:-htb_cake}
-    local module="/usr/lib/qos_gargoyle/${algo}.sh"
-    
-    if [ -f "$module" ]; then
-        # 加载算法模块并调用其停止函数
-        . "$module"
-        # 调用对应的停止函数，例如 stop_htb_cake_qos
-        stop_${algo}_qos
-    else
-        # 模块不存在时使用通用清理
-        echo "Warning: Algorithm module $module not found, using generic cleanup"
-        # 仍然需要加载必要的变量
-        if [ -z "$IFB_DEVICE" ]; then
-            IFB_DEVICE=$(uci -q get "$CONFIG_FILE.download.ifb_device" 2>/dev/null)
-            IFB_DEVICE="${IFB_DEVICE:-ifb0}"
-        fi
-        stop_qos
+    load_common_libraries
+    # 修复: 在 stop_qos 前尝试加载 IFB_DEVICE 变量
+    if [ -z "$IFB_DEVICE" ]; then
+        IFB_DEVICE=$(uci -q get "$CONFIG_FILE.download.ifb_device" 2>/dev/null)
+        IFB_DEVICE="${IFB_DEVICE:-ifb0}"
     fi
+    stop_qos
     
     echo "QoS Gargoyle stopped"
     save_service_status "stopped"
@@ -877,16 +864,16 @@ initialize_qos() {
     
     load_bandwidth_config
     
-    # 应用分类规则（cake 和 cake_dscp 算法跳过）  #应用规则已经移动到各个算法中，这里不在使用
-    #echo "调用分类规则应用..."    
-    #if [ "$algorithm" = "cake" ] || [ "$algorithm" = "cake_dscp" ]; then
-        #echo "CAKE/Cake_DSCP算法，跳过外部分类规则加载"
-        #echo "CAKE使用内置DiffServ分类机制，无需NFTables分类规则"
-        #nft flush chain inet gargoyle-qos-priority filter_qos_egress 2>/dev/null
-        #nft flush chain inet gargoyle-qos-priority filter_qos_ingress 2>/dev/null
-    #else  
-        #apply_classification_rules
-    #fi
+    # 应用分类规则（cake 和 cake_dscp 算法跳过）
+    echo "调用分类规则应用..."    
+    if [ "$algorithm" = "cake" ] || [ "$algorithm" = "cake_dscp" ]; then
+        echo "CAKE/Cake_DSCP算法，跳过外部分类规则加载"
+        echo "CAKE使用内置DiffServ分类机制，无需NFTables分类规则"
+        nft flush chain inet gargoyle-qos-priority filter_qos_egress 2>/dev/null
+        nft flush chain inet gargoyle-qos-priority filter_qos_ingress 2>/dev/null
+    else
+        apply_classification_rules
+    fi
     
     # 加载算法模块
     if ! load_algorithm_module "$algorithm"; then

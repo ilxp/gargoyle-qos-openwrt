@@ -1700,13 +1700,17 @@ initialize_htb_cake_qos() {
         return 1
     fi
     
-	# 初始化规则集（从 /etc/qos_gargoyle/rulesets/ 加载）
-	if ! init_ruleset; then
-		qos_log "ERROR" "初始化规则集失败，QoS 无法启动"
-		release_lock
-		rm -f "$QOS_RUNNING_FILE"
-		return 1
-	fi
+	# 初始化规则集（合并到主配置）
+    if ! init_ruleset; then
+        qos_log "ERROR" "初始化规则集失败，QoS 无法启动"
+        release_lock
+        return 1
+    fi
+
+    # 清空 nft 规则链，确保干净状态
+    nft flush chain inet gargoyle-qos-priority filter_qos_egress 2>/dev/null
+    nft flush chain inet gargoyle-qos-priority filter_qos_ingress 2>/dev/null
+    qos_log "INFO" "已清空 nft 规则链"
 	
     # 检查必需命令
     if ! check_required_commands; then
@@ -1758,7 +1762,14 @@ initialize_htb_cake_qos() {
         rm -f "$QOS_RUNNING_FILE"
         return 1
     fi
-    
+	
+	#开始应用规则
+	echo "调用分类规则应用..." 
+	apply_all_rules "upload_rule" "$UPLOAD_MASK" "filter_qos_egress"
+	apply_all_rules "download_rule" "$DOWNLOAD_MASK" "filter_qos_ingress"
+	qos_log "INFO" "应用自定义规则成功"
+	
+	echo "应用ipv6特别规则..." 
     setup_ipv6_specific_rules
     
     local upload_success=0
@@ -1792,10 +1803,12 @@ initialize_htb_cake_qos() {
         return 1
     fi
     
+	echo "应用HTB特别规则..." 
     setup_htb_enhance_chains
     apply_htb_specific_rules
-    
+	
     qos_log "INFO" "HTB+CAKE QoS初始化完成"
+	
     release_lock
     return 0
 }
@@ -1870,8 +1883,8 @@ stop_htb_cake_qos() {
     
     qos_log "INFO" "HTB+CAKE QoS停止完成 (清理前: ${tc_count_before}队列/${nft_count_before}规则, 清理后: ${tc_count_after}队列/${nft_count_after}规则)"
     
-    # 清理规则集
-    cleanup_ruleset
+    # 恢复备份的主配置
+    restore_main_config
 
     if $got_lock; then
         release_lock
