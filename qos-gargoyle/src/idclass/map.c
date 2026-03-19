@@ -2,9 +2,6 @@
 /*
  * Copyright (C) 2021 Felix Fietkau <nbd@nbd.name>
  * Modified to support multi-feature classification (idclass)
- *
- * This file integrates idclass's advanced feature thresholds from UCI
- * into the idclass framework.
  */
 #include <arpa/inet.h>
 #include <errno.h>
@@ -29,14 +26,19 @@ static uint8_t idclass_dscp_default[2] = { 0xff, 0xff };
 int idclass_map_timeout = 3600;
 int idclass_active_timeout = 300;
 struct idclass_global_config global_config;
-/* 全局特征阈值（从 idclass 节读取） */
 struct idclass_flow_config global_flow_config;
 static uint32_t map_dns_seq;
 
-/* 定时器定义 */
 struct uloop_timeout idclass_map_timer;
 
-/* map 信息数组（用于路径生成） */
+/* 动态 UCI 配置名 */
+static const char *uci_config_name = "qos_gargoyle";
+
+void idclass_set_config_name(const char *name)
+{
+	uci_config_name = name;
+}
+
 const struct {
 	const char *name;
 	const char *type_name;
@@ -48,9 +50,11 @@ const struct {
 	[CL_MAP_CLASS] = { "class_map", "class" },
 	[CL_MAP_GLOBAL_CONFIG] = { "global_config", "config" },
 	[CL_MAP_DNS] = { "dns", "dns" },
+	[CL_MAP_PRIO_CLASS_UP] = { "prio_class_up", "prio_class_up" },
+	[CL_MAP_PRIO_CLASS_DOWN] = { "prio_class_down", "prio_class_down" },
+	[CL_MAP_CLASS_MARK] = { "class_mark", "class_mark" },
 };
 
-/* DSCP 码点转换表 */
 static const struct {
 	const char name[5];
 	uint8_t val;
@@ -64,7 +68,6 @@ static const struct {
 	{ "EF", 46 }, { "VA", 44 }, { "LE", 1 }, { "DF", 0 },
 };
 
-/* 辅助函数：跳过空白字符 */
 char *str_skip(char *str, bool space)
 {
 	while (*str && isspace(*str) == space)
@@ -72,7 +75,6 @@ char *str_skip(char *str, bool space)
 	return str;
 }
 
-/* DSCP 码点转换：将字符串如 "CS0" 转换为数值 */
 int idclass_map_codepoint(const char *val)
 {
 	int i;
@@ -82,14 +84,12 @@ int idclass_map_codepoint(const char *val)
 	return 0xff;
 }
 
-/* 辅助函数：读取浮点数并乘以100 */
 static int read_float_mult100(const char *val)
 {
 	double d = atof(val);
 	return (int)(d * 100 + 0.5);
 }
 
-/* 原有的 map 操作函数 */
 static int idclass_map_entry_cmp(const void *k1, const void *k2, void *ptr)
 {
     const struct idclass_map_data *d1 = k1;
@@ -790,13 +790,9 @@ int map_fill_dscp_value(uint8_t *dest, struct blob_attr *attr, bool reset)
     return 0;
 }
 
-/* 解析 flow_config 的所有字段（包括特征阈值） */
 int map_parse_flow_config(struct idclass_flow_config *cfg, struct blob_attr *attr, bool reset)
 {
     enum {
-        CL_CONFIG_DSCP_PRIO,
-        CL_CONFIG_DSCP_BULK,
-        CL_CONFIG_DSCP_VIDEO,
         CL_CONFIG_BULK_TIMEOUT,
         CL_CONFIG_BULK_PPS,
         CL_CONFIG_PRIO_PKT_LEN,
@@ -834,39 +830,36 @@ int map_parse_flow_config(struct idclass_flow_config *cfg, struct blob_attr *att
         CL_CONFIG_ENABLE_CONN_DURATION,
         CL_CONFIG_ENABLE_UP_DOWN_RATIO,
         CL_CONFIG_ENABLE_BURST,
-        CL_CONFIG_CLASS_REALTIME,  // 4大分类
-		CL_CONFIG_CLASS_VIDEO,
-		CL_CONFIG_CLASS_NORMAL,
-		CL_CONFIG_CLASS_BULK,    
-		CL_CONFIG_WEIGHT_PKTLEN_REALTIME,  //自定义权重
-		CL_CONFIG_WEIGHT_PKTLEN_VIDEO,
-		CL_CONFIG_WEIGHT_PKTLEN_NORMAL,
-		CL_CONFIG_WEIGHT_PKTLEN_BULK,
-		CL_CONFIG_WEIGHT_CONN_REALTIME,
-		CL_CONFIG_WEIGHT_CONN_VIDEO,
-		CL_CONFIG_WEIGHT_CONN_NORMAL,
-		CL_CONFIG_WEIGHT_CONN_BULK,
-		CL_CONFIG_WEIGHT_PPS_REALTIME,
-		CL_CONFIG_WEIGHT_PPS_VIDEO,
-		CL_CONFIG_WEIGHT_PPS_NORMAL,
-		CL_CONFIG_WEIGHT_PPS_BULK,
-		CL_CONFIG_WEIGHT_BURST_BULK,
-		CL_CONFIG_WEIGHT_TCPFLAGS_BULK,
-		CL_CONFIG_WEIGHT_RETRANS_BULK,
-		CL_CONFIG_WEIGHT_DURATION_REALTIME,
-		CL_CONFIG_WEIGHT_DURATION_VIDEO,
-		CL_CONFIG_WEIGHT_DURATION_BULK,
-		CL_CONFIG_WEIGHT_RATIO_VIDEO,
-		CL_CONFIG_WEIGHT_RATIO_REALTIME,
-		CL_CONFIG_WEIGHT_RATIO_BULK,
-		CL_CONFIG_WEIGHT_IAT_REALTIME,
-		CL_CONFIG_SCORE_THRESHOLD,
-		__CL_CONFIG_MAX
-	};
+        CL_CONFIG_WEIGHT_PKTLEN_REALTIME,
+        CL_CONFIG_WEIGHT_PKTLEN_VIDEO,
+        CL_CONFIG_WEIGHT_PKTLEN_NORMAL,
+        CL_CONFIG_WEIGHT_PKTLEN_BULK,
+        CL_CONFIG_WEIGHT_CONN_REALTIME,
+        CL_CONFIG_WEIGHT_CONN_VIDEO,
+        CL_CONFIG_WEIGHT_CONN_NORMAL,
+        CL_CONFIG_WEIGHT_CONN_BULK,
+        CL_CONFIG_WEIGHT_PPS_REALTIME,
+        CL_CONFIG_WEIGHT_PPS_VIDEO,
+        CL_CONFIG_WEIGHT_PPS_NORMAL,
+        CL_CONFIG_WEIGHT_PPS_BULK,
+        CL_CONFIG_WEIGHT_BURST_BULK,
+        CL_CONFIG_WEIGHT_TCPFLAGS_BULK,
+        CL_CONFIG_WEIGHT_RETRANS_BULK,
+        CL_CONFIG_WEIGHT_DURATION_REALTIME,
+        CL_CONFIG_WEIGHT_DURATION_VIDEO,
+        CL_CONFIG_WEIGHT_DURATION_BULK,
+        CL_CONFIG_WEIGHT_RATIO_VIDEO,
+        CL_CONFIG_WEIGHT_RATIO_REALTIME,
+        CL_CONFIG_WEIGHT_RATIO_BULK,
+        CL_CONFIG_WEIGHT_IAT_REALTIME,
+        CL_CONFIG_SCORE_THRESHOLD,
+        CL_CONFIG_PRIO_REALTIME,
+        CL_CONFIG_PRIO_VIDEO,
+        CL_CONFIG_PRIO_NORMAL,
+        CL_CONFIG_PRIO_BULK,
+        __CL_CONFIG_MAX
+    };
     static const struct blobmsg_policy policy[__CL_CONFIG_MAX] = {
-        [CL_CONFIG_DSCP_PRIO] = { "dscp_prio", BLOBMSG_TYPE_STRING },
-        [CL_CONFIG_DSCP_BULK] = { "dscp_bulk", BLOBMSG_TYPE_STRING },
-        [CL_CONFIG_DSCP_VIDEO] = { "dscp_video", BLOBMSG_TYPE_STRING },
         [CL_CONFIG_BULK_TIMEOUT] = { "bulk_trigger_timeout", BLOBMSG_TYPE_INT32 },
         [CL_CONFIG_BULK_PPS] = { "bulk_trigger_pps", BLOBMSG_TYPE_INT32 },
         [CL_CONFIG_PRIO_PKT_LEN] = { "prio_max_avg_pkt_len", BLOBMSG_TYPE_INT32 },
@@ -904,71 +897,69 @@ int map_parse_flow_config(struct idclass_flow_config *cfg, struct blob_attr *att
         [CL_CONFIG_ENABLE_CONN_DURATION] = { "enable_conn_duration", BLOBMSG_TYPE_BOOL },
         [CL_CONFIG_ENABLE_UP_DOWN_RATIO] = { "enable_up_down_ratio", BLOBMSG_TYPE_BOOL },
         [CL_CONFIG_ENABLE_BURST] = { "enable_burst", BLOBMSG_TYPE_BOOL },
-		[CL_CONFIG_CLASS_REALTIME] = { "class_realtime", BLOBMSG_TYPE_INT32 },
-		[CL_CONFIG_CLASS_VIDEO]    = { "class_video",    BLOBMSG_TYPE_INT32 },
-		[CL_CONFIG_CLASS_NORMAL]   = { "class_normal",   BLOBMSG_TYPE_INT32 },
-		[CL_CONFIG_CLASS_BULK]     = { "class_bulk",     BLOBMSG_TYPE_INT32 },
-		[CL_CONFIG_WEIGHT_PKTLEN_REALTIME] = { "weight_pktlen_realtime", BLOBMSG_TYPE_INT32 },
-		[CL_CONFIG_WEIGHT_PKTLEN_VIDEO]    = { "weight_pktlen_video",    BLOBMSG_TYPE_INT32 },
-		[CL_CONFIG_WEIGHT_PKTLEN_NORMAL]   = { "weight_pktlen_normal",   BLOBMSG_TYPE_INT32 },
-		[CL_CONFIG_WEIGHT_PKTLEN_BULK]     = { "weight_pktlen_bulk",     BLOBMSG_TYPE_INT32 },
-		[CL_CONFIG_WEIGHT_CONN_REALTIME]   = { "weight_conn_realtime",   BLOBMSG_TYPE_INT32 },
-		[CL_CONFIG_WEIGHT_CONN_VIDEO]      = { "weight_conn_video",      BLOBMSG_TYPE_INT32 },
-		[CL_CONFIG_WEIGHT_CONN_NORMAL]     = { "weight_conn_normal",     BLOBMSG_TYPE_INT32 },
-		[CL_CONFIG_WEIGHT_CONN_BULK]       = { "weight_conn_bulk",       BLOBMSG_TYPE_INT32 },
-		[CL_CONFIG_WEIGHT_PPS_REALTIME]    = { "weight_pps_realtime",    BLOBMSG_TYPE_INT32 },
-		[CL_CONFIG_WEIGHT_PPS_VIDEO]       = { "weight_pps_video",       BLOBMSG_TYPE_INT32 },
-		[CL_CONFIG_WEIGHT_PPS_NORMAL]      = { "weight_pps_normal",      BLOBMSG_TYPE_INT32 },
-		[CL_CONFIG_WEIGHT_PPS_BULK]        = { "weight_pps_bulk",        BLOBMSG_TYPE_INT32 },
-		[CL_CONFIG_WEIGHT_BURST_BULK]      = { "weight_burst_bulk",      BLOBMSG_TYPE_INT32 },
-		[CL_CONFIG_WEIGHT_TCPFLAGS_BULK]   = { "weight_tcpflags_bulk",   BLOBMSG_TYPE_INT32 },
-		[CL_CONFIG_WEIGHT_RETRANS_BULK]    = { "weight_retrans_bulk",    BLOBMSG_TYPE_INT32 },
-		[CL_CONFIG_WEIGHT_DURATION_REALTIME] = { "weight_duration_realtime", BLOBMSG_TYPE_INT32 },
-		[CL_CONFIG_WEIGHT_DURATION_VIDEO]  = { "weight_duration_video",  BLOBMSG_TYPE_INT32 },
-		[CL_CONFIG_WEIGHT_DURATION_BULK]   = { "weight_duration_bulk",   BLOBMSG_TYPE_INT32 },
-		[CL_CONFIG_WEIGHT_RATIO_VIDEO]     = { "weight_ratio_video",     BLOBMSG_TYPE_INT32 },
-		[CL_CONFIG_WEIGHT_RATIO_REALTIME]  = { "weight_ratio_realtime",  BLOBMSG_TYPE_INT32 },
-		[CL_CONFIG_WEIGHT_RATIO_BULK]      = { "weight_ratio_bulk",      BLOBMSG_TYPE_INT32 },
-		[CL_CONFIG_WEIGHT_IAT_REALTIME]    = { "weight_iat_realtime",    BLOBMSG_TYPE_INT32 },
-		[CL_CONFIG_SCORE_THRESHOLD]        = { "score_threshold",        BLOBMSG_TYPE_INT32 },
-	};
+        [CL_CONFIG_WEIGHT_PKTLEN_REALTIME] = { "weight_pktlen_realtime", BLOBMSG_TYPE_INT32 },
+        [CL_CONFIG_WEIGHT_PKTLEN_VIDEO]    = { "weight_pktlen_video",    BLOBMSG_TYPE_INT32 },
+        [CL_CONFIG_WEIGHT_PKTLEN_NORMAL]   = { "weight_pktlen_normal",   BLOBMSG_TYPE_INT32 },
+        [CL_CONFIG_WEIGHT_PKTLEN_BULK]     = { "weight_pktlen_bulk",     BLOBMSG_TYPE_INT32 },
+        [CL_CONFIG_WEIGHT_CONN_REALTIME]   = { "weight_conn_realtime",   BLOBMSG_TYPE_INT32 },
+        [CL_CONFIG_WEIGHT_CONN_VIDEO]      = { "weight_conn_video",      BLOBMSG_TYPE_INT32 },
+        [CL_CONFIG_WEIGHT_CONN_NORMAL]     = { "weight_conn_normal",     BLOBMSG_TYPE_INT32 },
+        [CL_CONFIG_WEIGHT_CONN_BULK]       = { "weight_conn_bulk",       BLOBMSG_TYPE_INT32 },
+        [CL_CONFIG_WEIGHT_PPS_REALTIME]    = { "weight_pps_realtime",    BLOBMSG_TYPE_INT32 },
+        [CL_CONFIG_WEIGHT_PPS_VIDEO]       = { "weight_pps_video",       BLOBMSG_TYPE_INT32 },
+        [CL_CONFIG_WEIGHT_PPS_NORMAL]      = { "weight_pps_normal",      BLOBMSG_TYPE_INT32 },
+        [CL_CONFIG_WEIGHT_PPS_BULK]        = { "weight_pps_bulk",        BLOBMSG_TYPE_INT32 },
+        [CL_CONFIG_WEIGHT_BURST_BULK]      = { "weight_burst_bulk",      BLOBMSG_TYPE_INT32 },
+        [CL_CONFIG_WEIGHT_TCPFLAGS_BULK]   = { "weight_tcpflags_bulk",   BLOBMSG_TYPE_INT32 },
+        [CL_CONFIG_WEIGHT_RETRANS_BULK]    = { "weight_retrans_bulk",    BLOBMSG_TYPE_INT32 },
+        [CL_CONFIG_WEIGHT_DURATION_REALTIME] = { "weight_duration_realtime", BLOBMSG_TYPE_INT32 },
+        [CL_CONFIG_WEIGHT_DURATION_VIDEO]  = { "weight_duration_video",  BLOBMSG_TYPE_INT32 },
+        [CL_CONFIG_WEIGHT_DURATION_BULK]   = { "weight_duration_bulk",   BLOBMSG_TYPE_INT32 },
+        [CL_CONFIG_WEIGHT_RATIO_VIDEO]     = { "weight_ratio_video",     BLOBMSG_TYPE_INT32 },
+        [CL_CONFIG_WEIGHT_RATIO_REALTIME]  = { "weight_ratio_realtime",  BLOBMSG_TYPE_INT32 },
+        [CL_CONFIG_WEIGHT_RATIO_BULK]      = { "weight_ratio_bulk",      BLOBMSG_TYPE_INT32 },
+        [CL_CONFIG_WEIGHT_IAT_REALTIME]    = { "weight_iat_realtime",    BLOBMSG_TYPE_INT32 },
+        [CL_CONFIG_SCORE_THRESHOLD]        = { "score_threshold",        BLOBMSG_TYPE_INT32 },
+        [CL_CONFIG_PRIO_REALTIME] = { "prio_realtime", BLOBMSG_TYPE_INT32 },
+        [CL_CONFIG_PRIO_VIDEO]    = { "prio_video",    BLOBMSG_TYPE_INT32 },
+        [CL_CONFIG_PRIO_NORMAL]   = { "prio_normal",   BLOBMSG_TYPE_INT32 },
+        [CL_CONFIG_PRIO_BULK]     = { "prio_bulk",     BLOBMSG_TYPE_INT32 },
+    };
     struct blob_attr *tb[__CL_CONFIG_MAX];
     struct blob_attr *cur;
 
     if (reset) {
-    memset(cfg, 0, sizeof(*cfg));
-    /* 设置默认权重 */
-    cfg->weight_pktlen_realtime = 3;
-    cfg->weight_pktlen_video    = 3;
-    cfg->weight_pktlen_normal   = 1;
-    cfg->weight_pktlen_bulk     = 3;
-    cfg->weight_conn_realtime   = 2;
-    cfg->weight_conn_video      = 1;
-    cfg->weight_conn_normal     = 1;
-    cfg->weight_conn_bulk       = 2;
-    cfg->weight_pps_realtime    = 2;
-    cfg->weight_pps_video       = 2;
-    cfg->weight_pps_normal      = 1;
-    cfg->weight_pps_bulk        = 2;
-    cfg->weight_burst_bulk      = 3;
-    cfg->weight_tcpflags_bulk   = 2;
-    cfg->weight_retrans_bulk    = 2;
-    cfg->weight_duration_realtime = 1;
-    cfg->weight_duration_video  = 1;
-    cfg->weight_duration_bulk   = 2;
-    cfg->weight_ratio_video     = 1;
-    cfg->weight_ratio_realtime  = 1;
-    cfg->weight_ratio_bulk      = 1;
-    cfg->weight_iat_realtime    = 2;
-    cfg->score_threshold        = 3;
-	}
+        memset(cfg, 0, sizeof(*cfg));
+        cfg->weight_pktlen_realtime = 3;
+        cfg->weight_pktlen_video    = 3;
+        cfg->weight_pktlen_normal   = 1;
+        cfg->weight_pktlen_bulk     = 3;
+        cfg->weight_conn_realtime   = 2;
+        cfg->weight_conn_video      = 1;
+        cfg->weight_conn_normal     = 1;
+        cfg->weight_conn_bulk       = 2;
+        cfg->weight_pps_realtime    = 2;
+        cfg->weight_pps_video       = 2;
+        cfg->weight_pps_normal      = 1;
+        cfg->weight_pps_bulk        = 2;
+        cfg->weight_burst_bulk      = 3;
+        cfg->weight_tcpflags_bulk   = 2;
+        cfg->weight_retrans_bulk    = 2;
+        cfg->weight_duration_realtime = 1;
+        cfg->weight_duration_video  = 1;
+        cfg->weight_duration_bulk   = 2;
+        cfg->weight_ratio_video     = 1;
+        cfg->weight_ratio_realtime  = 1;
+        cfg->weight_ratio_bulk      = 1;
+        cfg->weight_iat_realtime    = 2;
+        cfg->score_threshold        = 3;
+        cfg->prio_realtime = 0;
+        cfg->prio_video    = 1;
+        cfg->prio_normal   = 2;
+        cfg->prio_bulk     = 3;
+    }
 
     blobmsg_parse(policy, __CL_CONFIG_MAX, tb, blobmsg_data(attr), blobmsg_len(attr));
-
-    if (map_fill_dscp_value(&cfg->dscp_prio, tb[CL_CONFIG_DSCP_PRIO], reset) ||
-        map_fill_dscp_value(&cfg->dscp_bulk, tb[CL_CONFIG_DSCP_BULK], reset) ||
-        map_fill_dscp_value(&cfg->dscp_video, tb[CL_CONFIG_DSCP_VIDEO], reset))
-        return -1;
 
 #define READ_U32(name, field) do { \
     if ((cur = tb[name]) != NULL) cfg->field = blobmsg_get_u32(cur); \
@@ -1000,11 +991,7 @@ int map_parse_flow_config(struct idclass_flow_config *cfg, struct blob_attr *att
     READ_U32(CL_CONFIG_BURST_BYTES, burst_bytes);
     READ_U32(CL_CONFIG_IAT_THRESHOLD_US, iat_threshold_us);
     READ_U32(CL_CONFIG_RETRANS_THRESHOLD, retrans_threshold);
-	READ_U32(CL_CONFIG_CLASS_REALTIME, class_realtime);
-	READ_U32(CL_CONFIG_CLASS_VIDEO,    class_video);
-	READ_U32(CL_CONFIG_CLASS_NORMAL,   class_normal);
-	READ_U32(CL_CONFIG_CLASS_BULK,     class_bulk);
-	READ_U32(CL_CONFIG_WEIGHT_PKTLEN_REALTIME, weight_pktlen_realtime);
+    READ_U32(CL_CONFIG_WEIGHT_PKTLEN_REALTIME, weight_pktlen_realtime);
     READ_U32(CL_CONFIG_WEIGHT_PKTLEN_VIDEO,    weight_pktlen_video);
     READ_U32(CL_CONFIG_WEIGHT_PKTLEN_NORMAL,   weight_pktlen_normal);
     READ_U32(CL_CONFIG_WEIGHT_PKTLEN_BULK,     weight_pktlen_bulk);
@@ -1027,16 +1014,18 @@ int map_parse_flow_config(struct idclass_flow_config *cfg, struct blob_attr *att
     READ_U32(CL_CONFIG_WEIGHT_RATIO_BULK,      weight_ratio_bulk);
     READ_U32(CL_CONFIG_WEIGHT_IAT_REALTIME,    weight_iat_realtime);
     READ_U32(CL_CONFIG_SCORE_THRESHOLD,        score_threshold);
+    READ_U32(CL_CONFIG_PRIO_REALTIME, prio_realtime);
+    READ_U32(CL_CONFIG_PRIO_VIDEO,    prio_video);
+    READ_U32(CL_CONFIG_PRIO_NORMAL,   prio_normal);
+    READ_U32(CL_CONFIG_PRIO_BULK,     prio_bulk);
 
 #undef READ_U32
 
-    /* 处理浮点数比例 */
     if ((cur = tb[CL_CONFIG_UP_DOWN_RATIO_LOW]) != NULL)
         cfg->up_down_ratio_low = read_float_mult100(blobmsg_get_string(cur));
     if ((cur = tb[CL_CONFIG_UP_DOWN_RATIO_HIGH]) != NULL)
         cfg->up_down_ratio_high = read_float_mult100(blobmsg_get_string(cur));
 
-    /* 构建特征掩码 */
     cfg->feature_mask = 0;
     if ((cur = tb[CL_CONFIG_ENABLE_PKTLEN]) != NULL && blobmsg_get_bool(cur))
         cfg->feature_mask |= (1 << 0);
@@ -1060,7 +1049,6 @@ int map_parse_flow_config(struct idclass_flow_config *cfg, struct blob_attr *att
     return 0;
 }
 
-/* 从 UCI 加载 idclass 全局配置 */
 static int load_idclass_config(void)
 {
     struct uci_context *uci;
@@ -1071,7 +1059,7 @@ static int load_idclass_config(void)
 
     uci = uci_alloc_context();
     if (!uci) return -1;
-    if (uci_load(uci, "qos_gargoyle", &pkg) != UCI_OK) {
+    if (uci_load(uci, uci_config_name, &pkg) != UCI_OK) {
         uci_free_context(uci);
         return -1;
     }
@@ -1082,17 +1070,14 @@ static int load_idclass_config(void)
         if (!type || strcmp(type, "idclass") != 0)
             continue;
 
-        /* 读取接口配置 */
         const char *wan_iface = uci_lookup_option_string(uci, s, "wan_interface");
         if (wan_iface) global_config.wan_ifindex = if_nametoindex(wan_iface);
         const char *ifb_iface = uci_lookup_option_string(uci, s, "ifb_device");
         if (ifb_iface) global_config.ifb_ifindex = if_nametoindex(ifb_iface);
 
-        /* 读取 dscp_icmp */
         const char *dscp_icmp = uci_lookup_option_string(uci, s, "dscp_icmp");
         if (dscp_icmp) idclass_map_dscp_value(dscp_icmp, &global_config.dscp_icmp);
 
-        /* 将整个节转换为 blob_attr 以解析特征阈值 */
         blob_buf_init(&b, 0);
         struct uci_element *opt;
         uci_foreach_element(&s->options, opt) {
@@ -1100,11 +1085,9 @@ static int load_idclass_config(void)
             if (o->type != UCI_TYPE_STRING) continue;
             blobmsg_add_string(&b, o->e.name, o->v.string);
         }
-        /* 解析特征阈值到 global_flow_config */
         map_parse_flow_config(&global_flow_config, b.head, true);
         blob_buf_free(&b);
 
-        /* 更新 global_config map */
         int fd = idclass_map_fds[CL_MAP_GLOBAL_CONFIG];
         if (fd >= 0) {
             uint32_t key = 0;
@@ -1118,7 +1101,6 @@ static int load_idclass_config(void)
     return 0;
 }
 
-/* 修改后的类创建函数：解析类特定的配置（如 ingress/egress DSCP）并应用全局阈值 */
 static int idclass_map_create_class(struct blob_attr *attr)
 {
     struct idclass_class *class;
@@ -1164,9 +1146,7 @@ static int idclass_map_create_class(struct blob_attr *attr)
         return -1;
     }
 
-    /* 将全局特征阈值复制到类的配置中 */
     class->data.config = global_flow_config;
-
     return 0;
 }
 
@@ -1193,15 +1173,8 @@ void idclass_map_set_classes(struct blob_attr *val)
         map_class[i] = NULL;
     }
 
-    blobmsg_for_each_attr(cur, val, rem) {
-        i = idclass_map_get_class_id(blobmsg_name(cur));
-        if (i < 0 || !map_class[i])
-            continue;
-    }
-
     for (i = 0; i < ARRAY_SIZE(map_class); i++) {
         struct idclass_class *data;
-
         data = map_class[i] ? &map_class[i]->data : &empty_data;
         bpf_map_update_elem(fd, &i, data, BPF_ANY);
     }
@@ -1214,104 +1187,165 @@ void idclass_map_update_config(void)
     bpf_map_update_elem(fd, &key, &global_config, BPF_ANY);
 }
 
-/* 从 UCI 加载 upload_class 和 download_class 配置 */
-static void load_classes_from_uci(void)
+static int compare_priority(const void *a, const void *b)
 {
-	struct uci_context *uci;
-	struct uci_package *pkg;
-	struct uci_element *e;
-	struct uci_section *s;
-	struct blob_buf b = { 0 };
-	int class_mark_fd = idclass_map_fds[CL_MAP_CLASS_MARK];
+    int pa = ((const struct class_prio *)a)->priority;
+    int pb = ((const struct class_prio *)b)->priority;
+    if (pa < pb) return -1;
+    if (pa > pb) return 1;
+    int ca = ((const struct class_prio *)a)->class_id;
+    int cb = ((const struct class_prio *)b)->class_id;
+    return ca - cb;
+}
 
-	uci = uci_alloc_context();
-	if (!uci) return;
-	if (uci_load(uci, "qos_gargoyle", &pkg) != UCI_OK) {
-		uci_free_context(uci);
-		return;
-	}
+static void build_priority_maps(void)
+{
+    struct uci_context *uci;
+    struct uci_package *pkg;
+    struct uci_element *e;
+    struct uci_section *s;
+    struct class_prio {
+        int class_id;
+        int priority;
+    } up[16], down[16];
+    int up_cnt = 0, down_cnt = 0;
 
-	blob_buf_init(&b, 0);
-	void *arr = blobmsg_open_array(&b, NULL);
+    uci = uci_alloc_context();
+    if (!uci) return;
+    if (uci_load(uci, uci_config_name, &pkg) != UCI_OK) {
+        uci_free_context(uci);
+        return;
+    }
 
-	uci_foreach_element(&pkg->sections, e) {
-		s = uci_to_section(e);
-		const char *type = uci_lookup_option_string(uci, s, "type") ?: s->type;
-		if (!type || (strcmp(type, "upload_class") != 0 && strcmp(type, "download_class") != 0))
-			continue;
+    uci_foreach_element(&pkg->sections, e) {
+        s = uci_to_section(e);
+        const char *type = uci_lookup_option_string(uci, s, "type") ?: s->type;
+        if (!type) continue;
 
-		/* 解析 class_id（从节名如 uclass_1 中提取数字） */
-		int class_id = 0;
-		if (sscanf(s->e.name, "uclass_%d", &class_id) != 1 &&
-		    sscanf(s->e.name, "dclass_%d", &class_id) != 1) {
-			continue;
-		}
+        int class_id = 0;
+        if (strcmp(type, "upload_class") == 0) {
+            if (sscanf(s->e.name, "uclass_%d", &class_id) != 1) continue;
+        } else if (strcmp(type, "download_class") == 0) {
+            if (sscanf(s->e.name, "dclass_%d", &class_id) != 1) continue;
+        } else {
+            continue;
+        }
 
-		/* 计算 mark：上传用低位，下载用高位 */
-		__u32 mark;
-		if (strcmp(type, "upload_class") == 0) {
-			mark = class_id;   /* 上传类 mark = class_id */
-		} else {
-			mark = 0x10000 | class_id; /* 下载类 mark = 0x10000 + class_id */
-		}
+        const char *prio_str = uci_lookup_option_string(uci, s, "priority");
+        int priority = prio_str ? atoi(prio_str) : 999;
 
-		/* 更新 class_mark map */
-		if (class_mark_fd >= 0) {
-			bpf_map_update_elem(class_mark_fd, &class_id, &mark, 0);
-		}
+        if (strcmp(type, "upload_class") == 0) {
+            up[up_cnt].class_id = class_id;
+            up[up_cnt].priority = priority;
+            up_cnt++;
+        } else {
+            down[down_cnt].class_id = class_id;
+            down[down_cnt].priority = priority;
+            down_cnt++;
+        }
+    }
 
-		/* 构建 blob 用于 class_map */
-		void *tab = blobmsg_open_table(&b, s->e.name);
+    uci_unload(uci, pkg);
+    uci_free_context(uci);
 
-		const char *ingress = uci_lookup_option_string(uci, s, "ingress");
-		if (ingress)
-			blobmsg_add_string(&b, "ingress", ingress);
+    qsort(up, up_cnt, sizeof(up[0]), compare_priority);
+    qsort(down, down_cnt, sizeof(down[0]), compare_priority);
 
-		const char *egress = uci_lookup_option_string(uci, s, "egress");
-		if (egress)
-			blobmsg_add_string(&b, "egress", egress);
+    uint32_t log_prio[4] = {
+        global_flow_config.prio_realtime,
+        global_flow_config.prio_video,
+        global_flow_config.prio_normal,
+        global_flow_config.prio_bulk
+    };
 
-		const char *name = uci_lookup_option_string(uci, s, "name");
-		if (name)
-			blobmsg_add_string(&b, "name", name);
+    uint32_t up_map[4], down_map[4];
 
-		blobmsg_close_table(&b, tab);
-	}
+    for (int i = 0; i < 4; i++) {
+        int target_prio = log_prio[i];
+        int best = -1;
+        for (int j = 0; j < up_cnt; j++) {
+            if (up[j].priority >= target_prio) {
+                best = up[j].class_id;
+                break;
+            }
+        }
+        if (best == -1 && up_cnt > 0) best = up[up_cnt-1].class_id;
+        up_map[i] = best;
 
-	blobmsg_close_array(&b, arr);
+        best = -1;
+        for (int j = 0; j < down_cnt; j++) {
+            if (down[j].priority >= target_prio) {
+                best = down[j].class_id;
+                break;
+            }
+        }
+        if (best == -1 && down_cnt > 0) best = down[down_cnt-1].class_id;
+        down_map[i] = best;
+    }
 
-	if (blobmsg_data_len(b.head) > 0)
-		idclass_map_set_classes(b.head);
+    int fd_up = idclass_map_fds[CL_MAP_PRIO_CLASS_UP];
+    if (fd_up >= 0) {
+        for (int i = 0; i < 4; i++)
+            bpf_map_update_elem(fd_up, &i, &up_map[i], 0);
+    }
+    int fd_down = idclass_map_fds[CL_MAP_PRIO_CLASS_DOWN];
+    if (fd_down >= 0) {
+        for (int i = 0; i < 4; i++)
+            bpf_map_update_elem(fd_down, &i, &down_map[i], 0);
+    }
+}
 
-	blob_buf_free(&b);
-	uci_unload(uci, pkg);
-	uci_free_context(uci);
+static void load_class_marks_from_file(void)
+{
+    FILE *fp = fopen("/tmp/idclass_class_marks", "r");
+    if (!fp) {
+        fprintf(stderr, "Warning: cannot open /tmp/idclass_class_marks, marks may be missing\n");
+        return;
+    }
+
+    int class_id;
+    unsigned int mark;
+    while (fscanf(fp, "%d:%u", &class_id, &mark) == 2) {
+        int fd = idclass_map_fds[CL_MAP_CLASS_MARK];
+        if (fd >= 0 && class_id >= 0 && class_id < IDCLASS_MAX_CLASS_ENTRIES)
+            bpf_map_update_elem(fd, &class_id, &mark, 0);
+    }
+    fclose(fp);
 }
 
 int idclass_map_init(void)
 {
-	int i;
+    int i;
 
-	for (i = 0; i < CL_MAP_DNS; i++) {
-		idclass_map_fds[i] = idclass_map_get_fd(i);
-		if (idclass_map_fds[i] < 0)
-			return -1;
-	}
+    for (i = 0; i < CL_MAP_DNS; i++) {
+        idclass_map_fds[i] = idclass_map_get_fd(i);
+        if (idclass_map_fds[i] < 0)
+            return -1;
+    }
 
-	/* 打开 global_config map */
-	idclass_map_fds[CL_MAP_GLOBAL_CONFIG] = idclass_map_get_fd(CL_MAP_GLOBAL_CONFIG);
-	if (idclass_map_fds[CL_MAP_GLOBAL_CONFIG] < 0)
-		return -1;
+    idclass_map_fds[CL_MAP_GLOBAL_CONFIG] = idclass_map_get_fd(CL_MAP_GLOBAL_CONFIG);
+    if (idclass_map_fds[CL_MAP_GLOBAL_CONFIG] < 0)
+        return -1;
 
-	idclass_map_clear_list(CL_MAP_IPV4_ADDR);
-	idclass_map_clear_list(CL_MAP_IPV6_ADDR);
-	idclass_map_reset_config();
+    idclass_map_fds[CL_MAP_PRIO_CLASS_UP] = idclass_map_get_fd(CL_MAP_PRIO_CLASS_UP);
+    if (idclass_map_fds[CL_MAP_PRIO_CLASS_UP] < 0)
+        return -1;
 
-    /* 从 UCI 加载 idclass 配置（包含所有特征阈值） */
+    idclass_map_fds[CL_MAP_PRIO_CLASS_DOWN] = idclass_map_get_fd(CL_MAP_PRIO_CLASS_DOWN);
+    if (idclass_map_fds[CL_MAP_PRIO_CLASS_DOWN] < 0)
+        return -1;
+
+    idclass_map_fds[CL_MAP_CLASS_MARK] = idclass_map_get_fd(CL_MAP_CLASS_MARK);
+    if (idclass_map_fds[CL_MAP_CLASS_MARK] < 0)
+        return -1;
+
+    idclass_map_clear_list(CL_MAP_IPV4_ADDR);
+    idclass_map_clear_list(CL_MAP_IPV6_ADDR);
+    idclass_map_reset_config();
+
     load_idclass_config();
-	
-	/* 加载 upload_class 和 download_class 配置（用于 class_mark 映射） */
-    load_classes_from_uci();
+    load_class_marks_from_file();
+    build_priority_maps();
 
     return 0;
 }

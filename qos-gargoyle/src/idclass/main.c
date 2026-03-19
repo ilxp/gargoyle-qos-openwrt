@@ -84,10 +84,11 @@ out:
 int main(int argc, char **argv)
 {
 	const char *load_file = NULL;
+	const char *config_name = "qos_gargoyle"; /* 默认配置名 */
 	bool oneshot = false;
 	int ch;
 
-	while ((ch = getopt(argc, argv, "fl:o")) != -1) {
+	while ((ch = getopt(argc, argv, "fl:oc:")) != -1) {
 		switch (ch) {
 		case 'f':
 			break;
@@ -97,10 +98,16 @@ int main(int argc, char **argv)
 		case 'o':
 			oneshot = true;
 			break;
+		case 'c':
+			config_name = optarg;
+			break;
 		default:
 			return usage(argv[0]);
 		}
 	}
+
+	/* 传递配置名给 map 模块（可通过全局变量或函数） */
+	idclass_set_config_name(config_name);
 
 	if (idclass_loader_init())
 		return 2;

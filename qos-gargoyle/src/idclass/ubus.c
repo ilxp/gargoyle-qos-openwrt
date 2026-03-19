@@ -8,7 +8,6 @@
 
 static struct blob_buf b;
 
-/* 已有的辅助函数（完整保留） */
 static int idclass_ubus_add_array(struct blob_attr *attr, uint8_t val, enum idclass_map_id id)
 {
     struct blob_attr *cur;
@@ -117,7 +116,6 @@ static int idclass_ubus_add(struct ubus_context *ctx, struct ubus_object *obj,
     return 0;
 }
 
-/* 扩展的 config 策略，包含所有特征参数 */
 enum {
     CL_CONFIG_RESET,
     CL_CONFIG_FILES,
@@ -128,7 +126,6 @@ enum {
     CL_CONFIG_INTERFACES,
     CL_CONFIG_DEVICES,
     CL_CONFIG_CLASSES,
-    /* 新增特征配置 */
     CL_CONFIG_GAME_MAX_AVG_PKT_LEN,
     CL_CONFIG_GAME_MIN_CONN,
     CL_CONFIG_GAME_MAX_CONN,
@@ -154,7 +151,6 @@ enum {
     CL_CONFIG_BURST_BYTES,
     CL_CONFIG_IAT_THRESHOLD_US,
     CL_CONFIG_RETRANS_THRESHOLD,
-    /* 特征开关 */
     CL_CONFIG_ENABLE_PKTLEN,
     CL_CONFIG_ENABLE_CONN_COUNT,
     CL_CONFIG_ENABLE_PPS,
@@ -164,34 +160,34 @@ enum {
     CL_CONFIG_ENABLE_CONN_DURATION,
     CL_CONFIG_ENABLE_UP_DOWN_RATIO,
     CL_CONFIG_ENABLE_BURST,
-    CL_CONFIG_CLASS_REALTIME,  // 4大分类
-	CL_CONFIG_CLASS_VIDEO,
-	CL_CONFIG_CLASS_NORMAL,
-	CL_CONFIG_CLASS_BULK,    
-	CL_CONFIG_WEIGHT_PKTLEN_REALTIME,  //自定义权重
-	CL_CONFIG_WEIGHT_PKTLEN_VIDEO,
-	CL_CONFIG_WEIGHT_PKTLEN_NORMAL,
-	CL_CONFIG_WEIGHT_PKTLEN_BULK,
-	CL_CONFIG_WEIGHT_CONN_REALTIME,
-	CL_CONFIG_WEIGHT_CONN_VIDEO,
-	CL_CONFIG_WEIGHT_CONN_NORMAL,
-	CL_CONFIG_WEIGHT_CONN_BULK,
-	CL_CONFIG_WEIGHT_PPS_REALTIME,
-	CL_CONFIG_WEIGHT_PPS_VIDEO,
-	CL_CONFIG_WEIGHT_PPS_NORMAL,
-	CL_CONFIG_WEIGHT_PPS_BULK,
-	CL_CONFIG_WEIGHT_BURST_BULK,
-	CL_CONFIG_WEIGHT_TCPFLAGS_BULK,
-	CL_CONFIG_WEIGHT_RETRANS_BULK,
-	CL_CONFIG_WEIGHT_DURATION_REALTIME,
-	CL_CONFIG_WEIGHT_DURATION_VIDEO,
-	CL_CONFIG_WEIGHT_DURATION_BULK,
-	CL_CONFIG_WEIGHT_RATIO_VIDEO,
-	CL_CONFIG_WEIGHT_RATIO_REALTIME,
-	CL_CONFIG_WEIGHT_RATIO_BULK,
-	CL_CONFIG_WEIGHT_IAT_REALTIME,
-	CL_CONFIG_SCORE_THRESHOLD,
-	__CL_CONFIG_MAX
+    CL_CONFIG_WEIGHT_PKTLEN_REALTIME,
+    CL_CONFIG_WEIGHT_PKTLEN_VIDEO,
+    CL_CONFIG_WEIGHT_PKTLEN_NORMAL,
+    CL_CONFIG_WEIGHT_PKTLEN_BULK,
+    CL_CONFIG_WEIGHT_CONN_REALTIME,
+    CL_CONFIG_WEIGHT_CONN_VIDEO,
+    CL_CONFIG_WEIGHT_CONN_NORMAL,
+    CL_CONFIG_WEIGHT_CONN_BULK,
+    CL_CONFIG_WEIGHT_PPS_REALTIME,
+    CL_CONFIG_WEIGHT_PPS_VIDEO,
+    CL_CONFIG_WEIGHT_PPS_NORMAL,
+    CL_CONFIG_WEIGHT_PPS_BULK,
+    CL_CONFIG_WEIGHT_BURST_BULK,
+    CL_CONFIG_WEIGHT_TCPFLAGS_BULK,
+    CL_CONFIG_WEIGHT_RETRANS_BULK,
+    CL_CONFIG_WEIGHT_DURATION_REALTIME,
+    CL_CONFIG_WEIGHT_DURATION_VIDEO,
+    CL_CONFIG_WEIGHT_DURATION_BULK,
+    CL_CONFIG_WEIGHT_RATIO_VIDEO,
+    CL_CONFIG_WEIGHT_RATIO_REALTIME,
+    CL_CONFIG_WEIGHT_RATIO_BULK,
+    CL_CONFIG_WEIGHT_IAT_REALTIME,
+    CL_CONFIG_SCORE_THRESHOLD,
+    CL_CONFIG_PRIO_REALTIME,
+    CL_CONFIG_PRIO_VIDEO,
+    CL_CONFIG_PRIO_NORMAL,
+    CL_CONFIG_PRIO_BULK,
+    __CL_CONFIG_MAX
 };
 
 static const struct blobmsg_policy idclass_config_policy[__CL_CONFIG_MAX] = {
@@ -204,7 +200,6 @@ static const struct blobmsg_policy idclass_config_policy[__CL_CONFIG_MAX] = {
     [CL_CONFIG_INTERFACES] = { "interfaces", BLOBMSG_TYPE_TABLE },
     [CL_CONFIG_DEVICES] = { "devices", BLOBMSG_TYPE_TABLE },
     [CL_CONFIG_CLASSES] = { "classes", BLOBMSG_TYPE_TABLE },
-    /* 新增 */
     [CL_CONFIG_GAME_MAX_AVG_PKT_LEN] = { "game_max_avg_pktlen", BLOBMSG_TYPE_INT32 },
     [CL_CONFIG_GAME_MIN_CONN] = { "game_min_conn", BLOBMSG_TYPE_INT32 },
     [CL_CONFIG_GAME_MAX_CONN] = { "game_max_conn", BLOBMSG_TYPE_INT32 },
@@ -230,7 +225,6 @@ static const struct blobmsg_policy idclass_config_policy[__CL_CONFIG_MAX] = {
     [CL_CONFIG_BURST_BYTES] = { "burst_bytes", BLOBMSG_TYPE_INT32 },
     [CL_CONFIG_IAT_THRESHOLD_US] = { "iat_threshold_us", BLOBMSG_TYPE_INT32 },
     [CL_CONFIG_RETRANS_THRESHOLD] = { "retrans_threshold", BLOBMSG_TYPE_INT32 },
-    /* 特征开关 */
     [CL_CONFIG_ENABLE_PKTLEN] = { "enable_pktlen", BLOBMSG_TYPE_BOOL },
     [CL_CONFIG_ENABLE_CONN_COUNT] = { "enable_conn_count", BLOBMSG_TYPE_BOOL },
     [CL_CONFIG_ENABLE_PPS] = { "enable_pps", BLOBMSG_TYPE_BOOL },
@@ -240,36 +234,35 @@ static const struct blobmsg_policy idclass_config_policy[__CL_CONFIG_MAX] = {
     [CL_CONFIG_ENABLE_CONN_DURATION] = { "enable_conn_duration", BLOBMSG_TYPE_BOOL },
     [CL_CONFIG_ENABLE_UP_DOWN_RATIO] = { "enable_up_down_ratio", BLOBMSG_TYPE_BOOL },
     [CL_CONFIG_ENABLE_BURST] = { "enable_burst", BLOBMSG_TYPE_BOOL },
-	[CL_CONFIG_CLASS_REALTIME] = { "class_realtime", BLOBMSG_TYPE_INT32 },
-	[CL_CONFIG_CLASS_VIDEO]    = { "class_video",    BLOBMSG_TYPE_INT32 },
-	[CL_CONFIG_CLASS_NORMAL]   = { "class_normal",   BLOBMSG_TYPE_INT32 },
-	[CL_CONFIG_CLASS_BULK]     = { "class_bulk",     BLOBMSG_TYPE_INT32 },
-	[CL_CONFIG_WEIGHT_PKTLEN_REALTIME] = { "weight_pktlen_realtime", BLOBMSG_TYPE_INT32 },
-	[CL_CONFIG_WEIGHT_PKTLEN_VIDEO]    = { "weight_pktlen_video",    BLOBMSG_TYPE_INT32 },
-	[CL_CONFIG_WEIGHT_PKTLEN_NORMAL]   = { "weight_pktlen_normal",   BLOBMSG_TYPE_INT32 },
-	[CL_CONFIG_WEIGHT_PKTLEN_BULK]     = { "weight_pktlen_bulk",     BLOBMSG_TYPE_INT32 },
-	[CL_CONFIG_WEIGHT_CONN_REALTIME]   = { "weight_conn_realtime",   BLOBMSG_TYPE_INT32 },
-	[CL_CONFIG_WEIGHT_CONN_VIDEO]      = { "weight_conn_video",      BLOBMSG_TYPE_INT32 },
-	[CL_CONFIG_WEIGHT_CONN_NORMAL]     = { "weight_conn_normal",     BLOBMSG_TYPE_INT32 },
-	[CL_CONFIG_WEIGHT_CONN_BULK]       = { "weight_conn_bulk",       BLOBMSG_TYPE_INT32 },
-	[CL_CONFIG_WEIGHT_PPS_REALTIME]    = { "weight_pps_realtime",    BLOBMSG_TYPE_INT32 },
-	[CL_CONFIG_WEIGHT_PPS_VIDEO]       = { "weight_pps_video",       BLOBMSG_TYPE_INT32 },
-	[CL_CONFIG_WEIGHT_PPS_NORMAL]      = { "weight_pps_normal",      BLOBMSG_TYPE_INT32 },
-	[CL_CONFIG_WEIGHT_PPS_BULK]        = { "weight_pps_bulk",        BLOBMSG_TYPE_INT32 },
-	[CL_CONFIG_WEIGHT_BURST_BULK]      = { "weight_burst_bulk",      BLOBMSG_TYPE_INT32 },
-	[CL_CONFIG_WEIGHT_TCPFLAGS_BULK]   = { "weight_tcpflags_bulk",   BLOBMSG_TYPE_INT32 },
-	[CL_CONFIG_WEIGHT_RETRANS_BULK]    = { "weight_retrans_bulk",    BLOBMSG_TYPE_INT32 },
-	[CL_CONFIG_WEIGHT_DURATION_REALTIME] = { "weight_duration_realtime", BLOBMSG_TYPE_INT32 },
-	[CL_CONFIG_WEIGHT_DURATION_VIDEO]  = { "weight_duration_video",  BLOBMSG_TYPE_INT32 },
-	[CL_CONFIG_WEIGHT_DURATION_BULK]   = { "weight_duration_bulk",   BLOBMSG_TYPE_INT32 },
-	[CL_CONFIG_WEIGHT_RATIO_VIDEO]     = { "weight_ratio_video",     BLOBMSG_TYPE_INT32 },
-	[CL_CONFIG_WEIGHT_RATIO_REALTIME]  = { "weight_ratio_realtime",  BLOBMSG_TYPE_INT32 },
-	[CL_CONFIG_WEIGHT_RATIO_BULK]      = { "weight_ratio_bulk",      BLOBMSG_TYPE_INT32 },
-	[CL_CONFIG_WEIGHT_IAT_REALTIME]    = { "weight_iat_realtime",    BLOBMSG_TYPE_INT32 },
-	[CL_CONFIG_SCORE_THRESHOLD]        = { "score_threshold",        BLOBMSG_TYPE_INT32 },
-	};
-	
-/* 辅助函数：读取浮点数乘以100 */
+    [CL_CONFIG_WEIGHT_PKTLEN_REALTIME] = { "weight_pktlen_realtime", BLOBMSG_TYPE_INT32 },
+    [CL_CONFIG_WEIGHT_PKTLEN_VIDEO]    = { "weight_pktlen_video",    BLOBMSG_TYPE_INT32 },
+    [CL_CONFIG_WEIGHT_PKTLEN_NORMAL]   = { "weight_pktlen_normal",   BLOBMSG_TYPE_INT32 },
+    [CL_CONFIG_WEIGHT_PKTLEN_BULK]     = { "weight_pktlen_bulk",     BLOBMSG_TYPE_INT32 },
+    [CL_CONFIG_WEIGHT_CONN_REALTIME]   = { "weight_conn_realtime",   BLOBMSG_TYPE_INT32 },
+    [CL_CONFIG_WEIGHT_CONN_VIDEO]      = { "weight_conn_video",      BLOBMSG_TYPE_INT32 },
+    [CL_CONFIG_WEIGHT_CONN_NORMAL]     = { "weight_conn_normal",     BLOBMSG_TYPE_INT32 },
+    [CL_CONFIG_WEIGHT_CONN_BULK]       = { "weight_conn_bulk",       BLOBMSG_TYPE_INT32 },
+    [CL_CONFIG_WEIGHT_PPS_REALTIME]    = { "weight_pps_realtime",    BLOBMSG_TYPE_INT32 },
+    [CL_CONFIG_WEIGHT_PPS_VIDEO]       = { "weight_pps_video",       BLOBMSG_TYPE_INT32 },
+    [CL_CONFIG_WEIGHT_PPS_NORMAL]      = { "weight_pps_normal",      BLOBMSG_TYPE_INT32 },
+    [CL_CONFIG_WEIGHT_PPS_BULK]        = { "weight_pps_bulk",        BLOBMSG_TYPE_INT32 },
+    [CL_CONFIG_WEIGHT_BURST_BULK]      = { "weight_burst_bulk",      BLOBMSG_TYPE_INT32 },
+    [CL_CONFIG_WEIGHT_TCPFLAGS_BULK]   = { "weight_tcpflags_bulk",   BLOBMSG_TYPE_INT32 },
+    [CL_CONFIG_WEIGHT_RETRANS_BULK]    = { "weight_retrans_bulk",    BLOBMSG_TYPE_INT32 },
+    [CL_CONFIG_WEIGHT_DURATION_REALTIME] = { "weight_duration_realtime", BLOBMSG_TYPE_INT32 },
+    [CL_CONFIG_WEIGHT_DURATION_VIDEO]  = { "weight_duration_video",  BLOBMSG_TYPE_INT32 },
+    [CL_CONFIG_WEIGHT_DURATION_BULK]   = { "weight_duration_bulk",   BLOBMSG_TYPE_INT32 },
+    [CL_CONFIG_WEIGHT_RATIO_VIDEO]     = { "weight_ratio_video",     BLOBMSG_TYPE_INT32 },
+    [CL_CONFIG_WEIGHT_RATIO_REALTIME]  = { "weight_ratio_realtime",  BLOBMSG_TYPE_INT32 },
+    [CL_CONFIG_WEIGHT_RATIO_BULK]      = { "weight_ratio_bulk",      BLOBMSG_TYPE_INT32 },
+    [CL_CONFIG_WEIGHT_IAT_REALTIME]    = { "weight_iat_realtime",    BLOBMSG_TYPE_INT32 },
+    [CL_CONFIG_SCORE_THRESHOLD]        = { "score_threshold",        BLOBMSG_TYPE_INT32 },
+    [CL_CONFIG_PRIO_REALTIME]          = { "prio_realtime",          BLOBMSG_TYPE_INT32 },
+    [CL_CONFIG_PRIO_VIDEO]             = { "prio_video",             BLOBMSG_TYPE_INT32 },
+    [CL_CONFIG_PRIO_NORMAL]            = { "prio_normal",            BLOBMSG_TYPE_INT32 },
+    [CL_CONFIG_PRIO_BULK]              = { "prio_bulk",              BLOBMSG_TYPE_INT32 },
+};
+
 static int read_float_mult100(const char *val)
 {
     double d = atof(val);
@@ -317,7 +310,6 @@ idclass_ubus_config(struct ubus_context *ctx, struct ubus_object *obj,
     if (dscp != 0xff)
         idclass_map_set_dscp_default(CL_MAP_TCP_PORTS, dscp);
 
-    /* 更新 global_config map */
     int fd = idclass_map_get_fd(CL_MAP_GLOBAL_CONFIG);
     if (fd >= 0) {
         uint32_t key = 0;

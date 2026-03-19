@@ -16,7 +16,7 @@
 #include <libubox/ulog.h>
 #include <netinet/in.h>
 
-#include "idclass-bpf.h"  /* 包含扩展后的结构 */
+#include "idclass-bpf.h"
 
 #define CLASSIFY_PROG_PATH	"/lib/bpf/idclass-bpf.o"
 #define CLASSIFY_PIN_PATH	"/sys/fs/bpf/idclass"
@@ -34,16 +34,17 @@ enum idclass_map_id {
 	CL_MAP_CLASS,
 	CL_MAP_GLOBAL_CONFIG,
 	CL_MAP_DNS,
+	CL_MAP_PRIO_CLASS_UP,
+	CL_MAP_PRIO_CLASS_DOWN,
+	CL_MAP_CLASS_MARK,
 	__CL_MAP_MAX,
 };
 
-/* 原有的 idclass_ip_map_val 保持不变 */
 struct idclass_ip_map_val {
 	uint8_t dscp;
 	uint8_t seen;
 };
 
-/* 其余现有结构保持不变 */
 struct idclass_map_data {
 	enum idclass_map_id id;
 	bool file : 1;
@@ -74,14 +75,12 @@ struct idclass_map_file {
 	char filename[];
 };
 
-/* 全局变量声明 */
 extern int idclass_map_timeout;
 extern int idclass_active_timeout;
 extern struct idclass_global_config global_config;
 extern struct idclass_flow_config global_flow_config;
 extern struct uloop_timeout idclass_map_timer;
 
-/* 函数声明 */
 int idclass_run_cmd(char *cmd, bool ignore_error);
 int idclass_loader_init(void);
 const char *idclass_get_program(uint32_t flags, int *fd);
@@ -117,10 +116,9 @@ int idclass_ubus_init(void);
 void idclass_ubus_stop(void);
 int idclass_ubus_check_interface(const char *name, char *ifname, int ifname_len);
 void idclass_ubus_update_bridger(bool shutdown);
-/* 获取 map 文件描述符 */
 int idclass_map_get_fd(enum idclass_map_id id);
+void idclass_set_config_name(const char *name);
 
-/* 辅助函数声明（在 map.c 中定义） */
 char *str_skip(char *str, bool space);
 int idclass_map_codepoint(const char *val);
 extern const struct {
