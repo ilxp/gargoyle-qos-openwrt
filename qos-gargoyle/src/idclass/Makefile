@@ -8,20 +8,30 @@ BINDIR ?= /usr/sbin
 INITDIR ?= /etc/init.d
 
 TARGET = idclass
-BPF_OBJ = idclass_kern.o
+BPF_OBJ = idclass-bpf.o
 SKEL = idclass.skel.h
 
 USER_SRCS = main.c loader.c map.c interface.c dns.c ubus.c
 USER_OBJS = $(USER_SRCS:.c=.o)
 
+# 内核头文件路径（从构建环境获取）
+LINUX_UAPI_DIR = $(BUILD_DIR)/include/uapi
+ifeq ($(wildcard $(LINUX_UAPI_DIR)),)
+    LINUX_UAPI_DIR = $(LINUX_DIR)/include/uapi
+endif
+BPF_CFLAGS = -I$(STAGING_DIR)/usr/include -I$(LINUX_UAPI_DIR)
+
 all: $(TARGET)
 
-$(BPF_OBJ): idclass-bpf.c idclass.h
-	clang -target bpf -g -O2 -c $< -o $@
+# 编译 BPF 程序
+$(BPF_OBJ): idclass-bpf.c idclass.h idclass-bpf.h
+	clang -target bpf -g -O2 $(BPF_CFLAGS) -c $< -o $@
 
+# 生成 BPF 骨架头文件
 $(SKEL): $(BPF_OBJ)
 	bpftool gen skeleton $(BPF_OBJ) > $(SKEL)
 
+# 编译用户态程序
 $(TARGET): $(USER_OBJS) $(SKEL)
 	$(CC) $(CFLAGS) -o $@ $(USER_OBJS) $(LDFLAGS)
 
