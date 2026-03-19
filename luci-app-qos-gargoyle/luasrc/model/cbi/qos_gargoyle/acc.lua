@@ -1,6 +1,5 @@
--- Copyright 2017 Xingwang Liao <kuoruan@gmail.com>
+-- Copyright 2026 ilxp <lixp@live.com>
 -- Licensed to the public under the Apache License 2.0.
--- Modified 2026 by ilxp <https://github.com/ilxp/gargoyle-qos-openwrt>
 
 local uci  = require "luci.model.uci".cursor()
 local dsp  = require "luci.dispatcher"

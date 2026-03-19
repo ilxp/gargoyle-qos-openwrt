@@ -569,6 +569,10 @@ msgstr "出"
 msgid "Overhead (bytes)"
 msgstr "开销（字节）"
 
+msgid "Optimized Algorithm Description"
+msgstr "优化参数描述"
+
+
 msgid "Packet Feature Code Match"
 msgstr "数据包特征码匹配"
 
@@ -649,6 +653,16 @@ msgstr "量子（字节）"
 
 msgid "Queue Length Limit"
 msgstr "队列长度限制"
+
+msgid "qosacc startup arguments"
+msgstr "qosacc启动参数"
+
+msgid "Ping Interval"
+msgstr "Ping间隔"
+
+msgid "Ping Target"
+msgstr "Ping目标"
+
 
 msgid "R2Q"
 msgstr "R2Q"

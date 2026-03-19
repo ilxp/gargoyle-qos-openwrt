@@ -1639,6 +1639,21 @@ initialize_hfsc_cake_qos() {
         return 1
     fi
     
+	# 幂等性检查
+    if ! check_already_running; then
+        qos_log "ERROR" "HFSC+CAKE QoS 已经在运行中"
+        release_lock
+        return 1
+    fi
+	
+	# 初始化规则集（从 /etc/qos_gargoyle/rulesets/ 加载）
+	if ! init_ruleset; then
+		qos_log "ERROR" "初始化规则集失败，QoS 无法启动"
+		release_lock
+		rm -f "$QOS_RUNNING_FILE"
+		return 1
+	fi
+	
     # 检查必需命令
     if ! check_required_commands; then
         qos_log "ERROR" "缺少必需的命令，请安装对应软件包"
@@ -1654,14 +1669,7 @@ initialize_hfsc_cake_qos() {
         rm -f "$QOS_RUNNING_FILE"
         return 1
     fi
-    
-    # 幂等性检查
-    if ! check_already_running; then
-        qos_log "ERROR" "HFSC+CAKE QoS 已经在运行中"
-        release_lock
-        return 1
-    fi
-    
+     
     # 确保 nftables 表存在
     nft add table inet gargoyle-qos-priority 2>/dev/null || true
     
@@ -1816,6 +1824,9 @@ stop_hfsc_cake_qos() {
     
     qos_log "INFO" "HFSC+CAKE QoS停止完成 (清理前: ${tc_count_before}队列/${nft_count_before}规则, 清理后: ${tc_count_after}队列/${nft_count_after}规则)"
     
+    # 清理规则集
+    cleanup_ruleset
+
     if $got_lock; then
         release_lock
     fi

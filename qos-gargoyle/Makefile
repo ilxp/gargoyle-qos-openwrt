@@ -18,7 +18,7 @@ define Package/qos-gargoyle
 	SECTION:=net
 	CATEGORY:=Network
 	TITLE:=A set of QoS scripts designed for use with Gargoyle Web Interface
-	DEPENDS:=+nftables +tc-full +ip +ethtool +coreutils-cksum +kmod-ifb \
+	DEPENDS:=+nftables +tc-full +ip +ethtool +kmod-ifb \
          +kmod-sched +kmod-sched-connmark +kmod-sched-ctinfo +kmod-sched-flower \
          +kmod-nf-conntrack +kmod-nf-conntrack6 +kmod-nf-nat +kmod-nf-nathelper +kmod-nf-nathelper-extra
 	MAINTAINER:=Eric Bishop <eric@gargoyle-router.com>
@@ -30,7 +30,8 @@ endef
 
 define Build/Prepare
 	mkdir -p $(PKG_BUILD_DIR)
-	$(CP) ./src/qosacc/* $(PKG_BUILD_DIR)/
+	#$(CP) ./src/qosacc/* $(PKG_BUILD_DIR)/
+	$(CP) ./src/idclass/* $(PKG_BUILD_DIR)/
 endef
 
 
@@ -73,7 +74,8 @@ define Package/qos-gargoyle/install
 	$(INSTALL_CONF) $(CURDIR)/files/etc/dscpclassify.d/*.nft $(1)/etc/dscpclassify.d/
 
 	$(INSTALL_DIR) $(1)/usr/sbin
-	$(INSTALL_BIN) $(PKG_BUILD_DIR)/qosacc $(1)/usr/sbin/qosacc
+	#$(INSTALL_BIN) $(PKG_BUILD_DIR)/qosacc $(1)/usr/sbin/qosacc
+	$(INSTALL_BIN) $(PKG_BUILD_DIR)/idclass $(1)/usr/sbin/idclass
 	
 endef
 

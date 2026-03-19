@@ -1,113 +1,10 @@
 #!/bin/sh
 # 规则辅助模块 (rule.sh)
 # 支持多样化端口、协议、IPv6双栈、连接字节数过滤和连接状态过滤
-# version=1.9.7 - 恢复 allocate_class_marks，采用唯一索引分配，确保算法脚本兼容
+# version=1.8.4 - 修复哈希算法，移除自实现；移除缓存；参数简化
 
-# ========== 全局配置常量 ==========
 CONFIG_FILE="qos_gargoyle"
 TEMP_FILES=""
-RULESET_DIR="/etc/qos_gargoyle/rulesets"          # 规则集存储目录
-RULESET_TEMP_DIR=""                                # 当前使用的临时UCI目录
-RULESET_ORIG_UCI_CONFIG_DIR="$UCI_CONFIG_DIR"      # 保存原始UCI_CONFIG_DIR
-CLASS_MARKS_FILE=""                                 # 类别标记映射文件（由 allocate_class_marks 生成）
-
-# ========== 规则集动态加载函数 ==========
-# 初始化规则集：根据 global.ruleset 创建临时UCI配置
-init_ruleset() {
-    # 如果已经初始化过，则直接返回
-    [ -n "$RULESET_TEMP_DIR" ] && return 0
-
-    local ruleset ruleset_file
-
-    # 读取全局配置中的 ruleset 选项（使用默认UCI环境）
-    ruleset=$(uci -q get ${CONFIG_FILE}.global.ruleset 2>/dev/null)
-    # 若未设置，则默认使用 "default.conf"
-    [ -z "$ruleset" ] && ruleset="default.conf"
-
-    # 处理规则集文件名：若没有 .conf 后缀，则自动添加
-    case "$ruleset" in
-        *.conf) ;;
-        *) ruleset="${ruleset}.conf" ;;
-    esac
-
-    ruleset_file="$RULESET_DIR/$ruleset"
-    if [ ! -f "$ruleset_file" ]; then
-        log "ERROR" "规则集文件 $ruleset_file 不存在，无法加载任何规则！"
-        return 1
-    fi
-
-    # 创建临时UCI目录（使用当前PID避免冲突）
-    RULESET_TEMP_DIR="/tmp/qos_gargoyle_uci.$$"
-    mkdir -p "$RULESET_TEMP_DIR" || {
-        log "ERROR" "无法创建临时UCI目录 $RULESET_TEMP_DIR"
-        return 1
-    }
-
-    # 保存原始UCI_CONFIG_DIR
-    RULESET_ORIG_UCI_CONFIG_DIR="$UCI_CONFIG_DIR"
-
-    # 复制主配置文件到临时目录
-    cp "/etc/config/${CONFIG_FILE}" "$RULESET_TEMP_DIR/" || {
-        log "ERROR" "无法复制主配置文件"
-        rm -rf "$RULESET_TEMP_DIR"
-        RULESET_TEMP_DIR=""
-        return 1
-    }
-
-    # 设置UCI_CONFIG_DIR指向临时目录
-    export UCI_CONFIG_DIR="$RULESET_TEMP_DIR"
-
-    # 删除临时配置中所有可能冲突的节（分类和规则），避免重复
-    # 删除所有 upload_class（匿名节）
-    for s in $(uci show ${CONFIG_FILE} | grep -E "^${CONFIG_FILE}\\.@upload_class\\[[0-9]+\\]=" | cut -d. -f2 | cut -d= -f1); do
-        uci delete ${CONFIG_FILE}.$s 2>/dev/null
-    done
-    # 删除所有 download_class（匿名节）
-    for s in $(uci show ${CONFIG_FILE} | grep -E "^${CONFIG_FILE}\\.@download_class\\[[0-9]+\\]=" | cut -d. -f2 | cut -d= -f1); do
-        uci delete ${CONFIG_FILE}.$s 2>/dev/null
-    done
-    # 删除所有 upload_rule（匿名节）
-    for s in $(uci show ${CONFIG_FILE} | grep -E "^${CONFIG_FILE}\\.@upload_rule\\[[0-9]+\\]=" | cut -d. -f2 | cut -d= -f1); do
-        uci delete ${CONFIG_FILE}.$s 2>/dev/null
-    done
-    # 删除所有 download_rule（匿名节）
-    for s in $(uci show ${CONFIG_FILE} | grep -E "^${CONFIG_FILE}\\.@download_rule\\[[0-9]+\\]=" | cut -d. -f2 | cut -d= -f1); do
-        uci delete ${CONFIG_FILE}.$s 2>/dev/null
-    done
-    # 同时删除可能存在的命名节（非匿名），匹配模式为 config_name.section_name=type
-    local all_sections=$(uci show ${CONFIG_FILE} | grep -E "^${CONFIG_FILE}\\.(upload_class|download_class|upload_rule|download_rule)=" | cut -d. -f2 | cut -d= -f1 | sort -u)
-    for s in $all_sections; do
-        uci delete ${CONFIG_FILE}.$s 2>/dev/null
-    done
-
-    uci commit ${CONFIG_FILE}
-
-    # 导入规则集文件
-    if ! uci import ${CONFIG_FILE} < "$ruleset_file" 2>/dev/null; then
-        log "ERROR" "规则集文件 $ruleset_file 格式错误，回退使用空配置（可能无规则可用）"
-        unset UCI_CONFIG_DIR
-        rm -rf "$RULESET_TEMP_DIR"
-        RULESET_TEMP_DIR=""
-        [ -n "$RULESET_ORIG_UCI_CONFIG_DIR" ] && export UCI_CONFIG_DIR="$RULESET_ORIG_UCI_CONFIG_DIR"
-        return 1
-    fi
-    uci commit ${CONFIG_FILE}
-
-    log "INFO" "已加载规则集: $ruleset (临时UCI目录: $RULESET_TEMP_DIR)"
-    return 0
-}
-
-# 清理规则集临时目录并恢复环境变量
-cleanup_ruleset() {
-    if [ -n "$RULESET_TEMP_DIR" ] && [ -d "$RULESET_TEMP_DIR" ]; then
-        rm -rf "$RULESET_TEMP_DIR"
-        RULESET_TEMP_DIR=""
-    fi
-    unset UCI_CONFIG_DIR
-    if [ -n "$RULESET_ORIG_UCI_CONFIG_DIR" ]; then
-        export UCI_CONFIG_DIR="$RULESET_ORIG_UCI_CONFIG_DIR"
-    fi
-}
 
 # ========== 检测算法，若为CAKE或CAKE_DSCP则直接退出 ==========
 ALGORITHM=$(uci -q get ${CONFIG_FILE}.global.algorithm 2>/dev/null || echo "htb_cake")
@@ -195,7 +92,6 @@ validate_port() {
     if echo "$clean_value" | grep -q ','; then
         IFS=,
         for port in $clean_value; do
-            # 跳过空项（如 "80,443," 中的末尾空项）
             [ -z "$port" ] && continue
             if echo "$port" | grep -q '-'; then
                 if ! echo "$port" | grep -qE '^[0-9]+-[0-9]+$'; then
@@ -409,11 +305,6 @@ load_all_config_options() {
     if [ -n "$val" ]; then
         val=$(echo "$val" | sed "s/^'//; s/'$//; s/^\"//; s/\"$//")
         val=$(sanitize_input "$val")
-        # 验证 family 值，仅接受 ipv4/ipv6/空
-        case "$val" in
-            ipv4|ipv6|"") ;;
-            *) log "WARN" "无效的 family 值 '$val'，将视为空（无限制）"; val="" ;;
-        esac
         val=$(escape_for_eval "$val")
         eval "${prefix}family=\"$val\""
     fi
@@ -432,65 +323,59 @@ load_all_config_options() {
     fi
 }
 
-# ========== 类别标记计算函数（新版：唯一索引分配）==========
-# 分配唯一标记并写入 CLASS_MARKS_FILE（供算法脚本使用）
-# 参数：方向（upload/download），类别列表（空格分隔）
-# 返回：0成功，1失败
-allocate_class_marks() {
-    local direction="$1"
-    local class_list="$2"
-    local base_value idx class mark_value
+# ========== 类别标记计算函数 ==========
+# 计算类名的哈希索引（优先使用 cksum，其次 sha1sum/sha1）
+calculate_hash_index() {
+    local class="$1"
+    local hash_val
 
-    if [ "$direction" = "upload" ]; then
-        base_value=$((0x1))
-    elif [ "$direction" = "download" ]; then
-        base_value=$((0x10000))
+    if command -v cksum >/dev/null 2>&1; then
+        hash_val=$(printf "%s" "$class" | cksum | cut -d' ' -f1)
+        echo "$hash_val"
+    elif command -v sha1sum >/dev/null 2>&1; then
+        hash_val=$(printf "%s" "$class" | sha1sum | cut -c1-8)
+        # 转换为无符号32位整数
+        printf "%u" "0x$hash_val" 2>/dev/null || echo "$((0x$hash_val & 0x7FFFFFFF))"
+    elif command -v sha1 >/dev/null 2>&1; then
+        hash_val=$(printf "%s" "$class" | sha1 | cut -c1-8)
+        printf "%u" "0x$hash_val" 2>/dev/null || echo "$((0x$hash_val & 0x7FFFFFFF))"
     else
-        log "ERROR" "未知方向: $direction"
+        log "ERROR" "没有可用的哈希工具 (cksum, sha1sum, sha1)，无法计算类标记"
         return 1
     fi
-
-    # 创建临时标记文件
-    CLASS_MARKS_FILE=$(mktemp /tmp/qos_class_marks_XXXXXX) || {
-        log "ERROR" "无法创建类标记临时文件"
-        return 1
-    }
-    TEMP_FILES="$TEMP_FILES $CLASS_MARKS_FILE"
-
-    # 将类别列表排序，按顺序分配索引
-    idx=1
-    for class in $(echo "$class_list" | tr ' ' '\n' | sort); do
-        # 计算标记值
-        mark_value=$((base_value << (idx - 1)))
-        mark_value=$((mark_value & 0xFFFFFFFF))
-        echo "$direction:$class:$mark_value" >> "$CLASS_MARKS_FILE"
-        log "INFO" "类别 $class 分配标记索引 $idx (标记: 0x$(printf '%X' $mark_value))"
-        idx=$((idx + 1))
-    done
-
-    return 0
 }
 
-# 根据类别名称和方向从 CLASS_MARKS_FILE 中获取标记值
-get_class_mark_by_class() {
-    local direction="$1"
-    local class="$2"
-    local mark_line
-
-    [ -z "$CLASS_MARKS_FILE" ] && { log "ERROR" "类标记文件未定义"; return 1; }
-    mark_line=$(grep "^$direction:$class:" "$CLASS_MARKS_FILE" 2>/dev/null | head -1)
-    if [ -n "$mark_line" ]; then
-        echo "${mark_line##*:}"
+# 获取类别的标记值（直接计算，无缓存）
+get_class_mark_for_rule() {
+    local class="$1"
+    local direction="$2"
+    local calculated_mark
+    calculated_mark=$(calculate_class_mark "$class" "$direction") || return 1
+    if [ -n "$calculated_mark" ] && echo "$calculated_mark" | grep -qE '^0x[0-9A-Fa-f]+$'; then
+        echo "$calculated_mark"
         return 0
     else
-        log "ERROR" "类别 $class 的标记值未找到"
+        log "ERROR" "无法为类别 $class 生成有效标记"
         return 1
     fi
 }
 
-# 保留旧函数别名，防止外部调用
-get_class_mark_for_rule() {
-    get_class_mark_by_class "$@"
+# 计算类别的标记值（哈希取模 16 后左移）
+calculate_class_mark() {
+    local class="$1"
+    local chain_type="$2"
+    local index
+    index=$(calculate_hash_index "$class") || return 1
+    index=$(( (index % 16) + 1 ))
+
+    local base_value=0
+    [ "$chain_type" = "upload" ] && base_value=$((0x1))
+    [ "$chain_type" = "download" ] && base_value=$((0x10000))
+    [ $base_value -eq 0 ] && { log "ERROR" "未知链类型: $chain_type"; return 1; }
+
+    local mark_value=$((base_value << (index - 1)))
+    mark_value=$((mark_value & 0xFFFFFFFF))
+    printf "0x%X" "$mark_value"
 }
 
 # ========== 快速排序（实时获取类优先级，并立即清理临时文件）==========
@@ -526,12 +411,12 @@ EOF
     echo "$result"
 }
 
-# ========== 快速构建nft规则（修正版） ==========
+# ========== 快速构建nft规则 ==========
 build_nft_rule_fast() {
     local rule_name="$1"
     local chain="$2"
     local class_mark="$3"
-    local mask="$4"          # 保留未用，但保持接口一致
+    local mask="$4"
     local family="$5"
     local proto="$6"
     local srcport="$7"
@@ -539,20 +424,8 @@ build_nft_rule_fast() {
     local connbytes_kb="$9"
     local state="${10}"
     
-    # 固定表名为 inet，根据 family 添加 nfproto 条件
-    local nft_cmd="add rule inet gargoyle-qos-priority $chain"
+    local nft_cmd="add rule $family gargoyle-qos-priority $chain"
     
-    case "$family" in
-        ipv4|4)
-            nft_cmd="$nft_cmd meta nfproto ipv4"
-            ;;
-        ipv6|6)
-            nft_cmd="$nft_cmd meta nfproto ipv6"
-            ;;
-        *) ;;  # 不加限制
-    esac
-    
-    # 协议条件
     if [ "$proto" = "tcp" ]; then
         nft_cmd="$nft_cmd meta l4proto tcp"
     elif [ "$proto" = "udp" ]; then
@@ -563,7 +436,6 @@ build_nft_rule_fast() {
         nft_cmd="$nft_cmd meta l4proto $proto"
     fi
     
-    # 端口条件（上传用 dstport，下载用 srcport）
     case "$chain" in
         *"ingress"*)
             if [ -n "$srcport" ]; then
@@ -579,7 +451,6 @@ build_nft_rule_fast() {
             ;;
     esac
     
-    # 连接状态
     if [ -n "$state" ]; then
         local state_value=$(echo "$state" | tr -d '{}')
         if echo "$state_value" | grep -q ','; then
@@ -589,7 +460,6 @@ build_nft_rule_fast() {
         fi
     fi
     
-    # 连接字节数
     if [ -n "$connbytes_kb" ] && [ "$connbytes_kb" != "0" ]; then
         local connbytes_kb_clean=$(echo "$connbytes_kb" | tr -d ' ')
         
@@ -618,7 +488,7 @@ build_nft_rule_fast() {
     echo "$nft_cmd"
 }
 
-# ========== 增强规则应用函数（核心，从 CLASS_MARKS_FILE 读取标记）==========
+# ========== 增强规则应用函数 ==========
 apply_enhanced_direction_rules() {
     local rule_type="$1"
     local chain="$2"
@@ -651,26 +521,14 @@ apply_enhanced_direction_rules() {
     done
     
     local class_list=$(cut -d: -f2 "$temp_config" | sort -u)
-    
-    # 预检查所有引用的类别是否真实存在
+    local class_count=0
     for class in $class_list; do
-        if ! uci -q show "${CONFIG_FILE}.${class}" | grep -q "^${CONFIG_FILE}\\.${class}="; then
-            log "ERROR" "规则引用的类别 '$class' 在配置中不存在，启动中止！"
-            rm -f "$temp_config" 2>/dev/null
-            return 1
-        fi
+        [ -n "$class" ] || continue
+        class_count=$((class_count + 1))
     done
     
-    local class_count=$(echo "$class_list" | wc -w)
     if [ $class_count -gt 16 ]; then
         log "ERROR" "方向 $direction 的启用类数量为 $class_count，超过16个，将导致标记冲突，启动中止！"
-        rm -f "$temp_config" 2>/dev/null
-        return 1
-    fi
-    
-    # 检查 CLASS_MARKS_FILE 是否存在（应由 allocate_class_marks 提前生成）
-    if [ ! -f "$CLASS_MARKS_FILE" ]; then
-        log "ERROR" "类标记文件 $CLASS_MARKS_FILE 不存在，请先调用 allocate_class_marks"
         rm -f "$temp_config" 2>/dev/null
         return 1
     fi
@@ -699,15 +557,13 @@ $rule_line
 EOF
         [ "$r_enabled" = "1" ] || continue
         
-        # 从 CLASS_MARKS_FILE 中读取该类的标记值
-        local class_mark=$(get_class_mark_by_class "$direction" "$r_class" | tr -d '[:space:]')
+        local class_mark=$(get_class_mark_for_rule "$r_class" "$direction" | tr -d '[:space:]')
         if [ -z "$class_mark" ]; then
             log "ERROR" "规则 $rule_name 的类 $r_class 无法获取标记，跳过"
             continue
         fi
         
-        # 如果 family 为空，默认无限制
-        [ -z "$r_family" ] && r_family=""
+        [ -z "$r_family" ] && r_family="inet"
         
         build_nft_rule_fast "$rule_name" "$chain" "$class_mark" "$mask" "$r_family" "$r_proto" "$r_srcport" "$r_dstport" "$r_connbytes" "$r_state" >> "$nft_batch_file"
         rule_count=$((rule_count + 1))
@@ -750,10 +606,176 @@ apply_all_rules() {
     apply_enhanced_direction_rules "$rule_type" "$chain" "$mask"
 }
 
-# ========== 以下为旧接口保留（标记为弃用）==========
-calculate_class_mark() {
-    log "WARN" "calculate_class_mark 已弃用，请使用 get_class_mark_by_class"
-    return 1
+process_single_rule() {
+    local rule_id="$1"
+    local chain="$2"
+    local mask="$3"
+    local chain_type="$4"
+    
+    local class=$(uci -q get "$CONFIG_FILE.$rule_id.class")
+    local proto=$(uci -q get "$CONFIG_FILE.$rule_id.proto")
+    local srcport=$(uci -q get "$CONFIG_FILE.$rule_id.srcport")
+    local dstport=$(uci -q get "$CONFIG_FILE.$rule_id.dstport")
+    
+    log "DEBUG" "规则 $rule_id: class=$class, proto=$proto\n  srcport='$srcport', dstport='$dstport'"
+    
+    [ -z "$class" ] && { log "ERROR" "规则 $rule_id 缺少 class 参数"; return 1; }
+    
+    local mark=$(calculate_class_mark "$class" "$chain_type")
+    [ -z "$mark" ] && { log "ERROR" "无法计算类别 $class 的标记值"; return 1; }
+    
+    log "INFO" "类别 $class 的标记: $mark"
+    
+    if [ "$proto" = "all" ] || [ -z "$proto" ]; then
+        apply_all_protocol_rule "$chain" "$mark" "$srcport" "$dstport"
+        return $?
+    fi
+    
+    local nft_cmd="add rule inet gargoyle-qos-priority $chain"
+    
+    if [ "$proto" = "tcp" ] || [ "$proto" = "udp" ]; then
+        nft_cmd="$nft_cmd meta l4proto $proto"
+    elif [ -n "$proto" ]; then
+        nft_cmd="$nft_cmd meta l4proto $proto"
+    else
+        nft_cmd="$nft_cmd meta mark set $mark counter"
+    fi
+    
+    case "$chain" in
+        *"ingress"*)
+            if [ -n "$srcport" ]; then
+                local ports=$(echo "$srcport" | tr -d ' ')
+                nft_cmd="$nft_cmd th sport { $ports }"
+            fi
+            ;;
+        *"egress"*)
+            if [ -n "$dstport" ]; then
+                local ports=$(echo "$dstport" | tr -d ' ')
+                nft_cmd="$nft_cmd th dport { $ports }"
+            fi
+            ;;
+    esac
+    
+    nft_cmd="$nft_cmd meta mark set $mark counter"
+    
+    if ! nft -c "$nft_cmd" 2>&1; then
+        log "ERROR" "NFT 规则语法错误"
+        return 1
+    fi
+    
+    if nft $nft_cmd 2>&1; then
+        log "INFO" "✅ NFT 规则添加成功\n  NFT命令: nft $nft_cmd"
+        return 0
+    else
+        log "ERROR" "❌ NFT 规则添加失败\n  NFT命令: nft $nft_cmd"
+        return 1
+    fi
+}
+
+apply_all_protocol_rule() {
+    local chain="$1"
+    local mark="$2"
+    local srcport="$3"
+    local dstport="$4"
+    
+    local success=0
+    local tcp_cmd udp_cmd
+    
+    case "$chain" in
+        *"ingress"*)
+            if [ -n "$srcport" ]; then
+                local ports=$(echo "$srcport" | tr -d ' ')
+                if [ -n "$ports" ]; then
+                    tcp_cmd="add rule inet gargoyle-qos-priority $chain meta l4proto tcp th sport { $ports } meta mark set $mark counter"
+                    if nft -c "$tcp_cmd" 2>&1; then
+                        nft $tcp_cmd 2>&1 && log "INFO" "✅ TCP 规则添加成功\n  NFT命令: nft $tcp_cmd" || { log "ERROR" "❌ TCP 规则添加失败"; success=1; }
+                    else
+                        log "ERROR" "❌ TCP 规则语法错误"
+                        success=1
+                    fi
+                fi
+            else
+                tcp_cmd="add rule inet gargoyle-qos-priority $chain meta l4proto tcp meta mark set $mark counter"
+                if nft -c "$tcp_cmd" 2>&1; then
+                    nft $tcp_cmd 2>&1 && log "INFO" "✅ TCP 规则添加成功\n  NFT命令: nft $tcp_cmd" || { log "ERROR" "❌ TCP 规则添加失败"; success=1; }
+                else
+                    log "ERROR" "❌ TCP 规则语法错误"
+                    success=1
+                fi
+            fi
+            ;;
+        *"egress"*)
+            if [ -n "$dstport" ]; then
+                local ports=$(echo "$dstport" | tr -d ' ')
+                if [ -n "$ports" ]; then
+                    tcp_cmd="add rule inet gargoyle-qos-priority $chain meta l4proto tcp th dport { $ports } meta mark set $mark counter"
+                    if nft -c "$tcp_cmd" 2>&1; then
+                        nft $tcp_cmd 2>&1 && log "INFO" "✅ TCP 规则添加成功\n  NFT命令: nft $tcp_cmd" || { log "ERROR" "❌ TCP 规则添加失败"; success=1; }
+                    else
+                        log "ERROR" "❌ TCP 规则语法错误"
+                        success=1
+                    fi
+                fi
+            else
+                tcp_cmd="add rule inet gargoyle-qos-priority $chain meta l4proto tcp meta mark set $mark counter"
+                if nft -c "$tcp_cmd" 2>&1; then
+                    nft $tcp_cmd 2>&1 && log "INFO" "✅ TCP 规则添加成功\n  NFT命令: nft $tcp_cmd" || { log "ERROR" "❌ TCP 规则添加失败"; success=1; }
+                else
+                    log "ERROR" "❌ TCP 规则语法错误"
+                    success=1
+                fi
+            fi
+            ;;
+    esac
+    
+    case "$chain" in
+        *"ingress"*)
+            if [ -n "$srcport" ]; then
+                local ports=$(echo "$srcport" | tr -d ' ')
+                if [ -n "$ports" ]; then
+                    udp_cmd="add rule inet gargoyle-qos-priority $chain meta l4proto udp th sport { $ports } meta mark set $mark counter"
+                    if nft -c "$udp_cmd" 2>&1; then
+                        nft $udp_cmd 2>&1 && log "INFO" "✅ UDP 规则添加成功\n  NFT命令: nft $udp_cmd" || { log "ERROR" "❌ UDP 规则添加失败"; success=1; }
+                    else
+                        log "ERROR" "❌ UDP 规则语法错误"
+                        success=1
+                    fi
+                fi
+            else
+                udp_cmd="add rule inet gargoyle-qos-priority $chain meta l4proto udp meta mark set $mark counter"
+                if nft -c "$udp_cmd" 2>&1; then
+                    nft $udp_cmd 2>&1 && log "INFO" "✅ UDP 规则添加成功\n  NFT命令: nft $udp_cmd" || { log "ERROR" "❌ UDP 规则添加失败"; success=1; }
+                else
+                    log "ERROR" "❌ UDP 规则语法错误"
+                    success=1
+                fi
+            fi
+            ;;
+        *"egress"*)
+            if [ -n "$dstport" ]; then
+                local ports=$(echo "$dstport" | tr -d ' ')
+                if [ -n "$ports" ]; then
+                    udp_cmd="add rule inet gargoyle-qos-priority $chain meta l4proto udp th dport { $ports } meta mark set $mark counter"
+                    if nft -c "$udp_cmd" 2>&1; then
+                        nft $udp_cmd 2>&1 && log "INFO" "✅ UDP 规则添加成功\n  NFT命令: nft $udp_cmd" || { log "ERROR" "❌ UDP 规则添加失败"; success=1; }
+                    else
+                        log "ERROR" "❌ UDP 规则语法错误"
+                        success=1
+                    fi
+                fi
+            else
+                udp_cmd="add rule inet gargoyle-qos-priority $chain meta l4proto udp meta mark set $mark counter"
+                if nft -c "$udp_cmd" 2>&1; then
+                    nft $udp_cmd 2>&1 && log "INFO" "✅ UDP 规则添加成功\n  NFT命令: nft $udp_cmd" || { log "ERROR" "❌ UDP 规则添加失败"; success=1; }
+                else
+                    log "ERROR" "❌ UDP 规则语法错误"
+                    success=1
+                fi
+            fi
+            ;;
+    esac
+    
+    return $success
 }
 
 # ========== 双栈过滤器函数 ==========

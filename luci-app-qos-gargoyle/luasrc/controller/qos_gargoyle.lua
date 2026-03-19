@@ -42,11 +42,14 @@ function index()
     entry({"admin", "qos", "qos_gargoyle", "download", "rule"},
         cbi("qos_gargoyle/download_rule")).leaf = true
 
-    entry({"admin", "qos", "qos_gargoyle", "acc"},
-        cbi("qos_gargoyle/acc"), _("Active Congestion Control"), 50)
+    entry({"admin", "network", "qos_gargoyle", "custom_rules"}, 
+	    cbi("qos_gargoyle/custom_rules"), _("Custom Rules"), 50)
+		
+	entry({"admin", "qos", "qos_gargoyle", "acc"},
+        cbi("qos_gargoyle/acc"), _("Active Congestion Control"), 60)
 
     entry({"admin", "qos", "qos_gargoyle", "show_status"},
-        template("qos_gargoyle/show_status"), _("Show Status"), 60)
+        template("qos_gargoyle/show_status"), _("Show Status"), 70)
 
     entry({"admin", "qos", "qos_gargoyle", "show_status", "data"},
         call("action_show_status_data"))

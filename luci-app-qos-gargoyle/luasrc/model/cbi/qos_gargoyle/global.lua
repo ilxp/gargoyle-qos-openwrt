@@ -67,6 +67,32 @@ o:value("hfsc_fqcodel", "HFSC+Fq_Codel (HFSC With Fq_Codel)")
 o:value("htb_fqcodel", "HTB+Fq_Codel (HTB With Fq_Codel)")
 o.default = "htb_cake"
 
+-- 自定义规则选择
+local ruleset_dir = "/etc/qos_gargoyle/rulesets"
+local ruleset_opts = { ["default.conf"] = "Default" }
+if nixio.fs.access(ruleset_dir) then
+    for f in nixio.fs.dir(ruleset_dir) do
+        if f:match("%.conf$") then
+            ruleset_opts[f] = f
+        end
+    end
+end
+
+local ruleset = s:option(ListValue, "ruleset", translate("Custom Rule"))
+ruleset.default = "default.conf"
+for k, v in pairs(ruleset_opts) do
+    ruleset:value(k, v)
+end
+ruleset.description = translate("Select a custom rule file to override built-in rules.")
+
+-- 管理自定义规则按钮
+local manage_btn = s:option(Button, "_manage_custom_rules")
+manage_btn.inputtitle = translate("Manage Custom Rules")
+manage_btn.inputstyle = "apply"
+manage_btn.write = function()
+    luci.http.redirect(luci.dispatcher.build_url("admin/network/qos_gargoyle/custom_rules"))
+end
+
 -- 链路类型
 o = s:option(ListValue, "linklayer", translate("Linklayer Type"), translate("Select linkelayer type"))
 o:value("ethernet", translate("Ethernet"))
