@@ -1,7 +1,7 @@
 #!/bin/sh
 # 规则辅助模块 (rule.sh)
 # 支持多样化端口、协议、IPv6双栈、连接字节数过滤和连接状态过滤
-# version=2.2.5 - 支持 DSCP 模式（用于单独 CAKE diffserv4），修复生成规则语法
+# version=2.2.6 - 修复标记分配覆盖问题，支持 UCI 带引号的值，优化多方向标记共存
 
 : ${DEBUG:=0}
 
@@ -95,8 +95,23 @@ validate_number() {
         log_error "参数 $param_name 必须是整数: $value"
         return 1
     fi
-    [ "$value" -lt "$min" ] 2>/dev/null && { log_error "$param_name 必须 ≥ $min"; return 1; }
-    [ "$value" -gt "$max" ] 2>/dev/null && { log_error "$param_name 必须 ≤ $max"; return 1; }
+    # 确保 min 和 max 是数字（防止算术错误）
+    if ! echo "$min" | grep -qE '^[0-9]+$'; then
+        log_error "内部错误：min 不是数字: $min"
+        return 1
+    fi
+    if ! echo "$max" | grep -qE '^[0-9]+$'; then
+        log_error "内部错误：max 不是数字: $max"
+        return 1
+    fi
+    if [ "$value" -lt "$min" ] 2>/dev/null; then
+        log_error "$param_name 必须 ≥ $min: $value"
+        return 1
+    fi
+    if [ "$value" -gt "$max" ] 2>/dev/null; then
+        log_error "$param_name 必须 ≤ $max: $value"
+        return 1
+    fi
     return 0
 }
 
@@ -263,10 +278,10 @@ allocate_class_marks() {
         i=$((i+1))
     done
 
-    # 清除之前该方向的映射（避免冲突）
+    # 删除当前方向的旧映射（避免冲突，保留其他方向）
     [ -f "$CLASS_MARKS_FILE" ] && sed -i "/^$direction:/d" "$CLASS_MARKS_FILE" 2>/dev/null
 
-    # 检查文件是否可写
+    # 确保文件可写
     touch "$CLASS_MARKS_FILE" 2>/dev/null || {
         log_error "无法写入标记文件 $CLASS_MARKS_FILE"
         return 1
@@ -299,15 +314,12 @@ clear_class_marks() { rm -f "$PERSISTENT_CLASS_MARKS" 2>/dev/null; }
 
 # ========== 配置加载函数 ==========
 load_all_config_sections() {
-    local config_name="$1" section_type="$2" config_output=$(uci show "$config_name" 2>/dev/null)
-    [ -z "$config_output" ] && { echo ""; return; }
+    local config_name="$1" section_type="$2"
     if [ -n "$section_type" ]; then
-        local anonymous=$(echo "$config_output" | grep -E "^${config_name}\\.@${section_type}\\[[0-9]+\\]=" | cut -d= -f1 | sed "s/^${config_name}\\.//")
-        local named=$(echo "$config_output" | grep -E "^${config_name}\\.[a-zA-Z0-9_]+=${section_type}"'$' | cut -d= -f1 | cut -d. -f2)
-        local old=$(echo "$config_output" | grep -E "^${config_name}\\.${section_type}_[0-9]+=" | cut -d= -f1 | cut -d. -f2)
-        echo "$anonymous $named $old" | tr ' ' '\n' | grep -v "^$" | sort -u | tr '\n' ' ' | sed 's/^[[:space:]]*//; s/[[:space:]]*$//'
+        # 使用 sed 直接提取节名，支持值带单引号或双引号
+        uci show "$config_name" 2>/dev/null | sed -n "s/^${config_name}\.\([a-zA-Z0-9_]*\)=[\"']\?${section_type}[\"']\?$/\1/p" | sort -u | tr '\n' ' ' | sed 's/ $//'
     else
-        echo "$config_output" | grep -E "^${config_name}\\.[a-zA-Z_]+[0-9]*=" | cut -d= -f1 | cut -d. -f2
+        uci show "$config_name" 2>/dev/null | sed -n "s/^${config_name}\.\([a-zA-Z0-9_]*\)=.*/\1/p" | sort -u | tr '\n' ' ' | sed 's/ $//'
     fi
 }
 
@@ -587,6 +599,20 @@ apply_enhanced_direction_rules() {
     [ "$chain" = "filter_qos_egress" ] && direction="upload"
     [ "$chain" = "filter_qos_ingress" ] && direction="download"
 
+    # 确保标记文件已初始化
+    init_class_marks_file
+
+    # 调试：输出标记文件路径和内容
+    log_info "标记文件路径: $CLASS_MARKS_FILE"
+    if [ -f "$CLASS_MARKS_FILE" ]; then
+        log_info "标记文件内容:"
+        cat "$CLASS_MARKS_FILE" | while IFS= read -r line; do
+            log_info "  $line"
+        done
+    else
+        log_info "标记文件不存在"
+    fi
+
     local rule_list=$(load_all_config_sections "$CONFIG_FILE" "$rule_type")
     [ -z "$rule_list" ] && { log_info "无 $rule_type 规则"; return 0; }
 
@@ -650,7 +676,10 @@ EOF
         echo "add chain inet gargoyle-qos-priority class_${class_id}_set" >> "$nft_batch_file" 2>/dev/null || true
         echo "flush chain inet gargoyle-qos-priority class_${class_id}_set" >> "$nft_batch_file" 2>/dev/null || true
         local class_mark=$(get_class_mark "$direction" "$class")
-        [ -z "$class_mark" ] && continue
+        if [ -z "$class_mark" ]; then
+            log_error "无法获取类 $class 的标记，文件: $CLASS_MARKS_FILE，方向: $direction"
+            continue
+        fi
         if [ "$USE_DSCP" = "1" ]; then
             local dscp=$((class_mark & 0x3F))
             echo "add rule inet gargoyle-qos-priority class_${class_id}_set ct mark set $class_id ip dscp set $dscp accept" >> "$nft_batch_file"
@@ -712,7 +741,14 @@ $rule_entry
 EOF
         local class_mark=$(get_class_mark "$direction" "$r_class")
         local class_id=$(get_class_id "$direction" "$r_class")
-        [ -z "$class_mark" ] || [ -z "$class_id" ] && continue
+        if [ -z "$class_mark" ]; then
+            log_error "规则 $r_name 的类 $r_class 无法获取标记，文件: $CLASS_MARKS_FILE，方向: $direction"
+            continue
+        fi
+        if [ -z "$class_id" ]; then
+            log_error "规则 $r_name 的类 $r_class 无法获取 class_id"
+            continue
+        fi
         [ -z "$r_family" ] && r_family="inet"
         build_complex_rule_fast "$r_name" "$chain" "$class_mark" "$r_family" "$r_proto" "$r_srcport" "$r_dstport" "$r_connbytes" "$r_state" "$class_id" "$USE_DSCP" >> "$nft_batch_file"
     done
@@ -748,6 +784,7 @@ apply_all_rules() {
     apply_enhanced_direction_rules "$rule_type" "$chain" "$mask"
 }
 
+# 脚本被 source 时不会执行任何操作
 if [ "$(basename "$0")" = "rule.sh" ]; then
     echo "此脚本为辅助模块，不应直接执行" >&2
     exit 1

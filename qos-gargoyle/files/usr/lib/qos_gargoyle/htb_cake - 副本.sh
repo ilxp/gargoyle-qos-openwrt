@@ -3,7 +3,7 @@
 # 基于HTB与CAKE组合算法实现QoS流量控制。
 # 必要工具：tc, nft, conntrack, ethtool, sysctl
 # 内核模块：ifb, sch_htb, sch_cake
-# version=2.16 - 修复标记分配冲突，优化变量保护，统一使用 rule.sh 函数
+# version=2.11 - 优化：类标记冲突检测、IPv6入口重定向强制成功（当存在IPv6地址时）、锁僵尸进程检测、移除seq依赖
 
 # ========== 全局配置常量 ==========
 : ${CONFIG_FILE:=qos_gargoyle}
@@ -23,8 +23,7 @@ upload_class_mark_list=""
 download_class_mark_list=""
 qos_interface=""
 IFB_DEVICE=""
-CLASS_MARKS_FILE=""
-PERSISTENT_CLASS_MARKS="/etc/qos_gargoyle/class_marks"   # 新增
+CLASS_MARKS_FILE="" 
 
 # 加载规则辅助模块（必须）
 if [ -f "/usr/lib/qos_gargoyle/rule.sh" ]; then
@@ -55,6 +54,7 @@ include /lib/network
 
 # ========== 辅助函数 ==========
 # 带宽单位转换（支持 kbit, mbit, gbit, KB, MB 等）
+# 带宽单位转换（严格区分字节与比特）
 convert_bandwidth_to_kbit() {
     local bw="$1"
     local num unit result
@@ -182,6 +182,7 @@ acquire_lock() {
             local now=$(date +%s)
             local mtime=0
 
+            # 更严谨的检查：直接测试 stat 的 -c 选项是否能正常工作
             if stat -c %Y /tmp >/dev/null 2>&1; then
                 mtime=$(stat -c %Y "$LOCK_PID_FILE" 2>/dev/null || echo 0)
             fi
@@ -219,13 +220,14 @@ acquire_lock() {
         return 1
     }
     echo "$$" > "$LOCK_PID_FILE"
+    # 移除原有的 trap 设置
+    # trap 'release_lock' EXIT INT TERM HUP QUIT   <-- 删除此行
     HAVE_LOCK=1
     log_debug "已获取锁: $LOCK_DIR (PID: $$)"
     return 0
 }
 
 release_lock() {
-    [ "$HAVE_LOCK" = "1" ] || return   # 未持有锁则直接返回
     rm -f "$LOCK_PID_FILE"
     rmdir "$LOCK_DIR" 2>/dev/null
     HAVE_LOCK=0
@@ -404,33 +406,21 @@ calculate_memory_limit() {
 
 # 计算HTB的burst参数（添加溢出检查和范围限制）
 calculate_htb_burst() {
-    local rate="$1"
-    local ceil="$2"
-    local mtu="$3"
-
-    # 参数检查
-    if [ -z "$rate" ] || [ -z "$ceil" ]; then
-        qos_log "ERROR" "calculate_htb_burst: rate或ceil为空"
-        echo "4kb 8kb"
-        return
+    local rate="$1"  # 单位: kbit
+    local ceil="$2"  # 单位: kbit
+    local mtu="$3"   # MTU大小
+    
+    if [ -z "$mtu" ]; then
+        mtu=1500
     fi
-
-    # 确保数字有效
-    if ! echo "$rate" | grep -qE '^[0-9]+$' || ! echo "$ceil" | grep -qE '^[0-9]+$'; then
-        qos_log "ERROR" "calculate_htb_burst: rate或ceil不是有效数字"
-        echo "4kb 8kb"
-        return
-    fi
-
-    # 原有计算逻辑不变，但添加边界保护
-    [ -z "$mtu" ] && mtu=1500
-
+    
     if [ "$rate" -gt 10000000 ] 2>/dev/null; then
         qos_log "WARN" "带宽值过大 ($rate kbit)，burst计算可能溢出，进行限制"
         rate=10000000
     fi
-
+    
     local burst_kb=$((rate / 8))
+    
     if [ "$burst_kb" -lt 1 ]; then
         burst_kb=1
     fi
@@ -438,7 +428,7 @@ calculate_htb_burst() {
         burst_kb=1048576
         qos_log "WARN" "burst值超过1GB，已限制为1048576KB"
     fi
-
+    
     local mtu_kb=$((mtu * 3 / 1024))
     if [ "$mtu_kb" -lt 1 ]; then
         mtu_kb=1
@@ -446,12 +436,12 @@ calculate_htb_burst() {
     if [ "$burst_kb" -lt "$mtu_kb" ]; then
         burst_kb="$mtu_kb"
     fi
-
+    
     local cburst_kb=$((burst_kb * 2))
     if [ "$cburst_kb" -gt 1048576 ]; then
         cburst_kb=1048576
     fi
-
+    
     echo "${burst_kb}kb ${cburst_kb}kb"
 }
 
@@ -548,12 +538,14 @@ load_htb_cake_config() {
 # ========== 检测内核是否支持特定 CAKE 参数 ==========
 check_cake_param_support() {
     local param="$1"
+    # 临时删除 lo 的根 qdisc（如果存在）
     tc qdisc del dev lo root 2>/dev/null
+    # 尝试添加测试 qdisc
     if tc qdisc add dev lo root cake bandwidth 1mbit "$param" 2>/dev/null; then
         tc qdisc del dev lo root 2>/dev/null
-        return 0
+        return 0  # 支持
     else
-        return 1
+        return 1  # 不支持
     fi
 }
 
@@ -561,7 +553,6 @@ check_cake_param_support() {
 build_cake_params() {
     local params=""
     
-    # 注意：CAKE 参数使用连字符，不是下划线
     if [ -n "$CAKE_BANDWIDTH" ]; then
         params="$params bandwidth $CAKE_BANDWIDTH"
         qos_log "INFO" "用户显式配置了CAKE bandwidth: $CAKE_BANDWIDTH，CAKE将进行二次整形（可能影响HTB调度）"
@@ -589,19 +580,18 @@ build_cake_params() {
     if [ "$CAKE_ACK_FILTER" = "1" ] || [ "$CAKE_ACK_FILTER" = "yes" ] || [ "$CAKE_ACK_FILTER" = "true" ]; then
         params="$params ack-filter"
     else
-        # 正确参数是 no-ack-filter（带连字符）
-        params="$params no-ack-filter"
+        params="$params noack-filter"
     fi
     
     if [ "$CAKE_SPLIT_GSO" = "1" ] || [ "$CAKE_SPLIT_GSO" = "yes" ] || [ "$CAKE_SPLIT_GSO" = "true" ]; then
         params="$params split-gso"
     else
-        # 正确参数是 no-split-gso
         params="$params no-split-gso"
     fi
     
     [ -n "$CAKE_MEMLIMIT" ] && params="$params memlimit $CAKE_MEMLIMIT"
     
+    # ECN 参数支持检测
     if [ -n "$CAKE_ECN" ]; then
         if check_cake_param_support "$CAKE_ECN"; then
             params="$params $CAKE_ECN"
@@ -633,10 +623,11 @@ load_htb_class_config() {
     if [ -n "$per_min_bandwidth" ] && ! validate_number "$per_min_bandwidth" "$class_name.per_min_bandwidth" 0 100; then
         per_min_bandwidth=""
     fi
-    if [ -n "$per_max_bandwidth" ] && ! validate_number "$per_max_bandwidth" "$class_name.per_max_bandwidth" 0 1000; then
+    if [ -n "$per_max_bandwidth" ] && ! validate_number "$per_max_bandwidth" "$class_name.per_max_bandwidth" 0 1000; then  #允许借用
         per_max_bandwidth=""
     fi
-    if [ -n "$priority" ] && ! validate_number "$priority" "$class_name.priority" 0 7; then
+    # 允许优先级0（最高）
+    if [ -n "$priority" ] && ! validate_number "$priority" "$class_name.priority" 0 7; then  #htb只支持0-7
         priority=""
     fi
     
@@ -725,11 +716,92 @@ setup_htb_enhance_chains() {
         jump filter_qos_ingress_enhance 2>/dev/null || true
 }
 
-# ========== 获取类别标记（使用 rule.sh 中的函数） ==========
+# ========== 类标记冲突检测函数 ==========
+# 检查并分配唯一标记，避免哈希冲突
+# 参数：方向（upload/download），类列表（空格分隔）
+# 返回：0成功，1失败（冲突无法解决）
+allocate_class_marks() {
+    local direction="$1"
+    local class_list="$2"
+    local mask base_value i class mark
+
+    if [ "$direction" = "upload" ]; then
+        base_value=1
+        mask="$UPLOAD_MASK"
+    else
+        base_value=65536
+        mask="$DOWNLOAD_MASK"
+    fi
+
+    # 初始化标记使用数组（16个独立变量）
+    i=1
+    while [ $i -le 16 ]; do
+        eval "mark_used_${i}=0"
+        i=$((i + 1))
+    done
+
+    # 创建临时文件存储类名到标记值的映射
+    CLASS_MARKS_FILE=$(mktemp /tmp/qos_class_marks_XXXXXX) || {
+        qos_log "ERROR" "无法创建类标记临时文件"
+        return 1
+    }
+    TEMP_FILES="$TEMP_FILES $CLASS_MARKS_FILE"
+
+    for class in $class_list; do
+        # 计算原始索引，并检查哈希计算是否成功
+        local index
+        index=$(calculate_hash_index "$class") || {
+            qos_log "ERROR" "无法计算类别 $class 的哈希值"
+            return 1
+        }
+        index=$(( (index % 16) + 1 ))
+        local original_index=$index
+        local found=0
+        local probe=0
+
+        # 线性探测，最多16次
+        while [ $probe -lt 16 ]; do
+            eval "used=\${mark_used_${index}}"
+            if [ "$used" = "0" ]; then
+                eval "mark_used_${index}=1"
+                # 计算标记值
+                local mark_value=$((base_value << (index - 1)))
+                mark_value=$((mark_value & 0xFFFFFFFF))
+
+                # 将类名和标记值写入临时文件，格式：方向:类名:标记值
+                echo "$direction:$class:$mark_value" >> "$CLASS_MARKS_FILE"
+
+                qos_log "INFO" "类别 $class 分配标记索引 $index (原始哈希: $original_index, 探测次数: $probe)"
+                found=1
+                break
+            fi
+            index=$(( (index % 16) + 1 ))
+            probe=$((probe + 1))
+        done
+
+        if [ $found -eq 0 ]; then
+            qos_log "ERROR" "类别 $class 无法分配唯一标记，所有16个索引均已占用"
+            return 1
+        fi
+    done
+
+    return 0
+}
+
 get_class_mark_by_class() {
     local direction="$1"
     local class="$2"
-    get_class_mark "$direction" "$class"
+    local mark_line
+
+    [ -z "$CLASS_MARKS_FILE" ] && { qos_log "ERROR" "类标记文件未定义"; return 1; }
+    mark_line=$(grep "^$direction:$class:" "$CLASS_MARKS_FILE" 2>/dev/null | head -1)
+    if [ -n "$mark_line" ]; then
+        echo "${mark_line##*:}"
+        return 0
+    else
+        qos_log "ERROR" "类别 $class 的标记值未找到"
+        return 1
+    fi
 }
 
 # ========== HTB核心队列函数（使用CAKE） ==========
@@ -739,24 +811,7 @@ create_htb_root_qdisc() {
     local root_handle="$3"
     local root_classid="$4"
     local bandwidth=""
-
-    # 确保 r2q 有值
-    local r2q="${HTB_R2Q:-10}"
-
-    # 参数检查
-    if [ -z "$device" ]; then
-        qos_log "ERROR" "设备名称为空，无法创建根队列"
-        return 1
-    fi
-    if [ -z "$root_handle" ]; then
-        qos_log "ERROR" "根句柄为空"
-        return 1
-    fi
-    if [ -z "$root_classid" ]; then
-        qos_log "ERROR" "根类ID为空"
-        return 1
-    fi
-
+    
     if [ "$direction" = "upload" ]; then
         bandwidth="$total_upload_bandwidth"
     elif [ "$direction" = "download" ]; then
@@ -765,39 +820,36 @@ create_htb_root_qdisc() {
         qos_log "ERROR" "未知方向: $direction"
         return 1
     fi
-
+    
     if ! validate_number "$bandwidth" "bandwidth" 1 "$MAX_PHYSICAL_BANDWIDTH"; then
         qos_log "ERROR" "无效的带宽值: $bandwidth"
         return 1
     fi
-
+    
     qos_log "INFO" "为$device创建$direction方向HTB根队列 (带宽: ${bandwidth}kbit)"
-    qos_log "DEBUG" "参数: handle=$root_handle, r2q=$r2q, classid=$root_classid"
-
+    
     tc qdisc del dev "$device" ingress 2>/dev/null || true
     tc qdisc del dev "$device" root 2>/dev/null || true
-
+    
     qos_log "INFO" "正在为 $device 创建 HTB 根队列..."
-    local cmd="tc qdisc add dev \"$device\" root handle $root_handle htb r2q $r2q"
-    qos_log "DEBUG" "执行命令: $cmd"
-    if ! eval "$cmd"; then
+    if ! tc qdisc add dev "$device" root handle $root_handle htb r2q $HTB_R2Q; then
         qos_log "ERROR" "无法在 $device 上创建HTB根队列"
         return 1
     fi
-
-    # 以下原有计算 burst 和创建根类的代码保持不变
+    
     local burst_params=$(calculate_htb_burst "$bandwidth" "$bandwidth")
     local burst=$(echo "$burst_params" | awk '{print $1}')
     local cburst=$(echo "$burst_params" | awk '{print $2}')
-
+    
     qos_log "INFO" "正在为 $device 创建 HTB 根类..."
     if ! tc class add dev "$device" parent $root_handle classid $root_classid htb \
         rate ${bandwidth}kbit ceil ${bandwidth}kbit burst $burst cburst $cburst; then
         qos_log "ERROR" "无法在$device上创建HTB根类"
+        # 清理已创建的根队列
         tc qdisc del dev "$device" root 2>/dev/null
         return 1
     fi
-
+    
     qos_log "INFO" "$device的$direction方向HTB根队列创建完成"
     return 0
 }
@@ -900,6 +952,7 @@ create_htb_upload_class() {
     if ! tc qdisc add dev "$qos_interface" parent 1:$class_index \
         handle ${class_index}:1 cake $cake_params; then
         qos_log "ERROR" "添加上传CAKE队列失败"
+        # 清理已创建的类
         tc class del dev "$qos_interface" classid 1:$class_index 2>/dev/null
         return 1
     fi
@@ -1039,6 +1092,7 @@ create_htb_download_class() {
     if ! tc qdisc add dev "$ifb_dev" parent 1:$class_index \
         handle ${class_index}:1 cake $cake_params; then
         qos_log "ERROR" "添加下载CAKE队列失败"
+        # 清理已创建的类
         tc class del dev "$ifb_dev" classid 1:$class_index 2>/dev/null
         return 1
     fi
@@ -1334,12 +1388,6 @@ check_ingress_redirect() {
 
 # ========== 上传方向初始化 ==========
 initialize_htb_upload() {
-    # 确保接口变量有效
-    if [ -z "$qos_interface" ]; then
-        qos_interface=$(uci -q get qos_gargoyle.global.wan_interface 2>/dev/null)
-        [ -z "$qos_interface" ] && network_find_wan qos_interface
-        qos_log "WARN" "重新获取 qos_interface: $qos_interface"
-    fi
     qos_log "INFO" "初始化上传方向HTB"
     
     load_upload_class_configurations
@@ -1364,7 +1412,11 @@ initialize_htb_upload() {
         return 1
     fi
     
-    # 注意：标记分配已在主函数中完成，此处不再重复分配，避免覆盖
+    # 预先分配标记，检查冲突
+    if ! allocate_class_marks "upload" "$upload_class_list"; then
+        qos_log "ERROR" "上传方向类标记分配失败，存在无法解决的冲突"
+        return 1
+    fi
     
     if ! create_htb_root_qdisc "$qos_interface" "upload" "1:0" "1:1"; then
         qos_log "ERROR" "创建上传根队列失败"
@@ -1380,6 +1432,7 @@ initialize_htb_upload() {
             upload_class_mark_list="$upload_class_mark_list$class_name:0x$(printf '%X' $class_mark_hex) "
         else
             qos_log "ERROR" "创建上传类别 $class_name 失败，停止初始化"
+            # 清理已创建的根队列
             tc qdisc del dev "$qos_interface" root 2>/dev/null
             return 1
         fi
@@ -1394,12 +1447,6 @@ initialize_htb_upload() {
 
 # ========== 下载方向初始化 ==========
 initialize_htb_download() {
-    # 确保 IFB 设备变量有效
-    if [ -z "$IFB_DEVICE" ]; then
-        IFB_DEVICE=$(uci -q get qos_gargoyle.download.ifb_device 2>/dev/null)
-        [ -z "$IFB_DEVICE" ] && IFB_DEVICE="ifb0"
-        qos_log "WARN" "重新获取 IFB_DEVICE: $IFB_DEVICE"
-    fi
     qos_log "INFO" "初始化下载方向HTB"
     
     load_download_class_configurations
@@ -1424,7 +1471,11 @@ initialize_htb_download() {
         return 1
     fi
     
-    # 注意：标记分配已在主函数中完成，此处不再重复分配，避免覆盖
+    # 预先分配标记，检查冲突
+    if ! allocate_class_marks "download" "$download_class_list"; then
+        qos_log "ERROR" "下载方向类标记分配失败，存在无法解决的冲突"
+        return 1
+    fi
     
     if ! ip link show dev "$IFB_DEVICE" >/dev/null 2>&1; then
         qos_log "ERROR" "IFB设备 $IFB_DEVICE 不存在"
@@ -1451,6 +1502,7 @@ initialize_htb_download() {
             download_class_mark_list="$download_class_mark_list$class_name:0x$(printf '%X' $class_mark_hex) "
         else
             qos_log "ERROR" "创建下载类别 $class_name 失败，停止初始化"
+            # 清理已创建的根队列
             tc qdisc del dev "$IFB_DEVICE" root 2>/dev/null
             return 1
         fi
@@ -1630,89 +1682,6 @@ apply_htb_specific_rules() {
     qos_log "INFO" "HTB特定增强规则应用完成"
 }
 
-# ========== 停止函数（改进锁处理，增加重试）==========
-stop_htb_cake_qos() {
-    qos_log "INFO" "停止HTB+CAKE QoS"
-    
-    local got_lock=false
-    local retry=3
-    while [ $retry -gt 0 ]; do
-        if acquire_lock 2>/dev/null; then
-            got_lock=true
-            qos_log "DEBUG" "停止时获取锁成功"
-            break
-        else
-            retry=$((retry - 1))
-            [ $retry -gt 0 ] && sleep 1
-        fi
-    done
-
-    if ! $got_lock; then
-        qos_log "ERROR" "无法获取锁，停止操作退出，请稍后重试"
-        return 1
-    fi
-
-    # 成功获取锁后再删除运行标记文件
-    rm -f "$QOS_RUNNING_FILE"
-    
-    # 获取清理前的计数
-    local tc_count_before=$(tc qdisc show 2>/dev/null | grep -c htb 2>/dev/null | tr -cd '0-9')
-    local nft_count_before=$(nft list ruleset 2>/dev/null | grep -c "gargoyle-qos-priority" 2>/dev/null | tr -cd '0-9')
-    tc_count_before=${tc_count_before:-0}
-    nft_count_before=${nft_count_before:-0}
-    
-    if [ "$tc_count_before" -gt 0 ] 2>/dev/null; then
-        qos_log "INFO" "检测到 $tc_count_before 个HTB队列，开始清理"
-    fi
-    if [ "$nft_count_before" -gt 0 ] 2>/dev/null; then
-        qos_log "INFO" "检测到 $nft_count_before 个NFTables规则，开始清理"
-    fi
-    
-    if [ -n "$qos_interface" ] && ip link show "$qos_interface" >/dev/null 2>&1; then
-        tc filter del dev "$qos_interface" parent 1:0 protocol all 2>/dev/null || true
-        tc qdisc del dev "$qos_interface" ingress 2>/dev/null || true
-        tc qdisc del dev "$qos_interface" root 2>/dev/null || true
-    fi
-    
-    if [ -n "$IFB_DEVICE" ] && ip link show "$IFB_DEVICE" >/dev/null 2>&1; then
-        tc filter del dev "$IFB_DEVICE" parent 1:0 protocol all 2>/dev/null || true
-        tc qdisc del dev "$IFB_DEVICE" ingress 2>/dev/null || true
-        tc qdisc del dev "$IFB_DEVICE" root 2>/dev/null || true
-    fi
-    
-    nft delete table inet gargoyle-qos-priority 2>/dev/null || true
-    
-    if [ -n "$IFB_DEVICE" ] && ip link show dev "$IFB_DEVICE" >/dev/null 2>&1; then
-        ip link set dev "$IFB_DEVICE" down
-        if [ "${DELETE_IFB_ON_STOP:-0}" = "1" ]; then
-            qos_log "INFO" "IFB设备 $IFB_DEVICE 已停用（保留）"
-        else
-            qos_log "INFO" "IFB设备 $IFB_DEVICE 已停用"
-        fi
-    fi
-    
-    local tc_count_after=$(tc qdisc show 2>/dev/null | grep -c htb 2>/dev/null | tr -cd '0-9')
-    local nft_count_after=$(nft list ruleset 2>/dev/null | grep -c "gargoyle-qos-priority" 2>/dev/null | tr -cd '0-9')
-    tc_count_after=${tc_count_after:-0}
-    nft_count_after=${nft_count_after:-0}
-    
-    if [ "$tc_count_after" -gt 0 ] 2>/dev/null; then
-        qos_log "WARN" "清理后仍有 $tc_count_after 个HTB队列残留"
-    fi
-    if [ "$nft_count_after" -gt 0 ] 2>/dev/null; then
-        qos_log "WARN" "清理后仍有 $nft_count_after 个NFTables规则残留"
-    fi
-    
-    qos_log "INFO" "HTB+CAKE QoS停止完成 (清理前: ${tc_count_before}队列/${nft_count_before}规则, 清理后: ${tc_count_after}队列/${nft_count_after}规则)"
-    
-    # 恢复备份的主配置
-    restore_main_config
-
-    if $got_lock; then
-        release_lock
-    fi
-}
-
 # ========== 主初始化函数 ==========
 initialize_htb_cake_qos() {
     qos_log "INFO" "开始初始化HTB+CAKE QoS系统"
@@ -1731,7 +1700,7 @@ initialize_htb_cake_qos() {
         return 1
     fi
     
-    # 初始化规则集（合并到主配置）
+	# 初始化规则集（合并到主配置）
     if ! init_ruleset; then
         qos_log "ERROR" "初始化规则集失败，QoS 无法启动"
         release_lock
@@ -1742,7 +1711,7 @@ initialize_htb_cake_qos() {
     nft flush chain inet gargoyle-qos-priority filter_qos_egress 2>/dev/null
     nft flush chain inet gargoyle-qos-priority filter_qos_ingress 2>/dev/null
     qos_log "INFO" "已清空 nft 规则链"
-    
+	
     # 检查必需命令
     if ! check_required_commands; then
         qos_log "ERROR" "缺少必需的命令，请安装对应软件包"
@@ -1793,56 +1762,16 @@ initialize_htb_cake_qos() {
         rm -f "$QOS_RUNNING_FILE"
         return 1
     fi
-    
-    # 加载上传/下载类别列表
-    load_upload_class_configurations
-    load_download_class_configurations
-    
-    # ========== 关键修复：先分配标记，后应用规则 ==========
-    if [ -n "$upload_class_list" ]; then
-        if ! allocate_class_marks "upload" "$upload_class_list"; then
-            qos_log "ERROR" "上传方向标记分配失败"
-            release_lock
-            rm -f "$QOS_RUNNING_FILE"
-            return 1
-        fi
-    fi
-    if [ -n "$download_class_list" ]; then
-        if ! allocate_class_marks "download" "$download_class_list"; then
-            qos_log "ERROR" "下载方向标记分配失败"
-            release_lock
-            rm -f "$QOS_RUNNING_FILE"
-            return 1
-        fi
-    fi
-
-    # 创建 class_mark 映射用于 conntrack 恢复
-    nft add map inet gargoyle-qos-priority class_mark { type mark : mark; } 2>/dev/null || true
-    nft flush map inet gargoyle-qos-priority class_mark 2>/dev/null || true
-    if [ -f "$PERSISTENT_CLASS_MARKS" ]; then
-        while IFS=: read -r dir cls mark; do
-            [ -z "$dir" ] || [ -z "$cls" ] || [ -z "$mark" ] && continue
-            class_id=$(get_class_id "$dir" "$cls") || continue
-            nft add element inet gargoyle-qos-priority class_mark { $class_id : $mark } 2>/dev/null
-        done < "$PERSISTENT_CLASS_MARKS"
-    fi
-    
-    # 应用 nft 规则
-    echo "调用分类规则应用..." 
-    apply_all_rules "upload_rule" "$UPLOAD_MASK" "filter_qos_egress"
-    apply_all_rules "download_rule" "$DOWNLOAD_MASK" "filter_qos_ingress"
-    qos_log "INFO" "应用自定义规则成功"
-
-    # 添加 conntrack 恢复规则（使用单引号避免 & 被解释，修复语法错误）
-    nft 'insert rule inet gargoyle-qos-priority filter_qos_egress ct state established,related meta mark set @class_mark[ct mark & 0xff]'
-    nft 'insert rule inet gargoyle-qos-priority filter_qos_ingress ct state established,related meta mark set @class_mark[ct mark & 0xff]'
-    qos_log "INFO" "已添加 conntrack 恢复规则"
-    
-    # 应用 ipv6 特别规则
-    echo "应用ipv6特别规则..." 
+	
+	#开始应用规则
+	echo "调用分类规则应用..." 
+	apply_all_rules "upload_rule" "$UPLOAD_MASK" "filter_qos_egress"
+	apply_all_rules "download_rule" "$DOWNLOAD_MASK" "filter_qos_ingress"
+	qos_log "INFO" "应用自定义规则成功"
+	
+	echo "应用ipv6特别规则..." 
     setup_ipv6_specific_rules
     
-    # 最后创建 HTB 队列
     local upload_success=0
     local download_success=0
     
@@ -1874,12 +1803,12 @@ initialize_htb_cake_qos() {
         return 1
     fi
     
-    echo "应用HTB特别规则..." 
+	echo "应用HTB特别规则..." 
     setup_htb_enhance_chains
     apply_htb_specific_rules
-    
+	
     qos_log "INFO" "HTB+CAKE QoS初始化完成"
-    
+	
     release_lock
     return 0
 }
@@ -1980,7 +1909,7 @@ show_htb_cake_status() {
         [ -z "$qos_interface" ] && qos_interface="未知"
     fi
     
-    echo "===== HTB-CAKE QoS 状态报告 (v2.16) ====="
+    echo "===== HTB-CAKE QoS 状态报告 (v2.11) ====="
     echo "时间: $(date)"
     echo "WAN接口: ${qos_interface}"
     
@@ -2108,6 +2037,7 @@ show_htb_cake_status() {
     # ========== 活动连接标记 ==========
     echo -e "\n======== 活动连接标记 ========"
 
+    # 检查 conntrack 命令是否存在
     if ! command -v conntrack >/dev/null 2>&1; then
         echo "  conntrack 命令未安装，无法显示连接标记信息。"
         echo "  请安装 conntrack-tools 包以获取此功能。"
