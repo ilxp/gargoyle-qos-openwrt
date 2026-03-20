@@ -2,13 +2,12 @@
 /*
  * Copyright (C) 2022 Felix Fietkau <nbd@nbd.name>
  * Version: 2022-09-21
- * Modified for idclass: added missing includes and removed uapi prefixes
+ * Modified for idclass: added READ_ONCE definition and removed unnecessary includes
  */
 #ifndef __BPF_SKB_UTILS_H
 #define __BPF_SKB_UTILS_H
 
 #include <linux/types.h>
-#include <linux/compiler.h>
 #include <linux/if_ether.h>
 #include <linux/if_vlan.h>
 #include <linux/ip.h>
@@ -17,6 +16,10 @@
 #include <linux/udp.h>
 #include <bpf/bpf_helpers.h>
 #include <bpf/bpf_endian.h>
+
+#ifndef READ_ONCE
+#define READ_ONCE(x) (*(volatile typeof(x) *)&(x))
+#endif
 
 struct skb_parser_info {
 	struct __sk_buff *skb;
