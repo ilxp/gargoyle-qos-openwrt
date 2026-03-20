@@ -1,17 +1,17 @@
 #!/bin/sh
-# version=2.23
+# version=2.21
 # HFSC_CAKE算法实现模块
 # 基于HFSC与CAKE组合算法实现QoS流量控制。
 # 必要工具：tc, nft, conntrack, ethtool, sysctl
 # 内核模块：ifb, sch_hfsc, sch_cake
-# 优化：整合rule.sh标记分配，修正调用顺序，添加conntrack恢复规则
+# 优化：类标记冲突检测、IPv6入口重定向强制成功（当存在IPv6地址时）、锁僵尸进程检测、移除seq依赖
 
 # ========== 全局配置常量 ==========
 : ${CONFIG_FILE:=qos_gargoyle}
 : ${LOCK_DIR:=/var/run/hfsc_cake.lock}           # 并发锁目录
 : ${LOCK_PID_FILE:=$LOCK_DIR/pid}                 # 锁目录中的PID文件
 : ${QOS_RUNNING_FILE:=/var/run/hfsc_cake.running}     # 运行标记文件
-: ${MAX_PHYSICAL_BANDWIDTH:=10000000}              # 最大物理带宽10Gbps（单位kbit）
+: ${MAX_PHYSICAL_BANDWIDTH:=10000000}              # 最大物理带宽10Gbps（单位kbit），实际会尽力检测
 : ${UPLOAD_MASK:=0xFFFF}                           # 上传方向标记掩码，使用低 16 位
 : ${DOWNLOAD_MASK:=0xFFFF0000}                     # 下载方向标记掩码，使用高 16 位
 : ${DELETE_IFB_ON_STOP:=0}                          # 停止时是否删除IFB设备（默认0不删除）
@@ -24,10 +24,7 @@ upload_class_mark_list=""
 download_class_mark_list=""
 qos_interface=""
 IFB_DEVICE=""
-
-# 标记文件路径（由 rule.sh 使用，此处统一设置）
-CLASS_MARKS_FILE="/var/run/qos_class_marks"
-PERSISTENT_CLASS_MARKS="/etc/qos_gargoyle/class_marks"
+CLASS_MARKS_FILE="" 
 
 # 加载规则辅助模块（必须）
 if [ -f "/usr/lib/qos_gargoyle/rule.sh" ]; then
@@ -58,6 +55,7 @@ include /lib/network
 
 # ========== 辅助函数 ==========
 # 带宽单位转换（支持 kbit, mbit, gbit, KB, MB 等）
+# 带宽单位转换（严格区分字节与比特）
 convert_bandwidth_to_kbit() {
     local bw="$1"
     local num unit result
@@ -76,6 +74,7 @@ convert_bandwidth_to_kbit() {
         unit=$(echo "$bw" | sed 's/[0-9.]//g' | tr '[:lower:]' '[:upper:]')
 
         case "$unit" in
+            # 比特单位
             K|KBIT|KILOBIT)
                 result=$(awk "BEGIN {printf \"%.0f\", $num * 1}")
                 ;;
@@ -85,6 +84,7 @@ convert_bandwidth_to_kbit() {
             G|GBIT|GIGABIT)
                 result=$(awk "BEGIN {printf \"%.0f\", $num * 1000000}")
                 ;;
+            # 字节单位 → 乘以 8 转换为比特
             KB|KIB)
                 qos_log "WARN" "检测到字节单位 '$unit'，将自动乘以 8 转换为 kbit"
                 result=$(awk "BEGIN {printf \"%.0f\", $num * 8}")
@@ -183,6 +183,7 @@ acquire_lock() {
             local now=$(date +%s)
             local mtime=0
 
+            # 更严谨的检查：直接测试 stat 的 -c 选项是否能正常工作
             if stat -c %Y /tmp >/dev/null 2>&1; then
                 mtime=$(stat -c %Y "$LOCK_PID_FILE" 2>/dev/null || echo 0)
             fi
@@ -220,13 +221,14 @@ acquire_lock() {
         return 1
     }
     echo "$$" > "$LOCK_PID_FILE"
+    # 移除原有的 trap 设置
+    # trap 'release_lock' EXIT INT TERM HUP QUIT   <-- 删除此行
     HAVE_LOCK=1
     log_debug "已获取锁: $LOCK_DIR (PID: $$)"
     return 0
 }
 
 release_lock() {
-    [ "$HAVE_LOCK" = "1" ] || return   # 未持有锁则直接返回
     rm -f "$LOCK_PID_FILE"
     rmdir "$LOCK_DIR" 2>/dev/null
     HAVE_LOCK=0
@@ -276,6 +278,7 @@ get_physical_interface_max_bandwidth() {
     if [ -z "$max_bandwidth" ]; then
         max_bandwidth="$MAX_PHYSICAL_BANDWIDTH"
         qos_log "WARN" "无法获取接口 $interface 的物理速度，使用默认最大值 ${max_bandwidth}kbit"
+        qos_log "WARN" "建议在配置文件中手动设置总带宽以确保QoS效果"
     fi
     
     echo "$max_bandwidth"
@@ -291,6 +294,7 @@ load_bandwidth_from_config() {
         qos_log "ERROR" "上传总带宽未配置，请检查UCI"
         return 1
     fi
+    # 转换带宽为 kbit
     total_upload_bandwidth=$(convert_bandwidth_to_kbit "$config_upload_bw") || return 1
     if ! validate_number "$total_upload_bandwidth" "upload.total_bandwidth" 1 "$max_physical_bw"; then
         return 1
@@ -311,15 +315,78 @@ load_bandwidth_from_config() {
     return 0
 }
 
+# 计算内存限制 - 使用向上取整避免除法结果为0（用于CAKE的memlimit）
+calculate_memory_limit() {
+    local config_value="$1"
+    local result
+
+    if [ -z "$config_value" ]; then
+        echo ""
+        return
+    fi
+    
+    if [ "$config_value" = "auto" ]; then
+        local total_mem_mb=0
+        
+        if [ -f /sys/fs/cgroup/memory/memory.limit_in_bytes ]; then
+            local total_mem_bytes=$(cat /sys/fs/cgroup/memory/memory.limit_in_bytes 2>/dev/null)
+            if [ -n "$total_mem_bytes" ] && [ "$total_mem_bytes" -gt 0 ] 2>/dev/null; then
+                total_mem_mb=$(( total_mem_bytes / 1024 / 1024 ))
+                qos_log "INFO" "从cgroups获取内存限制: ${total_mem_mb}MB"
+            fi
+        fi
+        
+        if [ -z "$total_mem_mb" ] || [ "$total_mem_mb" -eq 0 ]; then
+            local total_mem_kb=$(grep MemTotal /proc/meminfo 2>/dev/null | awk '{print $2}')
+            if [ -n "$total_mem_kb" ] && [ "$total_mem_kb" -gt 0 ] 2>/dev/null; then
+                total_mem_mb=$(( total_mem_kb / 1024 ))
+                qos_log "INFO" "从/proc/meminfo获取内存: ${total_mem_mb}MB"
+            fi
+        fi
+        
+        if [ -n "$total_mem_mb" ] && [ "$total_mem_mb" -gt 0 ] 2>/dev/null; then
+            # 每256MB内存分配1MB给CAKE，向上取整确保至少1MB基数
+            result="$(( (total_mem_mb + 255) / 256 ))Mb"
+            
+            local min_limit=4
+            local max_limit=32
+            local result_value=$(echo "$result" | sed 's/Mb//')
+            if [ "$result_value" -lt "$min_limit" ] 2>/dev/null; then
+                result="${min_limit}Mb"
+            elif [ "$result_value" -gt "$max_limit" ] 2>/dev/null; then
+                result="${max_limit}Mb"
+            fi
+            
+            qos_log "INFO" "系统内存 ${total_mem_mb}MB，自动计算 memlimit=${result}"
+        else
+            qos_log "WARN" "无法读取内存信息，使用默认值 16Mb"
+            result="16Mb"
+        fi
+    else
+        # 用户自定义值，验证格式（必须为数字+Mb，例如 16Mb）
+        if echo "$config_value" | grep -qE '^[0-9]+Mb$'; then
+            result="$config_value"
+            qos_log "INFO" "使用用户配置的 memlimit: ${result}"
+        else
+            qos_log "WARN" "无效的 memlimit 格式 '$config_value'，使用默认值 16Mb"
+            result="16Mb"
+        fi
+    fi
+    
+    echo "$result"
+}
+
 # 加载HFSC与CAKE专属配置
 load_hfsc_cake_config() {
     qos_log "INFO" "加载HFSC与CAKE配置"
     
+    # 加载带宽配置
     if ! load_bandwidth_from_config; then
         echo "带宽配置加载失败" >&2
         return 1
     fi
     
+    # 从UCI配置读取IFB设备（通过LuCI选择）
     IFB_DEVICE=$(uci -q get qos_gargoyle.download.ifb_device 2>/dev/null)
     if [ -z "$IFB_DEVICE" ]; then
         IFB_DEVICE="ifb0"
@@ -328,14 +395,34 @@ load_hfsc_cake_config() {
         qos_log "INFO" "从配置文件读取IFB设备: $IFB_DEVICE"
     fi
     
+    # 从UCI配置读取HFSC特定参数
     HFSC_LATENCY_MODE=$(uci -q get qos_gargoyle.hfsc.latency_mode 2>/dev/null)
+    if [ -z "$HFSC_LATENCY_MODE" ]; then
+        qos_log "WARN" "HFSC延迟模式未配置，将使用默认行为"
+    else
+        qos_log "INFO" "HFSC延迟模式: ${HFSC_LATENCY_MODE}"
+    fi
+    
     HFSC_MINRTT_ENABLED=$(uci -q get qos_gargoyle.hfsc.minrtt_enabled 2>/dev/null)
-    [ -z "$HFSC_MINRTT_ENABLED" ] && HFSC_MINRTT_ENABLED=0
-    
+    if [ -z "$HFSC_MINRTT_ENABLED" ]; then
+        HFSC_MINRTT_ENABLED=0
+        qos_log "INFO" "HFSC最小RTT未配置，使用默认值: ${HFSC_MINRTT_ENABLED}"
+    else
+        qos_log "INFO" "HFSC最小RTT启用: ${HFSC_MINRTT_ENABLED}"
+    fi
+	
+	# 读取minrtt_delay
     HFSC_MINRTT_DELAY=$(uci -q get qos_gargoyle.hfsc.minrtt_delay 2>/dev/null)
-    [ -z "$HFSC_MINRTT_DELAY" ] && HFSC_MINRTT_DELAY="1000us"
+    # 如果未设置，则使用默认值 1000us
+    if [ -z "$HFSC_MINRTT_DELAY" ]; then
+        HFSC_MINRTT_DELAY=1000us
+        qos_log "INFO" "HFSC最小RTT延迟未配置，使用默认值: ${HFSC_MINRTT_DELAY}"
+    else
+        qos_log "INFO" "HFSC最小RTT延迟已配置: ${HFSC_MINRTT_DELAY}"
+    fi
     
-    CAKE_BANDWIDTH=$(uci -q get qos_gargoyle.cake.bandwidth 2>/dev/null)
+    # 从UCI配置读取CAKE参数
+    CAKE_BANDWIDTH=$(uci -q get qos_gargoyle.cake.bandwidth 2>/dev/null)   # 可选，HFSC场景下通常不应设置
     if [ -n "$CAKE_BANDWIDTH" ]; then
         qos_log "ERROR" "检测到 CAKE_BANDWIDTH 已配置 (值: $CAKE_BANDWIDTH)，这将导致CAKE二次整形，可能严重影响HFSC调度性能。建议删除此配置项以使用HFSC主导的整形。"
     fi
@@ -374,7 +461,7 @@ load_hfsc_cake_config() {
                 qos_log "INFO" "CAKE ECN 已启用"
                 ;;
             no|0|disable|off|false|noecn)
-                CAKE_ECN="noecn"
+                CAKE_ECN="noecn"   # 必须显式传递 noecn
                 qos_log "INFO" "CAKE ECN 已禁用"
                 ;;
             *)
@@ -383,12 +470,12 @@ load_hfsc_cake_config() {
                 ;;
         esac
     else
-        CAKE_ECN=""
+        CAKE_ECN=""   # 未配置时默认禁用，不传递参数
         qos_log "INFO" "CAKE ECN 未配置，使用默认禁用"
     fi
     
     qos_log "INFO" "HFSC配置: latency_mode=${HFSC_LATENCY_MODE}, minrtt_enabled=${HFSC_MINRTT_ENABLED}, minrtt_delay=${HFSC_MINRTT_DELAY}"
-    qos_log "INFO" "CAKE参数: bandwidth=${CAKE_BANDWIDTH:-未配置}, rtt=${CAKE_RTT:-未配置}, flowmode=${CAKE_FLOWMODE}, diffserv=${CAKE_DIFFSERV}, nat=${CAKE_NAT}, wash=${CAKE_WASH}, overhead=${CAKE_OVERHEAD:-未配置}, mpu=${CAKE_MPU:-未配置}, ack_filter=${CAKE_ACK_FILTER}, split_gso=${CAKE_SPLIT_GSO}, memlimit=${CAKE_MEMLIMIT:-未配置}, ecn=${CAKE_ECN}"
+    qos_log "INFO" "CAKE参数: bandwidth=${CAKE_BANDWIDTH:-未配置}, rtt=${CAKE_RTT:-未配置}, flowmode=${CAKE_FLOWMODE}, diffserv=${CAKE_DIFFSERV}, nat=${CAKE_NAT}, wash=${CAKE_WASH}, overhead=${CAKE_OVERHEAD:-未配置}, mpu=${CAKE_MPU:-未配置}, ack_filter=${CAKE_ACK_FILTER}, split_gso=${CAKE_SPLIT_GSO}, limit=${CAKE_LIMIT:-未配置}, memlimit=${CAKE_MEMLIMIT:-未配置}, ecn=${CAKE_ECN}"
     
     return 0
 }
@@ -413,9 +500,10 @@ load_hfsc_class_config() {
     if [ -n "$per_min_bandwidth" ] && ! validate_number "$per_min_bandwidth" "$class_name.per_min_bandwidth" 0 100; then
         per_min_bandwidth=""
     fi
-    if [ -n "$per_max_bandwidth" ] && ! validate_number "$per_max_bandwidth" "$class_name.per_max_bandwidth" 0 1000; then
+    if [ -n "$per_max_bandwidth" ] && ! validate_number "$per_max_bandwidth" "$class_name.per_max_bandwidth" 0 1000; then  #允许借用
         per_max_bandwidth=""
     fi
+	# 允许优先级0（最高）
     if [ -n "$priority" ] && ! validate_number "$priority" "$class_name.priority" 0 255; then
         priority=""
     fi
@@ -459,7 +547,9 @@ load_download_class_configurations() {
 setup_ipv6_specific_rules() {
     qos_log "INFO" "设置IPv6特定规则（优化版）"
     
+    # 确保表存在
     nft add table inet gargoyle-qos-priority 2>/dev/null || true
+    
     nft add chain inet gargoyle-qos-priority filter_prerouting '{ type filter hook prerouting priority 0; policy accept; }' 2>/dev/null || true
     nft flush chain inet gargoyle-qos-priority filter_prerouting 2>/dev/null || true
     
@@ -504,6 +594,94 @@ setup_hfsc_enhance_chains() {
         jump filter_qos_ingress_enhance 2>/dev/null || true
 }
 
+# ========== 类标记冲突检测函数 ==========
+# 检查并分配唯一标记，避免哈希冲突
+# 参数：方向（upload/download），类列表（空格分隔）
+# 返回：0成功，1失败（冲突无法解决）
+allocate_class_marks() {
+    local direction="$1"
+    local class_list="$2"
+    local mask base_value i class mark
+
+    if [ "$direction" = "upload" ]; then
+        base_value=1
+        mask="$UPLOAD_MASK"
+    else
+        base_value=65536
+        mask="$DOWNLOAD_MASK"
+    fi
+
+    # 初始化标记使用数组（16个独立变量）
+    i=1
+    while [ $i -le 16 ]; do
+        eval "mark_used_${i}=0"
+        i=$((i + 1))
+    done
+
+    # 创建临时文件存储类名到标记值的映射
+    CLASS_MARKS_FILE=$(mktemp /tmp/qos_class_marks_XXXXXX) || {
+        qos_log "ERROR" "无法创建类标记临时文件"
+        return 1
+    }
+    TEMP_FILES="$TEMP_FILES $CLASS_MARKS_FILE"
+
+    for class in $class_list; do
+        # 计算原始索引，并检查哈希计算是否成功
+        local index
+        index=$(calculate_hash_index "$class") || {
+            qos_log "ERROR" "无法计算类别 $class 的哈希值"
+            return 1
+        }
+        index=$(( (index % 16) + 1 ))
+        local original_index=$index
+        local found=0
+        local probe=0
+
+        # 线性探测，最多16次
+        while [ $probe -lt 16 ]; do
+            eval "used=\${mark_used_${index}}"
+            if [ "$used" = "0" ]; then
+                eval "mark_used_${index}=1"
+                # 计算标记值
+                local mark_value=$((base_value << (index - 1)))
+                mark_value=$((mark_value & 0xFFFFFFFF))
+
+                # 将类名和标记值写入临时文件，格式：方向:类名:标记值
+                echo "$direction:$class:$mark_value" >> "$CLASS_MARKS_FILE"
+
+                qos_log "INFO" "类别 $class 分配标记索引 $index (原始哈希: $original_index, 探测次数: $probe)"
+                found=1
+                break
+            fi
+            index=$(( (index % 16) + 1 ))
+            probe=$((probe + 1))
+        done
+
+        if [ $found -eq 0 ]; then
+            qos_log "ERROR" "类别 $class 无法分配唯一标记，所有16个索引均已占用"
+            return 1
+        fi
+    done
+
+    return 0
+}
+
+get_class_mark_by_class() {
+    local direction="$1"
+    local class="$2"
+    local mark_line
+
+    [ -z "$CLASS_MARKS_FILE" ] && { qos_log "ERROR" "类标记文件未定义"; return 1; }
+    mark_line=$(grep "^$direction:$class:" "$CLASS_MARKS_FILE" 2>/dev/null | head -1)
+    if [ -n "$mark_line" ]; then
+        echo "${mark_line##*:}"
+        return 0
+    else
+        qos_log "ERROR" "类别 $class 的标记值未找到"
+        return 1
+    fi
+}
+
 # ========== HFSC核心队列函数（使用CAKE） ==========
 create_hfsc_root_qdisc() {
     local device="$1"
@@ -521,6 +699,7 @@ create_hfsc_root_qdisc() {
         return 1
     fi
     
+    # 验证带宽值
     if ! validate_number "$bandwidth" "bandwidth" 1 "$MAX_PHYSICAL_BANDWIDTH"; then
         qos_log "ERROR" "无效的带宽值: $bandwidth"
         return 1
@@ -540,6 +719,7 @@ create_hfsc_root_qdisc() {
     qos_log "INFO" "正在为 $device 创建 HFSC 根类..."
     if ! tc class add dev "$device" parent $root_handle classid $root_classid hfsc ls rate ${bandwidth}kbit ul rate ${bandwidth}kbit; then
         qos_log "ERROR" "无法在$device上创建HFSC根类"
+        # 清理已创建的根队列
         tc qdisc del dev "$device" root 2>/dev/null
         return 1
     fi
@@ -548,15 +728,17 @@ create_hfsc_root_qdisc() {
     return 0
 }
 
-# 检测内核是否支持特定 CAKE 参数
+# ========== 检测内核是否支持特定 CAKE 参数 ==========
 check_cake_param_support() {
     local param="$1"
+    # 临时删除 lo 的根 qdisc（如果存在）
     tc qdisc del dev lo root 2>/dev/null
+    # 尝试添加测试 qdisc
     if tc qdisc add dev lo root cake bandwidth 1mbit "$param" 2>/dev/null; then
         tc qdisc del dev lo root 2>/dev/null
-        return 0
+        return 0  # 支持
     else
-        return 1
+        return 1  # 不支持
     fi
 }
 
@@ -564,6 +746,7 @@ check_cake_param_support() {
 build_cake_params() {
     local params=""
     
+    # 仅在用户显式配置了CAKE_BANDWIDTH时添加，HFSC场景下通常不应设置
     if [ -n "$CAKE_BANDWIDTH" ]; then
         params="$params bandwidth $CAKE_BANDWIDTH"
         qos_log "INFO" "用户显式配置了CAKE bandwidth: $CAKE_BANDWIDTH，CAKE将进行二次整形（可能影响HFSC调度）"
@@ -602,13 +785,15 @@ build_cake_params() {
 	
     [ -n "$CAKE_MEMLIMIT" ] && params="$params memlimit $CAKE_MEMLIMIT"
         
-    if [ -n "$CAKE_ECN" ]; then
-        if check_cake_param_support "$CAKE_ECN"; then
-            params="$params $CAKE_ECN"
-        else
-            logger -t "qos_gargoyle" "CAKE警告: 内核不支持 $CAKE_ECN 参数，已忽略 ECN 设置"
-        fi
-    fi
+    # ECN 参数支持检测
+	if [ -n "$CAKE_ECN" ]; then
+		if check_cake_param_support "$CAKE_ECN"; then
+			params="$params $CAKE_ECN"
+		else
+			logger -t "qos_gargoyle" "CAKE警告: 内核不支持 $CAKE_ECN 参数，已忽略 ECN 设置"
+			CAKE_ECN=""
+		fi
+	fi
     
     echo "$params"
 }
@@ -629,7 +814,7 @@ create_hfsc_upload_class() {
     eval "$class_config"
     
     local class_mark
-    class_mark=$(get_class_mark "upload" "$class_name")
+    class_mark=$(get_class_mark_by_class "upload" "$class_name")
     if [ -z "$class_mark" ]; then
         qos_log "ERROR" "无法获取类别 $class_name 的标记"
         return 1
@@ -657,7 +842,7 @@ create_hfsc_upload_class() {
     
     if [ -n "$per_min_bandwidth" ] && [ "$per_min_bandwidth" -ge 0 ] 2>/dev/null; then
         if [ "$per_min_bandwidth" -eq 0 ]; then
-            m2="1kbit"
+            m2="1kbit"   # 设置为极小值避免 HFSC 报错
             qos_log "INFO" "类别 $class_name 不保证最小带宽 (per_min_bandwidth=0)"
         else
             m2="$((class_total_bw * per_min_bandwidth / 100))kbit"
@@ -683,21 +868,24 @@ create_hfsc_upload_class() {
         m2="$ul_m2"
     fi
     
-    local enable_minrtt=0
-    if [ -n "$minRTT" ]; then
-        case "$minRTT" in
-            [Yy]es|[Yy]|1|[Tt]rue) enable_minrtt=1 ;;
-            [Nn]o|[Nn]|0|[Ff]alse) enable_minrtt=0 ;;
-            *) enable_minrtt="${HFSC_MINRTT_ENABLED:-0}" ;;
-        esac
-    else
-        enable_minrtt="${HFSC_MINRTT_ENABLED:-0}"
-    fi
+    # 确定是否启用最小延迟
+	local enable_minrtt=0
+	if [ -n "$minRTT" ]; then
+		# 类别已显式配置 minRTT
+		case "$minRTT" in
+			[Yy]es|[Yy]|1|[Tt]rue) enable_minrtt=1 ;;
+			[Nn]o|[Nn]|0|[Ff]alse) enable_minrtt=0 ;;
+			*) enable_minrtt="${HFSC_MINRTT_ENABLED:-0}" ;;  # 无效值时回退全局
+		esac
+	else
+		# 类别未配置 minRTT，使用全局开关
+		enable_minrtt="${HFSC_MINRTT_ENABLED:-0}"
+	fi
 
-    if [ "$enable_minrtt" = "1" ]; then
-        d="${HFSC_MINRTT_DELAY:-1000us}"
-        qos_log "INFO" "类别 $class_name 启用最小延迟模式 (d=$d)"
-    fi
+	if [ "$enable_minrtt" = "1" ]; then
+		d="${HFSC_MINRTT_DELAY:-1000us}"
+		qos_log "INFO" "类别 $class_name 启用最小延迟模式 (d=$d, 来源: $([ -n "$minRTT" ] && echo "类别配置" || echo "全局开关"))"
+	fi
     
     qos_log "INFO" "正在创建HFSC类别 1:$class_index (带宽: ls=$m2, ul=$ul_m2)"
     if ! tc class add dev "$qos_interface" parent 1:1 \
@@ -708,12 +896,14 @@ create_hfsc_upload_class() {
         return 1
     fi
     
+    # 构建CAKE参数
     local cake_params=$(build_cake_params)
     qos_log "INFO" "添加上传CAKE队列参数: $cake_params"
     
     if ! tc qdisc add dev "$qos_interface" parent 1:$class_index \
         handle ${class_index}:1 cake $cake_params; then
         qos_log "ERROR" "添加上传CAKE队列失败"
+        # 清理已创建的类
         tc class del dev "$qos_interface" classid 1:$class_index 2>/dev/null
         return 1
     fi
@@ -733,6 +923,7 @@ create_hfsc_upload_class() {
         if ! tc filter add dev "$qos_interface" parent 1:0 protocol ipv6 \
             prio $ipv6_priority handle ${class_mark}/$UPLOAD_MASK fw classid 1:$class_index 2>/dev/null; then
             qos_log "WARN" "添加上传IPv6过滤器失败 (标记:$class_mark -> 类别:1:$class_index, 优先级:$ipv6_priority)"
+            # 可选：记录详细错误信息
             local err_msg=$(tc filter add dev "$qos_interface" parent 1:0 protocol ipv6 \
                 prio $ipv6_priority handle ${class_mark}/$UPLOAD_MASK fw classid 1:$class_index 2>&1)
             qos_log "DEBUG" "详细错误: $err_msg"
@@ -755,6 +946,7 @@ create_hfsc_download_class() {
     
     qos_log "INFO" "创建下载类别: $class_name, ID: 1:$class_index, 过滤器优先级: $filter_prio"
     
+    # 确保IFB设备已存在并启用
     if ! ip link show dev "$ifb_dev" >/dev/null 2>&1; then
         qos_log "ERROR" "IFB设备 $ifb_dev 不存在，无法创建下载类"
         return 1
@@ -769,7 +961,7 @@ create_hfsc_download_class() {
     eval "$class_config"
     
     local class_mark
-    class_mark=$(get_class_mark "download" "$class_name")
+    class_mark=$(get_class_mark_by_class "download" "$class_name")
     if [ -z "$class_mark" ]; then
         qos_log "ERROR" "无法获取类别 $class_name 的标记"
         return 1
@@ -797,7 +989,7 @@ create_hfsc_download_class() {
     
     if [ -n "$per_min_bandwidth" ] && [ "$per_min_bandwidth" -ge 0 ] 2>/dev/null; then
         if [ "$per_min_bandwidth" -eq 0 ]; then
-            m2="1kbit"
+            m2="1kbit"   # 设置为极小值避免 HFSC 报错
             qos_log "INFO" "类别 $class_name 不保证最小带宽 (per_min_bandwidth=0)"
         else
             m2="$((class_total_bw * per_min_bandwidth / 100))kbit"
@@ -823,21 +1015,24 @@ create_hfsc_download_class() {
         m2="$ul_m2"
     fi
     
-    local enable_minrtt=0
-    if [ -n "$minRTT" ]; then
-        case "$minRTT" in
-            [Yy]es|[Yy]|1|[Tt]rue) enable_minrtt=1 ;;
-            [Nn]o|[Nn]|0|[Ff]alse) enable_minrtt=0 ;;
-            *) enable_minrtt="${HFSC_MINRTT_ENABLED:-0}" ;;
-        esac
-    else
-        enable_minrtt="${HFSC_MINRTT_ENABLED:-0}"
-    fi
+    # 确定是否启用最小延迟
+	local enable_minrtt=0
+	if [ -n "$minRTT" ]; then
+		# 类别已显式配置 minRTT
+		case "$minRTT" in
+			[Yy]es|[Yy]|1|[Tt]rue) enable_minrtt=1 ;;
+			[Nn]o|[Nn]|0|[Ff]alse) enable_minrtt=0 ;;
+			*) enable_minrtt="${HFSC_MINRTT_ENABLED:-0}" ;;  # 无效值时回退全局
+		esac
+	else
+		# 类别未配置 minRTT，使用全局开关
+		enable_minrtt="${HFSC_MINRTT_ENABLED:-0}"
+	fi
 
-    if [ "$enable_minrtt" = "1" ]; then
-        d="${HFSC_MINRTT_DELAY:-1000us}"
-        qos_log "INFO" "类别 $class_name 启用最小延迟模式 (d=$d)"
-    fi
+	if [ "$enable_minrtt" = "1" ]; then
+		d="${HFSC_MINRTT_DELAY:-1000us}"
+		qos_log "INFO" "类别 $class_name 启用最小延迟模式 (d=$d, 来源: $([ -n "$minRTT" ] && echo "类别配置" || echo "全局开关"))"
+	fi
     
     qos_log "INFO" "正在创建下载HFSC类别 1:$class_index (带宽: ls=$m2, ul=$ul_m2)"
     if ! tc class add dev "$ifb_dev" parent 1:1 \
@@ -854,6 +1049,7 @@ create_hfsc_download_class() {
     if ! tc qdisc add dev "$ifb_dev" parent 1:$class_index \
         handle ${class_index}:1 cake $cake_params; then
         qos_log "ERROR" "添加下载CAKE队列失败"
+        # 清理已创建的类
         tc class del dev "$ifb_dev" classid 1:$class_index 2>/dev/null
         return 1
     fi
@@ -885,10 +1081,9 @@ create_hfsc_download_class() {
     return 0
 }
 
-# 创建默认上传类（接收一个标记参数）
+# 创建默认上传类
 create_default_upload_class() {
-    local default_mark="$1"
-    qos_log "INFO" "创建默认上传类别，使用标记: 0x$(printf '%X' $default_mark)"
+    qos_log "INFO" "创建默认上传类别"
     
     if ! create_hfsc_root_qdisc "$qos_interface" "upload" "1:0" "1:1"; then
         qos_log "ERROR" "创建上传根队列失败"
@@ -910,24 +1105,26 @@ create_default_upload_class() {
         return 1
     fi
     
+    tc qdisc change dev "$qos_interface" root handle 1:0 hfsc default 2 2>/dev/null || true
+    
+    local mark_hex="0x1"
     if ! tc filter add dev "$qos_interface" parent 1:0 protocol ip \
-        prio 1 handle ${default_mark}/$UPLOAD_MASK fw flowid 1:2 2>/dev/null; then
+        prio 1 handle ${mark_hex}/$UPLOAD_MASK fw flowid 1:2 2>/dev/null; then
         qos_log "WARN" "添加上传默认IPv4过滤器失败"
     fi
     if ! tc filter add dev "$qos_interface" parent 1:0 protocol ipv6 \
-        prio 1 handle ${default_mark}/$UPLOAD_MASK fw flowid 1:2 2>/dev/null; then
+        prio 1 handle ${mark_hex}/$UPLOAD_MASK fw flowid 1:2 2>/dev/null; then
         qos_log "WARN" "添加上传默认IPv6过滤器失败"
     fi
     
-    upload_class_mark_list="default_class:0x$(printf '%X' $default_mark)"
-    qos_log "INFO" "默认上传类别创建完成 (类ID: 1:2, 标记: 0x$(printf '%X' $default_mark))"
+    upload_class_mark_list="default_class:$mark_hex"
+    qos_log "INFO" "默认上传类别创建完成 (类ID: 1:2, 标记: $mark_hex)"
     return 0
 }
 
-# 创建默认下载类（接收一个标记参数）
+# 创建默认下载类
 create_default_download_class() {
-    local default_mark="$1"
-    qos_log "INFO" "创建默认下载类别，使用标记: 0x$(printf '%X' $default_mark)"
+    qos_log "INFO" "创建默认下载类别"
     
     local ifb_dev="$IFB_DEVICE"
     
@@ -956,12 +1153,15 @@ create_default_download_class() {
         return 1
     fi
     
+    tc qdisc change dev "$ifb_dev" root handle 1:0 hfsc default 2 2>/dev/null || true
+    
+    local mark_hex="0x100"
     if ! tc filter add dev "$ifb_dev" parent 1:0 protocol ip \
-        prio 1 handle ${default_mark}/$DOWNLOAD_MASK fw flowid 1:2 2>/dev/null; then
+        prio 1 handle ${mark_hex}/$DOWNLOAD_MASK fw flowid 1:2 2>/dev/null; then
         qos_log "WARN" "添加下载默认IPv4过滤器失败"
     fi
     if ! tc filter add dev "$ifb_dev" parent 1:0 protocol ipv6 \
-        prio 1 handle ${default_mark}/$DOWNLOAD_MASK fw flowid 1:2 2>/dev/null; then
+        prio 1 handle ${mark_hex}/$DOWNLOAD_MASK fw flowid 1:2 2>/dev/null; then
         qos_log "WARN" "添加下载默认IPv6过滤器失败"
     fi
     
@@ -970,18 +1170,19 @@ create_default_download_class() {
         return 1
     fi
     
-    download_class_mark_list="default_class:0x$(printf '%X' $default_mark)"
-    qos_log "INFO" "默认下载类别创建完成 (类ID: 1:2, 标记: 0x$(printf '%X' $default_mark))"
+    download_class_mark_list="default_class:$mark_hex"
+    qos_log "INFO" "默认下载类别创建完成 (类ID: 1:2, 标记: $mark_hex)"
     return 0
 }
 
-# ========== 入口重定向 ==========
+# ========== 入口重定向（依赖conntrack恢复标记，增加IPv6强制成功逻辑）==========
 setup_ingress_redirect() {
     if [ -z "$qos_interface" ]; then
         qos_log "ERROR" "无法确定 WAN 接口"
         return 1
     fi
     
+    # 检测 connmark 支持
     if ! check_tc_connmark_support; then
         qos_log "ERROR" "内核不支持 tc action connmark，无法实现下载方向QoS"
         return 1
@@ -997,6 +1198,7 @@ setup_ingress_redirect() {
     
     tc filter del dev "$qos_interface" parent ffff: 2>/dev/null || true
     
+    # IPv4重定向（必须成功）
     if ! tc filter add dev "$qos_interface" parent ffff: protocol ip \
         u32 match u32 0 0 \
         action connmark \
@@ -1008,6 +1210,7 @@ setup_ingress_redirect() {
         qos_log "INFO" "IPv4入口重定向规则添加成功"
     fi
 
+    # 检测接口是否有全局 IPv6 地址，以决定是否强制 IPv6 必须成功
     local has_ipv6_global=0
     if ip -6 addr show dev "$qos_interface" scope global 2>/dev/null | grep -q "inet6"; then
         has_ipv6_global=1
@@ -1016,9 +1219,11 @@ setup_ingress_redirect() {
         qos_log "INFO" "接口 $qos_interface 无全局 IPv6 地址，IPv6 重定向失败仅警告"
     fi
     
+    # ========== IPv6 重定向：三阶尝试 ==========
     local ipv6_success=false
     local ipv6_attempts=0
     
+    # 第一优先：flower 匹配全球单播地址 (2000::/3)
     if tc filter add dev "$qos_interface" parent ffff: protocol ipv6 \
         flower dst_ip 2000::/3 \
         action connmark \
@@ -1029,6 +1234,7 @@ setup_ingress_redirect() {
         qos_log "WARN" "flower 规则添加失败，尝试 u32 全球单播匹配"
         ipv6_attempts=$((ipv6_attempts + 1))
         
+        # 第二优先：u32 匹配全球单播地址 (2000::/3)
         if tc filter add dev "$qos_interface" parent ffff: protocol ipv6 \
             u32 match u32 0x20000000 0xe0000000 at 24 \
             action connmark \
@@ -1039,6 +1245,7 @@ setup_ingress_redirect() {
             qos_log "WARN" "u32 全球单播规则添加失败，尝试无过滤规则"
             ipv6_attempts=$((ipv6_attempts + 1))
             
+            # 第三优先：无过滤的 u32 全匹配
             if tc filter add dev "$qos_interface" parent ffff: protocol ipv6 \
                 u32 match u32 0 0 \
                 action connmark \
@@ -1053,6 +1260,7 @@ setup_ingress_redirect() {
         fi
     fi
 
+    # 根据是否有全局 IPv6 地址决定是否必须成功
     if [ "$has_ipv6_global" = "1" ]; then
         if [ "$ipv6_success" != "true" ]; then
             qos_log "ERROR" "接口存在全局 IPv6 地址，但 IPv6 入口重定向配置失败，QoS 无法正常工作"
@@ -1069,6 +1277,7 @@ setup_ingress_redirect() {
         fi
     fi
     
+    # 检查是否有规则指向 IFB 设备（仅用于日志）
     local ipv4_rule_count=$(tc filter show dev "$qos_interface" parent ffff: protocol ip 2>/dev/null | grep -c "mirred.*Redirect to device $IFB_DEVICE")
     local ipv6_rule_count=$(tc filter show dev "$qos_interface" parent ffff: protocol ipv6 2>/dev/null | grep -c "mirred.*Redirect to device $IFB_DEVICE")
     if [ "$ipv4_rule_count" -ge 1 ] && [ "$ipv6_rule_count" -ge 1 ]; then
@@ -1119,20 +1328,20 @@ check_ingress_redirect() {
 }
 
 # ========== 上传方向初始化 ==========
-init_hfsc_upload() {
+initialize_hfsc_upload() {
     qos_log "INFO" "初始化上传方向HFSC"
     
     load_upload_class_configurations
     
     if [ -z "$upload_class_list" ]; then
         qos_log "WARN" "未找到上传类别配置，使用默认类别"
-        # 使用固定标记 0x1（因为没有自定义类，不会冲突）
-        if ! create_default_upload_class 1; then
+        if ! create_default_upload_class; then
             return 1
         fi
         return 0
     fi
     
+    # 统计启用类数量（包括默认类？实际上默认类单独处理，但这里已有自定义类）
     local class_count=0
     for class in $upload_class_list; do
         local enabled=$(uci -q get ${CONFIG_FILE}.${class}.enabled 2>/dev/null)
@@ -1144,16 +1353,27 @@ init_hfsc_upload() {
         return 1
     fi
     
-    # 标记已在 init_hfsc_cake_qos 中分配，这里直接创建类
+    # 预先分配标记，检查冲突
+    if ! allocate_class_marks "upload" "$upload_class_list"; then
+        qos_log "ERROR" "上传方向类标记分配失败，存在无法解决的冲突"
+        return 1
+    fi
+    
+    if ! create_hfsc_root_qdisc "$qos_interface" "upload" "1:0" "1:1"; then
+        qos_log "ERROR" "创建上传根队列失败"
+        return 1
+    fi
+    
     local class_index=2
     upload_class_mark_list=""
     
     for class_name in $upload_class_list; do
         if create_hfsc_upload_class "$class_name" "$class_index"; then
-            local class_mark_hex=$(get_class_mark "upload" "$class_name")
+            local class_mark_hex=$(get_class_mark_by_class "upload" "$class_name")
             upload_class_mark_list="$upload_class_mark_list$class_name:0x$(printf '%X' $class_mark_hex) "
         else
             qos_log "ERROR" "创建上传类别 $class_name 失败，停止初始化"
+            # 清理已创建的根队列
             tc qdisc del dev "$qos_interface" root 2>/dev/null
             return 1
         fi
@@ -1167,20 +1387,20 @@ init_hfsc_upload() {
 }
 
 # ========== 下载方向初始化 ==========
-init_hfsc_download() {
+initialize_hfsc_download() {
     qos_log "INFO" "初始化下载方向HFSC"
     
     load_download_class_configurations
     
     if [ -z "$download_class_list" ]; then
         qos_log "WARN" "未找到下载类别配置，使用默认类别"
-        # 使用固定标记 0x10000（因为没有自定义类，不会冲突）
-        if ! create_default_download_class 65536; then
+        if ! create_default_download_class; then
             return 1
         fi
         return 0
     fi
     
+    # 统计启用类数量
     local class_count=0
     for class in $download_class_list; do
         local enabled=$(uci -q get ${CONFIG_FILE}.${class}.enabled 2>/dev/null)
@@ -1192,7 +1412,13 @@ init_hfsc_download() {
         return 1
     fi
     
-    # 标记已在 init_hfsc_cake_qos 中分配，这里直接创建类
+    # 预先分配标记，检查冲突
+    if ! allocate_class_marks "download" "$download_class_list"; then
+        qos_log "ERROR" "下载方向类标记分配失败，存在无法解决的冲突"
+        return 1
+    fi
+    
+    # 确保IFB设备已存在并启用
     if ! ip link show dev "$IFB_DEVICE" >/dev/null 2>&1; then
         qos_log "ERROR" "IFB设备 $IFB_DEVICE 不存在"
         return 1
@@ -1214,10 +1440,11 @@ init_hfsc_download() {
     
     for class_name in $download_class_list; do
         if create_hfsc_download_class "$class_name" "$class_index" "$filter_prio"; then
-            local class_mark_hex=$(get_class_mark "download" "$class_name")
+            local class_mark_hex=$(get_class_mark_by_class "download" "$class_name")
             download_class_mark_list="$download_class_mark_list$class_name:0x$(printf '%X' $class_mark_hex) "
         else
             qos_log "ERROR" "创建下载类别 $class_name 失败，停止初始化"
+            # 清理已创建的根队列
             tc qdisc del dev "$IFB_DEVICE" root 2>/dev/null
             return 1
         fi
@@ -1251,8 +1478,7 @@ set_default_upload_class() {
             default_class_name=$(echo "$upload_class_list" | awk '{print $1}')
             qos_log "INFO" "自动选择第一个类别: $default_class_name"
         else
-            # 无自定义类，默认类ID固定为1:2
-            tc filter add dev "$qos_interface" parent 1:0 protocol all prio 999 u32 match u32 0 0 flowid 1:2 2>/dev/null || true
+            tc qdisc change dev "$qos_interface" root handle 1:0 hfsc default 2 2>/dev/null || true
             qos_log "INFO" "上传默认类别设置为TC类ID: 1:2"
             return
         fi
@@ -1293,9 +1519,11 @@ set_default_upload_class() {
             qos_log "INFO" "无自定义类别，使用默认类ID 1:2"
         fi
     fi
-    
-    # HFSC 不支持 default 参数，使用全匹配过滤器
-    tc filter add dev "$qos_interface" parent 1:0 protocol all prio 999 u32 match u32 0 0 flowid 1:$found_index 2>/dev/null || true
+    #hfsc qdisc 不支持 default 参数（htb 支持），导致未匹配任何规则的流量可能被丢弃。
+    #tc qdisc change dev "$qos_interface" root handle 1:0 hfsc default $found_index 2>/dev/null || true 
+	#改为根 qdisc 上添加一条低优先级的全匹配规则，指向默认类
+	tc filter add dev "$qos_interface" parent 1:0 protocol all prio 999 u32 match u32 0 0 flowid 1:$found_index
+	
     qos_log "INFO" "上传默认类别设置为TC类ID: 1:$found_index"
 }
 
@@ -1314,7 +1542,7 @@ set_default_download_class() {
             default_class_name=$(echo "$download_class_list" | awk '{print $1}')
             qos_log "INFO" "自动选择第一个类别: $default_class_name"
         else
-            tc filter add dev "$IFB_DEVICE" parent 1:0 protocol all prio 999 u32 match u32 0 0 flowid 1:2 2>/dev/null || true
+            tc qdisc change dev "$IFB_DEVICE" root handle 1:0 hfsc default 2 2>/dev/null || true
             qos_log "INFO" "下载默认类别设置为TC类ID: 1:2"
             return
         fi
@@ -1356,7 +1584,11 @@ set_default_download_class() {
         fi
     fi
     
-    tc filter add dev "$IFB_DEVICE" parent 1:0 protocol all prio 999 u32 match u32 0 0 flowid 1:$found_index 2>/dev/null || true
+	#hfsc qdisc 不支持 default 参数（htb 支持），导致未匹配任何规则的流量可能被丢弃。
+    #tc qdisc change dev "$IFB_DEVICE" root handle 1:0 hfsc default $found_index 2>/dev/null || true 
+	#改为根 qdisc 上添加一条低优先级的全匹配规则，指向默认类
+	tc filter add dev "$IFB_DEVICE" parent 1:0 protocol all prio 999 u32 match u32 0 0 flowid 1:$found_index
+	
     qos_log "INFO" "下载默认类别设置为TC类ID: 1:$found_index"
 }
 
@@ -1397,33 +1629,32 @@ apply_hfsc_specific_rules() {
 }
 
 # ========== 主初始化函数 ==========
-init_hfsc_cake_qos() {
+initialize_hfsc_cake_qos() {
     qos_log "INFO" "开始初始化HFSC+CAKE QoS系统"
     
+    # 获取并发锁
     if ! acquire_lock; then
         qos_log "ERROR" "无法获取并发锁，可能已有其他QoS进程在运行"
         rm -f "$QOS_RUNNING_FILE"
         return 1
     fi
     
+	# 幂等性检查
     if ! check_already_running; then
         qos_log "ERROR" "HFSC+CAKE QoS 已经在运行中"
         release_lock
         return 1
     fi
 	
-    if ! init_ruleset; then
-        qos_log "ERROR" "初始化规则集失败，QoS 无法启动"
-        release_lock
-        rm -f "$QOS_RUNNING_FILE"
-        return 1
-    fi
+	# 初始化规则集（从 /etc/qos_gargoyle/rulesets/ 加载）
+	if ! init_ruleset; then
+		qos_log "ERROR" "初始化规则集失败，QoS 无法启动"
+		release_lock
+		rm -f "$QOS_RUNNING_FILE"
+		return 1
+	fi
 	
-    # 清空 nft 规则链
-    nft flush chain inet gargoyle-qos-priority filter_qos_egress 2>/dev/null
-    nft flush chain inet gargoyle-qos-priority filter_qos_ingress 2>/dev/null
-    qos_log "INFO" "已清空 nft 规则链"
-    
+    # 检查必需命令
     if ! check_required_commands; then
         qos_log "ERROR" "缺少必需的命令，请安装对应软件包"
         release_lock
@@ -1431,6 +1662,7 @@ init_hfsc_cake_qos() {
         return 1
     fi
     
+    # 检查并加载内核模块
     if ! load_required_modules; then
         qos_log "ERROR" "无法加载必需的内核模块"
         release_lock
@@ -1438,8 +1670,10 @@ init_hfsc_cake_qos() {
         return 1
     fi
      
+    # 确保 nftables 表存在
     nft add table inet gargoyle-qos-priority 2>/dev/null || true
     
+    # 检查qos_interface是否已设置
     if [ -z "$qos_interface" ]; then
         qos_interface=$(uci -q get qos_gargoyle.global.wan_interface 2>/dev/null)
         if [ -z "$qos_interface" ] && [ -f "/lib/functions/network.sh" ]; then
@@ -1463,6 +1697,7 @@ init_hfsc_cake_qos() {
         return 1
     fi
     
+    # 确保IFB设备存在（仅检查，不创建）——此时已从配置读取IFB_DEVICE
     if ! ensure_ifb_device "$IFB_DEVICE"; then
         qos_log "ERROR" "IFB设备 $IFB_DEVICE 无法使用，请检查配置或启动IFB管理脚本"
         release_lock
@@ -1470,71 +1705,13 @@ init_hfsc_cake_qos() {
         return 1
     fi
     
-    # 加载类别列表
-    load_upload_class_configurations
-    load_download_class_configurations
-    
-    # ========== 先分配标记 ==========
-	# 在分配标记前清空文件
-	: > "$PERSISTENT_CLASS_MARKS"
-
-    if [ -n "$upload_class_list" ]; then
-        if ! allocate_class_marks "upload" "$upload_class_list"; then
-            qos_log "ERROR" "上传方向标记分配失败"
-            release_lock
-            rm -f "$QOS_RUNNING_FILE"
-            return 1
-        fi
-    fi
-    if [ -n "$download_class_list" ]; then
-        if ! allocate_class_marks "download" "$download_class_list"; then
-            qos_log "ERROR" "下载方向标记分配失败"
-            release_lock
-            rm -f "$QOS_RUNNING_FILE"
-            return 1
-        fi
-    fi
-
-    # ========== 创建 class_mark 映射用于 conntrack 恢复 ==========
-    nft add map inet gargoyle-qos-priority class_mark { type mark : mark; } 2>/dev/null || true
-    nft flush map inet gargoyle-qos-priority class_mark 2>/dev/null || true
-    if [ -f "$PERSISTENT_CLASS_MARKS" ]; then
-        while IFS=: read -r dir cls mark; do
-            [ -z "$dir" ] || [ -z "$cls" ] || [ -z "$mark" ] && continue
-            class_id=$(get_class_id "$dir" "$cls") || continue
-            nft add element inet gargoyle-qos-priority class_mark { $class_id : $mark } 2>/dev/null
-        done < "$PERSISTENT_CLASS_MARKS"
-    fi
-    
-    # ========== 然后应用 nft 规则（此时标记已就绪）==========
-    echo "调用分类规则应用..." 
-    if ! apply_all_rules "upload_rule" "$UPLOAD_MASK" "filter_qos_egress"; then
-        qos_log "ERROR" "上传规则应用失败，回滚"
-        stop_hfsc_cake_qos
-        return 1
-    fi
-    if ! apply_all_rules "download_rule" "$DOWNLOAD_MASK" "filter_qos_ingress"; then
-        qos_log "ERROR" "下载规则应用失败，回滚"
-        stop_hfsc_cake_qos
-        return 1
-    fi
-    qos_log "INFO" "应用自定义规则成功"
-    
-    # ========== 添加 conntrack 恢复规则（位于链顶部） ==========
-    nft insert rule inet gargoyle-qos-priority filter_qos_egress ct state established,related meta mark set class_mark[ct mark & 0xff]
-    nft insert rule inet gargoyle-qos-priority filter_qos_ingress ct state established,related meta mark set class_mark[ct mark & 0xff]
-    qos_log "INFO" "已添加 conntrack 恢复规则"
-    
-    # 应用 ipv6 特别规则
-    echo "应用ipv6特别规则..." 
     setup_ipv6_specific_rules
     
-    # ========== 最后创建 HFSC 队列 ==========
     local upload_success=0
     local download_success=0
     
     if [ "$total_upload_bandwidth" -gt 0 ] 2>/dev/null; then
-        if ! init_hfsc_upload; then
+        if ! initialize_hfsc_upload; then
             qos_log "ERROR" "上传方向初始化失败"
             upload_success=1
         fi
@@ -1544,7 +1721,7 @@ init_hfsc_cake_qos() {
     fi
     
     if [ "$total_download_bandwidth" -gt 0 ] 2>/dev/null; then
-        if ! init_hfsc_download; then
+        if ! initialize_hfsc_download; then
             qos_log "ERROR" "下载方向初始化失败"
             download_success=1
         fi
@@ -1561,7 +1738,6 @@ init_hfsc_cake_qos() {
         return 1
     fi
     
-    echo "应用HFSC特别规则..." 
     setup_hfsc_enhance_chains
     apply_hfsc_specific_rules
     
@@ -1570,6 +1746,7 @@ init_hfsc_cake_qos() {
     return 0
 }
 
+# ========== 停止函数（改进锁处理，增加重试）==========
 # ========== 停止函数 ==========
 stop_hfsc_cake_qos() {
     qos_log "INFO" "停止HFSC+CAKE QoS"
@@ -1592,8 +1769,10 @@ stop_hfsc_cake_qos() {
         return 1
     fi
 
+    # 成功获取锁后再删除运行标记文件
     rm -f "$QOS_RUNNING_FILE"
     
+    # 获取清理前的计数，去除所有非数字字符
     local tc_count_before=$(tc qdisc show 2>/dev/null | grep -c hfsc 2>/dev/null | tr -cd '0-9')
     local nft_count_before=$(nft list ruleset 2>/dev/null | grep -c "gargoyle-qos-priority" 2>/dev/null | tr -cd '0-9')
     tc_count_before=${tc_count_before:-0}
@@ -1606,31 +1785,36 @@ stop_hfsc_cake_qos() {
         qos_log "INFO" "检测到 $nft_count_before 个NFTables规则，开始清理"
     fi
     
+    # 清理上传方向队列
     if [ -n "$qos_interface" ] && ip link show "$qos_interface" >/dev/null 2>&1; then
         tc filter del dev "$qos_interface" parent 1:0 protocol all 2>/dev/null || true
         tc qdisc del dev "$qos_interface" ingress 2>/dev/null || true
         tc qdisc del dev "$qos_interface" root 2>/dev/null || true
     fi
     
+    # 清理下载方向队列
     if [ -n "$IFB_DEVICE" ] && ip link show "$IFB_DEVICE" >/dev/null 2>&1; then
         tc filter del dev "$IFB_DEVICE" parent 1:0 protocol all 2>/dev/null || true
         tc qdisc del dev "$IFB_DEVICE" ingress 2>/dev/null || true
         tc qdisc del dev "$IFB_DEVICE" root 2>/dev/null || true
     fi
     
+    # 彻底删除nftables表（更干净）
     nft delete table inet gargoyle-qos-priority 2>/dev/null || true
     
-    # 清理标记文件
-    clear_class_marks
-    
+    # 处理IFB设备（仅当配置允许删除时）
     if [ -n "$IFB_DEVICE" ] && ip link show dev "$IFB_DEVICE" >/dev/null 2>&1; then
         ip link set dev "$IFB_DEVICE" down
         if [ "${DELETE_IFB_ON_STOP:-0}" = "1" ]; then
+            # 注意：这里不删除设备，因为可能被其他服务使用
             qos_log "INFO" "IFB设备 $IFB_DEVICE 已停用（保留）"
         else
             qos_log "INFO" "IFB设备 $IFB_DEVICE 已停用"
         fi
     fi
+    
+    # 清理连接标记（已不再需要，保留注释）
+    # conntrack -U --mark 0 2>/dev/null || true
     
     local tc_count_after=$(tc qdisc show 2>/dev/null | grep -c hfsc 2>/dev/null | tr -cd '0-9')
     local nft_count_after=$(nft list ruleset 2>/dev/null | grep -c "gargoyle-qos-priority" 2>/dev/null | tr -cd '0-9')
@@ -1646,14 +1830,14 @@ stop_hfsc_cake_qos() {
     
     qos_log "INFO" "HFSC+CAKE QoS停止完成 (清理前: ${tc_count_before}队列/${nft_count_before}规则, 清理后: ${tc_count_after}队列/${nft_count_after}规则)"
     
+    # 恢复备份的主配置
     restore_main_config
 
     if $got_lock; then
         release_lock
     fi
 }
-
-# ========== 状态显示函数 ==========
+# ========== 状态显示函数（增加 conntrack 命令检查）==========
 show_hfsc_cake_status() {
     if [ -z "$IFB_DEVICE" ]; then
         IFB_DEVICE=$(uci -q get qos_gargoyle.download.ifb_device)
@@ -1666,7 +1850,7 @@ show_hfsc_cake_status() {
         [ -z "$qos_interface" ] && qos_interface="未知"
     fi
     
-    echo "===== HFSC-CAKE QoS 状态报告 (v2.23) ====="
+    echo "===== HFSC-CAKE QoS 状态报告 (v2.21) ====="
     echo "时间: $(date)"
     echo "WAN接口: ${qos_interface}"
     
@@ -1794,19 +1978,28 @@ show_hfsc_cake_status() {
     # ========== 活动连接标记 ==========
     echo -e "\n======== 活动连接标记 ========"
 
+    # 检查 conntrack 命令是否存在
     if ! command -v conntrack >/dev/null 2>&1; then
         echo "  conntrack 命令未安装，无法显示连接标记信息。"
         echo "  请安装 conntrack-tools 包以获取此功能。"
     else
+        # 获取 WAN 接口的 IP 地址
         local wan_ipv4=""
         local wan_ipv6=""
 
+        # IPv4 地址
         wan_ipv4=$(ip -4 addr show dev "$qos_interface" 2>/dev/null | grep "inet " | awk '{print $2}' | cut -d/ -f1 | head -1)
-        [ -z "$wan_ipv4" ] && wan_ipv4=$(ifconfig "$qos_interface" 2>/dev/null | grep "inet addr:" | awk '{print $2}' | cut -d: -f2)
+        if [ -z "$wan_ipv4" ]; then
+            wan_ipv4=$(ifconfig "$qos_interface" 2>/dev/null | grep "inet addr:" | awk '{print $2}' | cut -d: -f2)
+        fi
 
+        # IPv6 地址
         wan_ipv6=$(ip -6 addr show dev "$qos_interface" 2>/dev/null | grep "inet6 " | grep -v "fe80::" | awk '{print $2}' | cut -d/ -f1 | head -1)
-        [ -z "$wan_ipv6" ] && wan_ipv6=$(ifconfig "$qos_interface" 2>/dev/null | grep "inet6 addr:" | grep -v "fe80::" | awk '{print $3}' | cut -d/ -f1)
+        if [ -z "$wan_ipv6" ]; then
+            wan_ipv6=$(ifconfig "$qos_interface" 2>/dev/null | grep "inet6 addr:" | grep -v "fe80::" | awk '{print $3}' | cut -d/ -f1)
+        fi
 
+        # IPv4 连接标记（目的地址为 WAN）
         echo -e "\nIPv4 连接标记 (目标地址为 WAN):"
         if [ -n "$wan_ipv4" ]; then
             echo "WAN IPv4: $wan_ipv4"
@@ -1831,6 +2024,7 @@ show_hfsc_cake_status() {
             echo "  WAN IPv4 地址不可用"
         fi
 
+        # IPv6 连接标记（目的地址为 WAN）
         echo -e "\nIPv6 连接标记 (目标地址为 WAN):"
         if [ -n "$wan_ipv6" ]; then
             echo "WAN IPv6: $wan_ipv6"
@@ -1845,6 +2039,7 @@ show_hfsc_cake_status() {
                     local dec_mark=$(echo "$line" | grep -o "mark=[0-9]\+" | cut -d= -f2 | head -1)
                     local mark_hex="0x$(printf '%x' "$dec_mark" 2>/dev/null || echo '0')"
                     
+                    # 简化 IPv6 地址显示（压缩连续的零）
                     src_ip=$(echo "$src_ip" | sed 's/\(:\)[0:]*/\1/g')
                     dst_ip=$(echo "$dst_ip" | sed 's/\(:\)[0:]*/\1/g')
                     
@@ -1858,6 +2053,7 @@ show_hfsc_cake_status() {
             echo "  WAN IPv6 地址不可用"
         fi
 
+        # 上传方向连接标记（源地址为 WAN）
         echo -e "\n上传方向连接标记 (源地址为 WAN):"
         if [ -n "$wan_ipv4" ]; then
             local upload_marks=$(conntrack -L -s "$wan_ipv4" 2>/dev/null | grep -E "mark=[0-9]+" | head -n 3)
@@ -1902,7 +2098,7 @@ main_hfsc_cake_qos() {
     
     case "$action" in
         "start")
-            if ! init_hfsc_cake_qos; then
+            if ! initialize_hfsc_cake_qos; then
                 qos_log "ERROR" "HFSC+CAKE QoS启动失败"
                 exit 1
             fi
@@ -1913,7 +2109,7 @@ main_hfsc_cake_qos() {
         "restart")
             stop_hfsc_cake_qos
             sleep 1
-            if ! init_hfsc_cake_qos; then
+            if ! initialize_hfsc_cake_qos; then
                 qos_log "ERROR" "HFSC+CAKE QoS重启失败"
                 exit 1
             fi

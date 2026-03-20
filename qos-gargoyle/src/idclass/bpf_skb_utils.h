@@ -6,10 +6,10 @@
 #ifndef __BPF_SKB_UTILS_H
 #define __BPF_SKB_UTILS_H
 
-#include <uapi/linux/bpf.h>
-#include <uapi/linux/if_ether.h>
-#include <uapi/linux/ip.h>
-#include <uapi/linux/ipv6.h>
+#include <linux/bpf.h>
+#include <linux/if_ether.h>
+#include <linux/ip.h>
+#include <linux/ipv6.h>
 #include <linux/if_vlan.h>
 #include <linux/ip.h>
 #include <net/ipv6.h>
