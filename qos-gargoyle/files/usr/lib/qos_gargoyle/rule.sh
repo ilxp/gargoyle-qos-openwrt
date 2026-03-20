@@ -9,7 +9,8 @@ CONFIG_FILE="qos_gargoyle"
 TEMP_FILES=""
 RULESET_DIR="/etc/qos_gargoyle/rulesets"          # 规则集存储目录
 RULESET_MERGED_FLAG="/tmp/qos_ruleset_merged"     # 标记文件，避免重复合并
-CLASS_MARKS_FILE=""                                # 标记映射文件（由主脚本设置或自动创建）
+CLASS_MARKS_FILE=""   
+PERSISTENT_CLASS_MARKS="/etc/qos_gargoyle/class_marks"   # 标记映射文件（自动创建供idclas使用）
 
 # ========== 日志函数别名 ==========
 log_debug() { [ "$DEBUG" = "1" ] && log "DEBUG" "$@"; }
@@ -321,6 +322,13 @@ allocate_class_marks() {
     local direction="$1"
     local class_list="$2"
     local mask base_value i class mark
+	
+	mkdir -p /etc/qos_gargoyle
+	
+	# 清空持久化标记文件（idclass专用）
+	: > "$PERSISTENT_CLASS_MARKS"
+	allocate_class_marks upload "$upload_classes"
+	allocate_class_marks download "$download_classes"
 
     init_class_marks_file
 
@@ -358,6 +366,7 @@ allocate_class_marks() {
                 mark_value=$((mark_value & 0xFFFFFFFF))
 
                 echo "$direction:$class:$mark_value" >> "$CLASS_MARKS_FILE"
+				echo "$direction:$class:$mark_value" >> "$PERSISTENT_CLASS_MARKS"  #写入持久化标记文件
                 log_info "类别 $class 分配标记索引 $index (原始哈希: $original_index, 探测次数: $probe)"
                 found=1
                 break
@@ -394,9 +403,11 @@ get_class_mark() {
     fi
 }
 
+
 # 清空标记文件（停止时调用）
 clear_class_marks() {
     rm -f "$CLASS_MARKS_FILE" 2>/dev/null
+	rm -f "$PERSISTENT_CLASS_MARKS" 2>/dev/null
 }
 
 # ========== 配置加载函数 ==========

@@ -16,6 +16,10 @@
 #include <bpf/bpf.h>
 #include <uci.h>
 #include "idclass.h"
+#include <unistd.h>
+#include <sys/stat.h>
+#include <fcntl.h>
+#define PERSISTENT_CLASS_MARKS "/etc/qos_gargoyle/class_marks"
 
 static int idclass_map_fds[__CL_MAP_MAX];
 static AVL_TREE(map_data, idclass_map_entry_cmp, false, NULL);
@@ -1334,20 +1338,125 @@ static void build_priority_maps(void)
 
 static void load_class_marks_from_file(void)
 {
-    FILE *fp = fopen("/tmp/idclass_class_marks", "r");
+    FILE *fp = fopen(PERSISTENT_CLASS_MARKS, "r");
     if (!fp) {
-        fprintf(stderr, "Warning: cannot open /tmp/idclass_class_marks, marks may be missing\n");
+        // 文件不存在时不报错，只是警告（可能由 rule.sh 生成）
+        fprintf(stderr, "Info: %s not found, class marks may be missing\n", PERSISTENT_CLASS_MARKS);
         return;
     }
 
-    int class_id;
-    unsigned int mark;
-    while (fscanf(fp, "%d:%u", &class_id, &mark) == 2) {
+    char line[256];
+    while (fgets(line, sizeof(line), fp)) {
+        // 去除换行符
+        line[strcspn(line, "\n")] = 0;
+        if (line[0] == '#' || line[0] == '\0')
+            continue;
+
+        char direction[16] = {0};
+        char class_name[64] = {0};
+        unsigned int mark;
+        if (sscanf(line, "%15[^:]:%63[^:]:%u", direction, class_name, &mark) != 3) {
+            fprintf(stderr, "Invalid line in %s: %s\n", PERSISTENT_CLASS_MARKS, line);
+            continue;
+        }
+
+        int class_id = -1;
+        if (strncmp(class_name, "uclass_", 7) == 0) {
+            class_id = atoi(class_name + 7);
+            if (class_id < 1 || class_id > 16) {
+                fprintf(stderr, "Invalid upload class id %d from %s\n", class_id, class_name);
+                continue;
+            }
+            // 上传类 class_id 保持不变 (1-16)
+        } else if (strncmp(class_name, "dclass_", 7) == 0) {
+            class_id = atoi(class_name + 7);
+            if (class_id < 1 || class_id > 16) {
+                fprintf(stderr, "Invalid download class id %d from %s\n", class_id, class_name);
+                continue;
+            }
+            class_id += 16; // 下载类映射到 17-32
+        } else {
+            fprintf(stderr, "Unknown class name format: %s\n", class_name);
+            continue;
+        }
+
         int fd = idclass_map_fds[CL_MAP_CLASS_MARK];
-        if (fd >= 0 && class_id >= 0 && class_id < IDCLASS_MAX_CLASS_ENTRIES)
+        if (fd >= 0 && class_id >= 0 && class_id < IDCLASS_MAX_CLASS_ENTRIES) {
             bpf_map_update_elem(fd, &class_id, &mark, 0);
+            fprintf(stderr, "Loaded class %s (id=%d) mark=%u\n", class_name, class_id, mark);
+        } else {
+            fprintf(stderr, "Class id %d out of range (max %d)\n", class_id, IDCLASS_MAX_CLASS_ENTRIES - 1);
+        }
     }
     fclose(fp);
+}
+
+static void generate_default_class_marks(void)
+{
+    struct uci_context *uci;
+    struct uci_package *pkg;
+    struct uci_element *e;
+    struct uci_section *s;
+    FILE *fp;
+    char path[256];
+
+    // 确保目录存在
+    mkdir("/etc/qos_gargoyle", 0755);
+
+    uci = uci_alloc_context();
+    if (!uci) return;
+    if (uci_load(uci, uci_config_name, &pkg) != UCI_OK) {
+        uci_free_context(uci);
+        return;
+    }
+
+    snprintf(path, sizeof(path), "/etc/qos_gargoyle/class_marks");
+    fp = fopen(path, "w");
+    if (!fp) {
+        fprintf(stderr, "Cannot create %s\n", path);
+        uci_unload(uci, pkg);
+        uci_free_context(uci);
+        return;
+    }
+
+    uci_foreach_element(&pkg->sections, e) {
+        s = uci_to_section(e);
+        const char *type = uci_lookup_option_string(uci, s, "type") ?: s->type;
+        if (!type) continue;
+
+        int class_id = 0;
+        const char *class_name = NULL;
+        const char *direction = NULL;
+
+        if (strcmp(type, "upload_class") == 0) {
+            if (sscanf(s->e.name, "uclass_%d", &class_id) == 1) {
+                class_name = s->e.name;
+                direction = "upload";
+            }
+        } else if (strcmp(type, "download_class") == 0) {
+            if (sscanf(s->e.name, "dclass_%d", &class_id) == 1) {
+                class_name = s->e.name;
+                direction = "download";
+            }
+        }
+
+        if (class_name && direction && class_id >= 1 && class_id <= 16) {
+            uint32_t mark = class_id; // 默认 mark = class_id
+            fprintf(fp, "%s:%s:%u\n", direction, class_name, mark);
+
+            // 更新 eBPF map
+            int fd = idclass_map_fds[CL_MAP_CLASS_MARK];
+            if (fd >= 0) {
+                int map_class_id = (strcmp(direction, "upload") == 0) ? class_id : class_id + 16;
+                bpf_map_update_elem(fd, &map_class_id, &mark, 0);
+            }
+        }
+    }
+
+    fclose(fp);
+    uci_unload(uci, pkg);
+    uci_free_context(uci);
+    ULOG_INFO("Generated default class marks in %s\n", path);
 }
 
 // 定义 ip_key 结构体（与内核态一致）
@@ -1408,6 +1517,7 @@ static void idclass_check_uci_reload(struct uloop_timeout *t)
             last_uci_mtime = st.st_mtime;
             // 重新加载 UCI 配置
             load_idclass_config();
+			load_class_marks_from_file();
             // 更新 eBPF maps
             idclass_map_update_config();
             // 同步所有 class 的 config
@@ -1479,7 +1589,12 @@ int idclass_map_init(void)
     idclass_map_reset_config();
 
     load_idclass_config();
-    load_class_marks_from_file();
+	load_class_marks_from_file();
+    // 如果 class_marks 文件不存在，生成默认的
+    if (access("/etc/qos_gargoyle/class_marks", F_OK) != 0) {
+        generate_default_class_marks();
+    }
+	
     build_priority_maps();
 
     ip_conn_timer.cb = idclass_update_ip_conn;
