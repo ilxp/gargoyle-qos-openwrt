@@ -199,9 +199,9 @@ start() {
         return 0
     fi
     
-    initialize_qos
+    init_qos
     ret=$?
-    echo "initialize_qos returned: $ret"
+    echo "init_qos returned: $ret"
     
     if [ $ret -eq 0 ]; then
         echo "QoS Gargoyle started successfully"
@@ -335,7 +335,6 @@ load_common_libraries() {
 }
 
 # 加载算法模块
-# 新增 cake_dscp 分支
 load_algorithm_module() {
     local algo="$1"
     local module=""
@@ -367,7 +366,6 @@ load_algorithm_module() {
 }
 
 # 加载 QoS 配置
-# 修复: 简化重试逻辑，直接读取，若失败则自动检测
 load_qos_config() {
     echo "加载 UCI 配置..." >&2
     
@@ -618,7 +616,7 @@ setup_nft_tables() {
     nft add rule inet gargoyle-qos-priority filter_input iifname "$qos_interface" jump filter_qos_ingress
     nft add rule inet gargoyle-qos-priority filter_forward iifname "$qos_interface" jump filter_qos_ingress
     
-    echo "NFT tables initialized"
+    echo "NFT tables init"
     return 0
 }
 
@@ -830,8 +828,8 @@ release_lock() {
 }
 
 # ========== 主初始化函数 ==========
-initialize_qos() {
-    echo "Initializing QoS system..."
+init_qos() {
+    echo "init QoS system..."
     
     # 获取锁
     if ! acquire_lock; then
@@ -901,9 +899,9 @@ initialize_qos() {
     case "$algorithm" in
         "hfsc_fqcodel")
             export RULES_ALREADY_APPLIED=1
-            if type initialize_hfsc_qos >/dev/null 2>&1; then
+            if type init_hfsc_qos >/dev/null 2>&1; then
                 echo "正在初始化 HFSC QoS..."
-                initialize_hfsc_qos start
+                init_hfsc_qos start
                 ALGO_RET=$?
             else
                 echo "错误: HFSC 初始化函数未找到"
@@ -914,10 +912,10 @@ initialize_qos() {
             ;;
         "cake"|"cake_dscp")                     # 新增 cake_dscp 分支
             export RULES_ALREADY_APPLIED=1
-            if type initialize_cake_qos >/dev/null 2>&1; then
-                initialize_cake_qos start
+            if type init_cake_qos >/dev/null 2>&1; then
+                init_cake_qos start
                 ALGO_RET=$?
-                echo "DEBUG: initialize_cake_qos start returned $ALGO_RET"
+                echo "DEBUG: init_cake_qos start returned $ALGO_RET"
             else
                 echo "CAKE initialization function not found"
                 stop_qos
@@ -927,8 +925,8 @@ initialize_qos() {
             ;;
         "htb_fqcodel")
             export RULES_ALREADY_APPLIED=1
-            if type initialize_htb_qos >/dev/null 2>&1; then
-                initialize_htb_qos start
+            if type init_htb_qos >/dev/null 2>&1; then
+                init_htb_qos start
                 ALGO_RET=$?
             else
                 echo "HTB initialization function not found"
@@ -939,8 +937,8 @@ initialize_qos() {
             ;;
         "hfsc_cake")
             export RULES_ALREADY_APPLIED=1
-            if type initialize_hfsc_cake_qos >/dev/null 2>&1; then
-                initialize_hfsc_cake_qos start
+            if type init_hfsc_cake_qos >/dev/null 2>&1; then
+                init_hfsc_cake_qos start
                 ALGO_RET=$?
             else
                 echo "HFSC+CAKE initialization function not found"
@@ -951,8 +949,8 @@ initialize_qos() {
             ;;
         "htb_cake")
             export RULES_ALREADY_APPLIED=1
-            if type initialize_htb_cake_qos >/dev/null 2>&1; then
-                initialize_htb_cake_qos start
+            if type init_htb_cake_qos >/dev/null 2>&1; then
+                init_htb_cake_qos start
                 ALGO_RET=$?
             else
                 echo "HTB+CAKE initialization function not found"
@@ -981,7 +979,7 @@ initialize_qos() {
     
     release_lock
     
-    echo "✅ QoS initialized successfully (Algorithm: $algorithm)"
+    echo "✅ QoS init successfully (Algorithm: $algorithm)"
     return 0
 }
 

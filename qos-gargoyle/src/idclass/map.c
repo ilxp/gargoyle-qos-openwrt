@@ -31,6 +31,14 @@ static uint32_t map_dns_seq;
 
 struct uloop_timeout idclass_map_timer;
 
+// 连接数统计相关
+static int ip_conn_fd = -1;
+static int flow_stats_fd = -1;
+static struct uloop_timeout ip_conn_timer;
+// UCI 热重载
+static struct uloop_timeout uci_reload_timer;
+static time_t last_uci_mtime = 0;
+
 /* 动态 UCI 配置名 */
 static const char *uci_config_name = "qos_gargoyle";
 
@@ -53,6 +61,7 @@ const struct {
 	[CL_MAP_PRIO_CLASS_UP] = { "prio_class_up", "prio_class_up" },
 	[CL_MAP_PRIO_CLASS_DOWN] = { "prio_class_down", "prio_class_down" },
 	[CL_MAP_CLASS_MARK] = { "class_mark", "class_mark" },
+	[CL_MAP_IP_CONN] = { "ip_conn_map", "ip_conn" },
 };
 
 static const struct {
@@ -930,6 +939,33 @@ int map_parse_flow_config(struct idclass_flow_config *cfg, struct blob_attr *att
 
     if (reset) {
         memset(cfg, 0, sizeof(*cfg));
+        // 设置默认阈值
+        cfg->bulk_trigger_pps = 500;
+        cfg->prio_max_avg_pkt_len = 200;
+        cfg->game_max_avg_pkt_len = 200;
+        cfg->game_max_conn = 5;
+        cfg->game_max_pps = 50;
+        cfg->game_sample_packets = 10;
+        cfg->video_min_avg_pkt_len = 1000;
+        cfg->video_max_avg_pkt_len = 1400;
+        cfg->video_max_conn = 20;
+        cfg->video_min_pps = 100;
+        cfg->video_max_pps = 500;
+        cfg->bulk_min_avg_pkt_len = 1400;
+        cfg->bulk_min_conn = 50;
+        cfg->bulk_min_pps = 500;
+        cfg->tcp_flags_syn_ack_ratio = 10; // 10%
+        cfg->tcp_flags_window = 20;
+        cfg->conn_duration_short = 10; // 10秒
+        cfg->conn_duration_long = 60;  // 60秒
+        cfg->up_down_ratio_low = 10;   // 10%
+        cfg->up_down_ratio_high = 90;  // 90%
+        cfg->burst_window_ms = 100;    // 100ms
+        cfg->burst_packets = 10;
+        cfg->burst_bytes = 10000;      // 10KB
+        cfg->iat_threshold_us = 10000; // 10ms
+        cfg->retrans_threshold = 5;    // 5%
+        // 权重默认值
         cfg->weight_pktlen_realtime = 3;
         cfg->weight_pktlen_video    = 3;
         cfg->weight_pktlen_normal   = 1;
@@ -1049,7 +1085,8 @@ int map_parse_flow_config(struct idclass_flow_config *cfg, struct blob_attr *att
     return 0;
 }
 
-static int load_idclass_config(void)
+// 将 load_idclass_config 改为非静态
+int load_idclass_config(void)
 {
     struct uci_context *uci;
     struct uci_package *pkg;
@@ -1313,6 +1350,93 @@ static void load_class_marks_from_file(void)
     fclose(fp);
 }
 
+// 定义 ip_key 结构体（与内核态一致）
+struct ip_key {
+    __u8 addr[16];
+};
+
+// 更新 ip_conn_map 的定时器回调（支持完整 IPv6 地址）
+static void idclass_update_ip_conn(struct uloop_timeout *t)
+{
+    __u32 key = 0, next_key;
+    struct flow_stats stats;
+    __u32 cur_time = idclass_gettime();
+    int fd = ip_conn_fd;
+
+    // 清空 ip_conn_map（先获取第一个 key，然后循环删除）
+    struct ip_key cur_key = {0};
+    struct ip_key next_key_ip;
+    while (bpf_map_get_next_key(fd, &cur_key, &next_key_ip) == 0) {
+        bpf_map_delete_elem(fd, &next_key_ip);
+        cur_key = next_key_ip;
+    }
+
+    // 遍历 flow_stats_map
+    key = 0;
+    while (bpf_map_get_next_key(flow_stats_fd, &key, &next_key) == 0) {
+        if (bpf_map_lookup_elem(flow_stats_fd, &next_key, &stats) == 0) {
+            __u64 last_seen_sec = stats.last_seen / 1000000000ULL;
+            if (cur_time - last_seen_sec <= idclass_active_timeout) {
+                // 检查 client_ip 是否非零（简单检查第一个字节即可）
+                if (stats.client_ip[0] != 0 || stats.client_ip[1] != 0) {
+                    struct ip_key ipkey;
+                    memcpy(ipkey.addr, stats.client_ip, 16);
+                    uint32_t *cnt = bpf_map_lookup_elem(fd, &ipkey);
+                    if (cnt) {
+                        uint32_t new_cnt = *cnt + 1;
+                        bpf_map_update_elem(fd, &ipkey, &new_cnt, BPF_EXIST);
+                    } else {
+                        uint32_t one = 1;
+                        bpf_map_update_elem(fd, &ipkey, &one, BPF_NOEXIST);
+                    }
+                }
+            }
+        }
+        key = next_key;
+    }
+    uloop_timeout_set(t, 1000);
+}
+
+// UCI 文件监控回调
+static void idclass_check_uci_reload(struct uloop_timeout *t)
+{
+    struct stat st;
+    char path[256];
+    snprintf(path, sizeof(path), "/etc/config/%s", uci_config_name);
+    if (stat(path, &st) == 0) {
+        if (st.st_mtime != last_uci_mtime) {
+            last_uci_mtime = st.st_mtime;
+            // 重新加载 UCI 配置
+            load_idclass_config();
+            // 更新 eBPF maps
+            idclass_map_update_config();
+            // 同步所有 class 的 config
+            sync_class_config();
+            // 重新构建优先级映射
+            build_priority_maps();
+        }
+    }
+    uloop_timeout_set(t, 1000);
+}
+
+// 新增：同步所有 class 的 config 为当前 global_flow_config
+void sync_class_config(void)
+{
+    int fd = idclass_map_fds[CL_MAP_CLASS];
+    if (fd < 0) return;
+    uint32_t key = 0, next_key;
+    struct idclass_class class;
+
+    while (bpf_map_get_next_key(fd, &key, &next_key) == 0) {
+        if (bpf_map_lookup_elem(fd, &next_key, &class) == 0) {
+            // 仅更新 config 字段，保留 val 和 flags
+            memcpy(&class.config, &global_flow_config, sizeof(global_flow_config));
+            bpf_map_update_elem(fd, &next_key, &class, BPF_EXIST);
+        }
+        key = next_key;
+    }
+}
+
 int idclass_map_init(void)
 {
     int i;
@@ -1339,6 +1463,17 @@ int idclass_map_init(void)
     if (idclass_map_fds[CL_MAP_CLASS_MARK] < 0)
         return -1;
 
+    idclass_map_fds[CL_MAP_IP_CONN] = idclass_map_get_fd(CL_MAP_IP_CONN);
+    if (idclass_map_fds[CL_MAP_IP_CONN] < 0)
+        return -1;
+    ip_conn_fd = idclass_map_fds[CL_MAP_IP_CONN];
+
+    flow_stats_fd = bpf_obj_get("/sys/fs/bpf/idclass_data/flow_stats_map");
+    if (flow_stats_fd < 0) {
+        fprintf(stderr, "Failed to open flow_stats_map\n");
+        return -1;
+    }
+
     idclass_map_clear_list(CL_MAP_IPV4_ADDR);
     idclass_map_clear_list(CL_MAP_IPV6_ADDR);
     idclass_map_reset_config();
@@ -1346,6 +1481,12 @@ int idclass_map_init(void)
     load_idclass_config();
     load_class_marks_from_file();
     build_priority_maps();
+
+    ip_conn_timer.cb = idclass_update_ip_conn;
+    uloop_timeout_set(&ip_conn_timer, 1000);
+
+    uci_reload_timer.cb = idclass_check_uci_reload;
+    uloop_timeout_set(&uci_reload_timer, 1000);
 
     return 0;
 }

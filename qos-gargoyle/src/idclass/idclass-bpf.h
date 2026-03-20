@@ -24,6 +24,17 @@
 
 #define IDCLASS_CLASS_FLAG_PRESENT	(1 << 0)
 
+// 特征掩码宏
+#define FEATURE_PKTLEN    (1 << 0)
+#define FEATURE_CONN      (1 << 1)
+#define FEATURE_PPS       (1 << 2)
+#define FEATURE_IAT       (1 << 3)
+#define FEATURE_RETRANS   (1 << 4)
+#define FEATURE_TCPFLAGS  (1 << 5)
+#define FEATURE_DURATION  (1 << 6)
+#define FEATURE_RATIO     (1 << 7)
+#define FEATURE_BURST     (1 << 8)
+
 struct idclass_dscp_val {
 	uint8_t ingress;
 	uint8_t egress;
@@ -121,6 +132,10 @@ struct flow_stats {
 	__u64 down_bytes;
 	__u64 last_pkt_ts;
 	__u32 iat_us;
+	// 新增字段（优化 IPv6 支持）
+	__u8 client_ip[16];        // 客户端 IP（IPv4 用 IPv4-mapped 格式）
+	__u8 client_family;        // 地址族：4 或 6
+	__u32 max_seq;              // 最大 TCP 序列号
 };
 
 struct global_config {

@@ -321,6 +321,8 @@ idclass_ubus_config(struct ubus_context *ctx, struct ubus_object *obj,
     idclass_iface_config_update(tb[CL_CONFIG_INTERFACES], tb[CL_CONFIG_DEVICES]);
 
     idclass_iface_check();
+	
+	sync_class_config();   // 全局配置变化后同步所有 class 的 config
 
     return 0;
 }

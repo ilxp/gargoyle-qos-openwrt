@@ -224,6 +224,7 @@ acquire_lock() {
 }
 
 release_lock() {
+    [ "$HAVE_LOCK" = "1" ] || return   # 未持有锁则直接返回
     rm -f "$LOCK_PID_FILE"
     rmdir "$LOCK_DIR" 2>/dev/null
     HAVE_LOCK=0
@@ -337,67 +338,6 @@ load_bandwidth_from_config() {
     qos_log "INFO" "下载总带宽: ${total_download_bandwidth}kbit/s"
     
     return 0
-}
-
-# 计算内存限制 - 使用向上取整避免除法结果为0
-calculate_memory_limit() {
-    local config_value="$1"
-    local result
-
-    if [ -z "$config_value" ]; then
-        echo ""
-        return
-    fi
-    
-    if [ "$config_value" = "auto" ]; then
-        local total_mem_mb=0
-        
-        if [ -f /sys/fs/cgroup/memory/memory.limit_in_bytes ]; then
-            local total_mem_bytes=$(cat /sys/fs/cgroup/memory/memory.limit_in_bytes 2>/dev/null)
-            if [ -n "$total_mem_bytes" ] && [ "$total_mem_bytes" -gt 0 ] 2>/dev/null; then
-                total_mem_mb=$(( total_mem_bytes / 1024 / 1024 ))
-                qos_log "INFO" "从cgroups获取内存限制: ${total_mem_mb}MB"
-            fi
-        fi
-        
-        if [ -z "$total_mem_mb" ] || [ "$total_mem_mb" -eq 0 ]; then
-            local total_mem_kb=$(grep MemTotal /proc/meminfo 2>/dev/null | awk '{print $2}')
-            if [ -n "$total_mem_kb" ] && [ "$total_mem_kb" -gt 0 ] 2>/dev/null; then
-                total_mem_mb=$(( total_mem_kb / 1024 ))
-                qos_log "INFO" "从/proc/meminfo获取内存: ${total_mem_mb}MB"
-            fi
-        fi
-        
-        if [ -n "$total_mem_mb" ] && [ "$total_mem_mb" -gt 0 ] 2>/dev/null; then
-            # 每256MB内存分配1MB给CAKE，向上取整确保至少1MB基数
-            result="$(((total_mem_mb + 255) / 256))Mb"
-            
-            local min_limit=4
-            local max_limit=32
-            local result_value=$(echo "$result" | sed 's/Mb//')
-            if [ "$result_value" -lt "$min_limit" ] 2>/dev/null; then
-                result="${min_limit}Mb"
-            elif [ "$result_value" -gt "$max_limit" ] 2>/dev/null; then
-                result="${max_limit}Mb"
-            fi
-            
-            qos_log "INFO" "系统内存 ${total_mem_mb}MB，自动计算 memlimit=${result}"
-        else
-            qos_log "WARN" "无法读取内存信息，使用默认值 16Mb"
-            result="16Mb"
-        fi
-    else
-        # 用户自定义值，验证格式（必须为数字+Mb，例如 16Mb）
-        if echo "$config_value" | grep -qE '^[0-9]+Mb$'; then
-            result="$config_value"
-            qos_log "INFO" "使用用户配置的 memlimit: ${result}"
-        else
-            qos_log "WARN" "无效的 memlimit 格式 '$config_value'，使用默认值 16Mb"
-            result="16Mb"
-        fi
-    fi
-    
-    echo "$result"
 }
 
 # 计算HTB的burst参数（添加溢出检查和范围限制）
@@ -1281,7 +1221,7 @@ check_ingress_redirect() {
 }
 
 # ========== 上传方向初始化 ==========
-initialize_htb_upload() {
+init_htb_upload() {
     qos_log "INFO" "初始化上传方向HTB"
     
     load_upload_class_configurations
@@ -1307,7 +1247,7 @@ initialize_htb_upload() {
         return 1
     fi
     
-    # 标记已在 initialize_htb_cake_qos 中分配，这里直接创建类
+    # 标记已在 init_htb_cake_qos 中分配，这里直接创建类
     local class_index=2
     upload_class_mark_list=""
     
@@ -1330,7 +1270,7 @@ initialize_htb_upload() {
 }
 
 # ========== 下载方向初始化 ==========
-initialize_htb_download() {
+init_htb_download() {
     qos_log "INFO" "初始化下载方向HTB"
     
     load_download_class_configurations
@@ -1356,7 +1296,7 @@ initialize_htb_download() {
         return 1
     fi
     
-    # 标记已在 initialize_htb_cake_qos 中分配，这里直接创建类
+    # 标记已在 init_htb_cake_qos 中分配，这里直接创建类
     if ! ip link show dev "$IFB_DEVICE" >/dev/null 2>&1; then
         qos_log "ERROR" "IFB设备 $IFB_DEVICE 不存在"
         return 1
@@ -1562,7 +1502,7 @@ apply_htb_specific_rules() {
 }
 
 # ========== 主初始化函数 ==========
-initialize_htb_cake_qos() {
+init_htb_cake_qos() {
     qos_log "INFO" "开始初始化HTB+CAKE QoS系统"
     
     # 获取并发锁
@@ -1669,13 +1609,11 @@ initialize_htb_cake_qos() {
     if ! apply_all_rules "upload_rule" "$UPLOAD_MASK" "filter_qos_egress"; then
         qos_log "ERROR" "上传规则应用失败，回滚"
         stop_htb_cake_qos
-        release_lock
         return 1
     fi
     if ! apply_all_rules "download_rule" "$DOWNLOAD_MASK" "filter_qos_ingress"; then
         qos_log "ERROR" "下载规则应用失败，回滚"
         stop_htb_cake_qos
-        release_lock
         return 1
     fi
     qos_log "INFO" "应用自定义规则成功"
@@ -1689,7 +1627,7 @@ initialize_htb_cake_qos() {
     local download_success=0
     
     if [ "$total_upload_bandwidth" -gt 0 ] 2>/dev/null; then
-        if ! initialize_htb_upload; then
+        if ! init_htb_upload; then
             qos_log "ERROR" "上传方向初始化失败"
             upload_success=1
         fi
@@ -1699,7 +1637,7 @@ initialize_htb_cake_qos() {
     fi
     
     if [ "$total_download_bandwidth" -gt 0 ] 2>/dev/null; then
-        if ! initialize_htb_download; then
+        if ! init_htb_download; then
             qos_log "ERROR" "下载方向初始化失败"
             download_success=1
         fi
@@ -2057,7 +1995,7 @@ main_htb_cake_qos() {
     
     case "$action" in
         "start")
-            if ! initialize_htb_cake_qos; then
+            if ! init_htb_cake_qos; then
                 qos_log "ERROR" "HTB+CAKE QoS启动失败"
                 exit 1
             fi
@@ -2068,7 +2006,7 @@ main_htb_cake_qos() {
         "restart")
             stop_htb_cake_qos
             sleep 1
-            if ! initialize_htb_cake_qos; then
+            if ! init_htb_cake_qos; then
                 qos_log "ERROR" "HTB+CAKE QoS重启失败"
                 exit 1
             fi

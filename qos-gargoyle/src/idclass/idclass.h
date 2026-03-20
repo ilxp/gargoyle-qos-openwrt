@@ -37,6 +37,7 @@ enum idclass_map_id {
 	CL_MAP_PRIO_CLASS_UP,
 	CL_MAP_PRIO_CLASS_DOWN,
 	CL_MAP_CLASS_MARK,
+	CL_MAP_IP_CONN,               // 新增
 	__CL_MAP_MAX,
 };
 
@@ -118,6 +119,7 @@ int idclass_ubus_check_interface(const char *name, char *ifname, int ifname_len)
 void idclass_ubus_update_bridger(bool shutdown);
 int idclass_map_get_fd(enum idclass_map_id id);
 void idclass_set_config_name(const char *name);
+void sync_class_config(void);
 
 char *str_skip(char *str, bool space);
 int idclass_map_codepoint(const char *val);

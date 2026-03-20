@@ -13,6 +13,7 @@ LOCK_DIR="/var/run/cake_qos.lock"
 LOCK_PID_FILE="$LOCK_DIR/pid"
 RUNTIME_PARAMS_FILE="/tmp/cake_runtime_params"
 QOS_RUNNING_FILE="/var/run/cake_qos.running"
+HAVE_LOCK=0
 
 # 加载 dscpclassify 核心库（用于智能分类）- 先检查文件是否存在
 DSCPCLASSIFY_LIB="/usr/lib/qos_gargoyle/dscpclassify.sh"
@@ -1022,7 +1023,7 @@ stop_cake_qos() {
     log_info "CAKE_DSCP QoS停止完成"
 }
 
-# ========== 锁函数（增强：支持僵尸进程检测，使用更严谨的 stat 检查）==========
+# ========== 锁函数（增强：支持僵尸进程检测）==========
 acquire_lock() {
     if [ -d "$LOCK_DIR" ]; then
         if [ -f "$LOCK_PID_FILE" ]; then
@@ -1030,7 +1031,6 @@ acquire_lock() {
             local now=$(date +%s)
             local mtime=0
 
-            # 更严谨的检查：直接测试 stat 的 -c 选项是否能正常工作
             if stat -c %Y /tmp >/dev/null 2>&1; then
                 mtime=$(stat -c %Y "$LOCK_PID_FILE" 2>/dev/null || echo 0)
             fi
@@ -1045,6 +1045,7 @@ acquire_lock() {
             if [ -n "$old_pid" ] && kill -0 "$old_pid" 2>/dev/null; then
                 if [ "$old_pid" -eq "$$" ]; then
                     log_debug "已持有锁 (PID: $$)"
+                    HAVE_LOCK=1
                     return 0
                 fi
                 log_error "无法获取锁，进程 $old_pid 仍在运行"
@@ -1068,14 +1069,17 @@ acquire_lock() {
         return 1
     }
     echo "$$" > "$LOCK_PID_FILE"
+    HAVE_LOCK=1
     trap 'release_lock' EXIT INT TERM HUP QUIT
     log_debug "已获取锁: $LOCK_DIR (PID: $$)"
     return 0
 }
 
 release_lock() {
+    [ "$HAVE_LOCK" = "1" ] || return
     rm -f "$LOCK_PID_FILE"
     rmdir "$LOCK_DIR" 2>/dev/null
+    HAVE_LOCK=0
     log_debug "锁已释放"
 }
 
@@ -1136,7 +1140,6 @@ initialize_cake_qos() {
             if [ $upload_success -eq 1 ] || [ $download_success -eq 1 ]; then
                 log_error "CAKE_DSCP QoS 初始化部分失败"
                 stop_cake_qos
-                release_lock
                 rm -f "$QOS_RUNNING_FILE"
                 exit 1
             fi

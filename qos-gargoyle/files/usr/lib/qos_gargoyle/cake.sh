@@ -2,7 +2,7 @@
 # version=5.6-mq
 # CAKE算法实现模块 - 多队列增强版 v5.6
 # 优化：带宽单位转换区分字节/比特；IPv6重定向循环简化并增加全局地址检测；
-#       锁机制强化（含僵尸进程检测）；变量作用域限定
+#       锁机制强化（含僵尸进程检测）；变量作用域限定；双重释放防护
 
 # ========== 变量初始化 ==========
 : ${total_upload_bandwidth:=50000}
@@ -12,6 +12,7 @@ LOCK_DIR="/var/run/cake_qos.lock"
 LOCK_PID_FILE="$LOCK_DIR/pid"
 RUNTIME_PARAMS_FILE="/tmp/cake_runtime_params"
 QOS_RUNNING_FILE="/var/run/cake_qos.running"
+HAVE_LOCK=0
 
 # 如果 qos_interface 未设置，尝试获取
 if [ -z "$qos_interface" ]; then
@@ -878,7 +879,7 @@ show_cake_status() {
         echo "状态: IFB设备未创建"
     fi
 	
-	 # conntrack 标记显示
+    # conntrack 标记显示
     if command -v conntrack >/dev/null 2>&1; then
         echo -e "\n===== conntrack 标记示例 (最近5条) ====="
         conntrack -L 2>/dev/null | grep -E "mark=[1-9][0-9]*" | head -n 10 | while IFS= read -r line; do
@@ -1013,16 +1014,14 @@ acquire_lock() {
             local old_pid=$(cat "$LOCK_PID_FILE" 2>/dev/null)
             local now=$(date +%s)
             local mtime=0
-			# 更严谨的检查：直接测试 -c 选项是否能正常工作
-			if stat -c %Y /tmp >/dev/null 2>&1; then
-				mtime=$(stat -c %Y "$LOCK_PID_FILE" 2>/dev/null || echo 0)
-			fi
 
-            # 如果锁文件存在超过120秒，且进程仍在运行（可能僵死），强制清理
+            if stat -c %Y /tmp >/dev/null 2>&1; then
+                mtime=$(stat -c %Y "$LOCK_PID_FILE" 2>/dev/null || echo 0)
+            fi
+
             if [ "$mtime" -gt 0 ] && [ $((now - mtime)) -gt 120 ]; then
                 log_warn "锁文件过期（超过120秒），进程 $old_pid 可能僵死，强制清理锁目录"
                 rm -rf "$LOCK_DIR"
-                # 重新尝试获取锁
                 acquire_lock
                 return $?
             fi
@@ -1030,6 +1029,7 @@ acquire_lock() {
             if [ -n "$old_pid" ] && kill -0 "$old_pid" 2>/dev/null; then
                 if [ "$old_pid" -eq "$$" ]; then
                     log_debug "已持有锁 (PID: $$)"
+                    HAVE_LOCK=1
                     return 0
                 fi
                 log_error "无法获取锁，进程 $old_pid 仍在运行"
@@ -1053,14 +1053,17 @@ acquire_lock() {
         return 1
     }
     echo "$$" > "$LOCK_PID_FILE"
+    HAVE_LOCK=1
     trap 'release_lock' EXIT INT TERM HUP QUIT
     log_debug "已获取锁: $LOCK_DIR (PID: $$)"
     return 0
 }
 
 release_lock() {
+    [ "$HAVE_LOCK" = "1" ] || return
     rm -f "$LOCK_PID_FILE"
     rmdir "$LOCK_DIR" 2>/dev/null
+    HAVE_LOCK=0
     log_debug "锁已释放"
 }
 
@@ -1106,7 +1109,7 @@ initialize_cake_qos() {
             if [ $upload_success -eq 1 ] || [ $download_success -eq 1 ]; then
                 log_error "CAKE QoS 初始化部分失败"
                 stop_cake_qos
-                release_lock
+                # stop_cake_qos 已释放锁，此处不再重复 release_lock
                 rm -f "$QOS_RUNNING_FILE"
                 exit 1
             fi

@@ -46,6 +46,7 @@ define Build/Compile
 		LDFLAGS="$(TARGET_LDFLAGS) -L $(STAGING_DIR)/usr/lib" \
 		BUILD_DIR="$(KERNEL_BUILD_DIR)" \
 		STAGING_DIR="$(STAGING_DIR)" \
+		LINUX_DIR="$(LINUX_DIR)" \
 		all
 endef
 

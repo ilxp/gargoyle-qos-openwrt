@@ -56,6 +56,7 @@ struct {
 	__uint(max_entries, 65536);
 	__type(key, __u32);
 	__type(value, struct flow_stats);
+	__uint(pinning, 1);
 } flow_stats_map SEC(".maps");
 
 struct {
@@ -109,31 +110,23 @@ struct {
 			    IDCLASS_DEFAULT_CLASS_ENTRIES);
 } class_map SEC(".maps");
 
-struct {
-	__uint(type, BPF_MAP_TYPE_HASH);
-	__uint(max_entries, 1024);
-	__type(key, struct rule_key);
-	__type(value, uint32_t);
-} static_rules SEC(".maps");
+/* ip_conn_map 的 key 类型 */
+struct ip_key {
+	__u8 addr[16];
+};
 
 struct {
 	__uint(type, BPF_MAP_TYPE_LRU_HASH);
 	__uint(max_entries, 16384);
-	__type(key, __u32);
+	__type(key, struct ip_key);
 	__type(value, uint32_t);
+	__uint(pinning, 1);
 } ip_conn_map SEC(".maps");
 
 static struct global_config *get_global_config(void)
 {
 	__u32 key = 0;
 	return bpf_map_lookup_elem(&global_config, &key);
-}
-
-static __always_inline __u32 cur_time(void)
-{
-	__u32 val = bpf_ktime_get_ns() >> 24;
-	if (!val) val = 1;
-	return val;
 }
 
 static __always_inline __u32 ewma(__u32 *avg, __u32 val)
@@ -148,51 +141,6 @@ static __always_inline __u32 ewma(__u32 *avg, __u32 val)
 static __always_inline __u8 dscp_val(struct idclass_dscp_val *val, bool ingress)
 {
 	return ingress ? val->ingress : val->egress;
-}
-
-static __always_inline void
-ipv4_change_dsfield(struct __sk_buff *skb, __u32 offset,
-		    __u8 mask, __u8 value, bool force)
-{
-	struct iphdr *iph;
-	__u32 check;
-	__u8 dsfield;
-
-	iph = skb_ptr(skb, offset, sizeof(*iph));
-	if (!iph) return;
-
-	check = bpf_ntohs(iph->check);
-	if ((iph->tos & mask) && !force) return;
-
-	dsfield = (iph->tos & mask) | value;
-	if (iph->tos == dsfield) return;
-
-	check += iph->tos;
-	if ((check + 1) >> 16)
-		check = (check + 1) & 0xffff;
-	check -= dsfield;
-	check += check >> 16;
-	iph->check = bpf_htons(check);
-	iph->tos = dsfield;
-}
-
-static __always_inline void
-ipv6_change_dsfield(struct __sk_buff *skb, __u32 offset,
-		    __u8 mask, __u8 value, bool force)
-{
-	struct ipv6hdr *ipv6h;
-	__u16 *p;
-	__u16 val;
-
-	ipv6h = skb_ptr(skb, offset, sizeof(*ipv6h));
-	if (!ipv6h) return;
-
-	p = (__u16 *)ipv6h;
-	if (((*p >> 4) & mask) && !force) return;
-
-	val = (*p & bpf_htons((((__u16)mask << 4) | 0xf00f))) | bpf_htons((__u16)value << 4);
-	if (val == *p) return;
-	*p = val;
 }
 
 static void
@@ -318,6 +266,7 @@ static __always_inline void update_flow_stats(struct flow_stats *stats,
 		}
 	}
 
+	// 突发特征：滑动窗口重置
 	if (cfg && cfg->burst_window_ms) {
 		__u64 now_ms_val = bpf_ktime_get_ns() / 1000000ULL;
 		if (stats->burst_start_ts == 0) {
@@ -330,6 +279,7 @@ static __always_inline void update_flow_stats(struct flow_stats *stats,
 				__sync_fetch_and_add(&stats->burst_packets, 1);
 				__sync_fetch_and_add(&stats->burst_bytes, pkt_len);
 			} else {
+				// 超过窗口，重置为当前包
 				stats->burst_start_ts = now_ms_val;
 				stats->burst_packets = 1;
 				stats->burst_bytes = pkt_len;
@@ -337,6 +287,7 @@ static __always_inline void update_flow_stats(struct flow_stats *stats,
 		}
 	}
 
+	// TCP 相关统计（包括重传检测改进）
 	if (tcph) {
 		__u8 tcp_flags = ((__u8 *)tcph)[13];
 		if (tcp_flags & 0x02)
@@ -348,21 +299,37 @@ static __always_inline void update_flow_stats(struct flow_stats *stats,
 		if (tcp_flags & 0x04)
 			__sync_fetch_and_add(&stats->rst_count, 1);
 
-		__u32 old_seq = __sync_lock_test_and_set(&stats->tcp_seq, bpf_ntohl(tcph->seq));
-		if (old_seq == bpf_ntohl(tcph->seq))
-			__sync_fetch_and_add(&stats->retrans_count, 1);
+		__u32 seq = bpf_ntohl(tcph->seq);
+		__u32 old_max = stats->max_seq;
+		__u64 now_ns = bpf_ktime_get_ns();
+
+		// 更新最大序列号
+		if (seq > old_max) {
+			__sync_lock_test_and_set(&stats->max_seq, seq);
+		} else if (seq < old_max) {
+			// 可能重传，检查时间间隔
+			__u64 last_pkt = stats->last_pkt_ts;
+			if (last_pkt != 0 && (now_ns - last_pkt) < 200000000) { // 200ms
+				__sync_fetch_and_add(&stats->retrans_count, 1);
+			}
+		}
+
+		// 更新上一个序列号和最后包时间
+		__sync_lock_test_and_set(&stats->tcp_seq, seq);
+		stats->last_pkt_ts = now_ns;
 	}
 }
 
+// 分类评分函数，根据 feature_mask 跳过未启用的特征
 static __always_inline __u32 classify_score(struct flow_stats *stats,
-                                           __u32 client_ip,
                                            struct idclass_flow_config *cfg)
 {
     __u32 score_realtime = 0, score_video = 0, score_normal = 0, score_bulk = 0;
     __u32 packets = stats->packets;
     __u32 *conn = NULL;
+    __u32 mask = cfg->feature_mask;
 
-    if (packets >= cfg->game_sample_packets) {
+    if ((mask & FEATURE_PKTLEN) && packets >= cfg->game_sample_packets) {
         if (stats->avg_pkt_len <= cfg->game_max_avg_pkt_len)
             score_realtime += cfg->weight_pktlen_realtime;
         else if (stats->avg_pkt_len >= cfg->video_min_avg_pkt_len &&
@@ -374,19 +341,23 @@ static __always_inline __u32 classify_score(struct flow_stats *stats,
             score_normal += cfg->weight_pktlen_normal;
     }
 
-    conn = bpf_map_lookup_elem(&ip_conn_map, &client_ip);
-    if (conn) {
-        if (*conn <= cfg->game_max_conn)
-            score_realtime += cfg->weight_conn_realtime;
-        else if (*conn >= cfg->bulk_min_conn)
-            score_bulk += cfg->weight_conn_bulk;
-        else if (*conn <= cfg->video_max_conn)
-            score_video += cfg->weight_conn_video;
-        else
-            score_normal += cfg->weight_conn_normal;
+    if (mask & FEATURE_CONN) {
+        struct ip_key key;
+        __builtin_memcpy(key.addr, stats->client_ip, 16);
+        conn = bpf_map_lookup_elem(&ip_conn_map, &key);
+        if (conn) {
+            if (*conn <= cfg->game_max_conn)
+                score_realtime += cfg->weight_conn_realtime;
+            else if (*conn >= cfg->bulk_min_conn)
+                score_bulk += cfg->weight_conn_bulk;
+            else if (*conn <= cfg->video_max_conn)
+                score_video += cfg->weight_conn_video;
+            else
+                score_normal += cfg->weight_conn_normal;
+        }
     }
 
-    if (packets >= cfg->game_sample_packets) {
+    if ((mask & FEATURE_PPS) && packets >= cfg->game_sample_packets) {
         if (stats->pps <= cfg->game_max_pps)
             score_realtime += cfg->weight_pps_realtime;
         else if (stats->pps >= cfg->video_min_pps && stats->pps <= cfg->video_max_pps)
@@ -397,26 +368,25 @@ static __always_inline __u32 classify_score(struct flow_stats *stats,
             score_normal += cfg->weight_pps_normal;
     }
 
-    if (stats->burst_packets > cfg->burst_packets || stats->burst_bytes > cfg->burst_bytes)
+    if ((mask & FEATURE_BURST) &&
+        (stats->burst_packets > cfg->burst_packets || stats->burst_bytes > cfg->burst_bytes))
         score_bulk += cfg->weight_burst_bulk;
 
-    if (packets >= cfg->tcp_flags_window) {
+    if ((mask & FEATURE_TCPFLAGS) && packets >= cfg->tcp_flags_window) {
         if (stats->ack_count > 0) {
-            __u32 ratio = (stats->syn_count * 100) / stats->ack_count;
-            if (ratio > cfg->tcp_flags_syn_ack_ratio)
+            if (stats->syn_count * 100 > stats->ack_count * cfg->tcp_flags_syn_ack_ratio)
                 score_bulk += cfg->weight_tcpflags_bulk;
         }
         if (stats->rst_count > packets / 10)
             score_bulk += cfg->weight_tcpflags_bulk;
     }
 
-    if (packets >= 10) {
-        __u32 retrans_ratio = (stats->retrans_count * 100) / packets;
-        if (retrans_ratio > cfg->retrans_threshold)
+    if ((mask & FEATURE_RETRANS) && packets >= 10) {
+        if (stats->retrans_count * 100 > packets * cfg->retrans_threshold)
             score_bulk += cfg->weight_retrans_bulk;
     }
 
-    if (packets >= cfg->game_sample_packets) {
+    if ((mask & FEATURE_DURATION) && packets >= cfg->game_sample_packets) {
         __u64 duration = (stats->last_seen - stats->first_seen) / 1000000000ULL;
         if (duration < cfg->conn_duration_short)
             score_realtime += cfg->weight_duration_realtime;
@@ -426,7 +396,7 @@ static __always_inline __u32 classify_score(struct flow_stats *stats,
             score_video += cfg->weight_duration_video;
     }
 
-    if (stats->down_bytes > 0) {
+    if ((mask & FEATURE_RATIO) && stats->down_bytes > 0) {
         __u32 ratio = (stats->up_bytes * 100) / stats->down_bytes;
         if (ratio < cfg->up_down_ratio_low)
             score_video += cfg->weight_ratio_video;
@@ -436,7 +406,7 @@ static __always_inline __u32 classify_score(struct flow_stats *stats,
             score_bulk += cfg->weight_ratio_bulk;
     }
 
-    if (stats->iat_us > 0 && stats->iat_us < cfg->iat_threshold_us)
+    if ((mask & FEATURE_IAT) && stats->iat_us > 0 && stats->iat_us < cfg->iat_threshold_us)
         score_realtime += cfg->weight_iat_realtime;
 
     __u32 threshold = cfg->score_threshold;
@@ -476,7 +446,6 @@ int classify(struct __sk_buff *skb)
 	__u32 hash;
 	struct flow_stats *stats;
 	__u32 prio_level = 0;
-	__u32 client_ip_mapped = 0;
 
 	gcfg = get_global_config();
 	if (!gcfg) return TC_ACT_UNSPEC;
@@ -514,17 +483,6 @@ int classify(struct __sk_buff *skb)
 			class = NULL;
 	}
 
-	if (key.family == 4) {
-		__u32 src = *(__u32 *)key.saddr;
-		__u32 dst = *(__u32 *)key.daddr;
-		client_ip_mapped = (ingress) ? src : dst;
-	} else {
-		if (ingress)
-			__builtin_memcpy(&client_ip_mapped, key.saddr, 4);
-		else
-			__builtin_memcpy(&client_ip_mapped, key.daddr, 4);
-	}
-
 	hash = bpf_get_hash_recalc(skb);
 	stats = bpf_map_lookup_elem(&flow_stats_map, &hash);
 	if (!stats) {
@@ -536,13 +494,41 @@ int classify(struct __sk_buff *skb)
 		new.burst_start_ts = bpf_ktime_get_ns() / 1000000ULL;
 		new.burst_packets = 1;
 		new.burst_bytes = skb->len;
+		// 初始化 client_ip 全零
+		__builtin_memset(new.client_ip, 0, 16);
+		new.client_family = 0;
 		bpf_map_update_elem(&flow_stats_map, &hash, &new, BPF_NOEXIST);
 		stats = bpf_map_lookup_elem(&flow_stats_map, &hash);
 	}
 
 	if (stats && class) {
+		// 更新流统计
 		update_flow_stats(stats, skb->len, bpf_ktime_get_ns(), ingress, &class->config, tcph);
-		prio_level = classify_score(stats, client_ip_mapped, &class->config);
+
+		// 提取客户端 IP（优化 IPv6 支持）
+		if (type == bpf_htons(ETH_P_IP)) {
+			struct iphdr *iph = skb_ptr(skb, iph_offset, sizeof(*iph));
+			if (iph) {
+				__u32 src = iph->saddr;
+				__u32 dst = iph->daddr;
+				__u32 ip = (ingress) ? src : dst;
+				// 转换为 IPv4-mapped IPv6 地址: ::ffff:a.b.c.d
+				__builtin_memset(stats->client_ip, 0, 10);
+				stats->client_ip[10] = 0xff;
+				stats->client_ip[11] = 0xff;
+				__builtin_memcpy(stats->client_ip + 12, &ip, 4);
+				stats->client_family = 4;
+			}
+		} else if (type == bpf_htons(ETH_P_IPV6)) {
+			struct ipv6hdr *ip6h = skb_ptr(skb, iph_offset, sizeof(*ip6h));
+			if (ip6h) {
+				void *addr = ingress ? (void *)&ip6h->saddr : (void *)&ip6h->daddr;
+				__builtin_memcpy(stats->client_ip, addr, 16);
+				stats->client_family = 6;
+			}
+		}
+
+		prio_level = classify_score(stats, &class->config);
 	}
 
 	__u32 *class_id_ptr;
