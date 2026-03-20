@@ -14,7 +14,6 @@
 #include <linux/filter.h>
 #include <linux/pkt_cls.h>
 #include <linux/ip.h>
-#include <net/ipv6.h>
 #include <bpf/bpf_helpers.h>
 #include <bpf/bpf_endian.h>
 #include "bpf_skb_utils.h"
