@@ -6,6 +6,8 @@
 #ifndef __BPF_IDCLASS_H
 #define __BPF_IDCLASS_H
 
+#include <linux/types.h>
+
 #define IDCLASS_MAX_CLASS_ENTRIES	33
 #define IDCLASS_DEFAULT_CLASS_ENTRIES	2
 

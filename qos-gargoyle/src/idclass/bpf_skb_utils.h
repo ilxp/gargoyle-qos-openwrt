@@ -2,16 +2,19 @@
 /*
  * Copyright (C) 2022 Felix Fietkau <nbd@nbd.name>
  * Version: 2022-09-21
+ * Modified for idclass: added missing includes and removed uapi prefixes
  */
 #ifndef __BPF_SKB_UTILS_H
 #define __BPF_SKB_UTILS_H
 
-#include <linux/bpf.h>
+#include <linux/types.h>
+#include <linux/compiler.h>
 #include <linux/if_ether.h>
-#include <linux/ip.h>
-#include <linux/ipv6.h>
 #include <linux/if_vlan.h>
 #include <linux/ip.h>
+#include <linux/ipv6.h>
+#include <linux/tcp.h>
+#include <linux/udp.h>
 #include <bpf/bpf_helpers.h>
 #include <bpf/bpf_endian.h>
 

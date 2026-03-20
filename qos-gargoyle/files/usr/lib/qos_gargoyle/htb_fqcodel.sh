@@ -3,7 +3,7 @@
 # 基于HTB与FQ_CODEL组合算法实现QoS流量控制。
 # 必要工具：tc, nft, conntrack, ethtool, sysctl
 # 内核模块：ifb, sch_htb, sch_fq_codel
-# version=2.11 - 优化：类标记冲突检测、IPv6入口重定向强制成功（当存在IPv6地址时）、锁僵尸进程检测、移除seq依赖
+# version=2.12 - 整合rule.sh标记分配，修正调用顺序，默认类冲突处理
 
 # ========== 全局配置常量 ==========
 : ${CONFIG_FILE:=qos_gargoyle}
@@ -23,7 +23,9 @@ upload_class_mark_list=""
 download_class_mark_list=""
 qos_interface=""
 IFB_DEVICE=""
-CLASS_MARKS_FILE="" 
+
+# 标记文件路径（由 rule.sh 使用，此处统一设置）
+CLASS_MARKS_FILE="/var/run/qos_class_marks"
 
 # 加载规则辅助模块（必须）
 if [ -f "/usr/lib/qos_gargoyle/rule.sh" ]; then
@@ -54,7 +56,6 @@ include /lib/network
 
 # ========== 辅助函数 ==========
 # 带宽单位转换（支持 kbit, mbit, gbit, KB, MB 等）
-# 带宽单位转换（严格区分字节与比特）
 convert_bandwidth_to_kbit() {
     local bw="$1"
     local num unit result
@@ -73,7 +74,6 @@ convert_bandwidth_to_kbit() {
         unit=$(echo "$bw" | sed 's/[0-9.]//g' | tr '[:lower:]' '[:upper:]')
 
         case "$unit" in
-            # 比特单位
             K|KBIT|KILOBIT)
                 result=$(awk "BEGIN {printf \"%.0f\", $num * 1}")
                 ;;
@@ -83,7 +83,6 @@ convert_bandwidth_to_kbit() {
             G|GBIT|GIGABIT)
                 result=$(awk "BEGIN {printf \"%.0f\", $num * 1000000}")
                 ;;
-            # 字节单位 → 乘以 8 转换为比特
             KB|KIB)
                 qos_log "WARN" "检测到字节单位 '$unit'，将自动乘以 8 转换为 kbit"
                 result=$(awk "BEGIN {printf \"%.0f\", $num * 8}")
@@ -182,7 +181,6 @@ acquire_lock() {
             local now=$(date +%s)
             local mtime=0
 
-            # 更严谨的检查：直接测试 stat 的 -c 选项是否能正常工作
             if stat -c %Y /tmp >/dev/null 2>&1; then
                 mtime=$(stat -c %Y "$LOCK_PID_FILE" 2>/dev/null || echo 0)
             fi
@@ -220,14 +218,13 @@ acquire_lock() {
         return 1
     }
     echo "$$" > "$LOCK_PID_FILE"
-    # 移除原有的 trap 设置
-    # trap 'release_lock' EXIT INT TERM HUP QUIT   <-- 删除此行
     HAVE_LOCK=1
     log_debug "已获取锁: $LOCK_DIR (PID: $$)"
     return 0
 }
 
 release_lock() {
+    [ "$HAVE_LOCK" = "1" ] || return   # 未持有锁则直接返回
     rm -f "$LOCK_PID_FILE"
     rmdir "$LOCK_DIR" 2>/dev/null
     HAVE_LOCK=0
@@ -341,67 +338,6 @@ load_bandwidth_from_config() {
     qos_log "INFO" "下载总带宽: ${total_download_bandwidth}kbit/s"
     
     return 0
-}
-
-# 计算内存限制 - 使用向上取整避免除法结果为0
-calculate_memory_limit() {
-    local config_value="$1"
-    local result
-
-    if [ -z "$config_value" ]; then
-        echo ""
-        return
-    fi
-    
-    if [ "$config_value" = "auto" ]; then
-        local total_mem_mb=0
-        
-        if [ -f /sys/fs/cgroup/memory/memory.limit_in_bytes ]; then
-            local total_mem_bytes=$(cat /sys/fs/cgroup/memory/memory.limit_in_bytes 2>/dev/null)
-            if [ -n "$total_mem_bytes" ] && [ "$total_mem_bytes" -gt 0 ] 2>/dev/null; then
-                total_mem_mb=$(( total_mem_bytes / 1024 / 1024 ))
-                qos_log "INFO" "从cgroups获取内存限制: ${total_mem_mb}MB"
-            fi
-        fi
-        
-        if [ -z "$total_mem_mb" ] || [ "$total_mem_mb" -eq 0 ]; then
-            local total_mem_kb=$(grep MemTotal /proc/meminfo 2>/dev/null | awk '{print $2}')
-            if [ -n "$total_mem_kb" ] && [ "$total_mem_kb" -gt 0 ] 2>/dev/null; then
-                total_mem_mb=$(( total_mem_kb / 1024 ))
-                qos_log "INFO" "从/proc/meminfo获取内存: ${total_mem_mb}MB"
-            fi
-        fi
-        
-        if [ -n "$total_mem_mb" ] && [ "$total_mem_mb" -gt 0 ] 2>/dev/null; then
-            # 每256MB内存分配1MB给FQCoDel，向上取整确保至少1MB基数
-            result="$(((total_mem_mb + 255) / 256))Mb"
-            
-            local min_limit=4
-            local max_limit=32
-            local result_value=$(echo "$result" | sed 's/Mb//')
-            if [ "$result_value" -lt "$min_limit" ] 2>/dev/null; then
-                result="${min_limit}Mb"
-            elif [ "$result_value" -gt "$max_limit" ] 2>/dev/null; then
-                result="${max_limit}Mb"
-            fi
-            
-            qos_log "INFO" "系统内存 ${total_mem_mb}MB，自动计算 memory_limit=${result}"
-        else
-            qos_log "WARN" "无法读取内存信息，使用默认值 16Mb"
-            result="16Mb"
-        fi
-    else
-        # 用户自定义值，验证格式（必须为数字+Mb，例如 16Mb）
-        if echo "$config_value" | grep -qE '^[0-9]+Mb$'; then
-            result="$config_value"
-            qos_log "INFO" "使用用户配置的 memory_limit: ${result}"
-        else
-            qos_log "WARN" "无效的 memory_limit 格式 '$config_value'，使用默认值 16Mb"
-            result="16Mb"
-        fi
-    fi
-    
-    echo "$result"
 }
 
 # 计算HTB的burst参数（添加溢出检查）
@@ -587,11 +523,10 @@ load_htb_class_config() {
     if [ -n "$per_min_bandwidth" ] && ! validate_number "$per_min_bandwidth" "$class_name.per_min_bandwidth" 0 100; then
         per_min_bandwidth=""
     fi
-    if [ -n "$per_max_bandwidth" ] && ! validate_number "$per_max_bandwidth" "$class_name.per_max_bandwidth" 0 1000; then  #允许借用
+    if [ -n "$per_max_bandwidth" ] && ! validate_number "$per_max_bandwidth" "$class_name.per_max_bandwidth" 0 1000; then
         per_max_bandwidth=""
     fi
-    # 允许优先级0（最高）
-    if [ -n "$priority" ] && ! validate_number "$priority" "$class_name.priority" 0 7; then   #htb只支持0-7
+    if [ -n "$priority" ] && ! validate_number "$priority" "$class_name.priority" 0 7; then
         priority=""
     fi
     
@@ -680,94 +615,6 @@ setup_htb_enhance_chains() {
         jump filter_qos_ingress_enhance 2>/dev/null || true
 }
 
-# ========== 类标记冲突检测函数 ==========
-# 检查并分配唯一标记，避免哈希冲突
-# 参数：方向（upload/download），类列表（空格分隔）
-# 返回：0成功，1失败（冲突无法解决）
-allocate_class_marks() {
-    local direction="$1"
-    local class_list="$2"
-    local mask base_value i class mark
-
-    if [ "$direction" = "upload" ]; then
-        base_value=1
-        mask="$UPLOAD_MASK"
-    else
-        base_value=65536
-        mask="$DOWNLOAD_MASK"
-    fi
-
-    # 初始化标记使用数组（16个独立变量）
-    i=1
-    while [ $i -le 16 ]; do
-        eval "mark_used_${i}=0"
-        i=$((i + 1))
-    done
-
-    # 创建临时文件存储类名到标记值的映射
-    CLASS_MARKS_FILE=$(mktemp /tmp/qos_class_marks_XXXXXX) || {
-        qos_log "ERROR" "无法创建类标记临时文件"
-        return 1
-    }
-    TEMP_FILES="$TEMP_FILES $CLASS_MARKS_FILE"
-
-    for class in $class_list; do
-        # 计算原始索引，并检查哈希计算是否成功
-        local index
-        index=$(calculate_hash_index "$class") || {
-            qos_log "ERROR" "无法计算类别 $class 的哈希值"
-            return 1
-        }
-        index=$(( (index % 16) + 1 ))
-        local original_index=$index
-        local found=0
-        local probe=0
-
-        # 线性探测，最多16次
-        while [ $probe -lt 16 ]; do
-            eval "used=\${mark_used_${index}}"
-            if [ "$used" = "0" ]; then
-                eval "mark_used_${index}=1"
-                # 计算标记值
-                local mark_value=$((base_value << (index - 1)))
-                mark_value=$((mark_value & 0xFFFFFFFF))
-
-                # 将类名和标记值写入临时文件，格式：方向:类名:标记值
-                echo "$direction:$class:$mark_value" >> "$CLASS_MARKS_FILE"
-
-                qos_log "INFO" "类别 $class 分配标记索引 $index (原始哈希: $original_index, 探测次数: $probe)"
-                found=1
-                break
-            fi
-            index=$(( (index % 16) + 1 ))
-            probe=$((probe + 1))
-        done
-
-        if [ $found -eq 0 ]; then
-            qos_log "ERROR" "类别 $class 无法分配唯一标记，所有16个索引均已占用"
-            return 1
-        fi
-    done
-
-    return 0
-}
-
-get_class_mark_by_class() {
-    local direction="$1"
-    local class="$2"
-    local mark_line
-
-    [ -z "$CLASS_MARKS_FILE" ] && { qos_log "ERROR" "类标记文件未定义"; return 1; }
-    mark_line=$(grep "^$direction:$class:" "$CLASS_MARKS_FILE" 2>/dev/null | head -1)
-    if [ -n "$mark_line" ]; then
-        echo "${mark_line##*:}"
-        return 0
-    else
-        qos_log "ERROR" "类别 $class 的标记值未找到"
-        return 1
-    fi
-}
-
 # ========== HTB核心队列函数 ==========
 create_htb_root_qdisc() {
     local device="$1"
@@ -832,8 +679,9 @@ create_htb_upload_class() {
     local percent_bandwidth per_min_bandwidth per_max_bandwidth priority name
     eval "$class_config"
     
+    # 从标记文件中获取该类的标记值
     local class_mark
-    class_mark=$(get_class_mark_by_class "upload" "$class_name")
+    class_mark=$(get_class_mark "upload" "$class_name")
     if [ -z "$class_mark" ]; then
         qos_log "ERROR" "无法获取类别 $class_name 的标记"
         return 1
@@ -983,8 +831,9 @@ create_htb_download_class() {
     local percent_bandwidth per_min_bandwidth per_max_bandwidth priority name
     eval "$class_config"
     
+    # 从标记文件中获取该类的标记值
     local class_mark
-    class_mark=$(get_class_mark_by_class "download" "$class_name")
+    class_mark=$(get_class_mark "download" "$class_name")
     if [ -z "$class_mark" ]; then
         qos_log "ERROR" "无法获取类别 $class_name 的标记"
         return 1
@@ -1112,9 +961,10 @@ create_htb_download_class() {
     return 0
 }
 
-# 创建默认上传类
+# 创建默认上传类（接收一个标记参数）
 create_default_upload_class() {
-    qos_log "INFO" "创建默认上传类别"
+    local default_mark="$1"
+    qos_log "INFO" "创建默认上传类别，使用标记: 0x$(printf '%X' $default_mark)"
     
     if ! create_htb_root_qdisc "$qos_interface" "upload" "1:0" "1:1"; then
         qos_log "ERROR" "创建上传根队列失败"
@@ -1156,24 +1006,24 @@ create_default_upload_class() {
     
     tc qdisc change dev "$qos_interface" root handle 1:0 htb default 2 2>/dev/null || true
     
-    local mark_hex="0x1"
     if ! tc filter add dev "$qos_interface" parent 1:0 protocol ip \
-        prio 1 handle ${mark_hex}/$UPLOAD_MASK fw flowid 1:2 2>/dev/null; then
+        prio 1 handle ${default_mark}/$UPLOAD_MASK fw flowid 1:2 2>/dev/null; then
         qos_log "WARN" "添加上传默认IPv4过滤器失败"
     fi
     if ! tc filter add dev "$qos_interface" parent 1:0 protocol ipv6 \
-        prio 2 handle ${mark_hex}/$UPLOAD_MASK fw flowid 1:2 2>/dev/null; then
+        prio 2 handle ${default_mark}/$UPLOAD_MASK fw flowid 1:2 2>/dev/null; then
         qos_log "WARN" "添加上传默认IPv6过滤器失败"
     fi
     
-    upload_class_mark_list="default_class:$mark_hex"
-    qos_log "INFO" "默认上传类别创建完成 (类ID: 1:2, 标记: $mark_hex)"
+    upload_class_mark_list="default_class:0x$(printf '%X' $default_mark)"
+    qos_log "INFO" "默认上传类别创建完成 (类ID: 1:2, 标记: 0x$(printf '%X' $default_mark))"
     return 0
 }
 
-# 创建默认下载类
+# 创建默认下载类（接收一个标记参数）
 create_default_download_class() {
-    qos_log "INFO" "创建默认下载类别"
+    local default_mark="$1"
+    qos_log "INFO" "创建默认下载类别，使用标记: 0x$(printf '%X' $default_mark)"
     
     local ifb_dev="$IFB_DEVICE"
     
@@ -1222,13 +1072,12 @@ create_default_download_class() {
     
     tc qdisc change dev "$ifb_dev" root handle 1:0 htb default 2 2>/dev/null || true
     
-    local mark_hex="0x100"
     if ! tc filter add dev "$ifb_dev" parent 1:0 protocol ip \
-        prio 1 handle ${mark_hex}/$DOWNLOAD_MASK fw flowid 1:2 2>/dev/null; then
+        prio 1 handle ${default_mark}/$DOWNLOAD_MASK fw flowid 1:2 2>/dev/null; then
         qos_log "WARN" "添加下载默认IPv4过滤器失败"
     fi
     if ! tc filter add dev "$ifb_dev" parent 1:0 protocol ipv6 \
-        prio 2 handle ${mark_hex}/$DOWNLOAD_MASK fw flowid 1:2 2>/dev/null; then
+        prio 2 handle ${default_mark}/$DOWNLOAD_MASK fw flowid 1:2 2>/dev/null; then
         qos_log "WARN" "添加下载默认IPv6过滤器失败"
     fi
     
@@ -1237,8 +1086,8 @@ create_default_download_class() {
         return 1
     fi
     
-    download_class_mark_list="default_class:$mark_hex"
-    qos_log "INFO" "默认下载类别创建完成 (类ID: 1:2, 标记: $mark_hex)"
+    download_class_mark_list="default_class:0x$(printf '%X' $default_mark)"
+    qos_log "INFO" "默认下载类别创建完成 (类ID: 1:2, 标记: 0x$(printf '%X' $default_mark))"
     return 0
 }
 
@@ -1395,20 +1244,21 @@ check_ingress_redirect() {
 }
 
 # ========== 上传方向初始化 ==========
-initialize_htb_upload() {
+init_htb_upload() {
     qos_log "INFO" "初始化上传方向HTB"
     
     load_upload_class_configurations
     
     if [ -z "$upload_class_list" ]; then
         qos_log "WARN" "未找到上传类别配置，使用默认类别"
-        if ! create_default_upload_class; then
+        # 使用固定标记 0x1（因为没有自定义类，不会冲突）
+        if ! create_default_upload_class 1; then
             return 1
         fi
         return 0
     fi
     
-    # 统计启用类数量（假设未设置 enabled 的默认为启用，与 rule.sh 中一致）
+    # 统计启用类数量
     local class_count=0
     for class in $upload_class_list; do
         local enabled=$(uci -q get ${CONFIG_FILE}.${class}.enabled 2>/dev/null)
@@ -1420,27 +1270,21 @@ initialize_htb_upload() {
         return 1
     fi
     
-    # 预先分配标记，检查冲突
-    if ! allocate_class_marks "upload" "$upload_class_list"; then
-        qos_log "ERROR" "上传方向类标记分配失败，存在无法解决的冲突"
-        return 1
-    fi
-    
-    if ! create_htb_root_qdisc "$qos_interface" "upload" "1:0" "1:1"; then
+	if ! create_htb_root_qdisc "$qos_interface" "upload" "1:0" "1:1"; then
         qos_log "ERROR" "创建上传根队列失败"
         return 1
     fi
-    
+	
+    # 标记已在 init_htb_qos 中分配，这里直接创建类
     local class_index=2
     upload_class_mark_list=""
     
     for class_name in $upload_class_list; do
         if create_htb_upload_class "$class_name" "$class_index"; then
-            local class_mark_hex=$(get_class_mark_by_class "upload" "$class_name")
+            local class_mark_hex=$(get_class_mark "upload" "$class_name")
             upload_class_mark_list="$upload_class_mark_list$class_name:0x$(printf '%X' $class_mark_hex) "
         else
             qos_log "ERROR" "创建上传类别 $class_name 失败，停止初始化"
-            # 清理已创建的根队列
             tc qdisc del dev "$qos_interface" root 2>/dev/null
             return 1
         fi
@@ -1454,14 +1298,15 @@ initialize_htb_upload() {
 }
 
 # ========== 下载方向初始化 ==========
-initialize_htb_download() {
+init_htb_download() {
     qos_log "INFO" "初始化下载方向HTB"
     
     load_download_class_configurations
     
     if [ -z "$download_class_list" ]; then
         qos_log "WARN" "未找到下载类别配置，使用默认类别"
-        if ! create_default_download_class; then
+        # 使用固定标记 0x10000（因为没有自定义类，不会冲突）
+        if ! create_default_download_class 65536; then
             return 1
         fi
         return 0
@@ -1479,12 +1324,7 @@ initialize_htb_download() {
         return 1
     fi
     
-    # 预先分配标记，检查冲突
-    if ! allocate_class_marks "download" "$download_class_list"; then
-        qos_log "ERROR" "下载方向类标记分配失败，存在无法解决的冲突"
-        return 1
-    fi
-    
+    # 标记已在 init_htb_qos 中分配，这里直接创建类
     if ! ip link show dev "$IFB_DEVICE" >/dev/null 2>&1; then
         qos_log "ERROR" "IFB设备 $IFB_DEVICE 不存在"
         return 1
@@ -1506,11 +1346,10 @@ initialize_htb_download() {
     
     for class_name in $download_class_list; do
         if create_htb_download_class "$class_name" "$class_index" "$filter_prio"; then
-            local class_mark_hex=$(get_class_mark_by_class "download" "$class_name")
+            local class_mark_hex=$(get_class_mark "download" "$class_name")
             download_class_mark_list="$download_class_mark_list$class_name:0x$(printf '%X' $class_mark_hex) "
         else
             qos_log "ERROR" "创建下载类别 $class_name 失败，停止初始化"
-            # 清理已创建的根队列
             tc qdisc del dev "$IFB_DEVICE" root 2>/dev/null
             return 1
         fi
@@ -1691,10 +1530,10 @@ apply_htb_specific_rules() {
 }
 
 # ========== 主初始化函数 ==========
-initialize_htb_qos() {
+init_htb_qos() {
     qos_log "INFO" "开始初始化HTB QoS系统"
     
-    # 获取并发锁（先获取锁，再检查幂等性）
+    # 获取并发锁
     if ! acquire_lock; then
         qos_log "ERROR" "无法获取并发锁，可能已有其他QoS进程在运行"
         rm -f "$QOS_RUNNING_FILE"
@@ -1707,14 +1546,19 @@ initialize_htb_qos() {
         release_lock
         return 1
     fi
-	
-	# 初始化规则集（从 /etc/qos_gargoyle/rulesets/ 加载）
-	if ! init_ruleset; then
-		qos_log "ERROR" "初始化规则集失败，QoS 无法启动"
-		release_lock
-		rm -f "$QOS_RUNNING_FILE"
-		return 1
-	fi
+    
+    # 初始化规则集（合并到主配置）
+    if ! init_ruleset; then
+        qos_log "ERROR" "初始化规则集失败，QoS 无法启动"
+        release_lock
+        rm -f "$QOS_RUNNING_FILE"
+        return 1
+    fi
+
+    # 清空 nft 规则链，确保干净状态
+    nft flush chain inet gargoyle-qos-priority filter_qos_egress 2>/dev/null
+    nft flush chain inet gargoyle-qos-priority filter_qos_ingress 2>/dev/null
+    qos_log "INFO" "已清空 nft 规则链"
     
     # 检查必需命令
     if ! check_required_commands; then
@@ -1735,7 +1579,7 @@ initialize_htb_qos() {
     # 确保 nftables 表存在
     nft add table inet gargoyle-qos-priority 2>/dev/null || true
     
-    # 检查qos_interface是否已设置
+    # 确定 qos_interface
     if [ -z "$qos_interface" ]; then
         qos_interface=$(uci -q get qos_gargoyle.global.wan_interface 2>/dev/null)
         if [ -z "$qos_interface" ] && [ -f "/lib/functions/network.sh" ]; then
@@ -1767,13 +1611,52 @@ initialize_htb_qos() {
         return 1
     fi
     
+    # 加载上传/下载类别列表
+    load_upload_class_configurations
+    load_download_class_configurations
+    
+    # ========== 先分配标记 ==========
+    if [ -n "$upload_class_list" ]; then
+        if ! allocate_class_marks "upload" "$upload_class_list"; then
+            qos_log "ERROR" "上传方向标记分配失败"
+            release_lock
+            rm -f "$QOS_RUNNING_FILE"
+            return 1
+        fi
+    fi
+    if [ -n "$download_class_list" ]; then
+        if ! allocate_class_marks "download" "$download_class_list"; then
+            qos_log "ERROR" "下载方向标记分配失败"
+            release_lock
+            rm -f "$QOS_RUNNING_FILE"
+            return 1
+        fi
+    fi
+    
+    # ========== 然后应用 nft 规则（此时标记已就绪）==========
+    echo "调用分类规则应用..." 
+    if ! apply_all_rules "upload_rule" "$UPLOAD_MASK" "filter_qos_egress"; then
+        qos_log "ERROR" "上传规则应用失败，回滚"
+        stop_htb_fqcodel_qos
+        return 1
+    fi
+    if ! apply_all_rules "download_rule" "$DOWNLOAD_MASK" "filter_qos_ingress"; then
+        qos_log "ERROR" "下载规则应用失败，回滚"
+        stop_htb_fqcodel_qos
+        return 1
+    fi
+    qos_log "INFO" "应用自定义规则成功"
+    
+    # 应用 ipv6 特别规则
+    echo "应用ipv6特别规则..." 
     setup_ipv6_specific_rules
     
+    # ========== 最后创建 HTB 队列 ==========
     local upload_success=0
     local download_success=0
     
     if [ "$total_upload_bandwidth" -gt 0 ] 2>/dev/null; then
-        if ! initialize_htb_upload; then
+        if ! init_htb_upload; then
             qos_log "ERROR" "上传方向初始化失败"
             upload_success=1
         fi
@@ -1783,7 +1666,7 @@ initialize_htb_qos() {
     fi
     
     if [ "$total_download_bandwidth" -gt 0 ] 2>/dev/null; then
-        if ! initialize_htb_download; then
+        if ! init_htb_download; then
             qos_log "ERROR" "下载方向初始化失败"
             download_success=1
         fi
@@ -1794,22 +1677,23 @@ initialize_htb_qos() {
     
     if [ $upload_success -eq 1 ] || [ $download_success -eq 1 ]; then
         qos_log "ERROR" "HTB QoS 初始化部分失败"
-        stop_htb_qos
+        stop_htb_fqcodel_qos
         release_lock
         rm -f "$QOS_RUNNING_FILE"
         return 1
     fi
     
+    echo "应用HTB特别规则..." 
     setup_htb_enhance_chains
     apply_htb_specific_rules
     
     qos_log "INFO" "HTB QoS初始化完成"
+    
     release_lock
     return 0
 }
 
 # ========== 停止函数（改进锁处理，增加重试）==========
-# ========== 停止函数 ==========
 stop_htb_fqcodel_qos() {
     qos_log "INFO" "停止HTB QoS"
     
@@ -1834,7 +1718,7 @@ stop_htb_fqcodel_qos() {
     # 成功获取锁后再删除运行标记文件
     rm -f "$QOS_RUNNING_FILE"
     
-    # 获取清理前的计数，去除所有非数字字符
+    # 获取清理前的计数
     local tc_count_before=$(tc qdisc show 2>/dev/null | grep -c htb 2>/dev/null | tr -cd '0-9')
     local nft_count_before=$(nft list ruleset 2>/dev/null | grep -c "gargoyle-qos-priority" 2>/dev/null | tr -cd '0-9')
     tc_count_before=${tc_count_before:-0}
@@ -1860,6 +1744,9 @@ stop_htb_fqcodel_qos() {
     fi
     
     nft delete table inet gargoyle-qos-priority 2>/dev/null || true
+    
+    # 清理标记文件
+    clear_class_marks
     
     if [ -n "$IFB_DEVICE" ] && ip link show dev "$IFB_DEVICE" >/dev/null 2>&1; then
         ip link set dev "$IFB_DEVICE" down
@@ -1905,7 +1792,7 @@ show_htb_status() {
         [ -z "$qos_interface" ] && qos_interface="未知"
     fi
     
-    echo "===== HTB-FQ_CODEL QoS 状态报告 (v2.11) ====="
+    echo "===== HTB-FQ_CODEL QoS 状态报告 (v2.12) ====="
     echo "时间: $(date)"
     echo "WAN接口: ${qos_interface}"
     
@@ -2033,7 +1920,6 @@ show_htb_status() {
     # ========== 活动连接标记 ==========
     echo -e "\n======== 活动连接标记 ========"
 
-    # 检查 conntrack 命令是否存在
     if ! command -v conntrack >/dev/null 2>&1; then
         echo "  conntrack 命令未安装，无法显示连接标记信息。"
         echo "  请安装 conntrack-tools 包以获取此功能。"
@@ -2138,7 +2024,7 @@ main_htb_qos() {
     
     case "$action" in
         "start")
-            if ! initialize_htb_qos; then
+            if ! init_htb_qos; then
                 qos_log "ERROR" "HTB QoS启动失败"
                 exit 1
             fi
@@ -2149,7 +2035,7 @@ main_htb_qos() {
         "restart")
             stop_htb_qos
             sleep 1
-            if ! initialize_htb_qos; then
+            if ! init_htb_qos; then
                 qos_log "ERROR" "HTB QoS重启失败"
                 exit 1
             fi
