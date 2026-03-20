@@ -526,7 +526,7 @@ build_complex_rule_fast() {
     echo "$nft_cmd"
 }
 
-# ========== 生成基于 DNS 学习集合的规则（使用类别真实名称） ==========
+# ========== 生成基于 DNS 学习集合的规则（使用类别真实名称，统一小写） ==========
 generate_set_rules() {
     local direction="$1" chain="$2" nft_batch_file="$3"
 
@@ -541,7 +541,7 @@ generate_set_rules() {
 
         class_id=$(get_class_id "$direction" "$class_name") || continue
 
-        # 获取类的真实名称（如 realtime），并转换为小写
+        # 获取类的真实名称（如 realtime），并转换为小写（与 DNS 模块一致）
         realname=$(uci -q get ${CONFIG_FILE}.${class_name}.name 2>/dev/null | tr '[:upper:]' '[:lower:]')
         if [ -z "$realname" ]; then
             log_warn "类别 $class_name 未配置 name 选项，无法生成集合规则，跳过"
@@ -640,10 +640,13 @@ EOF
     local port_dir
     [ "$direction" = "upload" ] && port_dir="dport" || port_dir="sport"
 
+    # 先清空 map（只一次）
+    echo "flush map inet gargoyle-qos-priority ${direction}_tcp_${port_dir}_map" >> "$nft_batch_file" 2>/dev/null || true
+    echo "flush map inet gargoyle-qos-priority ${direction}_udp_${port_dir}_map" >> "$nft_batch_file" 2>/dev/null || true
+
     add_elements_to_map() {
         local map_name="$1" entries="$2"
         [ -z "$entries" ] && return
-        echo "flush map inet gargoyle-qos-priority $map_name" >> "$nft_batch_file" 2>/dev/null || true
         local entry
         for entry in $entries; do
             local class=$(echo "$entry" | cut -d: -f1)
