@@ -1,8 +1,9 @@
 #!/bin/sh
-# version=5.6-mq
-# CAKE算法实现模块 - 多队列增强版 v5.6
-# 优化：带宽单位转换区分字节/比特；IPv6重定向循环简化并增加全局地址检测；
-#       锁机制强化（含僵尸进程检测）；变量作用域限定；双重释放防护
+# version=5.8-mq
+# CAKE算法实现模块 - 多队列增强版 v5.8
+# 支持与 idclass 集成，通过 DSCP 进行分类（diffserv4 模式）
+# 必要工具：tc, nft, conntrack, ethtool, sysctl
+# 内核模块：sch_cake
 
 # ========== 变量初始化 ==========
 : ${total_upload_bandwidth:=50000}
@@ -20,7 +21,23 @@ if [ -z "$qos_interface" ]; then
     qos_interface="${qos_interface:-pppoe-wan}"
 fi
 
-echo "CAKE 模块初始化完成 (v5.6-mq)"
+# 持久化标记文件（用于 idclass 和 rule.sh）
+PERSISTENT_CLASS_MARKS="/etc/qos_gargoyle/class_marks"
+
+# 加载规则辅助模块（必须）
+if [ -f "/usr/lib/qos_gargoyle/rule.sh" ]; then
+    . /usr/lib/qos_gargoyle/rule.sh
+    qos_log() { log "$@"; }
+else
+    echo "错误: 规则辅助模块 /usr/lib/qos_gargoyle/rule.sh 未找到" >&2
+    exit 1
+fi
+
+# 掩码变量（DSCP 模式下未使用，但 rule.sh 需要）
+UPLOAD_MASK=0
+DOWNLOAD_MASK=0
+
+echo "CAKE 模块初始化完成 (v5.8-mq)"
 echo "  网络接口: $qos_interface"
 echo "  IFB 设备: $IFB_DEVICE"
 echo "  上传带宽: ${total_upload_bandwidth}kbit/s"
@@ -707,7 +724,7 @@ create_cake_root_qdisc() {
 }
 
 # ========== 上传初始化 ==========
-initialize_cake_upload() {
+init_cake_upload() {
     log_info "初始化上传方向CAKE"
     if [ -z "$total_upload_bandwidth" ] || [ "$total_upload_bandwidth" -le 0 ] 2>/dev/null; then
         log_info "上传带宽未配置，跳过上传方向初始化"
@@ -718,7 +735,7 @@ initialize_cake_upload() {
 }
 
 # ========== 下载初始化 ==========
-initialize_cake_download() {
+init_cake_download() {
     log_info "初始化下载方向CAKE"
     local expected_queues=1 current_queues
 
@@ -823,7 +840,7 @@ health_check_cake() {
 
 # ========== 状态显示 ==========
 show_cake_status() {
-    echo "===== CAKE QoS状态报告 (v5.6-mq) ====="
+    echo "===== CAKE QoS状态报告 (v5.8-mq) ====="
     echo "时间: $(date)"
     echo "网络接口: ${qos_interface:-未知}"
 
@@ -878,7 +895,7 @@ show_cake_status() {
     else
         echo "状态: IFB设备未创建"
     fi
-	
+
     # conntrack 标记显示
     if command -v conntrack >/dev/null 2>&1; then
         echo -e "\n===== conntrack 标记示例 (最近5条) ====="
@@ -1068,7 +1085,7 @@ release_lock() {
 }
 
 # ========== 主函数 ==========
-initialize_cake_qos() {
+init_cake_qos() {
     local action="$1"
 
     case "$action" in
@@ -1102,14 +1119,99 @@ initialize_cake_qos() {
                 exit 1
             }
 
+            # ========== 集成 rule.sh 生成静态规则和 conntrack 恢复 ==========
+            # 加载类别列表（来自 UCI）
+            load_upload_class_configurations
+            load_download_class_configurations
+
+            # 为 DSCP 模式生成标记文件（使用固定 DSCP 映射）
+            : > "$PERSISTENT_CLASS_MARKS"
+            for class in $upload_class_list; do
+                class_id=$(get_class_id "upload" "$class") || continue
+                case "$class_id" in
+                    1) dscp=46 ;;  # realtime -> EF
+                    2) dscp=34 ;;  # video -> AF41
+                    3) dscp=0 ;;   # normal -> CS0
+                    4) dscp=8 ;;   # bulk -> CS1
+                    *) dscp=0 ;;
+                esac
+                echo "upload:$class:$dscp" >> "$PERSISTENT_CLASS_MARKS"
+            done
+            for class in $download_class_list; do
+                class_id=$(get_class_id "download" "$class") || continue
+                case "$class_id" in
+                    1) dscp=46 ;;
+                    2) dscp=34 ;;
+                    3) dscp=0 ;;
+                    4) dscp=8 ;;
+                    *) dscp=0 ;;
+                esac
+                echo "download:$class:$dscp" >> "$PERSISTENT_CLASS_MARKS"
+            done
+
+            # 创建 nftables 表（如果不存在）
+            nft add table inet gargoyle-qos-priority 2>/dev/null || true
+
+            # 创建 vmap（用于纯端口规则）
+            nft add map inet gargoyle-qos-priority upload_tcp_dport_map { type mark : verdict; flags interval; } 2>/dev/null || true
+            nft add map inet gargoyle-qos-priority upload_udp_dport_map { type mark : verdict; flags interval; } 2>/dev/null || true
+            nft add map inet gargoyle-qos-priority download_tcp_sport_map { type mark : verdict; flags interval; } 2>/dev/null || true
+            nft add map inet gargoyle-qos-priority download_udp_sport_map { type mark : verdict; flags interval; } 2>/dev/null || true
+
+            # 创建基于类别的集合（用于 DNS 学习）
+            if [ -f "$PERSISTENT_CLASS_MARKS" ]; then
+                for class_name in $(cut -d: -f2 "$PERSISTENT_CLASS_MARKS" | sort -u); do
+                    realname=$(uci -q get ${CONFIG_FILE}.${class_name}.name 2>/dev/null | tr '[:upper:]' '[:lower:]')
+                    [ -z "$realname" ] && continue
+                    nft add set inet gargoyle-qos-priority upload_${realname} { type ipv4_addr; flags dynamic, timeout; } 2>/dev/null || true
+                    nft add set inet gargoyle-qos-priority upload_${realname}6 { type ipv6_addr; flags dynamic, timeout; } 2>/dev/null || true
+                    nft add set inet gargoyle-qos-priority download_${realname} { type ipv4_addr; flags dynamic, timeout; } 2>/dev/null || true
+                    nft add set inet gargoyle-qos-priority download_${realname}6 { type ipv6_addr; flags dynamic, timeout; } 2>/dev/null || true
+                done
+            fi
+
+            # 应用规则（DSCP 模式）
+            if ! apply_all_rules "upload_rule" "$UPLOAD_MASK" "filter_qos_egress"; then
+                log_error "上传规则应用失败"
+                stop_cake_qos
+                release_lock
+                rm -f "$QOS_RUNNING_FILE"
+                exit 1
+            fi
+            if ! apply_all_rules "download_rule" "$DOWNLOAD_MASK" "filter_qos_ingress"; then
+                log_error "下载规则应用失败"
+                stop_cake_qos
+                release_lock
+                rm -f "$QOS_RUNNING_FILE"
+                exit 1
+            fi
+
+            # 创建 class_mark 映射并添加 conntrack 恢复规则（设置 DSCP）
+            nft add map inet gargoyle-qos-priority class_mark { type mark : mark; } 2>/dev/null || true
+            nft flush map inet gargoyle-qos-priority class_mark 2>/dev/null || true
+            if [ -f "$PERSISTENT_CLASS_MARKS" ]; then
+                while IFS=: read -r dir cls mark; do
+                    [ -z "$dir" ] || [ -z "$cls" ] || [ -z "$mark" ] && continue
+                    class_id=$(get_class_id "$dir" "$cls") || continue
+                    nft add element inet gargoyle-qos-priority class_mark { $class_id : $mark } 2>/dev/null
+                done < "$PERSISTENT_CLASS_MARKS"
+            fi
+            # 插入恢复规则到链首（设置 DSCP）
+            nft insert rule inet gargoyle-qos-priority filter_qos_egress ct state established,related ip dscp set class_mark[ct mark & 0xff]
+            nft insert rule inet gargoyle-qos-priority filter_qos_egress ct state established,related ip6 dscp set class_mark[ct mark & 0xff]
+            nft insert rule inet gargoyle-qos-priority filter_qos_ingress ct state established,related ip dscp set class_mark[ct mark & 0xff]
+            nft insert rule inet gargoyle-qos-priority filter_qos_ingress ct state established,related ip6 dscp set class_mark[ct mark & 0xff]
+            log_info "已添加 conntrack 恢复规则（DSCP 模式）"
+
+            # 继续原有的 CAKE 队列配置
             local upload_success=0 download_success=0
-            initialize_cake_upload || upload_success=1
-            initialize_cake_download || download_success=1
+            init_cake_upload || upload_success=1
+            init_cake_download || download_success=1
 
             if [ $upload_success -eq 1 ] || [ $download_success -eq 1 ]; then
                 log_error "CAKE QoS 初始化部分失败"
                 stop_cake_qos
-                # stop_cake_qos 已释放锁，此处不再重复 release_lock
+                release_lock
                 rm -f "$QOS_RUNNING_FILE"
                 exit 1
             fi
@@ -1141,7 +1243,7 @@ initialize_cake_qos() {
             log_info "重启CAKE QoS"
             stop_cake_qos
             sleep 2
-            initialize_cake_qos start
+            init_cake_qos start
             ;;
 
         status|show)
@@ -1176,7 +1278,7 @@ initialize_cake_qos() {
         *)
             echo "错误: 未知操作 '$action'"
             echo ""
-            initialize_cake_qos "help"
+            init_cake_qos "help"
             exit 1
             ;;
     esac
@@ -1186,10 +1288,10 @@ if [ "$(basename "$0")" = "cake.sh" ]; then
     if [ $# -eq 0 ]; then
         echo "错误: 缺少参数"
         echo ""
-        initialize_cake_qos "help"
+        init_cake_qos "help"
         exit 1
     fi
-    initialize_cake_qos "$@"
+    init_cake_qos "$@"
 fi
 
 log_info "CAKE模块加载完成"

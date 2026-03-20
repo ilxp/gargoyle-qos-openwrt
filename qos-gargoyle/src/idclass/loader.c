@@ -7,6 +7,7 @@
 #include <arpa/inet.h>
 #include <glob.h>
 #include <unistd.h>
+#include <uci.h>
 
 #include "idclass.h"
 
@@ -33,7 +34,6 @@ static void idclass_init_env(void)
 		.rlim_cur = RLIM_INFINITY,
 		.rlim_max = RLIM_INFINITY,
 	};
-
 	setrlimit(RLIMIT_MEMLOCK, &limit);
 }
 
@@ -44,7 +44,6 @@ static void idclass_fill_rodata(struct bpf_object *obj, uint32_t flags)
 	while ((map = bpf_object__next_map(obj, map)) != NULL) {
 		if (!strstr(bpf_map__name(map), ".rodata"))
 			continue;
-
 		bpf_map__set_initial_value(map, &flags, sizeof(flags));
 	}
 }
@@ -56,16 +55,13 @@ const char *idclass_get_program(uint32_t flags, int *fd)
 	for (i = 0; i < ARRAY_SIZE(bpf_progs); i++) {
 		if (bpf_progs[i].flags != flags)
 			continue;
-
 		*fd = bpf_progs[i].fd;
 		return bpf_progs[i].suffix;
 	}
-
 	return NULL;
 }
 
-static int
-idclass_create_program(int idx)
+static int idclass_create_program(int idx)
 {
 	DECLARE_LIBBPF_OPTS(bpf_object_open_opts, opts,
 		.pin_root_path = CLASSIFY_DATA_PATH,
@@ -74,6 +70,25 @@ idclass_create_program(int idx)
 	struct bpf_object *obj;
 	char path[256];
 	int err;
+	uint32_t flags = bpf_progs[idx].flags;
+
+	// 读取算法配置，若为 cake 或 cake_dscp，则设置 DSCP 标志
+	const char *alg = NULL;
+	struct uci_context *uci = uci_alloc_context();
+	if (uci) {
+		struct uci_package *pkg;
+		if (uci_load(uci, "qos_gargoyle", &pkg) == UCI_OK) {
+			struct uci_section *s = uci_lookup_section(uci, pkg, "global");
+			if (s) {
+				alg = uci_lookup_option_string(uci, s, "algorithm");
+			}
+			uci_unload(uci, pkg);
+		}
+		uci_free_context(uci);
+	}
+	if (alg && (strcmp(alg, "cake") == 0 || strcmp(alg, "cake_dscp") == 0)) {
+		flags |= IDCLASS_SET_DSCP;
+	}
 
 	snprintf(path, sizeof(path), CLASSIFY_PIN_PATH "_" "%s", bpf_progs[idx].suffix);
 
@@ -84,7 +99,7 @@ idclass_create_program(int idx)
 		return -1;
 	}
 
-	prog = bpf_object__find_program_by_name(obj, "classify"); /* 注意程序名 */
+	prog = bpf_object__find_program_by_name(obj, "classify");
 	if (!prog) {
 		fprintf(stderr, "Can't find classifier prog\n");
 		return -1;
@@ -92,7 +107,7 @@ idclass_create_program(int idx)
 
 	bpf_program__set_type(prog, BPF_PROG_TYPE_SCHED_CLS);
 
-	idclass_fill_rodata(obj, bpf_progs[idx].flags);
+	idclass_fill_rodata(obj, flags);
 
 	err = bpf_object__load(obj);
 	if (err) {

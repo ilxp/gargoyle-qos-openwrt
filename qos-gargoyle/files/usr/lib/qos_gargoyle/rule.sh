@@ -1,7 +1,7 @@
 #!/bin/sh
 # 规则辅助模块 (rule.sh)
 # 支持多样化端口、协议、IPv6双栈、连接字节数过滤和连接状态过滤
-# version=2.2.3 - 修复启用规则统计误匹配、标记文件清空时机、集合名大小写
+# version=2.2.5 - 支持 DSCP 模式（用于单独 CAKE diffserv4），修复生成规则语法
 
 : ${DEBUG:=0}
 
@@ -41,6 +41,13 @@ log() {
         echo "[$(date '+%H:%M:%S')] $tag $prefix $line" >&2
     done
 }
+
+# 算法检测
+ALGORITHM=$(uci -q get ${CONFIG_FILE}.global.algorithm 2>/dev/null || echo "htb_cake")
+USE_DSCP=0
+if [ "$ALGORITHM" = "cake" ] || [ "$ALGORITHM" = "cake_dscp" ]; then
+    USE_DSCP=1
+fi
 
 # ========== 规则集合并 ==========
 init_ruleset() {
@@ -463,10 +470,11 @@ EOF
     echo "$result"
 }
 
-# ========== 构建复杂规则 ==========
+# ========== 构建复杂规则（支持 DSCP） ==========
 build_complex_rule_fast() {
     local rule_name="$1" chain="$2" class_mark="$3" family="$4" proto="$5"
     local srcport="$6" dstport="$7" connbytes_kb="$8" state="$9" class_id="${10}"
+    local use_dscp="${11}"
     local nft_cmd="add rule inet gargoyle-qos-priority $chain"
     case "$family" in
         ip|inet4|ipv4) nft_cmd="$nft_cmd meta nfproto ipv4" ;;
@@ -522,41 +530,51 @@ build_complex_rule_fast() {
             log_warn "规则 $rule_name 连接字节数格式无效，忽略"
         fi
     fi
-    nft_cmd="$nft_cmd ct mark set $class_id meta mark set $class_mark counter"
+    nft_cmd="$nft_cmd ct mark set $class_id"
+    if [ "$use_dscp" = "1" ]; then
+        local dscp=$((class_mark & 0x3F))
+        nft_cmd="$nft_cmd ip dscp set $dscp ip6 dscp set $dscp"
+    else
+        nft_cmd="$nft_cmd meta mark set $class_mark"
+    fi
+    nft_cmd="$nft_cmd counter"
     echo "$nft_cmd"
 }
 
-# ========== 生成基于 DNS 学习集合的规则（使用类别真实名称，统一小写） ==========
+# ========== 生成基于 DNS 学习集合的规则（使用类别真实名称，统一小写，支持 DSCP） ==========
 generate_set_rules() {
     local direction="$1" chain="$2" nft_batch_file="$3"
 
-    # 从持久化标记文件中提取该方向的所有类名（去重）
     local class_names=$(grep "^$direction:" "$PERSISTENT_CLASS_MARKS" 2>/dev/null | cut -d: -f2 | sort -u)
     [ -z "$class_names" ] && return 0
 
     local class_name class_mark class_id realname set_name
     for class_name in $class_names; do
-        class_mark=$(get_class_mark "$direction" "$class_name")
-        [ -z "$class_mark" ] && continue
-
+        class_mark=$(get_class_mark "$direction" "$class_name") || continue
         class_id=$(get_class_id "$direction" "$class_name") || continue
 
-        # 获取类的真实名称（如 realtime），并转换为小写（与 DNS 模块一致）
         realname=$(uci -q get ${CONFIG_FILE}.${class_name}.name 2>/dev/null | tr '[:upper:]' '[:lower:]')
-        if [ -z "$realname" ]; then
-            log_warn "类别 $class_name 未配置 name 选项，无法生成集合规则，跳过"
-            continue
-        fi
+        [ -z "$realname" ] && { log_warn "类别 $class_name 未配置 name 选项，跳过"; continue; }
         set_name="${direction}_${realname}"
 
         if [ "$direction" = "upload" ]; then
-            echo "add rule inet gargoyle-qos-priority $chain ip daddr @$set_name ct mark set $class_id meta mark set $class_mark" >> "$nft_batch_file"
-            echo "add rule inet gargoyle-qos-priority $chain ip6 daddr @${set_name}${IPV6_SET_SUFFIX} ct mark set $class_id meta mark set $class_mark" >> "$nft_batch_file"
+            if [ "$USE_DSCP" = "1" ]; then
+                echo "add rule inet gargoyle-qos-priority $chain ip daddr @$set_name ct mark set $class_id ip dscp set $((class_mark & 0x3F))" >> "$nft_batch_file"
+                echo "add rule inet gargoyle-qos-priority $chain ip6 daddr @${set_name}${IPV6_SET_SUFFIX} ct mark set $class_id ip6 dscp set $((class_mark & 0x3F))" >> "$nft_batch_file"
+            else
+                echo "add rule inet gargoyle-qos-priority $chain ip daddr @$set_name ct mark set $class_id meta mark set $class_mark" >> "$nft_batch_file"
+                echo "add rule inet gargoyle-qos-priority $chain ip6 daddr @${set_name}${IPV6_SET_SUFFIX} ct mark set $class_id meta mark set $class_mark" >> "$nft_batch_file"
+            fi
         else
-            echo "add rule inet gargoyle-qos-priority $chain ip saddr @$set_name ct mark set $class_id meta mark set $class_mark" >> "$nft_batch_file"
-            echo "add rule inet gargoyle-qos-priority $chain ip6 saddr @${set_name}${IPV6_SET_SUFFIX} ct mark set $class_id meta mark set $class_mark" >> "$nft_batch_file"
+            if [ "$USE_DSCP" = "1" ]; then
+                echo "add rule inet gargoyle-qos-priority $chain ip saddr @$set_name ct mark set $class_id ip dscp set $((class_mark & 0x3F))" >> "$nft_batch_file"
+                echo "add rule inet gargoyle-qos-priority $chain ip6 saddr @${set_name}${IPV6_SET_SUFFIX} ct mark set $class_id ip6 dscp set $((class_mark & 0x3F))" >> "$nft_batch_file"
+            else
+                echo "add rule inet gargoyle-qos-priority $chain ip saddr @$set_name ct mark set $class_id meta mark set $class_mark" >> "$nft_batch_file"
+                echo "add rule inet gargoyle-qos-priority $chain ip6 saddr @${set_name}${IPV6_SET_SUFFIX} ct mark set $class_id meta mark set $class_mark" >> "$nft_batch_file"
+            fi
         fi
-        log_info "添加集合规则: $direction $class_name ($realname) -> mark $class_mark, class_id $class_id"
+        log_info "添加集合规则: $direction $class_name ($realname) -> $([ "$USE_DSCP" = "1" ] && echo "dscp $((class_mark & 0x3F))" || echo "mark $class_mark"), class_id $class_id"
     done
 }
 
@@ -633,7 +651,13 @@ EOF
         echo "flush chain inet gargoyle-qos-priority class_${class_id}_set" >> "$nft_batch_file" 2>/dev/null || true
         local class_mark=$(get_class_mark "$direction" "$class")
         [ -z "$class_mark" ] && continue
-        echo "add rule inet gargoyle-qos-priority class_${class_id}_set ct mark set $class_id meta mark set $class_mark accept" >> "$nft_batch_file"
+        if [ "$USE_DSCP" = "1" ]; then
+            local dscp=$((class_mark & 0x3F))
+            echo "add rule inet gargoyle-qos-priority class_${class_id}_set ct mark set $class_id ip dscp set $dscp accept" >> "$nft_batch_file"
+            echo "add rule inet gargoyle-qos-priority class_${class_id}_set ct mark set $class_id ip6 dscp set $dscp accept" >> "$nft_batch_file"
+        else
+            echo "add rule inet gargoyle-qos-priority class_${class_id}_set ct mark set $class_id meta mark set $class_mark accept" >> "$nft_batch_file"
+        fi
     done
 
     # --- 2. 处理纯端口规则，向 vmap 添加元素 ---
@@ -690,7 +714,7 @@ EOF
         local class_id=$(get_class_id "$direction" "$r_class")
         [ -z "$class_mark" ] || [ -z "$class_id" ] && continue
         [ -z "$r_family" ] && r_family="inet"
-        build_complex_rule_fast "$r_name" "$chain" "$class_mark" "$r_family" "$r_proto" "$r_srcport" "$r_dstport" "$r_connbytes" "$r_state" "$class_id" >> "$nft_batch_file"
+        build_complex_rule_fast "$r_name" "$chain" "$class_mark" "$r_family" "$r_proto" "$r_srcport" "$r_dstport" "$r_connbytes" "$r_state" "$class_id" "$USE_DSCP" >> "$nft_batch_file"
     done
 
     # 执行批处理
@@ -723,14 +747,6 @@ apply_all_rules() {
     log_info "开始应用 $rule_type 规则到链 $chain (掩码: $mask)"
     apply_enhanced_direction_rules "$rule_type" "$chain" "$mask"
 }
-
-# 算法检测
-ALGORITHM=$(uci -q get ${CONFIG_FILE}.global.algorithm 2>/dev/null || echo "htb_cake")
-if [ "$ALGORITHM" = "cake" ] || [ "$ALGORITHM" = "cake_dscp" ]; then
-    echo "[$(date '+%H:%M:%S')] qos_gargoyle 信息: 当前算法为 $ALGORITHM，无需生成分类规则，退出" >&2
-    logger -t "qos_gargoyle" "信息: 当前算法为 $ALGORITHM，无需生成分类规则，退出"
-    return 0
-fi
 
 if [ "$(basename "$0")" = "rule.sh" ]; then
     echo "此脚本为辅助模块，不应直接执行" >&2

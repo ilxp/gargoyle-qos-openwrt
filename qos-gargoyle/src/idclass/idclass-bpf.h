@@ -21,7 +21,7 @@
 #define IDCLASS_DSCP_VALUE_MASK		((1 << 6) - 1)
 #define IDCLASS_DSCP_FALLBACK_FLAG	(1 << 6)
 #define IDCLASS_DSCP_CLASS_FLAG		(1 << 7)
-
+#define IDCLASS_SET_DSCP          (1 << 2)
 #define IDCLASS_CLASS_FLAG_PRESENT	(1 << 0)
 
 // 特征掩码宏

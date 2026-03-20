@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0+
 /*
  * Copyright (C) 2021 Felix Fietkau <nbd@nbd.name>
- * Modified to support multi-feature classification
+ * Modified to support multi-feature classification and DSCP setting
  */
 #define KBUILD_MODNAME "foo"
 #include <linux/bpf.h>
@@ -41,7 +41,7 @@ struct {
 	__type(value, __u32);
 } prio_class_down SEC(".maps");
 
-/* class_mark map（用于最终 skb->mark） */
+/* class_mark map（用于最终 skb->mark 或 DSCP 值） */
 struct {
 	__uint(type, BPF_MAP_TYPE_ARRAY);
 	__uint(max_entries, IDCLASS_MAX_CLASS_ENTRIES + 1);
@@ -265,7 +265,6 @@ static __always_inline void update_flow_stats(struct flow_stats *stats,
 		}
 	}
 
-	// 突发特征：滑动窗口重置
 	if (cfg && cfg->burst_window_ms) {
 		__u64 now_ms_val = bpf_ktime_get_ns() / 1000000ULL;
 		if (stats->burst_start_ts == 0) {
@@ -278,7 +277,6 @@ static __always_inline void update_flow_stats(struct flow_stats *stats,
 				__sync_fetch_and_add(&stats->burst_packets, 1);
 				__sync_fetch_and_add(&stats->burst_bytes, pkt_len);
 			} else {
-				// 超过窗口，重置为当前包
 				stats->burst_start_ts = now_ms_val;
 				stats->burst_packets = 1;
 				stats->burst_bytes = pkt_len;
@@ -286,7 +284,6 @@ static __always_inline void update_flow_stats(struct flow_stats *stats,
 		}
 	}
 
-	// TCP 相关统计（包括重传检测改进）
 	if (tcph) {
 		__u8 tcp_flags = ((__u8 *)tcph)[13];
 		if (tcp_flags & 0x02)
@@ -302,24 +299,20 @@ static __always_inline void update_flow_stats(struct flow_stats *stats,
 		__u32 old_max = stats->max_seq;
 		__u64 now_ns = bpf_ktime_get_ns();
 
-		// 更新最大序列号
 		if (seq > old_max) {
 			__sync_lock_test_and_set(&stats->max_seq, seq);
 		} else if (seq < old_max) {
-			// 可能重传，检查时间间隔
 			__u64 last_pkt = stats->last_pkt_ts;
-			if (last_pkt != 0 && (now_ns - last_pkt) < 200000000) { // 200ms
+			if (last_pkt != 0 && (now_ns - last_pkt) < 200000000) {
 				__sync_fetch_and_add(&stats->retrans_count, 1);
 			}
 		}
 
-		// 更新上一个序列号和最后包时间
 		__sync_lock_test_and_set(&stats->tcp_seq, seq);
 		stats->last_pkt_ts = now_ns;
 	}
 }
 
-// 分类评分函数，根据 feature_mask 跳过未启用的特征
 static __always_inline __u32 classify_score(struct flow_stats *stats,
                                            struct idclass_flow_config *cfg)
 {
@@ -410,7 +403,7 @@ static __always_inline __u32 classify_score(struct flow_stats *stats,
 
     __u32 threshold = cfg->score_threshold;
     __u32 max_score = 0;
-    __u32 selected = 0; /* 0=realtime,1=video,2=normal,3=bulk */
+    __u32 selected = 0;
 
     if (score_realtime >= threshold && score_realtime > max_score) {
         max_score = score_realtime;
@@ -429,6 +422,42 @@ static __always_inline __u32 classify_score(struct flow_stats *stats,
         selected = 3;
     }
     return selected;
+}
+
+static __always_inline void ipv4_set_dscp(struct __sk_buff *skb, __u32 offset, __u8 dscp)
+{
+    struct iphdr *iph;
+    __u32 check;
+    __u8 old_tos;
+
+    iph = skb_ptr(skb, offset, sizeof(*iph));
+    if (!iph) return;
+
+    old_tos = iph->tos;
+    if (old_tos == ((old_tos & 0xFC) | dscp)) return;
+
+    check = bpf_ntohs(iph->check);
+    check += old_tos;
+    check -= ((old_tos & 0xFC) | dscp);
+    check = (check & 0xFFFF) + (check >> 16);
+    iph->check = bpf_htons((__u16)check);
+    iph->tos = (iph->tos & 0xFC) | dscp;
+}
+
+static __always_inline void ipv6_set_dscp(struct __sk_buff *skb, __u32 offset, __u8 dscp)
+{
+    struct ipv6hdr *ip6h;
+    __u16 *p;
+    __u16 val;
+
+    ip6h = skb_ptr(skb, offset, sizeof(*ip6h));
+    if (!ip6h) return;
+
+    p = (__u16 *)ip6h;
+    // 前 4 位是版本，接着 12 位流标签，再 8 位流量类型（包括 DSCP 和 ECN）
+    val = (*p & bpf_htons(0x0F00)) | bpf_htons(((__u16)dscp << 4) & 0x0FF0);
+    if (val == *p) return;
+    *p = val;
 }
 
 SEC("classifier")
@@ -493,7 +522,6 @@ int classify(struct __sk_buff *skb)
 		new.burst_start_ts = bpf_ktime_get_ns() / 1000000ULL;
 		new.burst_packets = 1;
 		new.burst_bytes = skb->len;
-		// 初始化 client_ip 全零
 		__builtin_memset(new.client_ip, 0, 16);
 		new.client_family = 0;
 		bpf_map_update_elem(&flow_stats_map, &hash, &new, BPF_NOEXIST);
@@ -501,17 +529,14 @@ int classify(struct __sk_buff *skb)
 	}
 
 	if (stats && class) {
-		// 更新流统计
 		update_flow_stats(stats, skb->len, bpf_ktime_get_ns(), ingress, &class->config, tcph);
 
-		// 提取客户端 IP（优化 IPv6 支持）
 		if (type == bpf_htons(ETH_P_IP)) {
 			struct iphdr *iph = skb_ptr(skb, iph_offset, sizeof(*iph));
 			if (iph) {
 				__u32 src = iph->saddr;
 				__u32 dst = iph->daddr;
 				__u32 ip = (ingress) ? src : dst;
-				// 转换为 IPv4-mapped IPv6 地址: ::ffff:a.b.c.d
 				__builtin_memset(stats->client_ip, 0, 10);
 				stats->client_ip[10] = 0xff;
 				stats->client_ip[11] = 0xff;
@@ -537,9 +562,18 @@ int classify(struct __sk_buff *skb)
 		class_id_ptr = bpf_map_lookup_elem(&prio_class_down, &prio_level);
 
 	if (class_id_ptr) {
-		__u32 *mark = bpf_map_lookup_elem(&class_mark, class_id_ptr);
-		if (mark)
-			bpf_skb_set_mark(skb, *mark);
+		__u32 *val = bpf_map_lookup_elem(&class_mark, class_id_ptr);
+		if (val) {
+			if (module_flags & IDCLASS_SET_DSCP) {
+				__u8 dscp_val = *val & 0x3F;
+				if (type == bpf_htons(ETH_P_IP))
+					ipv4_set_dscp(skb, iph_offset, dscp_val);
+				else if (type == bpf_htons(ETH_P_IPV6))
+					ipv6_set_dscp(skb, iph_offset, dscp_val);
+			} else {
+				bpf_skb_set_mark(skb, *val);
+			}
+		}
 	}
 
 	return TC_ACT_UNSPEC;
