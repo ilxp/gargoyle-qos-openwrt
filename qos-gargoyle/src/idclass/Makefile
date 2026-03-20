@@ -14,12 +14,10 @@ SKEL = idclass.skel.h
 USER_SRCS = main.c loader.c map.c interface.c dns.c ubus.c
 USER_OBJS = $(USER_SRCS:.c=.o)
 
-# 内核头文件路径（从构建环境获取）
-LINUX_UAPI_DIR = $(BUILD_DIR)/include/uapi
-ifeq ($(wildcard $(LINUX_UAPI_DIR)),)
-    LINUX_UAPI_DIR = $(LINUX_DIR)/include/uapi
-endif
-BPF_CFLAGS = -I$(STAGING_DIR)/usr/include -I$(LINUX_UAPI_DIR)
+# 内核头文件路径（由上层传递）
+LINUX_INCLUDE_DIR = $(BUILD_DIR)/include
+STAGING_INCLUDE_DIR = $(STAGING_DIR)/usr/include
+BPF_CFLAGS = -I$(STAGING_INCLUDE_DIR) -I$(LINUX_INCLUDE_DIR)
 
 all: $(TARGET)
 
