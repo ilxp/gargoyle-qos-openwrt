@@ -1605,3 +1605,17 @@ int idclass_map_init(void)
 
     return 0;
 }
+
+const char *idclass_dscp_to_class_name(uint8_t dscp)
+{
+    int i;
+    for (i = 0; i < IDCLASS_MAX_CLASS_ENTRIES; i++) {
+        if (!map_class[i])
+            continue;
+        if (map_class[i]->data.val.ingress == dscp ||
+            map_class[i]->data.val.egress == dscp) {
+            return map_class[i]->name;
+        }
+    }
+    return NULL;
+}

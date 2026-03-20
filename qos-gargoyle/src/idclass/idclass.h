@@ -120,6 +120,7 @@ void idclass_ubus_update_bridger(bool shutdown);
 int idclass_map_get_fd(enum idclass_map_id id);
 void idclass_set_config_name(const char *name);
 void sync_class_config(void);
+const char *idclass_dscp_to_class_name(uint8_t dscp);
 
 char *str_skip(char *str, bool space);
 int idclass_map_codepoint(const char *val);

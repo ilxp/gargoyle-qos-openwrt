@@ -1,10 +1,10 @@
 #!/bin/sh
-# version=2.22
+# version=2.23
 # HFSC_FQCODEL算法实现模块
 # 基于HFSC与FQ_CODEL组合算法实现QoS流量控制。
 # 必要工具：tc, nft, conntrack, ethtool, sysctl
 # 内核模块：ifb, sch_hfsc, sch_fq_codel
-# 优化：整合rule.sh标记分配，修正调用顺序，默认类冲突处理
+# 优化：整合rule.sh标记分配，添加conntrack恢复规则，修正调用顺序
 
 # ========== 全局配置常量 ==========
 : ${CONFIG_FILE:=qos_gargoyle}
@@ -25,8 +25,9 @@ download_class_mark_list=""
 qos_interface=""
 IFB_DEVICE=""
 
-# 标记文件路径（由 rule.sh 使用，此处统一设置）
+# 标记文件路径（由 rule.sh 使用）
 CLASS_MARKS_FILE="/var/run/qos_class_marks"
+PERSISTENT_CLASS_MARKS="/etc/qos_gargoyle/class_marks"
 
 # 加载规则辅助模块（必须）
 if [ -f "/usr/lib/qos_gargoyle/rule.sh" ]; then
@@ -1486,6 +1487,9 @@ init_hfsc_qos() {
     load_download_class_configurations
     
     # ========== 先分配标记 ==========
+	# 在分配标记前清空文件
+	: > "$PERSISTENT_CLASS_MARKS"
+	
     if [ -n "$upload_class_list" ]; then
         if ! allocate_class_marks "upload" "$upload_class_list"; then
             qos_log "ERROR" "上传方向标记分配失败"
@@ -1502,6 +1506,17 @@ init_hfsc_qos() {
             return 1
         fi
     fi
+
+    # ========== 创建 class_mark 映射用于 conntrack 恢复 ==========
+    nft add map inet gargoyle-qos-priority class_mark { type mark : mark; } 2>/dev/null || true
+    nft flush map inet gargoyle-qos-priority class_mark 2>/dev/null || true
+    if [ -f "$PERSISTENT_CLASS_MARKS" ]; then
+        while IFS=: read -r dir cls mark; do
+            [ -z "$dir" ] || [ -z "$cls" ] || [ -z "$mark" ] && continue
+            class_id=$(get_class_id "$dir" "$cls") || continue
+            nft add element inet gargoyle-qos-priority class_mark { $class_id : $mark } 2>/dev/null
+        done < "$PERSISTENT_CLASS_MARKS"
+    fi
     
     # ========== 然后应用 nft 规则（此时标记已就绪）==========
     echo "调用分类规则应用..." 
@@ -1516,6 +1531,11 @@ init_hfsc_qos() {
         return 1
     fi
     qos_log "INFO" "应用自定义规则成功"
+    
+    # ========== 添加 conntrack 恢复规则（位于链顶部） ==========
+    nft insert rule inet gargoyle-qos-priority filter_qos_egress ct state established,related meta mark set class_mark[ct mark & 0xff]
+    nft insert rule inet gargoyle-qos-priority filter_qos_ingress ct state established,related meta mark set class_mark[ct mark & 0xff]
+    qos_log "INFO" "已添加 conntrack 恢复规则"
     
     # 应用 ipv6 特别规则
     echo "应用ipv6特别规则..." 
@@ -1658,7 +1678,7 @@ show_hfsc_status() {
         [ -z "$qos_interface" ] && qos_interface="未知"
     fi
     
-    echo "===== HFSC-FQ_CODEL QoS 状态报告 (v2.22) ====="
+    echo "===== HFSC-FQ_CODEL QoS 状态报告 (v2.23) ====="
     echo "时间: $(date)"
     echo "WAN接口: ${qos_interface}"
     

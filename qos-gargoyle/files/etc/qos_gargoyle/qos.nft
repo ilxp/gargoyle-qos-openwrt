@@ -1,0 +1,107 @@
+#!/usr/sbin/nft -f
+
+# QoS Gargoyle - nftables 基础配置
+# 包含动态集合定义和基础链
+
+table inet gargoyle-qos-priority {
+    # ---------- 上传方向集合（IPv4） ----------
+    set upload_realtime {
+        type ipv4_addr
+        flags dynamic, timeout
+        timeout 1h
+    }
+    set upload_video {
+        type ipv4_addr
+        flags dynamic, timeout
+        timeout 1h
+    }
+    set upload_normal {
+        type ipv4_addr
+        flags dynamic, timeout
+        timeout 1h
+    }
+    set upload_bulk {
+        type ipv4_addr
+        flags dynamic, timeout
+        timeout 1h
+    }
+
+    # ---------- 上传方向集合（IPv6） ----------
+    set upload_realtime6 {
+        type ipv6_addr
+        flags dynamic, timeout
+        timeout 1h
+    }
+    set upload_video6 {
+        type ipv6_addr
+        flags dynamic, timeout
+        timeout 1h
+    }
+    set upload_normal6 {
+        type ipv6_addr
+        flags dynamic, timeout
+        timeout 1h
+    }
+    set upload_bulk6 {
+        type ipv6_addr
+        flags dynamic, timeout
+        timeout 1h
+    }
+
+    # ---------- 下载方向集合（IPv4） ----------
+    set download_realtime {
+        type ipv4_addr
+        flags dynamic, timeout
+        timeout 1h
+    }
+    set download_video {
+        type ipv4_addr
+        flags dynamic, timeout
+        timeout 1h
+    }
+    set download_normal {
+        type ipv4_addr
+        flags dynamic, timeout
+        timeout 1h
+    }
+    set download_bulk {
+        type ipv4_addr
+        flags dynamic, timeout
+        timeout 1h
+    }
+
+    # ---------- 下载方向集合（IPv6） ----------
+    set download_realtime6 {
+        type ipv6_addr
+        flags dynamic, timeout
+        timeout 1h
+    }
+    set download_video6 {
+        type ipv6_addr
+        flags dynamic, timeout
+        timeout 1h
+    }
+    set download_normal6 {
+        type ipv6_addr
+        flags dynamic, timeout
+        timeout 1h
+    }
+    set download_bulk6 {
+        type ipv6_addr
+        flags dynamic, timeout
+        timeout 1h
+    }
+
+    # ---------- 基础链 ----------
+    # 上传方向链（egress）：处理本地发出的流量
+    chain filter_qos_egress {
+        type filter hook output priority 0; policy accept;
+        # 规则将由 rule.sh 动态添加
+    }
+
+    # 下载方向链（ingress）：处理进入本地的流量（通常用 input 或 prerouting）
+    chain filter_qos_ingress {
+        type filter hook input priority 0; policy accept;
+        # 规则将由 rule.sh 动态添加
+    }
+}

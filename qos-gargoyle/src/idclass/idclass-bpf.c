@@ -4,16 +4,15 @@
  * Modified to support multi-feature classification
  */
 #define KBUILD_MODNAME "foo"
-#include <uapi/linux/bpf.h>
-#include <uapi/linux/if_ether.h>
-#include <uapi/linux/if_packet.h>
-#include <uapi/linux/ip.h>
-#include <uapi/linux/ipv6.h>
-#include <uapi/linux/in.h>
-#include <uapi/linux/tcp.h>
-#include <uapi/linux/udp.h>
-#include <uapi/linux/filter.h>
-#include <uapi/linux/pkt_cls.h>
+#include <linux/bpf.h>
+#include <linux/if_ether.h>
+#include <linux/ip.h>
+#include <linux/ipv6.h>
+#include <linux/in.h>
+#include <linux/tcp.h>
+#include <linux/udp.h>
+#include <linux/filter.h>
+#include <linux/pkt_cls.h>
 #include <linux/ip.h>
 #include <net/ipv6.h>
 #include <bpf/bpf_helpers.h>

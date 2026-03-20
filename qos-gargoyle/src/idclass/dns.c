@@ -9,6 +9,8 @@
 #include <sys/types.h>
 #include <errno.h>
 #include <resolv.h>
+#include <stdlib.h>          // for system()
+#include <arpa/inet.h>        // for inet_ntop
 
 #include <libubox/uloop.h>
 #include <libubox/avl-cmp.h>
@@ -174,6 +176,46 @@ dns_parse_question(struct packet *pkt, const void *hdr, uint8_t *dscp, uint32_t 
 	return 0;
 }
 
+/* 新增函数：将 IP 添加到 nftables 集合（上传和下载方向） */
+static void add_ip_to_nft_sets(const void *addr, int family, uint32_t ttl, uint8_t dscp)
+{
+    char ip_str[INET6_ADDRSTRLEN];
+    const char *class_name;
+    char cmd[512];
+    int ret;
+
+    // 将二进制 IP 转换为字符串
+    if (inet_ntop(family, addr, ip_str, sizeof(ip_str)) == NULL) {
+        ULOG_ERR("inet_ntop failed\n");
+        return;
+    }
+
+    // 根据 dscp 获取 class name
+    class_name = idclass_dscp_to_class_name(dscp);
+    if (!class_name) {
+        ULOG_WARN("无法从 dscp 0x%02x 获取 class name，跳过 nft 添加\n", dscp);
+        return;
+    }
+
+    // 构造 nft 命令添加上传方向集合
+    snprintf(cmd, sizeof(cmd),
+             "nft add element inet gargoyle-qos-priority upload_%s { %s timeout %ds } 2>/dev/null",
+             class_name, ip_str, ttl);
+    ret = system(cmd);
+    if (ret != 0) {
+        ULOG_WARN("添加上传集合失败: %s\n", cmd);
+    }
+
+    // 构造 nft 命令添加下载方向集合
+    snprintf(cmd, sizeof(cmd),
+             "nft add element inet gargoyle-qos-priority download_%s { %s timeout %ds } 2>/dev/null",
+             class_name, ip_str, ttl);
+    ret = system(cmd);
+    if (ret != 0) {
+        ULOG_WARN("添加下载集合失败: %s\n", cmd);
+    }
+}
+
 static int
 dns_parse_answer(struct packet *pkt, void *hdr, uint8_t *dscp, uint32_t *seq)
 {
@@ -183,6 +225,7 @@ dns_parse_answer(struct packet *pkt, void *hdr, uint8_t *dscp, uint32_t *seq)
 	int prev_timeout;
 	void *rdata;
 	int len;
+	uint32_t ttl;
 
 	if (pkt_pull_name(pkt, hdr, NULL))
 		return -1;
@@ -195,6 +238,8 @@ dns_parse_answer(struct packet *pkt, void *hdr, uint8_t *dscp, uint32_t *seq)
 	rdata = pkt_pull(pkt, len);
 	if (!rdata)
 		return -1;
+
+	ttl = be32_to_cpu(a->ttl);
 
 	switch (be16_to_cpu(a->type)) {
 	case TYPE_CNAME:
@@ -209,10 +254,13 @@ dns_parse_answer(struct packet *pkt, void *hdr, uint8_t *dscp, uint32_t *seq)
 	case TYPE_A:
 		data.id = CL_MAP_IPV4_ADDR;
 		memcpy(&data.addr, rdata, 4);
+		/* 将 IP 添加到 nftables 集合 */
+		add_ip_to_nft_sets(rdata, AF_INET, ttl, *dscp);
 		break;
 	case TYPE_AAAA:
 		data.id = CL_MAP_IPV6_ADDR;
 		memcpy(&data.addr, rdata, 16);
+		add_ip_to_nft_sets(rdata, AF_INET6, ttl, *dscp);
 		break;
 	default:
 		return 0;
@@ -222,7 +270,7 @@ dns_parse_answer(struct packet *pkt, void *hdr, uint8_t *dscp, uint32_t *seq)
 	data.dscp = *dscp;
 
 	prev_timeout = idclass_map_timeout;
-	idclass_map_timeout = be32_to_cpu(a->ttl);
+	idclass_map_timeout = ttl;
 	__idclass_map_set_entry(&data);
 	idclass_map_timeout = prev_timeout;
 
@@ -418,4 +466,3 @@ void idclass_dns_stop(void)
 	avl_remove_all_elements(&cname_cache, e, node, tmp)
 		free(e);
 }
-
