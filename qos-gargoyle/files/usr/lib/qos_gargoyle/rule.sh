@@ -1,7 +1,7 @@
 #!/bin/sh
 # 规则辅助模块 (rule.sh)
-# 版本: 2.4.15 - 修复 nft 表重复清空、入口重定向 connmark 覆盖、停止时配置丢失、TEMP_FILES 初始化、
-#               以及 build_nft_rule_fast 族匹配逻辑。移除 generate_ipset_sets 中的表清空，由 apply_all_rules 统一处理。
+# 版本: 2.4.16 - 修复 ACK 限速和 TCP 升级规则语法（改用 meter），将基础链创建移到 apply_all_rules，
+#               确保 ipset 集合在每次启动时正确重建，完善 IPv6 支持。
 
 : ${DEBUG:=0}
 
@@ -778,7 +778,7 @@ setup_ratelimit_chain() {
     fi
 }
 
-# ========== ACK 限速规则生成 ==========
+# ========== ACK 限速规则生成（使用 meter） ==========
 generate_ack_limit_rules() {
     [ "$ENABLE_ACK_LIMIT" != "1" ] && return
     local slow_rate=$(uci -q get ${CONFIG_FILE}.ack_limit.slow_rate 2>/dev/null)
@@ -791,15 +791,15 @@ generate_ack_limit_rules() {
     [ -n "$xfast_rate" ] && ACK_XFAST="$xfast_rate"
 
     cat <<EOF
-# ACK rate limiting
-add rule inet gargoyle-qos-priority filter_qos_egress meta length < 100 tcp flags ack add @xfst4ack {ct id . ct direction limit rate over ${ACK_XFAST}/second} counter jump drop995
-add rule inet gargoyle-qos-priority filter_qos_egress meta length < 100 tcp flags ack add @fast4ack {ct id . ct direction limit rate over ${ACK_FAST}/second} counter jump drop95
-add rule inet gargoyle-qos-priority filter_qos_egress meta length < 100 tcp flags ack add @med4ack {ct id . ct direction limit rate over ${ACK_MED}/second} counter jump drop50
-add rule inet gargoyle-qos-priority filter_qos_egress meta length < 100 tcp flags ack add @slow4ack {ct id . ct direction limit rate over ${ACK_SLOW}/second} counter jump drop50
+# ACK rate limiting using meters
+add rule inet gargoyle-qos-priority filter_qos_egress meta length < 100 tcp flags ack meter xfst4ack { limit rate over ${ACK_XFAST}/second } counter jump drop995
+add rule inet gargoyle-qos-priority filter_qos_egress meta length < 100 tcp flags ack meter fast4ack { limit rate over ${ACK_FAST}/second } counter jump drop95
+add rule inet gargoyle-qos-priority filter_qos_egress meta length < 100 tcp flags ack meter med4ack { limit rate over ${ACK_MED}/second } counter jump drop50
+add rule inet gargoyle-qos-priority filter_qos_egress meta length < 100 tcp flags ack meter slow4ack { limit rate over ${ACK_SLOW}/second } counter jump drop50
 EOF
 }
 
-# ========== TCP 升级规则生成 ==========
+# ========== TCP 升级规则生成（使用 meter） ==========
 generate_tcp_upgrade_rules() {
     [ "$ENABLE_TCP_UPGRADE" != "1" ] && return
     local realtime_class=""
@@ -845,9 +845,9 @@ generate_tcp_upgrade_rules() {
     fi
 
     cat <<EOF
-# TCP upgrade for slow connections (using fwmark)
-add rule inet gargoyle-qos-priority filter_qos_egress meta l4proto tcp ct state established meta nfproto ipv4 add @slowtcp {ct id . ct direction limit rate 150/second burst 150 packets } meta mark set $realtime_mark counter
-add rule inet gargoyle-qos-priority filter_qos_egress meta l4proto tcp ct state established meta nfproto ipv6 add @slowtcp {ct id . ct direction limit rate 150/second burst 150 packets } meta mark set $realtime_mark counter
+# TCP upgrade for slow connections (using meter)
+add rule inet gargoyle-qos-priority filter_qos_egress meta l4proto tcp ct state established meta nfproto ipv4 meter slowtcp { limit rate 150/second burst 150 packets } meta mark set $realtime_mark counter
+add rule inet gargoyle-qos-priority filter_qos_egress meta l4proto tcp ct state established meta nfproto ipv6 meter slowtcp { limit rate 150/second burst 150 packets } meta mark set $realtime_mark counter
 EOF
 }
 
@@ -1000,7 +1000,6 @@ apply_enhanced_direction_rules() {
     local rule_type="$1" chain="$2" mask="$3"
     log_info "应用增强$rule_type规则到链: $chain, 掩码: $mask"
 
-    # 注意：ipset 集合已在 apply_all_rules 中生成，此处不再重复生成
     # 确保链存在
     nft add chain inet gargoyle-qos-priority "$chain" 2>/dev/null || true
 
@@ -1041,29 +1040,7 @@ apply_enhanced_direction_rules() {
     [ -z "$nft_batch_file" ] && { log_error "无法创建nft批处理文件"; rm -f "$temp_config"; return 1; }
     TEMP_FILES="$TEMP_FILES $nft_batch_file"
 
-    if [ "$chain" = "filter_qos_egress" ]; then
-        cat <<EOF >> "$nft_batch_file"
-# ACK 限速所需的动态集合
-add set inet gargoyle-qos-priority xfst4ack { typeof ct id . ct direction; flags dynamic; timeout 5m; } 2>/dev/null || true
-add set inet gargoyle-qos-priority fast4ack { typeof ct id . ct direction; flags dynamic; timeout 5m; } 2>/dev/null || true
-add set inet gargoyle-qos-priority med4ack { typeof ct id . ct direction; flags dynamic; timeout 5m; } 2>/dev/null || true
-add set inet gargoyle-qos-priority slow4ack { typeof ct id . ct direction; flags dynamic; timeout 5m; } 2>/dev/null || true
-# 概率丢包链
-add chain inet gargoyle-qos-priority drop995 2>/dev/null || true
-add chain inet gargoyle-qos-priority drop95 2>/dev/null || true
-add chain inet gargoyle-qos-priority drop50 2>/dev/null || true
-add rule inet gargoyle-qos-priority drop995 numgen random mod 1000 ge 995 return
-add rule inet gargoyle-qos-priority drop995 drop
-add rule inet gargoyle-qos-priority drop95 numgen random mod 1000 ge 950 return
-add rule inet gargoyle-qos-priority drop95 drop
-add rule inet gargoyle-qos-priority drop50 numgen random mod 1000 ge 500 return
-add rule inet gargoyle-qos-priority drop50 drop
-EOF
-        if [ "$ENABLE_TCP_UPGRADE" = "1" ]; then
-            echo "# TCP 升级所需的动态集合" >> "$nft_batch_file"
-            echo "add set inet gargoyle-qos-priority slowtcp { typeof ct id . ct direction; flags dynamic; timeout 5m; } 2>/dev/null || true" >> "$nft_batch_file"
-        fi
-    fi
+    # 注意：基础链（drop995等）已在 apply_all_rules 中创建，这里不再重复创建
 
     log_info "按优先级顺序生成nft规则..."
     local rule_count=0
@@ -1087,6 +1064,7 @@ EOF
         [ -n "$include_stmt" ] && echo "$include_stmt" >> "$nft_batch_file"
     fi
 
+    # 仅当链为 filter_qos_egress 时添加 ACK 和 TCP 升级规则（只在出口方向添加一次）
     if [ "$chain" = "filter_qos_egress" ]; then
         generate_ack_limit_rules >> "$nft_batch_file"
         generate_tcp_upgrade_rules >> "$nft_batch_file"
@@ -1119,12 +1097,27 @@ apply_all_rules() {
     local rule_type="$1" mask="$2" chain="$3"
     log_info "开始应用 $rule_type 规则到链 $chain (掩码: $mask)"
 
-    # 首次调用时清空表并生成 ipset 集合
+    # 首次调用时清空表并创建基础结构
     if [ "$_QOS_TABLE_FLUSHED" -eq 0 ]; then
         log_info "初始化 nftables 表"
         nft add table inet gargoyle-qos-priority 2>/dev/null || true
         nft flush table inet gargoyle-qos-priority 2>/dev/null || true
         generate_ipset_sets
+
+        # 创建概率丢包链（这些链在所有方向共享）
+        nft add chain inet gargoyle-qos-priority drop995 2>/dev/null || true
+        nft add chain inet gargoyle-qos-priority drop95 2>/dev/null || true
+        nft add chain inet gargoyle-qos-priority drop50 2>/dev/null || true
+        nft flush chain inet gargoyle-qos-priority drop995 2>/dev/null || true
+        nft flush chain inet gargoyle-qos-priority drop95 2>/dev/null || true
+        nft flush chain inet gargoyle-qos-priority drop50 2>/dev/null || true
+        nft add rule inet gargoyle-qos-priority drop995 numgen random mod 1000 ge 995 return
+        nft add rule inet gargoyle-qos-priority drop995 drop
+        nft add rule inet gargoyle-qos-priority drop95 numgen random mod 1000 ge 950 return
+        nft add rule inet gargoyle-qos-priority drop95 drop
+        nft add rule inet gargoyle-qos-priority drop50 numgen random mod 1000 ge 500 return
+        nft add rule inet gargoyle-qos-priority drop50 drop
+
         _QOS_TABLE_FLUSHED=1
     fi
 
