@@ -37,7 +37,7 @@
 #define FEATURE_RATIO     (1 << 7)
 #define FEATURE_BURST     (1 << 8)
 
-/* 添加缺失的结构体定义 */
+/* 定义结构体，放在 map 定义之前 */
 struct idclass_ip_map_val {
     __u8 dscp;
     __u8 seen;
