@@ -1,13 +1,10 @@
 #!/bin/sh
 # HFSC_FQCODEL算法实现模块
-# 版本: 2.3.0 - 完全适配 rule.sh 2.4.3，整合所有新功能（速率限制、ACK限速、TCP升级、内联规则、健康检查等）
+# 版本: 2.4.0 - 修复入口重定向 connmark 覆盖问题，移除重复函数依赖 rule.sh 2.4.15
 # 基于HFSC与FQ_CODEL组合算法实现QoS流量控制。
 
 # ========== 全局配置常量 ==========
 : ${CONFIG_FILE:=qos_gargoyle}
-: ${LOCK_DIR:=/var/run/hfsc_fqcodel.lock}
-: ${LOCK_PID_FILE:=$LOCK_DIR/pid}
-: ${QOS_RUNNING_FILE:=/var/run/hfsc_fqcodel.running}
 : ${MAX_PHYSICAL_BANDWIDTH:=10000000}
 : ${UPLOAD_MASK:=0xFFFF}
 : ${DOWNLOAD_MASK:=0xFFFF0000}
@@ -33,7 +30,7 @@ else
     exit 1
 fi
 
-# 锁持有标志
+# 锁持有标志（由 rule.sh 管理）
 HAVE_LOCK=0
 
 main_cleanup() {
@@ -48,7 +45,7 @@ trap main_cleanup EXIT INT TERM HUP QUIT
 . /lib/functions/network.sh
 include /lib/network
 
-# ========== HFSC 特有的配置加载 ==========
+# ========== HFSC 与 FQ_CODEL 专属配置加载 ==========
 load_hfsc_fqcodel_config() {
     qos_log "INFO" "加载HFSC与fq_codel配置"
     if ! load_bandwidth_from_config; then
@@ -164,6 +161,30 @@ load_hfsc_class_config() {
         return 1
     fi
     echo "percent_bandwidth='$percent_bandwidth' per_min_bandwidth='$per_min_bandwidth' per_max_bandwidth='$per_max_bandwidth' minRTT='$minRTT' priority='$priority' name='$name'"
+    return 0
+}
+
+load_upload_class_configurations() {
+    qos_log "INFO" "正在加载上传类别配置..."
+    upload_class_list=$(load_all_config_sections "$CONFIG_FILE" "upload_class")
+    if [ -n "$upload_class_list" ]; then
+        qos_log "INFO" "找到上传类别: $upload_class_list"
+    else
+        qos_log "WARN" "没有找到上传类别配置"
+        upload_class_list=""
+    fi
+    return 0
+}
+
+load_download_class_configurations() {
+    qos_log "INFO" "正在加载下载类别配置..."
+    download_class_list=$(load_all_config_sections "$CONFIG_FILE" "download_class")
+    if [ -n "$download_class_list" ]; then
+        qos_log "INFO" "找到下载类别: $download_class_list"
+    else
+        qos_log "WARN" "没有找到下载类别配置"
+        download_class_list=""
+    fi
     return 0
 }
 
@@ -524,14 +545,10 @@ create_default_download_class() {
     return 0
 }
 
-# ========== 入口重定向（三重尝试） ==========
+# ========== 入口重定向（修复 connmark 覆盖问题） ==========
 setup_ingress_redirect() {
     if [ -z "$qos_interface" ]; then
         qos_log "ERROR" "无法确定 WAN 接口"
-        return 1
-    fi
-    if ! check_tc_connmark_support; then
-        qos_log "ERROR" "内核不支持 tc action connmark，无法实现下载方向QoS"
         return 1
     fi
     qos_log "INFO" "设置入口重定向: $qos_interface -> $IFB_DEVICE"
@@ -541,10 +558,9 @@ setup_ingress_redirect() {
         return 1
     fi
     tc filter del dev "$qos_interface" parent ffff: 2>/dev/null || true
-    # IPv4 重定向（必须成功）
+    # IPv4 重定向（直接重定向，不使用 connmark）
     if ! tc filter add dev "$qos_interface" parent ffff: protocol ip \
         u32 match u32 0 0 \
-        action connmark \
         action mirred egress redirect dev "$IFB_DEVICE" 2>&1; then
         qos_log "ERROR" "IPv4入口重定向规则添加失败"
         tc qdisc del dev "$qos_interface" ingress 2>/dev/null
@@ -565,7 +581,6 @@ setup_ingress_redirect() {
     # 第一优先：flower 匹配全球单播地址 (2000::/3)
     if tc filter add dev "$qos_interface" parent ffff: protocol ipv6 \
         flower dst_ip 2000::/3 \
-        action connmark \
         action mirred egress redirect dev "$IFB_DEVICE" 2>&1; then
         ipv6_success=true
         qos_log "INFO" "IPv6入口重定向规则（flower 匹配全球单播）添加成功"
@@ -574,7 +589,6 @@ setup_ingress_redirect() {
         # 第二优先：u32 匹配全球单播地址 (2000::/3)
         if tc filter add dev "$qos_interface" parent ffff: protocol ipv6 \
             u32 match u32 0x20000000 0xe0000000 at 24 \
-            action connmark \
             action mirred egress redirect dev "$IFB_DEVICE" 2>&1; then
             ipv6_success=true
             qos_log "INFO" "IPv6入口重定向规则（u32 全球单播）添加成功"
@@ -583,7 +597,6 @@ setup_ingress_redirect() {
             # 第三优先：无过滤的 u32 全匹配
             if tc filter add dev "$qos_interface" parent ffff: protocol ipv6 \
                 u32 match u32 0 0 \
-                action connmark \
                 action mirred egress redirect dev "$IFB_DEVICE" 2>&1; then
                 ipv6_success=true
                 qos_log "INFO" "IPv6入口重定向规则（无过滤）添加成功"
@@ -916,7 +929,6 @@ init_hfsc_fqcodel_qos() {
     if ! init_ruleset; then
         qos_log "ERROR" "初始化规则集失败，QoS 无法启动"
         release_lock
-        rm -f "$QOS_RUNNING_FILE"
         return 1
     fi
     nft flush chain inet gargoyle-qos-priority filter_qos_egress 2>/dev/null
@@ -1085,7 +1097,7 @@ stop_hfsc_fqcodel_qos() {
 # ========== 状态显示函数 ==========
 show_hfsc_fqcodel_status() {
     if [ -z "$IFB_DEVICE" ]; then
-        IFB_DEVICE=$(uci -q get qos_gargoyle.download.ifb_device)
+        IFB_DEVICE=$(uci -q get qos_gargoyle.download.ifb_device 2>/dev/null)
         [ -z "$IFB_DEVICE" ] && IFB_DEVICE="ifb0"
     fi
     local qos_ifb="$IFB_DEVICE"
@@ -1093,7 +1105,7 @@ show_hfsc_fqcodel_status() {
         qos_interface=$(tc qdisc show 2>/dev/null | grep -E "hfsc.*root" | awk '{print $5}' | head -1)
         [ -z "$qos_interface" ] && qos_interface="未知"
     fi
-    echo "===== HFSC-FQ_CODEL QoS 状态报告 (v2.3.0) ====="
+    echo "===== HFSC-FQ_CODEL QoS 状态报告 (v2.4.0) ====="
     echo "时间: $(date)"
     echo "WAN接口: ${qos_interface}"
     if ! tc qdisc show dev "${qos_interface}" 2>/dev/null | grep -q hfsc; then
