@@ -1,0 +1,36 @@
+# ====================================================================
+# qos_gargoyle - 完整自定义 nftables 表
+# ====================================================================
+# 用途: 定义独立的 nftables 表，与主表 gargoyle-qos-priority 并行运行。
+#       可用于在 prerouting、forward 等钩子中做预处理，不干扰主链分类。
+# 语法: 必须是一个完整的 table inet 定义，包含链和规则。
+#       表名可以任意（例如 gargoyle-qos-priority-custom），但不要与主表冲突。
+# 生效: 修改后需重启服务: /etc/init.d/qos_gargoyle restart
+# 调试: 查看规则是否生效: nft list table inet gargoyle-qos-priority-custom
+# ====================================================================
+# 注意: 本表与主表是独立的，不会相互影响。若需要与主表交互（如修改标记），
+#       请注意钩子优先级，以免顺序错误。
+# ====================================================================
+
+table inet gargoyle-qos-priority-custom {
+    # 示例链: 在 prerouting 钩子中标记特定 IP 的流量为高优先级
+    chain prerouting_custom {
+        type filter hook prerouting priority 0; policy accept;
+        
+        # 标记来自指定 IP 的流量为高优先级 (realtime 类)
+        ip saddr 192.168.1.100 meta mark set 0x7F counter comment "Gaming PC"
+        ip6 saddr 2001:db8::1 meta mark set 0x7F counter
+        
+        # 标记来自特定网段的流量为低优先级 (bulk 类)
+        ip saddr 192.168.2.0/24 meta mark set 0x3F counter
+    }
+    
+    # 示例链: 在 forward 钩子中做二次分类
+    chain forward_custom {
+        type filter hook forward priority 5; policy accept;
+        
+        # 对已标记的流量进行计数
+        meta mark 0x7F counter comment "High priority traffic"
+        meta mark 0x3F counter comment "Low priority traffic"
+    }
+}

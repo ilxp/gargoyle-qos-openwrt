@@ -38,77 +38,77 @@
 #define FEATURE_BURST     (1 << 8)
 
 struct idclass_dscp_val {
-	uint8_t ingress;
-	uint8_t egress;
+	__u8 ingress;
+	__u8 egress;
 };
 
 struct idclass_flow_config {
-	uint8_t bulk_trigger_timeout;
-	uint16_t bulk_trigger_pps;
-	uint16_t prio_max_avg_pkt_len;
+	__u8 bulk_trigger_timeout;
+	__u16 bulk_trigger_pps;
+	__u16 prio_max_avg_pkt_len;
 
-	uint16_t game_max_avg_pkt_len;
-	uint16_t game_max_conn;
-	uint16_t game_max_pps;
-	uint16_t game_sample_packets;
+	__u16 game_max_avg_pkt_len;
+	__u16 game_max_conn;
+	__u16 game_max_pps;
+	__u16 game_sample_packets;
 
-	uint16_t video_min_avg_pkt_len;
-	uint16_t video_max_avg_pkt_len;
-	uint16_t video_max_conn;
-	uint16_t video_min_pps;
-	uint16_t video_max_pps;
+	__u16 video_min_avg_pkt_len;
+	__u16 video_max_avg_pkt_len;
+	__u16 video_max_conn;
+	__u16 video_min_pps;
+	__u16 video_max_pps;
 
-	uint16_t bulk_min_avg_pkt_len;
-	uint16_t bulk_min_conn;
-	uint16_t bulk_min_pps;
+	__u16 bulk_min_avg_pkt_len;
+	__u16 bulk_min_conn;
+	__u16 bulk_min_pps;
 
-	uint16_t tcp_flags_syn_ack_ratio;   /* 乘以 100 */
-	uint16_t tcp_flags_window;
+	__u16 tcp_flags_syn_ack_ratio;   /* 乘以 100 */
+	__u16 tcp_flags_window;
 
-	uint16_t conn_duration_short;
-	uint16_t conn_duration_long;
+	__u16 conn_duration_short;
+	__u16 conn_duration_long;
 
-	uint16_t up_down_ratio_low;
-	uint16_t up_down_ratio_high;
+	__u16 up_down_ratio_low;
+	__u16 up_down_ratio_high;
 
-	uint16_t burst_window_ms;
-	uint16_t burst_packets;
-	uint16_t burst_bytes;
+	__u16 burst_window_ms;
+	__u16 burst_packets;
+	__u16 burst_bytes;
 
-	uint16_t iat_threshold_us;
-	uint16_t retrans_threshold;
+	__u16 iat_threshold_us;
+	__u16 retrans_threshold;
 
-	uint32_t feature_mask;
+	__u32 feature_mask;
 
-	uint16_t weight_pktlen_realtime;
-	uint16_t weight_pktlen_video;
-	uint16_t weight_pktlen_normal;
-	uint16_t weight_pktlen_bulk;
-	uint16_t weight_conn_realtime;
-	uint16_t weight_conn_video;
-	uint16_t weight_conn_normal;
-	uint16_t weight_conn_bulk;
-	uint16_t weight_pps_realtime;
-	uint16_t weight_pps_video;
-	uint16_t weight_pps_normal;
-	uint16_t weight_pps_bulk;
-	uint16_t weight_burst_bulk;
-	uint16_t weight_tcpflags_bulk;
-	uint16_t weight_retrans_bulk;
-	uint16_t weight_duration_realtime;
-	uint16_t weight_duration_video;
-	uint16_t weight_duration_bulk;
-	uint16_t weight_ratio_video;
-	uint16_t weight_ratio_realtime;
-	uint16_t weight_ratio_bulk;
-	uint16_t weight_iat_realtime;
+	__u16 weight_pktlen_realtime;
+	__u16 weight_pktlen_video;
+	__u16 weight_pktlen_normal;
+	__u16 weight_pktlen_bulk;
+	__u16 weight_conn_realtime;
+	__u16 weight_conn_video;
+	__u16 weight_conn_normal;
+	__u16 weight_conn_bulk;
+	__u16 weight_pps_realtime;
+	__u16 weight_pps_video;
+	__u16 weight_pps_normal;
+	__u16 weight_pps_bulk;
+	__u16 weight_burst_bulk;
+	__u16 weight_tcpflags_bulk;
+	__u16 weight_retrans_bulk;
+	__u16 weight_duration_realtime;
+	__u16 weight_duration_video;
+	__u16 weight_duration_bulk;
+	__u16 weight_ratio_video;
+	__u16 weight_ratio_realtime;
+	__u16 weight_ratio_bulk;
+	__u16 weight_iat_realtime;
 
-	uint32_t score_threshold;
+	__u32 score_threshold;
 
-	uint32_t prio_realtime;
-	uint32_t prio_video;
-	uint32_t prio_normal;
-	uint32_t prio_bulk;
+	__u32 prio_realtime;
+	__u32 prio_video;
+	__u32 prio_normal;
+	__u32 prio_bulk;
 };
 
 struct flow_stats {
@@ -141,16 +141,16 @@ struct flow_stats {
 };
 
 struct global_config {
-	uint8_t dscp_icmp;
-	uint32_t wan_ifindex;
-	uint32_t ifb_ifindex;
+	__u8 dscp_icmp;
+	__u32 wan_ifindex;
+	__u32 ifb_ifindex;
 };
 
 struct idclass_class {
 	struct idclass_flow_config config;
 	struct idclass_dscp_val val;
-	uint8_t flags;
-	uint64_t packets;
+	__u8 flags;
+	__u64 packets;
 };
 
 #endif

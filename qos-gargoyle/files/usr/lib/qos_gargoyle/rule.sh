@@ -1,7 +1,7 @@
 #!/bin/sh
 # 规则辅助模块 (rule.sh)
-# 版本: 2.3.0 - 修复动态集合、自动IPv4/IPv6回退、TCP升级类查找、概率丢包链等问题
-# 支持多样化端口、协议、IPv6双栈、连接字节数过滤和连接状态过滤
+# 版本: 2.4.2 - 优化 ipset 元素生成（压缩连续空格），避免集合重复加载
+# 完全吸收 qosmate 优点：支持 UCI ipset、速率限制、ACK 限速、TCP 升级、内联规则、健康检查等
 
 : ${DEBUG:=0}  # 默认关闭调试
 
@@ -23,6 +23,9 @@ ACK_SLOW=50
 ACK_MED=100
 ACK_FAST=500
 ACK_XFAST=5000
+
+# ========== 全局标志 ==========
+_IPSET_LOADED=0  # 防止重复加载 ipset 集合
 
 # ========== 日志函数 ==========
 log_debug() { [ "$DEBUG" = "1" ] && log "DEBUG" "$@"; }
@@ -529,6 +532,95 @@ EOF
     echo "$result"
 }
 
+# ========== UCI ipset 生成 nftables 集合 ==========
+generate_ipset_sets() {
+    [ "$_IPSET_LOADED" -eq 1 ] && return 0  # 已加载过，跳过
+    
+    local sets_file=$(mktemp /tmp/qos_ipset_sets_XXXXXX)
+    local families_file="/tmp/qos_gargoyle_set_families"
+    TEMP_FILES="$TEMP_FILES $sets_file"
+    
+    # 清空或创建族文件
+    > "$families_file"
+    
+    process_ipset_section() {
+        local section="$1"
+        local name enabled mode family timeout ip4 ip6
+        local ip4_list ip6_list
+        
+        config_get_bool enabled "$section" enabled 1
+        [ "$enabled" -eq 0 ] && return 0
+        
+        config_get name "$section" name
+        [ -z "$name" ] && { log_warn "ipset 节 $section 缺少 name，跳过"; return 0; }
+        
+        config_get mode "$section" mode "static"
+        config_get family "$section" family "ipv4"
+        config_get timeout "$section" timeout "1h"
+        
+        # 验证族
+        case "$family" in
+            ipv4|ipv6) ;;
+            *) log_warn "ipset $name 族 '$family' 无效，使用 ipv4"; family="ipv4" ;;
+        esac
+        
+        # 获取 IP 列表
+        if [ "$family" = "ipv6" ]; then
+            config_get ip6 "$section" ip6
+            ip6_list="$ip6"
+        else
+            config_get ip4 "$section" ip4
+            ip4_list="$ip4"
+        fi
+        
+        # 写入族信息供其他函数使用
+        echo "$name $family" >> "$families_file"
+        
+        local set_flags=""
+        local elements=""
+        
+        if [ "$mode" = "dynamic" ]; then
+            set_flags="dynamic, timeout"
+            echo "add set inet gargoyle-qos-priority $name { type ${family}_addr; flags $set_flags; timeout $timeout; }" >> "$sets_file"
+        else
+            set_flags="interval"
+            local ip_list=""
+            if [ "$family" = "ipv6" ]; then
+                ip_list="$ip6_list"
+            else
+                ip_list="$ip4_list"
+            fi
+            
+            if [ -n "$ip_list" ]; then
+                # 压缩连续空格为单逗号
+                elements=$(echo "$ip_list" | sed 's/ \+/,/g')
+                echo "add set inet gargoyle-qos-priority $name { type ${family}_addr; flags $set_flags; elements = { $elements }; }" >> "$sets_file"
+            else
+                echo "add set inet gargoyle-qos-priority $name { type ${family}_addr; flags $set_flags; }" >> "$sets_file"
+            fi
+        fi
+        
+        log_info "已生成 ipset: $name ($family, mode=$mode)"
+    }
+    
+    # 遍历所有 ipset 节
+    local sections=$(load_all_config_sections "$CONFIG_FILE" "ipset")
+    for section in $sections; do
+        process_ipset_section "$section"
+    done
+    
+    # 如果有集合定义，执行批量添加
+    if [ -s "$sets_file" ]; then
+        nft -f "$sets_file" 2>/dev/null || {
+            log_warn "部分 ipset 集合加载失败，请检查 UCI 配置"
+        }
+        log_info "已加载 UCI 定义的 ipset 集合"
+    fi
+    
+    rm -f "$sets_file"
+    _IPSET_LOADED=1
+}
+
 # ========== 速率限制辅助函数 ==========
 build_device_conditions_for_direction() {
     local target_values="$1" direction="$2" result_var="$3"
@@ -544,10 +636,21 @@ build_device_conditions_for_direction() {
         case "$v" in '@'*)
             local setname="${v#@}"
             local set_family
+            # 尝试从缓存文件获取族，若文件不存在或找不到，尝试查询现有集合
             if [ -f "/tmp/qos_gargoyle_set_families" ]; then
                 set_family="$(awk -v set="$setname" '$1 == set {print $2}' /tmp/qos_gargoyle_set_families 2>/dev/null)"
             fi
-            [ -z "$set_family" ] && set_family="ipv4"
+            if [ -z "$set_family" ]; then
+                # 尝试从现有 nft 集合获取族（需要 nft 支持）
+                if command -v nft >/dev/null 2>&1; then
+                    set_family=$(nft list set inet gargoyle-qos-priority "$setname" 2>/dev/null | grep -o 'type [a-z0-9_]*' | head -1 | awk '{print $2}')
+                    set_family=${set_family%_addr}
+                fi
+            fi
+            if [ -z "$set_family" ]; then
+                log_warn "无法确定集合 $setname 的地址族，将视为 IPv4（可能导致规则错误）"
+                set_family="ipv4"
+            fi
             local ip_prefix='ip'
             [ "$set_family" = "ipv6" ] && ip_prefix='ip6'
             if [ -n "$negation" ]; then
@@ -593,6 +696,7 @@ generate_ratelimit_rules() {
         local name enabled download_limit upload_limit burst_factor target_values
         local meter_suffix download_kbytes upload_kbytes
         local download_burst upload_burst
+        local meter_hash
         
         config_get_bool enabled "$section" enabled 1
         [ "$enabled" -eq 0 ] && return 0
@@ -608,7 +712,9 @@ generate_ratelimit_rules() {
         [ -z "$target_values" ] && return 0
         [ "$download_limit" -eq 0 ] && [ "$upload_limit" -eq 0 ] && return 0
         
-        meter_suffix="$(printf '%s' "$name" | tr ' ' '_' | tr -cd 'a-zA-Z0-9_')"
+        # 生成唯一 meter 后缀（防止冲突）
+        meter_hash=$(printf "%s" "$section" | cksum | cut -d' ' -f1)
+        meter_suffix="${name}_${meter_hash}"
         download_kbytes=$((download_limit / 8))
         upload_kbytes=$((upload_limit / 8))
         
@@ -716,16 +822,28 @@ setup_ratelimit_chain() {
     [ "$ENABLE_RATELIMIT" != "1" ] && return 0
     local rules=$(generate_ratelimit_rules)
     if [ -n "$rules" ]; then
-        nft add chain inet gargoyle-qos-priority $RATELIMIT_CHAIN '{ type filter hook forward priority 0; policy accept; }' 2>/dev/null || true
-        nft flush chain inet gargoyle-qos-priority $RATELIMIT_CHAIN 2>/dev/null
+        local temp_ratelimit_file=$(mktemp /tmp/qos_ratelimit_XXXXXX)
+        TEMP_FILES="$TEMP_FILES $temp_ratelimit_file"
+        
+        # 创建链（如果不存在）
+        echo "add chain inet gargoyle-qos-priority $RATELIMIT_CHAIN '{ type filter hook forward priority 0; policy accept; }'" > "$temp_ratelimit_file"
+        # 清空链
+        echo "flush chain inet gargoyle-qos-priority $RATELIMIT_CHAIN" >> "$temp_ratelimit_file"
+        # 添加规则
         echo "$rules" | while IFS= read -r rule; do
-            [ -n "$rule" ] && nft add rule inet gargoyle-qos-priority $RATELIMIT_CHAIN $rule
+            [ -n "$rule" ] && echo "add rule inet gargoyle-qos-priority $RATELIMIT_CHAIN $rule" >> "$temp_ratelimit_file"
         done
+        
+        # 执行批量添加
+        nft -f "$temp_ratelimit_file" 2>/dev/null || {
+            log_error "无法创建速率限制链，请检查 nftables 语法"
+            return 1
+        }
         log_info "速率限制链已创建并填充规则"
     fi
 }
 
-# ========== ACK 限速规则生成 ==========
+# ========== ACK 限速规则生成（输出 add rule） ==========
 generate_ack_limit_rules() {
     [ "$ENABLE_ACK_LIMIT" != "1" ] && return
     local slow_rate=$(uci -q get ${CONFIG_FILE}.ack_limit.slow_rate 2>/dev/null)
@@ -738,15 +856,14 @@ generate_ack_limit_rules() {
     [ -n "$xfast_rate" ] && ACK_XFAST="$xfast_rate"
     
     cat <<EOF
-        # ACK rate limiting
-        meta length < 100 tcp flags ack add @xfst4ack {ct id . ct direction limit rate over ${ACK_XFAST}/second} counter jump drop995
-        meta length < 100 tcp flags ack add @fast4ack {ct id . ct direction limit rate over ${ACK_FAST}/second} counter jump drop95
-        meta length < 100 tcp flags ack add @med4ack {ct id . ct direction limit rate over ${ACK_MED}/second} counter jump drop50
-        meta length < 100 tcp flags ack add @slow4ack {ct id . ct direction limit rate over ${ACK_SLOW}/second} counter jump drop50
+add rule inet gargoyle-qos-priority filter_qos_egress meta length < 100 tcp flags ack add @xfst4ack {ct id . ct direction limit rate over ${ACK_XFAST}/second} counter jump drop995
+add rule inet gargoyle-qos-priority filter_qos_egress meta length < 100 tcp flags ack add @fast4ack {ct id . ct direction limit rate over ${ACK_FAST}/second} counter jump drop95
+add rule inet gargoyle-qos-priority filter_qos_egress meta length < 100 tcp flags ack add @med4ack {ct id . ct direction limit rate over ${ACK_MED}/second} counter jump drop50
+add rule inet gargoyle-qos-priority filter_qos_egress meta length < 100 tcp flags ack add @slow4ack {ct id . ct direction limit rate over ${ACK_SLOW}/second} counter jump drop50
 EOF
 }
 
-# ========== TCP 升级规则生成（使用 fwmark） ==========
+# ========== TCP 升级规则生成（输出 add rule） ==========
 generate_tcp_upgrade_rules() {
     [ "$ENABLE_TCP_UPGRADE" != "1" ] && return
     
@@ -764,6 +881,16 @@ generate_tcp_upgrade_rules() {
                 break
             fi
         done
+        # 也可能直接是 upload_class_realtime 或 uclass_realtime
+        if [ -z "$realtime_class" ]; then
+            for prefix in upload_class uclass; do
+                local candidate="${prefix}_realtime"
+                if uci -q get ${CONFIG_FILE}.${candidate} >/dev/null 2>&1; then
+                    realtime_class="$candidate"
+                    break
+                fi
+            done
+        fi
     fi
     
     # 方式2：查找名称包含 "realtime" 的 upload_class
@@ -778,10 +905,16 @@ generate_tcp_upgrade_rules() {
         done
     fi
     
-    # 方式3：回退到默认类 uclass_1
+    # 方式3：回退到第一个 upload_class 或默认 uclass_1
     if [ -z "$realtime_class" ]; then
-        log_warn "TCP升级功能启用但未找到 realtime 类，将使用默认类 uclass_1"
-        realtime_class="uclass_1"
+        local first_upload=$(load_all_config_sections "$CONFIG_FILE" "upload_class" | head -1)
+        if [ -n "$first_upload" ]; then
+            realtime_class="$first_upload"
+            log_warn "TCP升级：未找到 realtime 类，将使用第一个上传类 $realtime_class"
+        else
+            log_warn "TCP升级：未找到任何上传类，将禁用此功能"
+            return
+        fi
     fi
     
     local realtime_mark=$(get_class_mark "upload" "$realtime_class" 2>/dev/null)
@@ -791,9 +924,8 @@ generate_tcp_upgrade_rules() {
     fi
     
     cat <<EOF
-        # TCP upgrade for slow connections (using fwmark)
-        meta l4proto tcp ct state established meta nfproto ipv4 add @slowtcp {ct id . ct direction limit rate 150/second burst 150 packets } meta mark set $realtime_mark counter
-        meta l4proto tcp ct state established meta nfproto ipv6 add @slowtcp {ct id . ct direction limit rate 150/second burst 150 packets } meta mark set $realtime_mark counter
+add rule inet gargoyle-qos-priority filter_qos_egress meta l4proto tcp ct state established meta nfproto ipv4 add @slowtcp {ct id . ct direction limit rate 150/second burst 150 packets } meta mark set $realtime_mark counter
+add rule inet gargoyle-qos-priority filter_qos_egress meta l4proto tcp ct state established meta nfproto ipv6 add @slowtcp {ct id . ct direction limit rate 150/second burst 150 packets } meta mark set $realtime_mark counter
 EOF
 }
 
@@ -955,6 +1087,9 @@ apply_enhanced_direction_rules() {
     local direction=""
     [ "$chain" = "filter_qos_egress" ] && direction="upload"
     [ "$chain" = "filter_qos_ingress" ] && direction="download"
+    
+    # 确保 ipset 集合已加载（仅在第一次调用时加载）
+    generate_ipset_sets
     
     local rule_list=$(load_all_config_sections "$CONFIG_FILE" "$rule_type")
     [ -z "$rule_list" ] && { log_info "未找到$rule_type规则配置"; return 0; }

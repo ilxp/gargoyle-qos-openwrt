@@ -42,14 +42,20 @@ function index()
     entry({"admin", "qos", "qos_gargoyle", "download", "rule"},
         cbi("qos_gargoyle/download_rule")).leaf = true
 
-    entry({"admin", "network", "qos_gargoyle", "custom_rules"}, 
-	    cbi("qos_gargoyle/custom_rules"), _("Custom Rules"), 50)
+    entry({"admin", "network", "qos_gargoyle", "ruleset_manager"}, 
+	    cbi("qos_gargoyle/ruleset_manager"), _("Ruleset Manager"), 50)
+		
+	    entry({"admin", "network", "qos_gargoyle", "custom_nftrule"}, 
+	    cbi("qos_gargoyle/custom_nftrule"), _("Custom Nftrule"), 60)
+		
+	entry({"admin", "network", "qos_gargoyle", "ratelimit"}, 
+	    cbi("qos_gargoyle/ratelimit"), _("Rate Limit"), 70)
 		
 	entry({"admin", "qos", "qos_gargoyle", "acc"},
-        cbi("qos_gargoyle/acc"), _("Active Congestion Control"), 60)
+        cbi("qos_gargoyle/acc"), _("Active Congestion Control"), 80)
 
     entry({"admin", "qos", "qos_gargoyle", "show_status"},
-        template("qos_gargoyle/show_status"), _("Show Status"), 70)
+        template("qos_gargoyle/show_status"), _("Show Status"), 90)
 
     entry({"admin", "qos", "qos_gargoyle", "show_status", "data"},
         call("action_show_status_data"))

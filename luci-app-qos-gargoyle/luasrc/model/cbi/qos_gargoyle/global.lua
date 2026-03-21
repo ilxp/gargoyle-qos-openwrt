@@ -90,7 +90,7 @@ local manage_btn = s:option(Button, "_manage_custom_rules")
 manage_btn.inputtitle = translate("Manage Custom Rules")
 manage_btn.inputstyle = "apply"
 manage_btn.write = function()
-    luci.http.redirect(luci.dispatcher.build_url("admin/network/qos_gargoyle/custom_rules"))
+    luci.http.redirect(luci.dispatcher.build_url("admin/network/qos_gargoyle/ruleset_manager"))
 end
 
 -- 链路类型
