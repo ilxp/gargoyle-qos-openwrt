@@ -1,6 +1,6 @@
 #!/bin/sh
 # 规则辅助模块 (rule.sh)
-# 版本: 2.4.18 - 固定标记文件路径，实现自动分配与手动指定标记索引，移除哈希计算
+# 版本: 2.4.24 - 为 ACK 限速和 TCP 升级的 meter 添加随机后缀，彻底避免名称冲突
 
 : ${DEBUG:=0}
 
@@ -8,7 +8,7 @@ CONFIG_FILE="qos_gargoyle"
 TEMP_FILES=""
 RULESET_DIR="/etc/qos_gargoyle/rulesets"
 RULESET_MERGED_FLAG="/tmp/qos_ruleset_merged"
-CLASS_MARKS_FILE="/etc/qos_gargoyle/class_marks"   # 固定路径，持久化
+CLASS_MARKS_FILE="/etc/qos_gargoyle/class_marks"
 
 ENABLE_RATELIMIT=0
 ENABLE_ACK_LIMIT=0
@@ -30,9 +30,8 @@ ACK_XFAST=5000
 SET_FAMILIES_FILE="/tmp/qos_gargoyle_set_families"
 _IPSET_LOADED=0
 HAVE_LOCK=0
-
-# 表清空标志（全局）
 _QOS_TABLE_FLUSHED=0
+RANDOM_SUFFIX=""   # 全局唯一后缀
 
 # ========== 日志函数 ==========
 log_debug() { [ "$DEBUG" = "1" ] && log "DEBUG" "$@"; }
@@ -202,12 +201,10 @@ validate_state() {
     return 0
 }
 
-# 增强 IP/CIDR 验证，支持取反前缀 !=，IPv6 支持压缩格式（如 ::1），禁止非法格式
 validate_ip() {
     local ip="$1"
     local raw="${ip#!=}"
 
-    # 检测 IPv4
     if echo "$raw" | grep -qE '^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}(/[0-9]{1,2})?$'; then
         local ipnum="${raw%%/*}"
         local oct1=$(echo "$ipnum" | cut -d. -f1)
@@ -224,9 +221,7 @@ validate_ip() {
         return 0
     fi
 
-    # 检测 IPv6（允许压缩格式，如 ::1、2001:db8::1）
     if echo "$raw" | grep -qiE '^([0-9a-fA-F]{0,4}:){1,7}[0-9a-fA-F]{0,4}(/[0-9]{1,3})?$'; then
-        # 检查双冒号次数（最多一次）
         if echo "$raw" | grep -q '::.*::'; then
             log_error "IPv6地址 '$raw' 包含多个 '::'"
             return 1
@@ -235,9 +230,7 @@ validate_ip() {
             log_error "IPv6地址 '$raw' 包含非法序列 ':::'"
             return 1
         fi
-        # 禁止以单个冒号开头或结尾（允许 :: 开头或结尾）
         if echo "$raw" | grep -qE '^:[^:]' || echo "$raw" | grep -qE '[^:]:$'; then
-            # 例外情况：整个地址就是 :: 或 ::/...
             if ! echo "$raw" | grep -qE '^(::|::/|::/.*)$'; then
                 log_error "IPv6地址 '$raw' 不能以单个冒号开头或结尾"
                 return 1
@@ -253,7 +246,6 @@ validate_ip() {
     return 1
 }
 
-# ========== 辅助函数：映射 connbytes 操作符 ==========
 map_connbytes_operator() {
     local op="$1"
     case "$op" in
@@ -269,50 +261,57 @@ map_connbytes_operator() {
 
 # ========== 标记分配 ==========
 init_class_marks_file() {
-    # 确保目录存在
     mkdir -p "$(dirname "$CLASS_MARKS_FILE")" 2>/dev/null
-    # 不加入 TEMP_FILES，因为此文件需要持久化
 }
 
 allocate_class_marks() {
     local direction="$1" class_list="$2"
     local base_value i=1 mark mark_index
-    local -A used_indexes
+    local used_indexes=""   # 字符串记录已占用的索引
     local temp_file="${CLASS_MARKS_FILE}.tmp.$$"
 
     init_class_marks_file
     [ "$direction" = "upload" ] && base_value=1 || base_value=65536
 
-    # 收集手动指定的索引，并检查冲突
+    # 第一遍：收集手动指定的索引，并检查冲突
     for class in $class_list; do
         mark_index=$(uci -q get "${CONFIG_FILE}.${class}.mark_index" 2>/dev/null)
-        if validate_number "$mark_index" "$class.mark_index" 1 16; then
-            if [ -n "${used_indexes[$mark_index]}" ]; then
-                log_error "类别 $class 指定的标记索引 $mark_index 已被 ${used_indexes[$mark_index]} 占用"
+        if [ -n "$mark_index" ]; then
+            if ! validate_number "$mark_index" "$class.mark_index" 1 16; then
                 return 1
             fi
-            used_indexes[$mark_index]=$class
+            # 检查是否已经被占用
+            case " $used_indexes " in
+                *" $mark_index "*)
+                    log_error "类别 $class 指定的标记索引 $mark_index 已被占用"
+                    return 1
+                    ;;
+            esac
+            used_indexes="$used_indexes $mark_index"
         fi
     done
 
-    # 自动分配剩余索引
+    # 第二遍：分配标记
     local next_auto=1
     for class in $class_list; do
         mark_index=$(uci -q get "${CONFIG_FILE}.${class}.mark_index" 2>/dev/null)
-        if validate_number "$mark_index" "$class.mark_index" 1 16; then
-            # 用户已指定，直接使用
+        if [ -n "$mark_index" ] && validate_number "$mark_index" "$class.mark_index" 1 16 2>/dev/null; then
+            # 用户已指定且有效
             :
         else
             # 自动分配下一个可用索引
-            while [ $next_auto -le 16 ] && [ -n "${used_indexes[$next_auto]}" ]; do
-                next_auto=$((next_auto + 1))
+            while [ $next_auto -le 16 ]; do
+                case " $used_indexes " in
+                    *" $next_auto "*) next_auto=$((next_auto + 1)) ;;
+                    *) break ;;
+                esac
             done
             if [ $next_auto -gt 16 ]; then
                 log_error "没有可用的标记索引，无法为类别 $class 分配标记"
                 return 1
             fi
             mark_index=$next_auto
-            used_indexes[$mark_index]=$class
+            used_indexes="$used_indexes $mark_index"
             next_auto=$((next_auto + 1))
         fi
         mark=$((base_value << (mark_index - 1)))
@@ -320,11 +319,9 @@ allocate_class_marks() {
         log_info "类别 $class 分配标记索引 $mark_index (值: $mark / 0x$(printf '%X' $mark))"
     done
 
-    # 原子替换文件
+    # 原子写入文件
     if [ -s "$temp_file" ]; then
-        # 先保留原方向内容，再合并
         if [ -f "$CLASS_MARKS_FILE" ]; then
-            # 删除旧的本方向记录，保留其他方向
             grep -v "^$direction:" "$CLASS_MARKS_FILE" 2>/dev/null > "${temp_file}.merge"
             cat "$temp_file" >> "${temp_file}.merge"
             mv "${temp_file}.merge" "$CLASS_MARKS_FILE"
@@ -352,12 +349,7 @@ get_class_mark() {
 }
 
 clear_class_marks() {
-    # 持久化标记文件，停止时不删除，只清空内容？根据需求决定
-    # 此处为了安全，不做删除，仅提供空操作
-    # 如需彻底清空，可执行 rm -f "$CLASS_MARKS_FILE"
     log_debug "标记文件持久化，停止时不删除"
-    # 可选：清空内容，但保留文件
-    # > "$CLASS_MARKS_FILE" 2>/dev/null || true
 }
 
 # ========== 配置加载函数 ==========
@@ -783,7 +775,7 @@ setup_ratelimit_chain() {
     fi
 }
 
-# ========== ACK 限速规则生成 ==========
+# ========== ACK 限速规则生成（使用随机后缀） ==========
 generate_ack_limit_rules() {
     [ "$ENABLE_ACK_LIMIT" != "1" ] && return
     local slow_rate=$(uci -q get ${CONFIG_FILE}.ack_limit.slow_rate 2>/dev/null)
@@ -795,16 +787,18 @@ generate_ack_limit_rules() {
     [ -n "$fast_rate" ] && ACK_FAST="$fast_rate"
     [ -n "$xfast_rate" ] && ACK_XFAST="$xfast_rate"
 
+    # 使用全局唯一后缀，若未设置则用当前进程ID
+    local suffix="${RANDOM_SUFFIX:-$$}"
     cat <<EOF
-# ACK rate limiting using meters
-add rule inet gargoyle-qos-priority filter_qos_egress meta length < 100 tcp flags ack meter xfst4ack { ct id . ct direction limit rate over ${ACK_XFAST}/second } counter jump drop995
-add rule inet gargoyle-qos-priority filter_qos_egress meta length < 100 tcp flags ack meter fast4ack { ct id . ct direction limit rate over ${ACK_FAST}/second } counter jump drop95
-add rule inet gargoyle-qos-priority filter_qos_egress meta length < 100 tcp flags ack meter med4ack { ct id . ct direction limit rate over ${ACK_MED}/second } counter jump drop50
-add rule inet gargoyle-qos-priority filter_qos_egress meta length < 100 tcp flags ack meter slow4ack { ct id . ct direction limit rate over ${ACK_SLOW}/second } counter jump drop50
+# ACK rate limiting using unique meter names
+add rule inet gargoyle-qos-priority filter_qos_egress meta length < 100 tcp flags ack meter qos_xfst4ack_${suffix} { ct id . ct direction limit rate over ${ACK_XFAST}/second } counter jump drop995
+add rule inet gargoyle-qos-priority filter_qos_egress meta length < 100 tcp flags ack meter qos_fast4ack_${suffix} { ct id . ct direction limit rate over ${ACK_FAST}/second } counter jump drop95
+add rule inet gargoyle-qos-priority filter_qos_egress meta length < 100 tcp flags ack meter qos_med4ack_${suffix} { ct id . ct direction limit rate over ${ACK_MED}/second } counter jump drop50
+add rule inet gargoyle-qos-priority filter_qos_egress meta length < 100 tcp flags ack meter qos_slow4ack_${suffix} { ct id . ct direction limit rate over ${ACK_SLOW}/second } counter jump drop50
 EOF
 }
 
-# ========== TCP 升级规则生成 ==========
+# ========== TCP 升级规则生成（使用随机后缀） ==========
 generate_tcp_upgrade_rules() {
     [ "$ENABLE_TCP_UPGRADE" != "1" ] && return
     local realtime_class=""
@@ -849,10 +843,12 @@ generate_tcp_upgrade_rules() {
         return
     fi
 
+    # 使用全局唯一后缀
+    local suffix="${RANDOM_SUFFIX:-$$}"
     cat <<EOF
-# TCP upgrade for slow connections (using meter)
-add rule inet gargoyle-qos-priority filter_qos_egress meta l4proto tcp ct state established meta nfproto ipv4 meter slowtcp { ct id . ct direction limit rate 150/second burst 150 packets } meta mark set $realtime_mark counter
-add rule inet gargoyle-qos-priority filter_qos_egress meta l4proto tcp ct state established meta nfproto ipv6 meter slowtcp { ct id . ct direction limit rate 150/second burst 150 packets } meta mark set $realtime_mark counter
+# TCP upgrade for slow connections (using unique meter name)
+add rule inet gargoyle-qos-priority filter_qos_egress meta l4proto tcp ct state established meta nfproto ipv4 meter qos_tcp_upgrade_slow_${suffix} { ct id . ct direction limit rate 150/second burst 150 packets } meta mark set $realtime_mark counter
+add rule inet gargoyle-qos-priority filter_qos_egress meta l4proto tcp ct state established meta nfproto ipv6 meter qos_tcp_upgrade_slow_${suffix} { ct id . ct direction limit rate 150/second burst 150 packets } meta mark set $realtime_mark counter
 EOF
 }
 
@@ -1093,8 +1089,12 @@ apply_all_rules() {
 
     if [ "$_QOS_TABLE_FLUSHED" -eq 0 ]; then
         log_info "初始化 nftables 表"
+        # 彻底删除表（如果存在），确保没有残留对象
+        nft delete table inet gargoyle-qos-priority 2>/dev/null || true
         nft add table inet gargoyle-qos-priority 2>/dev/null || true
-        nft flush table inet gargoyle-qos-priority 2>/dev/null || true
+        # 生成唯一后缀用于 ACK 和 TCP 升级的 meter 名称
+        RANDOM_SUFFIX="$$_$(date +%s)_${RANDOM:-0}"
+        log_info "使用随机后缀: $RANDOM_SUFFIX"
         generate_ipset_sets
 
         nft add chain inet gargoyle-qos-priority drop995 2>/dev/null || true
@@ -1440,7 +1440,6 @@ init_ruleset() {
 }
 
 restore_main_config() {
-    # 仅清理规则集标记和备份文件，不恢复配置（避免覆盖用户修改）
     rm -f "/etc/config/${CONFIG_FILE}.bak"
     rm -f "$RULESET_MERGED_FLAG"
     log_info "已清理规则集标记和备份文件"

@@ -42,13 +42,13 @@ function index()
     entry({"admin", "qos", "qos_gargoyle", "download", "rule"},
         cbi("qos_gargoyle/download_rule")).leaf = true
 
-    entry({"admin", "network", "qos_gargoyle", "ruleset_manager"}, 
+    entry({"admin", "qos", "qos_gargoyle", "ruleset_manager"}, 
 	    cbi("qos_gargoyle/ruleset_manager"), _("Ruleset Manager"), 50)
 		
-	    entry({"admin", "network", "qos_gargoyle", "custom_nftrule"}, 
+	    entry({"admin", "qos", "qos_gargoyle", "custom_nftrule"}, 
 	    cbi("qos_gargoyle/custom_nftrule"), _("Custom Nftrule"), 60)
 		
-	entry({"admin", "network", "qos_gargoyle", "ratelimit"}, 
+	entry({"admin", "qos", "qos_gargoyle", "ratelimit"}, 
 	    cbi("qos_gargoyle/ratelimit"), _("Rate Limit"), 70)
 		
 	entry({"admin", "qos", "qos_gargoyle", "acc"},

@@ -134,7 +134,7 @@ struct flow_stats {
     __u32 fin_count;
     __u32 rst_count;
     __u32 retrans_count;
-    __u32 tcp_seq;
+    __u64 tcp_seq;
     __u8  fin_rst_seen;
     __u64 up_bytes;
     __u64 down_bytes;
@@ -143,7 +143,7 @@ struct flow_stats {
     // 新增字段（优化 IPv6 支持）
     __u8 client_ip[16];        // 客户端 IP（IPv4 用 IPv4-mapped 格式）
     __u8 client_family;        // 地址族：4 或 6
-    __u32 max_seq;              // 最大 TCP 序列号
+    __u64 max_seq;              // 最大 TCP 序列号
 };
 
 struct global_config {

@@ -303,22 +303,21 @@ static __always_inline void update_flow_stats(struct flow_stats *stats,
 			__sync_fetch_and_add(&stats->rst_count, 1);
 
 		__u32 seq = bpf_ntohl(tcph->seq);
-		__u32 old_max = stats->max_seq;
-		__u64 now_ns = bpf_ktime_get_ns();
+        __u64 old_max = stats->max_seq;   // 注意类型变化
+        __u64 now_ns = bpf_ktime_get_ns();
 
-		if (seq > old_max) {
-			__sync_lock_test_and_set(&stats->max_seq, seq);
-		} else if (seq < old_max) {
-			__u64 last_pkt = stats->last_pkt_ts;
-			if (last_pkt != 0 && (now_ns - last_pkt) < 200000000) {
-				__sync_fetch_and_add(&stats->retrans_count, 1);
-			}
-		}
+        if (seq > old_max) {
+            __sync_lock_test_and_set(&stats->max_seq, (__u64)seq);
+        } else if (seq < old_max) {
+            __u64 last_pkt = stats->last_pkt_ts;
+            if (last_pkt != 0 && (now_ns - last_pkt) < 200000000) {
+                __sync_fetch_and_add(&stats->retrans_count, 1);
+            }
+        }
 
-		__sync_lock_test_and_set(&stats->tcp_seq, seq);
-		stats->last_pkt_ts = now_ns;
-	}
-}
+        __sync_lock_test_and_set(&stats->tcp_seq, (__u64)seq);
+        stats->last_pkt_ts = now_ns;
+    }
 
 static __always_inline __u32 classify_score(struct flow_stats *stats,
                                            struct idclass_flow_config *cfg)
