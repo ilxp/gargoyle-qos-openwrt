@@ -1,7 +1,7 @@
 #!/bin/sh
 # 规则辅助模块 (rule.sh)
-# 版本: 2.4.16 - 修复 ACK 限速和 TCP 升级规则语法（改用 meter），将基础链创建移到 apply_all_rules，
-#               确保 ipset 集合在每次启动时正确重建，完善 IPv6 支持。
+# 版本: 2.4.17 - 修复 ACK 限速、TCP 升级、速率限制中 meter 语法缺少键的问题，
+#               为所有 meter 添加正确的键表达式，确保功能正常。
 
 : ${DEBUG:=0}
 
@@ -656,21 +656,22 @@ generate_ratelimit_rules() {
                 build_ip_conditions_for_direction "$iplist" "daddr" cond
                 if [ -n "$cond" ]; then
                     local meter_name="${meter_suffix}_dl4_ip_${type}"
+                    # 使用 ip daddr 作为 meter 的键
                     rules="${rules}
         # ${name} - Download limit (IPv4 IP ${type})
-        ${cond} meter ${meter_name} { limit rate over ${download_kbytes} kbytes/second${download_burst_param} } counter drop comment \"${name} download\""
+        ${cond} meter ${meter_name} { ip daddr limit rate over ${download_kbytes} kbytes/second${download_burst_param} } counter drop comment \"${name} download\""
                 fi
             done
             # 集合规则 (每个集合单独一条)
             for set in $sets_pos_v4; do
                 rules="${rules}
         # ${name} - Download limit (IPv4 set @${set})
-        ip daddr @${set} meter ${meter_suffix}_dl4_set_${set} { limit rate over ${download_kbytes} kbytes/second${download_burst_param} } counter drop comment \"${name} download\""
+        ip daddr @${set} meter ${meter_suffix}_dl4_set_${set} { ip daddr limit rate over ${download_kbytes} kbytes/second${download_burst_param} } counter drop comment \"${name} download\""
             done
             for set in $sets_neg_v4; do
                 rules="${rules}
         # ${name} - Download limit (IPv4 set != @${set})
-        ip daddr != @${set} meter ${meter_suffix}_dl4_set_neg_${set} { limit rate over ${download_kbytes} kbytes/second${download_burst_param} } counter drop comment \"${name} download\""
+        ip daddr != @${set} meter ${meter_suffix}_dl4_set_neg_${set} { ip daddr limit rate over ${download_kbytes} kbytes/second${download_burst_param} } counter drop comment \"${name} download\""
             done
         fi
 
@@ -685,18 +686,18 @@ generate_ratelimit_rules() {
                     local meter_name="${meter_suffix}_ul4_ip_${type}"
                     rules="${rules}
         # ${name} - Upload limit (IPv4 IP ${type})
-        ${cond} meter ${meter_name} { limit rate over ${upload_kbytes} kbytes/second${upload_burst_param} } counter drop comment \"${name} upload\""
+        ${cond} meter ${meter_name} { ip saddr limit rate over ${upload_kbytes} kbytes/second${upload_burst_param} } counter drop comment \"${name} upload\""
                 fi
             done
             for set in $sets_pos_v4; do
                 rules="${rules}
         # ${name} - Upload limit (IPv4 set @${set})
-        ip saddr @${set} meter ${meter_suffix}_ul4_set_${set} { limit rate over ${upload_kbytes} kbytes/second${upload_burst_param} } counter drop comment \"${name} upload\""
+        ip saddr @${set} meter ${meter_suffix}_ul4_set_${set} { ip saddr limit rate over ${upload_kbytes} kbytes/second${upload_burst_param} } counter drop comment \"${name} upload\""
             done
             for set in $sets_neg_v4; do
                 rules="${rules}
         # ${name} - Upload limit (IPv4 set != @${set})
-        ip saddr != @${set} meter ${meter_suffix}_ul4_set_neg_${set} { limit rate over ${upload_kbytes} kbytes/second${upload_burst_param} } counter drop comment \"${name} upload\""
+        ip saddr != @${set} meter ${meter_suffix}_ul4_set_neg_${set} { ip saddr limit rate over ${upload_kbytes} kbytes/second${upload_burst_param} } counter drop comment \"${name} upload\""
             done
         fi
 
@@ -712,18 +713,18 @@ generate_ratelimit_rules() {
                     local meter_name="${meter_suffix}_dl6_ip_${type}"
                     rules="${rules}
         # ${name} - Download limit (IPv6 IP ${type})
-        ${cond} meter ${meter_name} { limit rate over ${download_kbytes} kbytes/second${download_burst_param} } counter drop comment \"${name} download\""
+        ${cond} meter ${meter_name} { ip6 daddr limit rate over ${download_kbytes} kbytes/second${download_burst_param} } counter drop comment \"${name} download\""
                 fi
             done
             for set in $sets_pos_v6; do
                 rules="${rules}
         # ${name} - Download limit (IPv6 set @${set})
-        ip6 daddr @${set} meter ${meter_suffix}_dl6_set_${set} { limit rate over ${download_kbytes} kbytes/second${download_burst_param} } counter drop comment \"${name} download\""
+        ip6 daddr @${set} meter ${meter_suffix}_dl6_set_${set} { ip6 daddr limit rate over ${download_kbytes} kbytes/second${download_burst_param} } counter drop comment \"${name} download\""
             done
             for set in $sets_neg_v6; do
                 rules="${rules}
         # ${name} - Download limit (IPv6 set != @${set})
-        ip6 daddr != @${set} meter ${meter_suffix}_dl6_set_neg_${set} { limit rate over ${download_kbytes} kbytes/second${download_burst_param} } counter drop comment \"${name} download\""
+        ip6 daddr != @${set} meter ${meter_suffix}_dl6_set_neg_${set} { ip6 daddr limit rate over ${download_kbytes} kbytes/second${download_burst_param} } counter drop comment \"${name} download\""
             done
         fi
 
@@ -738,18 +739,18 @@ generate_ratelimit_rules() {
                     local meter_name="${meter_suffix}_ul6_ip_${type}"
                     rules="${rules}
         # ${name} - Upload limit (IPv6 IP ${type})
-        ${cond} meter ${meter_name} { limit rate over ${upload_kbytes} kbytes/second${upload_burst_param} } counter drop comment \"${name} upload\""
+        ${cond} meter ${meter_name} { ip6 saddr limit rate over ${upload_kbytes} kbytes/second${upload_burst_param} } counter drop comment \"${name} upload\""
                 fi
             done
             for set in $sets_pos_v6; do
                 rules="${rules}
         # ${name} - Upload limit (IPv6 set @${set})
-        ip6 saddr @${set} meter ${meter_suffix}_ul6_set_${set} { limit rate over ${upload_kbytes} kbytes/second${upload_burst_param} } counter drop comment \"${name} upload\""
+        ip6 saddr @${set} meter ${meter_suffix}_ul6_set_${set} { ip6 saddr limit rate over ${upload_kbytes} kbytes/second${upload_burst_param} } counter drop comment \"${name} upload\""
             done
             for set in $sets_neg_v6; do
                 rules="${rules}
         # ${name} - Upload limit (IPv6 set != @${set})
-        ip6 saddr != @${set} meter ${meter_suffix}_ul6_set_neg_${set} { limit rate over ${upload_kbytes} kbytes/second${upload_burst_param} } counter drop comment \"${name} upload\""
+        ip6 saddr != @${set} meter ${meter_suffix}_ul6_set_neg_${set} { ip6 saddr limit rate over ${upload_kbytes} kbytes/second${upload_burst_param} } counter drop comment \"${name} upload\""
             done
         fi
     }
@@ -778,7 +779,7 @@ setup_ratelimit_chain() {
     fi
 }
 
-# ========== ACK 限速规则生成（使用 meter） ==========
+# ========== ACK 限速规则生成（使用 meter + 键） ==========
 generate_ack_limit_rules() {
     [ "$ENABLE_ACK_LIMIT" != "1" ] && return
     local slow_rate=$(uci -q get ${CONFIG_FILE}.ack_limit.slow_rate 2>/dev/null)
@@ -791,15 +792,15 @@ generate_ack_limit_rules() {
     [ -n "$xfast_rate" ] && ACK_XFAST="$xfast_rate"
 
     cat <<EOF
-# ACK rate limiting using meters
-add rule inet gargoyle-qos-priority filter_qos_egress meta length < 100 tcp flags ack meter xfst4ack { limit rate over ${ACK_XFAST}/second } counter jump drop995
-add rule inet gargoyle-qos-priority filter_qos_egress meta length < 100 tcp flags ack meter fast4ack { limit rate over ${ACK_FAST}/second } counter jump drop95
-add rule inet gargoyle-qos-priority filter_qos_egress meta length < 100 tcp flags ack meter med4ack { limit rate over ${ACK_MED}/second } counter jump drop50
-add rule inet gargoyle-qos-priority filter_qos_egress meta length < 100 tcp flags ack meter slow4ack { limit rate over ${ACK_SLOW}/second } counter jump drop50
+# ACK rate limiting using meters with per-connection key
+add rule inet gargoyle-qos-priority filter_qos_egress meta length < 100 tcp flags ack meter xfst4ack { ct id . ct direction limit rate over ${ACK_XFAST}/second } counter jump drop995
+add rule inet gargoyle-qos-priority filter_qos_egress meta length < 100 tcp flags ack meter fast4ack { ct id . ct direction limit rate over ${ACK_FAST}/second } counter jump drop95
+add rule inet gargoyle-qos-priority filter_qos_egress meta length < 100 tcp flags ack meter med4ack { ct id . ct direction limit rate over ${ACK_MED}/second } counter jump drop50
+add rule inet gargoyle-qos-priority filter_qos_egress meta length < 100 tcp flags ack meter slow4ack { ct id . ct direction limit rate over ${ACK_SLOW}/second } counter jump drop50
 EOF
 }
 
-# ========== TCP 升级规则生成（使用 meter） ==========
+# ========== TCP 升级规则生成（使用 meter + 键） ==========
 generate_tcp_upgrade_rules() {
     [ "$ENABLE_TCP_UPGRADE" != "1" ] && return
     local realtime_class=""
@@ -845,9 +846,9 @@ generate_tcp_upgrade_rules() {
     fi
 
     cat <<EOF
-# TCP upgrade for slow connections (using meter)
-add rule inet gargoyle-qos-priority filter_qos_egress meta l4proto tcp ct state established meta nfproto ipv4 meter slowtcp { limit rate 150/second burst 150 packets } meta mark set $realtime_mark counter
-add rule inet gargoyle-qos-priority filter_qos_egress meta l4proto tcp ct state established meta nfproto ipv6 meter slowtcp { limit rate 150/second burst 150 packets } meta mark set $realtime_mark counter
+# TCP upgrade for slow connections (using meter with per-connection key)
+add rule inet gargoyle-qos-priority filter_qos_egress meta l4proto tcp ct state established meta nfproto ipv4 meter slowtcp { ct id . ct direction limit rate 150/second burst 150 packets } meta mark set $realtime_mark counter
+add rule inet gargoyle-qos-priority filter_qos_egress meta l4proto tcp ct state established meta nfproto ipv6 meter slowtcp { ct id . ct direction limit rate 150/second burst 150 packets } meta mark set $realtime_mark counter
 EOF
 }
 
@@ -1039,8 +1040,6 @@ apply_enhanced_direction_rules() {
     local nft_batch_file=$(mktemp /tmp/qos_nft_batch_XXXXXX 2>/dev/null)
     [ -z "$nft_batch_file" ] && { log_error "无法创建nft批处理文件"; rm -f "$temp_config"; return 1; }
     TEMP_FILES="$TEMP_FILES $nft_batch_file"
-
-    # 注意：基础链（drop995等）已在 apply_all_rules 中创建，这里不再重复创建
 
     log_info "按优先级顺序生成nft规则..."
     local rule_count=0
