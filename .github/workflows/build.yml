@@ -79,6 +79,11 @@ jobs:
           cp -r ../ipk.sh ./
           chmod 0755 ipk.sh
           /bin/bash ipk.sh
+
+    - name: Install bpftool
+      run: |
+          sudo apt-get update
+          sudo apt-get install -y bpftool
           
     - name: Install Feeds
       working-directory: ${{ github.workspace }}/openwrt
@@ -86,7 +91,6 @@ jobs:
           ./scripts/feeds clean
           ./scripts/feeds update -a
           ./scripts/feeds install -a   
-          ./scripts/feeds install conntrack-tools
   
     - name: import config
       working-directory: ${{ github.workspace }}/openwrt
