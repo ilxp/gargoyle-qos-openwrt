@@ -1,6 +1,6 @@
 #!/bin/sh
 # 规则辅助模块 (rule.sh)
-# 版本: 2.4.2 - 优化 ipset 元素生成（压缩连续空格），避免集合重复加载
+# 版本: 2.4.3 - 修复速率限制链中注释行误处理；集合族文件路径常量；ipset 加载失败不中断
 # 完全吸收 qosmate 优点：支持 UCI ipset、速率限制、ACK 限速、TCP 升级、内联规则、健康检查等
 
 : ${DEBUG:=0}  # 默认关闭调试
@@ -23,6 +23,9 @@ ACK_SLOW=50
 ACK_MED=100
 ACK_FAST=500
 ACK_XFAST=5000
+
+# ========== 新增常量：集合族文件路径 ==========
+SET_FAMILIES_FILE="/tmp/qos_gargoyle_set_families"
 
 # ========== 全局标志 ==========
 _IPSET_LOADED=0  # 防止重复加载 ipset 集合
@@ -537,7 +540,7 @@ generate_ipset_sets() {
     [ "$_IPSET_LOADED" -eq 1 ] && return 0  # 已加载过，跳过
     
     local sets_file=$(mktemp /tmp/qos_ipset_sets_XXXXXX)
-    local families_file="/tmp/qos_gargoyle_set_families"
+    local families_file="$SET_FAMILIES_FILE"
     TEMP_FILES="$TEMP_FILES $sets_file"
     
     # 清空或创建族文件
@@ -637,8 +640,8 @@ build_device_conditions_for_direction() {
             local setname="${v#@}"
             local set_family
             # 尝试从缓存文件获取族，若文件不存在或找不到，尝试查询现有集合
-            if [ -f "/tmp/qos_gargoyle_set_families" ]; then
-                set_family="$(awk -v set="$setname" '$1 == set {print $2}' /tmp/qos_gargoyle_set_families 2>/dev/null)"
+            if [ -f "$SET_FAMILIES_FILE" ]; then
+                set_family="$(awk -v set="$setname" '$1 == set {print $2}' "$SET_FAMILIES_FILE" 2>/dev/null)"
             fi
             if [ -z "$set_family" ]; then
                 # 尝试从现有 nft 集合获取族（需要 nft 支持）
@@ -751,8 +754,8 @@ generate_ratelimit_rules() {
             case "$value" in '!='*) prefix='!='; value="${value#!=}"; ;; esac
             case "$value" in '@'*)
                 setname="${value#@}"
-                if [ -f "/tmp/qos_gargoyle_set_families" ]; then
-                    set_family="$(awk -v set="$setname" '$1 == set {print $2}' /tmp/qos_gargoyle_set_families 2>/dev/null)"
+                if [ -f "$SET_FAMILIES_FILE" ]; then
+                    set_family="$(awk -v set="$setname" '$1 == set {print $2}' "$SET_FAMILIES_FILE" 2>/dev/null)"
                 else
                     set_family="ipv4"
                 fi
@@ -829,9 +832,11 @@ setup_ratelimit_chain() {
         echo "add chain inet gargoyle-qos-priority $RATELIMIT_CHAIN '{ type filter hook forward priority 0; policy accept; }'" > "$temp_ratelimit_file"
         # 清空链
         echo "flush chain inet gargoyle-qos-priority $RATELIMIT_CHAIN" >> "$temp_ratelimit_file"
-        # 添加规则
+        # 添加规则，跳过注释行和空行
         echo "$rules" | while IFS= read -r rule; do
-            [ -n "$rule" ] && echo "add rule inet gargoyle-qos-priority $RATELIMIT_CHAIN $rule" >> "$temp_ratelimit_file"
+            [ -z "$rule" ] && continue
+            [ "${rule#\#}" != "$rule" ] && continue  # 跳过以 # 开头的行
+            echo "add rule inet gargoyle-qos-priority $RATELIMIT_CHAIN $rule" >> "$temp_ratelimit_file"
         done
         
         # 执行批量添加
@@ -856,6 +861,7 @@ generate_ack_limit_rules() {
     [ -n "$xfast_rate" ] && ACK_XFAST="$xfast_rate"
     
     cat <<EOF
+# ACK rate limiting
 add rule inet gargoyle-qos-priority filter_qos_egress meta length < 100 tcp flags ack add @xfst4ack {ct id . ct direction limit rate over ${ACK_XFAST}/second} counter jump drop995
 add rule inet gargoyle-qos-priority filter_qos_egress meta length < 100 tcp flags ack add @fast4ack {ct id . ct direction limit rate over ${ACK_FAST}/second} counter jump drop95
 add rule inet gargoyle-qos-priority filter_qos_egress meta length < 100 tcp flags ack add @med4ack {ct id . ct direction limit rate over ${ACK_MED}/second} counter jump drop50
@@ -924,6 +930,7 @@ generate_tcp_upgrade_rules() {
     fi
     
     cat <<EOF
+# TCP upgrade for slow connections (using fwmark)
 add rule inet gargoyle-qos-priority filter_qos_egress meta l4proto tcp ct state established meta nfproto ipv4 add @slowtcp {ct id . ct direction limit rate 150/second burst 150 packets } meta mark set $realtime_mark counter
 add rule inet gargoyle-qos-priority filter_qos_egress meta l4proto tcp ct state established meta nfproto ipv6 add @slowtcp {ct id . ct direction limit rate 150/second burst 150 packets } meta mark set $realtime_mark counter
 EOF
@@ -1088,8 +1095,8 @@ apply_enhanced_direction_rules() {
     [ "$chain" = "filter_qos_egress" ] && direction="upload"
     [ "$chain" = "filter_qos_ingress" ] && direction="download"
     
-    # 确保 ipset 集合已加载（仅在第一次调用时加载）
-    generate_ipset_sets
+    # 确保 ipset 集合已加载（仅在第一次调用时加载），失败时记录错误但不中断
+    generate_ipset_sets || log_warn "ipset 集合加载失败，部分规则可能无法匹配集合引用"
     
     local rule_list=$(load_all_config_sections "$CONFIG_FILE" "$rule_type")
     [ -z "$rule_list" ] && { log_info "未找到$rule_type规则配置"; return 0; }
