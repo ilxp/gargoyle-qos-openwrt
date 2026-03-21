@@ -18,8 +18,14 @@
 #include "bpf_skb_utils.h"
 #include "idclass-bpf.h"
 
-/* 手动声明 bpf_skb_set_mark 辅助函数，因为某些环境可能未提供 */
-static int (*bpf_skb_set_mark)(struct __sk_buff *skb, __u32 mark) = (void *)BPF_FUNC_skb_set_mark;
+/* 确保 bpf_skb_set_mark 辅助函数可用 */
+#ifndef BPF_FUNC_skb_set_mark
+#define BPF_FUNC_skb_set_mark 63
+#endif
+
+static __always_inline int bpf_skb_set_mark(struct __sk_buff *skb, __u32 mark) {
+    return ((int (*)(struct __sk_buff *, __u32))BPF_FUNC_skb_set_mark)(skb, mark);
+}
 
 #define INET_ECN_MASK 3
 #define EWMA_SHIFT 12

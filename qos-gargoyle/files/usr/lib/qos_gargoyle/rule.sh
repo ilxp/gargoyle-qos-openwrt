@@ -1,7 +1,6 @@
 #!/bin/sh
 # 规则辅助模块 (rule.sh)
-# 版本: 2.4.17 - 修复 ACK 限速、TCP 升级、速率限制中 meter 语法缺少键的问题，
-#               为所有 meter 添加正确的键表达式，确保功能正常。
+# 版本: 2.4.18 - 固定标记文件路径，实现自动分配与手动指定标记索引，移除哈希计算
 
 : ${DEBUG:=0}
 
@@ -9,7 +8,7 @@ CONFIG_FILE="qos_gargoyle"
 TEMP_FILES=""
 RULESET_DIR="/etc/qos_gargoyle/rulesets"
 RULESET_MERGED_FLAG="/tmp/qos_ruleset_merged"
-CLASS_MARKS_FILE=""
+CLASS_MARKS_FILE="/etc/qos_gargoyle/class_marks"   # 固定路径，持久化
 
 ENABLE_RATELIMIT=0
 ENABLE_ACK_LIMIT=0
@@ -268,63 +267,73 @@ map_connbytes_operator() {
     esac
 }
 
-# ========== 哈希函数 ==========
-calculate_hash_index() {
-    local class="$1" hash_val
-    if command -v cksum >/dev/null 2>&1; then
-        hash_val=$(printf "%s" "$class" | cksum | cut -d' ' -f1)
-        echo "$hash_val"
-    elif command -v sha1sum >/dev/null 2>&1; then
-        hash_val=$(printf "%s" "$class" | sha1sum | cut -c1-8)
-        printf "%u" "0x$hash_val" 2>/dev/null || echo "$((0x$hash_val & 0x7FFFFFFF))"
-    elif command -v sha1 >/dev/null 2>&1; then
-        hash_val=$(printf "%s" "$class" | sha1 | cut -c1-8)
-        printf "%u" "0x$hash_val" 2>/dev/null || echo "$((0x$hash_val & 0x7FFFFFFF))"
-    else
-        log_error "没有可用的哈希工具"
-        return 1
-    fi
-}
-
 # ========== 标记分配 ==========
 init_class_marks_file() {
-    if [ -z "$CLASS_MARKS_FILE" ]; then
-        CLASS_MARKS_FILE="/tmp/qos_class_marks_$$"
-        TEMP_FILES="$TEMP_FILES $CLASS_MARKS_FILE"
-    fi
+    # 确保目录存在
+    mkdir -p "$(dirname "$CLASS_MARKS_FILE")" 2>/dev/null
+    # 不加入 TEMP_FILES，因为此文件需要持久化
 }
 
 allocate_class_marks() {
-    local direction="$1" class_list="$2" mask base_value i class mark
+    local direction="$1" class_list="$2"
+    local base_value i=1 mark mark_index
+    local -A used_indexes
+    local temp_file="${CLASS_MARKS_FILE}.tmp.$$"
+
     init_class_marks_file
     [ "$direction" = "upload" ] && base_value=1 || base_value=65536
 
-    i=1; while [ $i -le 16 ]; do eval "mark_used_${direction}_${i}=0"; i=$((i+1)); done
-    [ -f "$CLASS_MARKS_FILE" ] && sed -i "/^$direction:/d" "$CLASS_MARKS_FILE" 2>/dev/null
-
+    # 收集手动指定的索引，并检查冲突
     for class in $class_list; do
-        local index
-        index=$(calculate_hash_index "$class") || return 1
-        index=$(( (index % 16) + 1 ))
-        local original_index=$index found=0 probe=0
-        while [ $probe -lt 16 ]; do
-            eval "used=\${mark_used_${direction}_${index}}"
-            if [ "$used" = "0" ]; then
-                eval "mark_used_${direction}_${index}=1"
-                local mark_value=$((base_value << (index - 1)))
-                mark_value=$((mark_value & 0xFFFFFFFF))
-                echo "$direction:$class:$mark_value" >> "$CLASS_MARKS_FILE"
-                log_info "类别 $class 分配标记索引 $index (原始哈希: $original_index, 探测次数: $probe)"
-                found=1; break
+        mark_index=$(uci -q get "${CONFIG_FILE}.${class}.mark_index" 2>/dev/null)
+        if validate_number "$mark_index" "$class.mark_index" 1 16; then
+            if [ -n "${used_indexes[$mark_index]}" ]; then
+                log_error "类别 $class 指定的标记索引 $mark_index 已被 ${used_indexes[$mark_index]} 占用"
+                return 1
             fi
-            index=$(( (index % 16) + 1 ))
-            probe=$((probe+1))
-        done
-        if [ $found -eq 0 ]; then
-            log_error "类别 $class 无法分配唯一标记"
-            return 1
+            used_indexes[$mark_index]=$class
         fi
     done
+
+    # 自动分配剩余索引
+    local next_auto=1
+    for class in $class_list; do
+        mark_index=$(uci -q get "${CONFIG_FILE}.${class}.mark_index" 2>/dev/null)
+        if validate_number "$mark_index" "$class.mark_index" 1 16; then
+            # 用户已指定，直接使用
+            :
+        else
+            # 自动分配下一个可用索引
+            while [ $next_auto -le 16 ] && [ -n "${used_indexes[$next_auto]}" ]; do
+                next_auto=$((next_auto + 1))
+            done
+            if [ $next_auto -gt 16 ]; then
+                log_error "没有可用的标记索引，无法为类别 $class 分配标记"
+                return 1
+            fi
+            mark_index=$next_auto
+            used_indexes[$mark_index]=$class
+            next_auto=$((next_auto + 1))
+        fi
+        mark=$((base_value << (mark_index - 1)))
+        echo "$direction:$class:$mark" >> "$temp_file"
+        log_info "类别 $class 分配标记索引 $mark_index (值: $mark / 0x$(printf '%X' $mark))"
+    done
+
+    # 原子替换文件
+    if [ -s "$temp_file" ]; then
+        # 先保留原方向内容，再合并
+        if [ -f "$CLASS_MARKS_FILE" ]; then
+            # 删除旧的本方向记录，保留其他方向
+            grep -v "^$direction:" "$CLASS_MARKS_FILE" 2>/dev/null > "${temp_file}.merge"
+            cat "$temp_file" >> "${temp_file}.merge"
+            mv "${temp_file}.merge" "$CLASS_MARKS_FILE"
+        else
+            mv "$temp_file" "$CLASS_MARKS_FILE"
+        fi
+        chmod 644 "$CLASS_MARKS_FILE"
+    fi
+    rm -f "$temp_file" 2>/dev/null
     return 0
 }
 
@@ -342,7 +351,14 @@ get_class_mark() {
     fi
 }
 
-clear_class_marks() { rm -f "$CLASS_MARKS_FILE" 2>/dev/null; }
+clear_class_marks() {
+    # 持久化标记文件，停止时不删除，只清空内容？根据需求决定
+    # 此处为了安全，不做删除，仅提供空操作
+    # 如需彻底清空，可执行 rm -f "$CLASS_MARKS_FILE"
+    log_debug "标记文件持久化，停止时不删除"
+    # 可选：清空内容，但保留文件
+    # > "$CLASS_MARKS_FILE" 2>/dev/null || true
+}
 
 # ========== 配置加载函数 ==========
 load_all_config_sections() {
@@ -444,8 +460,6 @@ sort_rules_by_priority_fast() {
 generate_ipset_sets() {
     [ "$_IPSET_LOADED" -eq 1 ] && return 0
 
-    # 注意：此函数不再清空表，表清空由 apply_all_rules 在第一次调用时统一完成
-    # 这里只负责创建集合，假设表已经存在且为空（或已清空）
     if ! nft list table inet gargoyle-qos-priority >/dev/null 2>&1; then
         nft add table inet gargoyle-qos-priority 2>/dev/null || true
     fi
@@ -543,7 +557,6 @@ build_ip_conditions_for_direction() {
 }
 
 generate_ratelimit_rules() {
-    # 确保 UCI 函数库已加载，以便使用 config_load 和 config_get
     if ! type config_load >/dev/null 2>&1; then
         . /lib/functions.sh
     fi
@@ -596,13 +609,11 @@ generate_ratelimit_rules() {
                 ;;
         esac
 
-        # 分离目标：集合 vs 独立IP，并进一步按取反状态分组
         for value in $target_values; do
             prefix=''
             case "$value" in '!='*) prefix='!='; value="${value#!=}"; ;; esac
             case "$value" in '@'*)
                 setname="${value#@}"
-                # 获取族
                 if [ -f "$SET_FAMILIES_FILE" ]; then
                     set_family="$(awk -v set="$setname" '$1 == set {print $2}' "$SET_FAMILIES_FILE" 2>/dev/null)"
                 fi
@@ -646,9 +657,7 @@ generate_ratelimit_rules() {
         done
 
         # ----- IPv4 部分 -----
-        # 下载规则 (IPv4)
         if [ "$download_limit" -gt 0 ]; then
-            # 独立IP规则 (正负)
             for grp in "pos:$ips_pos_v4" "neg:$ips_neg_v4"; do
                 local type="${grp%:*}" iplist="${grp#*:}"
                 [ -z "$iplist" ] && continue
@@ -656,13 +665,11 @@ generate_ratelimit_rules() {
                 build_ip_conditions_for_direction "$iplist" "daddr" cond
                 if [ -n "$cond" ]; then
                     local meter_name="${meter_suffix}_dl4_ip_${type}"
-                    # 使用 ip daddr 作为 meter 的键
                     rules="${rules}
         # ${name} - Download limit (IPv4 IP ${type})
         ${cond} meter ${meter_name} { ip daddr limit rate over ${download_kbytes} kbytes/second${download_burst_param} } counter drop comment \"${name} download\""
                 fi
             done
-            # 集合规则 (每个集合单独一条)
             for set in $sets_pos_v4; do
                 rules="${rules}
         # ${name} - Download limit (IPv4 set @${set})
@@ -675,7 +682,6 @@ generate_ratelimit_rules() {
             done
         fi
 
-        # 上传规则 (IPv4)
         if [ "$upload_limit" -gt 0 ]; then
             for grp in "pos:$ips_pos_v4" "neg:$ips_neg_v4"; do
                 local type="${grp%:*}" iplist="${grp#*:}"
@@ -702,7 +708,6 @@ generate_ratelimit_rules() {
         fi
 
         # ----- IPv6 部分 -----
-        # 下载规则 (IPv6)
         if [ "$download_limit" -gt 0 ]; then
             for grp in "pos:$ips_pos_v6" "neg:$ips_neg_v6"; do
                 local type="${grp%:*}" iplist="${grp#*:}"
@@ -728,7 +733,6 @@ generate_ratelimit_rules() {
             done
         fi
 
-        # 上传规则 (IPv6)
         if [ "$upload_limit" -gt 0 ]; then
             for grp in "pos:$ips_pos_v6" "neg:$ips_neg_v6"; do
                 local type="${grp%:*}" iplist="${grp#*:}"
@@ -779,7 +783,7 @@ setup_ratelimit_chain() {
     fi
 }
 
-# ========== ACK 限速规则生成（使用 meter + 键） ==========
+# ========== ACK 限速规则生成 ==========
 generate_ack_limit_rules() {
     [ "$ENABLE_ACK_LIMIT" != "1" ] && return
     local slow_rate=$(uci -q get ${CONFIG_FILE}.ack_limit.slow_rate 2>/dev/null)
@@ -792,7 +796,7 @@ generate_ack_limit_rules() {
     [ -n "$xfast_rate" ] && ACK_XFAST="$xfast_rate"
 
     cat <<EOF
-# ACK rate limiting using meters with per-connection key
+# ACK rate limiting using meters
 add rule inet gargoyle-qos-priority filter_qos_egress meta length < 100 tcp flags ack meter xfst4ack { ct id . ct direction limit rate over ${ACK_XFAST}/second } counter jump drop995
 add rule inet gargoyle-qos-priority filter_qos_egress meta length < 100 tcp flags ack meter fast4ack { ct id . ct direction limit rate over ${ACK_FAST}/second } counter jump drop95
 add rule inet gargoyle-qos-priority filter_qos_egress meta length < 100 tcp flags ack meter med4ack { ct id . ct direction limit rate over ${ACK_MED}/second } counter jump drop50
@@ -800,7 +804,7 @@ add rule inet gargoyle-qos-priority filter_qos_egress meta length < 100 tcp flag
 EOF
 }
 
-# ========== TCP 升级规则生成（使用 meter + 键） ==========
+# ========== TCP 升级规则生成 ==========
 generate_tcp_upgrade_rules() {
     [ "$ENABLE_TCP_UPGRADE" != "1" ] && return
     local realtime_class=""
@@ -846,7 +850,7 @@ generate_tcp_upgrade_rules() {
     fi
 
     cat <<EOF
-# TCP upgrade for slow connections (using meter with per-connection key)
+# TCP upgrade for slow connections (using meter)
 add rule inet gargoyle-qos-priority filter_qos_egress meta l4proto tcp ct state established meta nfproto ipv4 meter slowtcp { ct id . ct direction limit rate 150/second burst 150 packets } meta mark set $realtime_mark counter
 add rule inet gargoyle-qos-priority filter_qos_egress meta l4proto tcp ct state established meta nfproto ipv6 meter slowtcp { ct id . ct direction limit rate 150/second burst 150 packets } meta mark set $realtime_mark counter
 EOF
@@ -878,7 +882,6 @@ build_nft_rule_fast() {
     local srcport="$7" dstport="$8" connbytes_kb="$9" state="${10}" src_ip="${11}" dest_ip="${12}"
     local has_ipv4=0 has_ipv6=0 ipv4_cond="" ipv6_cond=""
 
-    # 处理源 IP (可能包含 != 前缀)
     if [ -n "$src_ip" ]; then
         local src_neg=""
         local src_val="$src_ip"
@@ -891,7 +894,6 @@ build_nft_rule_fast() {
             ipv4_cond="$ipv4_cond ip saddr $src_neg $src_val"
         fi
     fi
-    # 处理目的 IP (可能包含 != 前缀)
     if [ -n "$dest_ip" ]; then
         local dest_neg=""
         local dest_val="$dest_ip"
@@ -905,19 +907,16 @@ build_nft_rule_fast() {
         fi
     fi
 
-    # 根据 family 确定哪些族需要生成规则
     local do_ipv4=0 do_ipv6=0
     case "$family" in
         ip|ipv4|inet4)
             if [ "$has_ipv4" -eq 1 ]; then
                 do_ipv4=1
             else
-                # family=ip 但只有 IPv6 地址，不生成规则
                 if [ "$has_ipv6" -eq 1 ]; then
                     log_warn "规则 $rule_name 指定 family=ipv4 但只包含 IPv6 地址，规则将被忽略"
                     return
                 fi
-                # 没有 IP 条件，生成默认 IPv4 规则
                 do_ipv4=1
             fi
             ;;
@@ -936,7 +935,6 @@ build_nft_rule_fast() {
             if [ "$has_ipv4" -eq 1 ]; then do_ipv4=1; fi
             if [ "$has_ipv6" -eq 1 ]; then do_ipv6=1; fi
             if [ "$do_ipv4" -eq 0 ] && [ "$do_ipv6" -eq 0 ]; then
-                # 没有 IP 条件，生成双栈规则
                 do_ipv4=1
                 do_ipv6=1
             fi
@@ -1001,7 +999,6 @@ apply_enhanced_direction_rules() {
     local rule_type="$1" chain="$2" mask="$3"
     log_info "应用增强$rule_type规则到链: $chain, 掩码: $mask"
 
-    # 确保链存在
     nft add chain inet gargoyle-qos-priority "$chain" 2>/dev/null || true
 
     local direction=""
@@ -1023,7 +1020,6 @@ apply_enhanced_direction_rules() {
     for rule; do
         [ -n "$rule" ] || continue
         if load_all_config_options "$CONFIG_FILE" "$rule" "tmp_"; then
-            # 使用制表符分隔字段，避免 IPv6 地址中的冒号干扰
             printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n" \
                 "$rule" "$tmp_class" "$tmp_order" "$tmp_enabled" "$tmp_proto" "$tmp_srcport" "$tmp_dstport" \
                 "$tmp_connbytes_kb" "$tmp_family" "$tmp_state" "$tmp_src_ip" "$tmp_dest_ip" >> "$temp_config"
@@ -1063,7 +1059,6 @@ EOF
         [ -n "$include_stmt" ] && echo "$include_stmt" >> "$nft_batch_file"
     fi
 
-    # 仅当链为 filter_qos_egress 时添加 ACK 和 TCP 升级规则（只在出口方向添加一次）
     if [ "$chain" = "filter_qos_egress" ]; then
         generate_ack_limit_rules >> "$nft_batch_file"
         generate_tcp_upgrade_rules >> "$nft_batch_file"
@@ -1096,14 +1091,12 @@ apply_all_rules() {
     local rule_type="$1" mask="$2" chain="$3"
     log_info "开始应用 $rule_type 规则到链 $chain (掩码: $mask)"
 
-    # 首次调用时清空表并创建基础结构
     if [ "$_QOS_TABLE_FLUSHED" -eq 0 ]; then
         log_info "初始化 nftables 表"
         nft add table inet gargoyle-qos-priority 2>/dev/null || true
         nft flush table inet gargoyle-qos-priority 2>/dev/null || true
         generate_ipset_sets
 
-        # 创建概率丢包链（这些链在所有方向共享）
         nft add chain inet gargoyle-qos-priority drop995 2>/dev/null || true
         nft add chain inet gargoyle-qos-priority drop95 2>/dev/null || true
         nft add chain inet gargoyle-qos-priority drop50 2>/dev/null || true
