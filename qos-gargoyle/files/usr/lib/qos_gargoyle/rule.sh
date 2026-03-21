@@ -1,23 +1,35 @@
 #!/bin/sh
 # 规则辅助模块 (rule.sh)
+# 版本: 2.3.0 - 修复动态集合、自动IPv4/IPv6回退、TCP升级类查找、概率丢包链等问题
 # 支持多样化端口、协议、IPv6双栈、连接字节数过滤和连接状态过滤
-# version=2.0.3 - 修复调试日志级别，统一标记分配，增强验证
 
 : ${DEBUG:=0}  # 默认关闭调试
 
 CONFIG_FILE="qos_gargoyle"
 TEMP_FILES=""
-RULESET_DIR="/etc/qos_gargoyle/rulesets"          # 规则集存储目录
-RULESET_MERGED_FLAG="/tmp/qos_ruleset_merged"     # 标记文件，避免重复合并
-CLASS_MARKS_FILE=""                                # 标记映射文件（由主脚本设置或自动创建）
+RULESET_DIR="/etc/qos_gargoyle/rulesets"
+RULESET_MERGED_FLAG="/tmp/qos_ruleset_merged"
+CLASS_MARKS_FILE=""  # 标记映射文件（由主脚本设置或自动创建）
 
-# ========== 日志函数别名 ==========
+# ========== 新增配置常量（可从 UCI 覆盖） ==========
+ENABLE_RATELIMIT=0
+ENABLE_ACK_LIMIT=0
+ENABLE_TCP_UPGRADE=0
+SAVE_NFT_RULES=0
+RATELIMIT_CHAIN="ratelimit"
+CUSTOM_EGRESS_FILE="/etc/qos_gargoyle/egress_custom.nft"
+CUSTOM_INGRESS_FILE="/etc/qos_gargoyle/ingress_custom.nft"
+ACK_SLOW=50
+ACK_MED=100
+ACK_FAST=500
+ACK_XFAST=5000
+
+# ========== 日志函数 ==========
 log_debug() { [ "$DEBUG" = "1" ] && log "DEBUG" "$@"; }
 log_info()  { log "INFO" "$@"; }
 log_warn()  { log "WARN" "$@"; }
 log_error() { log "ERROR" "$@"; }
 
-# 统一日志函数
 log() {
     local level="$1"
     local message="$2"
@@ -43,67 +55,19 @@ log() {
     done
 }
 
-# ========== 规则集合并函数（保持原有备份恢复机制） ==========
-init_ruleset() {
-    # 如果已经合并过，则直接返回
-    [ -f "$RULESET_MERGED_FLAG" ] && return 0
-
-    local ruleset ruleset_file
-
-    ruleset=$(uci -q get ${CONFIG_FILE}.global.ruleset 2>/dev/null)
-    [ -z "$ruleset" ] && ruleset="default.conf"
-
-    case "$ruleset" in
-        *.conf) ;;
-        *) ruleset="${ruleset}.conf" ;;
-    esac
-
-    ruleset_file="$RULESET_DIR/$ruleset"
-    if [ ! -f "$ruleset_file" ]; then
-        log_error "规则集文件 $ruleset_file 不存在，无法加载任何规则！"
-        return 1
-    fi
-
-    # 检查主配置中是否已存在该规则集的标记（防止重复追加）
-    if grep -q "^# === RULESET_${ruleset} ===" /etc/config/${CONFIG_FILE} 2>/dev/null; then
-        log_info "规则集 $ruleset 已合并到主配置文件，跳过"
-        touch "$RULESET_MERGED_FLAG"
-        return 0
-    fi
-
-    # 如果主配置中已有其他规则集标记，则先删除之前追加的部分
-    if grep -q "^# === RULESET_" /etc/config/${CONFIG_FILE}; then
-        sed -i '/^# === RULESET_/,/^# === RULESET_END ===/d' "/etc/config/${CONFIG_FILE}"
-        log_info "已清理之前的规则集"
-    fi
-
-    # 备份主配置文件
-    cp "/etc/config/${CONFIG_FILE}" "/etc/config/${CONFIG_FILE}.bak"
-
-    # 将规则集文件内容追加到主配置文件末尾，并添加标记
-    {
-        echo ""
-        echo "# === RULESET_${ruleset} ==="
-        cat "$ruleset_file"
-        echo "# === RULESET_END ==="
-    } >> "/etc/config/${CONFIG_FILE}"
-
-    # 重新加载 UCI 配置
-    uci commit ${CONFIG_FILE}
-
-    touch "$RULESET_MERGED_FLAG"
-    log_info "已将规则集 $ruleset 合并到主配置文件"
-    return 0
-}
-
-restore_main_config() {
-    if [ -f "/etc/config/${CONFIG_FILE}.bak" ]; then
-        cp "/etc/config/${CONFIG_FILE}.bak" "/etc/config/${CONFIG_FILE}"
-        rm -f "/etc/config/${CONFIG_FILE}.bak"
-        uci commit ${CONFIG_FILE}
-        log_info "已恢复主配置文件备份"
-    fi
-    rm -f "$RULESET_MERGED_FLAG"
+# ========== 加载全局配置中的开关 ==========
+load_global_config() {
+    ENABLE_RATELIMIT=$(uci -q get ${CONFIG_FILE}.global.enable_ratelimit 2>/dev/null)
+    [ -z "$ENABLE_RATELIMIT" ] && ENABLE_RATELIMIT=0
+    
+    ENABLE_ACK_LIMIT=$(uci -q get ${CONFIG_FILE}.global.enable_ack_limit 2>/dev/null)
+    [ -z "$ENABLE_ACK_LIMIT" ] && ENABLE_ACK_LIMIT=0
+    
+    ENABLE_TCP_UPGRADE=$(uci -q get ${CONFIG_FILE}.global.enable_tcp_upgrade 2>/dev/null)
+    [ -z "$ENABLE_TCP_UPGRADE" ] && ENABLE_TCP_UPGRADE=0
+    
+    SAVE_NFT_RULES=$(uci -q get ${CONFIG_FILE}.global.save_nft_rules 2>/dev/null)
+    [ -z "$SAVE_NFT_RULES" ] && SAVE_NFT_RULES=0
 }
 
 # ========== 验证函数 ==========
@@ -138,7 +102,6 @@ validate_port() {
     
     [ -z "$value" ] && return 0
     
-    # 清理输入，只允许数字、逗号、横线
     local clean_value=$(echo "$value" | tr -d '[:space:]' | sed 's/[^0-9,-]//g')
     
     if echo "$clean_value" | grep -q ','; then
@@ -190,7 +153,6 @@ validate_port() {
     return 0
 }
 
-# 验证协议名称
 validate_protocol() {
     local proto="$1"
     local param_name="$2"
@@ -205,7 +167,6 @@ validate_protocol() {
     esac
 }
 
-# 验证地址族
 validate_family() {
     local family="$1"
     local param_name="$2"
@@ -220,14 +181,12 @@ validate_family() {
     esac
 }
 
-# 验证连接字节数格式
 validate_connbytes() {
     local value="$1"
     local param_name="$2"
     
     [ -z "$value" ] && return 0
     
-    # 支持格式：数字范围（如 10-100）、带操作符（如 >=50, <100）、纯数字（默认 >=）
     if echo "$value" | grep -qE '^[0-9]+-[0-9]+$'; then
         local min=$(echo "$value" | cut -d- -f1)
         local max=$(echo "$value" | cut -d- -f2)
@@ -249,7 +208,6 @@ validate_connbytes() {
                 return 1 ;;
         esac
     elif echo "$value" | grep -qE '^[0-9]+$'; then
-        # 纯数字，视为 >= 该值
         if ! validate_number "$value" "$param_name" 0 1048576; then
             return 1
         fi
@@ -260,7 +218,6 @@ validate_connbytes() {
     return 0
 }
 
-# 验证连接状态
 validate_state() {
     local state="$1"
     local param_name="$2"
@@ -285,7 +242,7 @@ validate_state() {
     return 0
 }
 
-# 计算哈希索引（复用 cksum/sha1）
+# ========== 哈希函数 ==========
 calculate_hash_index() {
     local class="$1"
     local hash_val
@@ -305,8 +262,7 @@ calculate_hash_index() {
     fi
 }
 
-# ========== 统一标记分配 ==========
-# 初始化标记文件（如果未设置）
+# ========== 标记分配 ==========
 init_class_marks_file() {
     if [ -z "$CLASS_MARKS_FILE" ]; then
         CLASS_MARKS_FILE="/tmp/qos_class_marks_$$"
@@ -314,9 +270,6 @@ init_class_marks_file() {
     fi
 }
 
-# 为指定方向分配所有类的标记
-# 参数：方向（upload/download），类列表（空格分隔）
-# 返回：0成功，1失败（冲突无法解决）
 allocate_class_marks() {
     local direction="$1"
     local class_list="$2"
@@ -330,14 +283,12 @@ allocate_class_marks() {
         base_value=65536
     fi
 
-    # 初始化标记使用数组（16个独立变量）
     i=1
     while [ $i -le 16 ]; do
         eval "mark_used_${direction}_${i}=0"
         i=$((i + 1))
     done
 
-    # 清除之前该方向的映射（避免冲突）
     if [ -f "$CLASS_MARKS_FILE" ]; then
         sed -i "/^$direction:/d" "$CLASS_MARKS_FILE" 2>/dev/null
     fi
@@ -375,7 +326,6 @@ allocate_class_marks() {
     return 0
 }
 
-# 获取类别的标记值
 get_class_mark() {
     local direction="$1"
     local class="$2"
@@ -394,7 +344,6 @@ get_class_mark() {
     fi
 }
 
-# 清空标记文件（停止时调用）
 clear_class_marks() {
     rm -f "$CLASS_MARKS_FILE" 2>/dev/null
 }
@@ -418,7 +367,6 @@ load_all_config_sections() {
     fi
 }
 
-# 加载配置节的所有选项，并进行验证
 load_all_config_options() {
     local config_name="$1"
     local section_id="$2"
@@ -426,19 +374,17 @@ load_all_config_options() {
     
     local escaped_section_id=$(printf "%s" "$section_id" | sed 's/[][\.*?^$()+{}|]/\\&/g')
     
-    # 初始化变量
-    for var in class order enabled proto srcport dstport connbytes_kb family state; do
+    for var in class order enabled proto srcport dstport connbytes_kb family state src_ip dest_ip; do
         eval "${prefix}${var}=''"
     done
     
     local config_data=$(uci show "${config_name}.${section_id}" 2>/dev/null)
     local val
     
-    # class 必须存在，否则跳过
+    # class 必须存在
     val=$(echo "$config_data" | grep "^${config_name}\\.${escaped_section_id}\\.class=" | cut -d= -f2-)
     if [ -n "$val" ]; then
         val=$(echo "$val" | sed "s/^'//; s/'$//; s/^\"//; s/\"$//")
-        # 清理特殊字符（允许字母数字、下划线、横线）
         val=$(echo "$val" | tr -d '\n\r' | sed 's/[^a-zA-Z0-9_-]//g')
         eval "${prefix}class=\"$val\""
     else
@@ -467,7 +413,6 @@ load_all_config_options() {
     if [ -n "$val" ]; then
         val=$(echo "$val" | sed "s/^'//; s/'$//; s/^\"//; s/\"$//" | tr -d '\n\r')
         if validate_protocol "$val" "${section_id}.proto"; then
-            # 允许字母数字和下划线
             val=$(echo "$val" | sed 's/[^a-zA-Z0-9_]//g')
             eval "${prefix}proto=\"$val\""
         else
@@ -480,7 +425,6 @@ load_all_config_options() {
     if [ -n "$val" ]; then
         val=$(echo "$val" | sed "s/^'//; s/'$//; s/^\"//; s/\"$//" | tr -d '\n\r')
         if validate_port "$val" "${section_id}.srcport"; then
-            # 保留数字、逗号、横线
             val=$(echo "$val" | tr -d '[:space:]' | sed 's/[^0-9,-]//g')
             eval "${prefix}srcport=\"$val\""
         else
@@ -505,7 +449,6 @@ load_all_config_options() {
     if [ -n "$val" ]; then
         val=$(echo "$val" | sed "s/^'//; s/'$//; s/^\"//; s/\"$//" | tr -d '\n\r')
         if validate_connbytes "$val" "${section_id}.connbytes_kb"; then
-            # 保留数字、横线、操作符
             val=$(echo "$val" | sed 's/[^0-9<>!= -]//g' | tr -d ' ')
             eval "${prefix}connbytes_kb=\"$val\""
         else
@@ -530,7 +473,6 @@ load_all_config_options() {
     if [ -n "$val" ]; then
         val=$(echo "$val" | sed "s/^'//; s/'$//; s/^\"//; s/\"$//" | tr -d '\n\r')
         if validate_state "$val" "${section_id}.state"; then
-            # 保留字母、逗号、大括号
             val=$(echo "$val" | tr -d '[:space:]' | sed 's/[^{},a-zA-Z]//g')
             eval "${prefix}state=\"$val\""
         else
@@ -538,10 +480,658 @@ load_all_config_options() {
         fi
     fi
     
+    # src_ip (扩展字段)
+    val=$(echo "$config_data" | grep "^${config_name}\\.${escaped_section_id}\\.src_ip=" | cut -d= -f2-)
+    if [ -n "$val" ]; then
+        val=$(echo "$val" | sed "s/^'//; s/'$//; s/^\"//; s/\"$//" | tr -d '\n\r')
+        eval "${prefix}src_ip=\"$val\""
+    fi
+    
+    # dest_ip (扩展字段)
+    val=$(echo "$config_data" | grep "^${config_name}\\.${escaped_section_id}\\.dest_ip=" | cut -d= -f2-)
+    if [ -n "$val" ]; then
+        val=$(echo "$val" | sed "s/^'//; s/'$//; s/^\"//; s/\"$//" | tr -d '\n\r')
+        eval "${prefix}dest_ip=\"$val\""
+    fi
+    
     return 0
 }
 
-# ========== 内存限制计算（供各算法调用） ==========
+sort_rules_by_priority_fast() {
+    local config_file="$1"
+    local temp_sort
+    
+    temp_sort=$(mktemp /tmp/qos_sort_XXXXXX) || {
+        log_error "无法创建排序临时文件"
+        return 1
+    }
+    TEMP_FILES="$TEMP_FILES $temp_sort"
+    
+    while IFS= read -r line; do
+        [ -z "$line" ] && continue
+        IFS=':' read -r r_name r_class r_order r_enabled r_proto r_srcport r_dstport r_connbytes r_family r_state r_src_ip r_dest_ip <<EOF
+$line
+EOF
+        [ "$r_enabled" != "1" ] && continue
+        
+        local class_priority=$(uci -q get "${CONFIG_FILE}.${r_class}.priority" 2>/dev/null)
+        class_priority=${class_priority:-999}
+        local rule_order=${r_order:-100}
+        
+        local composite=$(( class_priority * 1000 + rule_order ))
+        echo "$composite:$r_name" >> "$temp_sort"
+    done < "$config_file"
+    
+    local result=$(sort -t ':' -k1,1n "$temp_sort" 2>/dev/null | cut -d: -f2- | tr '\n' ' ' | sed 's/ $//')
+    
+    rm -f "$temp_sort" 2>/dev/null
+    
+    echo "$result"
+}
+
+# ========== 速率限制辅助函数 ==========
+build_device_conditions_for_direction() {
+    local target_values="$1" direction="$2" result_var="$3"
+    local result="" ipv4_pos="" ipv4_neg="" ipv6_pos="" ipv6_neg=""
+    local value negation v
+    
+    for value in $target_values; do
+        negation=""
+        v="$value"
+        case "$v" in '!='*) negation="!="; v="${v#!=}"; ;; esac
+        
+        # 集合引用
+        case "$v" in '@'*)
+            local setname="${v#@}"
+            local set_family
+            if [ -f "/tmp/qos_gargoyle_set_families" ]; then
+                set_family="$(awk -v set="$setname" '$1 == set {print $2}' /tmp/qos_gargoyle_set_families 2>/dev/null)"
+            fi
+            [ -z "$set_family" ] && set_family="ipv4"
+            local ip_prefix='ip'
+            [ "$set_family" = "ipv6" ] && ip_prefix='ip6'
+            if [ -n "$negation" ]; then
+                result="${result}${result:+ }${ip_prefix} ${direction} != @${setname}"
+            else
+                result="${result}${result:+ }${ip_prefix} ${direction} @${setname}"
+            fi
+            ;;
+        *)
+            # 检测地址类型
+            if printf '%s' "$v" | grep -q ':' && ! printf '%s' "$v" | grep -qE '^([0-9a-fA-F]{2}[:-]){5}[0-9a-fA-F]{2}$'; then
+                # IPv6
+                if [ -n "$negation" ]; then
+                    ipv6_neg="${ipv6_neg}${ipv6_neg:+,}${v}"
+                else
+                    ipv6_pos="${ipv6_pos}${ipv6_pos:+,}${v}"
+                fi
+            else
+                # IPv4
+                if [ -n "$negation" ]; then
+                    ipv4_neg="${ipv4_neg}${ipv4_neg:+,}${v}"
+                else
+                    ipv4_pos="${ipv4_pos}${ipv4_pos:+,}${v}"
+                fi
+            fi
+            ;;
+        esac
+    done
+    
+    [ -n "$ipv4_neg" ] && result="${result}${result:+ }ip ${direction} != { ${ipv4_neg} }"
+    [ -n "$ipv4_pos" ] && result="${result}${result:+ }ip ${direction} { ${ipv4_pos} }"
+    [ -n "$ipv6_neg" ] && result="${result}${result:+ }ip6 ${direction} != { ${ipv6_neg} }"
+    [ -n "$ipv6_pos" ] && result="${result}${result:+ }ip6 ${direction} { ${ipv6_pos} }"
+    
+    eval "${result_var}=\"\${result}\""
+}
+
+generate_ratelimit_rules() {
+    local rules=""
+    
+    process_ratelimit_section() {
+        local section="$1"
+        local name enabled download_limit upload_limit burst_factor target_values
+        local meter_suffix download_kbytes upload_kbytes
+        local download_burst upload_burst
+        
+        config_get_bool enabled "$section" enabled 1
+        [ "$enabled" -eq 0 ] && return 0
+        
+        config_get name "$section" name
+        [ -z "$name" ] && return 0
+        
+        config_get download_limit "$section" download_limit "0"
+        config_get upload_limit "$section" upload_limit "0"
+        config_get burst_factor "$section" burst_factor "1.0"
+        config_get target_values "$section" target
+        
+        [ -z "$target_values" ] && return 0
+        [ "$download_limit" -eq 0 ] && [ "$upload_limit" -eq 0 ] && return 0
+        
+        meter_suffix="$(printf '%s' "$name" | tr ' ' '_' | tr -cd 'a-zA-Z0-9_')"
+        download_kbytes=$((download_limit / 8))
+        upload_kbytes=$((upload_limit / 8))
+        
+        # 计算 burst
+        local download_burst_param='' upload_burst_param=''
+        case "$burst_factor" in
+            0|0.0|0.00) ;;
+            *.*) 
+                local burst_int="${burst_factor%.*}" burst_dec="${burst_factor#*.}"
+                [ -z "$burst_int" ] && burst_int='0'
+                [ -z "$burst_dec" ] && burst_dec='0'
+                case "${#burst_dec}" in
+                    1) burst_dec="${burst_dec}0" ;;
+                    2) ;;
+                    *) burst_dec="${burst_dec:0:2}" ;;
+                esac
+                local download_burst=$((download_kbytes * burst_int + download_kbytes * burst_dec / 100))
+                local upload_burst=$((upload_kbytes * burst_int + upload_kbytes * burst_dec / 100))
+                [ "$download_burst" -gt 0 ] && download_burst_param=" burst ${download_burst} kbytes"
+                [ "$upload_burst" -gt 0 ] && upload_burst_param=" burst ${upload_burst} kbytes"
+                ;;
+            *)
+                local download_burst=$((download_kbytes * burst_factor))
+                local upload_burst=$((upload_kbytes * burst_factor))
+                download_burst_param=" burst ${download_burst} kbytes"
+                upload_burst_param=" burst ${upload_burst} kbytes"
+                ;;
+        esac
+        
+        # 分离 IPv4 和 IPv6 目标
+        local targets_v4='' targets_v6='' value prefix setname set_family
+        for value in $target_values; do
+            prefix=''
+            case "$value" in '!='*) prefix='!='; value="${value#!=}"; ;; esac
+            case "$value" in '@'*)
+                setname="${value#@}"
+                if [ -f "/tmp/qos_gargoyle_set_families" ]; then
+                    set_family="$(awk -v set="$setname" '$1 == set {print $2}' /tmp/qos_gargoyle_set_families 2>/dev/null)"
+                else
+                    set_family="ipv4"
+                fi
+                if [ "$set_family" = "ipv6" ]; then
+                    targets_v6="${targets_v6}${targets_v6:+ }${prefix}${value}"
+                else
+                    targets_v4="${targets_v4}${targets_v4:+ }${prefix}${value}"
+                fi
+                ;;
+            *)
+                if printf '%s' "$value" | grep -q ':' && ! printf '%s' "$value" | grep -qE '^([0-9a-fA-F]{2}[:-]){5}[0-9a-fA-F]{2}$'; then
+                    targets_v6="${targets_v6}${targets_v6:+ }${prefix}${value}"
+                else
+                    targets_v4="${targets_v4}${targets_v4:+ }${prefix}${value}"
+                fi
+                ;;
+            esac
+        done
+        
+        # 生成 IPv4 规则
+        if [ -n "$targets_v4" ]; then
+            if [ "$download_limit" -gt 0 ]; then
+                local download_conditions_v4=''
+                build_device_conditions_for_direction "$targets_v4" "daddr" download_conditions_v4
+                [ -n "$download_conditions_v4" ] && rules="${rules}
+        # ${name} - Download limit (IPv4)
+        ${download_conditions_v4} meter ${meter_suffix}_dl4 { ip daddr limit rate over ${download_kbytes} kbytes/second${download_burst_param} } counter drop comment \"${name} download\""
+            fi
+            if [ "$upload_limit" -gt 0 ]; then
+                local upload_conditions_v4=''
+                build_device_conditions_for_direction "$targets_v4" "saddr" upload_conditions_v4
+                [ -n "$upload_conditions_v4" ] && rules="${rules}
+        # ${name} - Upload limit (IPv4)
+        ${upload_conditions_v4} meter ${meter_suffix}_ul4 { ip saddr limit rate over ${upload_kbytes} kbytes/second${upload_burst_param} } counter drop comment \"${name} upload\""
+            fi
+        fi
+        
+        # 生成 IPv6 规则
+        if [ -n "$targets_v6" ]; then
+            if [ "$download_limit" -gt 0 ]; then
+                local download_conditions_v6=''
+                build_device_conditions_for_direction "$targets_v6" "daddr" download_conditions_v6
+                [ -n "$download_conditions_v6" ] && rules="${rules}
+        # ${name} - Download limit (IPv6)
+        ${download_conditions_v6} meter ${meter_suffix}_dl6 { ip6 daddr limit rate over ${download_kbytes} kbytes/second${download_burst_param} } counter drop comment \"${name} download\""
+            fi
+            if [ "$upload_limit" -gt 0 ]; then
+                local upload_conditions_v6=''
+                build_device_conditions_for_direction "$targets_v6" "saddr" upload_conditions_v6
+                [ -n "$upload_conditions_v6" ] && rules="${rules}
+        # ${name} - Upload limit (IPv6)
+        ${upload_conditions_v6} meter ${meter_suffix}_ul6 { ip6 saddr limit rate over ${upload_kbytes} kbytes/second${upload_burst_param} } counter drop comment \"${name} upload\""
+            fi
+        fi
+    }
+    
+    # 遍历所有 ratelimit 节
+    local sections=$(load_all_config_sections "$CONFIG_FILE" "ratelimit")
+    for section in $sections; do
+        process_ratelimit_section "$section"
+    done
+    
+    echo "$rules"
+}
+
+setup_ratelimit_chain() {
+    [ "$ENABLE_RATELIMIT" != "1" ] && return 0
+    local rules=$(generate_ratelimit_rules)
+    if [ -n "$rules" ]; then
+        nft add chain inet gargoyle-qos-priority $RATELIMIT_CHAIN '{ type filter hook forward priority 0; policy accept; }' 2>/dev/null || true
+        nft flush chain inet gargoyle-qos-priority $RATELIMIT_CHAIN 2>/dev/null
+        echo "$rules" | while IFS= read -r rule; do
+            [ -n "$rule" ] && nft add rule inet gargoyle-qos-priority $RATELIMIT_CHAIN $rule
+        done
+        log_info "速率限制链已创建并填充规则"
+    fi
+}
+
+# ========== ACK 限速规则生成 ==========
+generate_ack_limit_rules() {
+    [ "$ENABLE_ACK_LIMIT" != "1" ] && return
+    local slow_rate=$(uci -q get ${CONFIG_FILE}.ack_limit.slow_rate 2>/dev/null)
+    local med_rate=$(uci -q get ${CONFIG_FILE}.ack_limit.med_rate 2>/dev/null)
+    local fast_rate=$(uci -q get ${CONFIG_FILE}.ack_limit.fast_rate 2>/dev/null)
+    local xfast_rate=$(uci -q get ${CONFIG_FILE}.ack_limit.xfast_rate 2>/dev/null)
+    [ -n "$slow_rate" ] && ACK_SLOW="$slow_rate"
+    [ -n "$med_rate" ] && ACK_MED="$med_rate"
+    [ -n "$fast_rate" ] && ACK_FAST="$fast_rate"
+    [ -n "$xfast_rate" ] && ACK_XFAST="$xfast_rate"
+    
+    cat <<EOF
+        # ACK rate limiting
+        meta length < 100 tcp flags ack add @xfst4ack {ct id . ct direction limit rate over ${ACK_XFAST}/second} counter jump drop995
+        meta length < 100 tcp flags ack add @fast4ack {ct id . ct direction limit rate over ${ACK_FAST}/second} counter jump drop95
+        meta length < 100 tcp flags ack add @med4ack {ct id . ct direction limit rate over ${ACK_MED}/second} counter jump drop50
+        meta length < 100 tcp flags ack add @slow4ack {ct id . ct direction limit rate over ${ACK_SLOW}/second} counter jump drop50
+EOF
+}
+
+# ========== TCP 升级规则生成（使用 fwmark） ==========
+generate_tcp_upgrade_rules() {
+    [ "$ENABLE_TCP_UPGRADE" != "1" ] && return
+    
+    # 获取 realtime 类的标记
+    local realtime_class=""
+    local class_id=$(uci -q get ${CONFIG_FILE}.idclass.class_realtime 2>/dev/null)
+    
+    # 方式1：通过 idclass.class_realtime 数字查找
+    if [ -n "$class_id" ]; then
+        # 尝试常见的类名模式
+        for prefix in upload_class uclass; do
+            local candidate="${prefix}_${class_id}"
+            if uci -q get ${CONFIG_FILE}.${candidate} >/dev/null 2>&1; then
+                realtime_class="$candidate"
+                break
+            fi
+        done
+    fi
+    
+    # 方式2：查找名称包含 "realtime" 的 upload_class
+    if [ -z "$realtime_class" ]; then
+        local upload_classes=$(load_all_config_sections "$CONFIG_FILE" "upload_class")
+        for cls in $upload_classes; do
+            local name=$(uci -q get ${CONFIG_FILE}.${cls}.name 2>/dev/null)
+            if [ "$name" = "realtime" ]; then
+                realtime_class="$cls"
+                break
+            fi
+        done
+    fi
+    
+    # 方式3：回退到默认类 uclass_1
+    if [ -z "$realtime_class" ]; then
+        log_warn "TCP升级功能启用但未找到 realtime 类，将使用默认类 uclass_1"
+        realtime_class="uclass_1"
+    fi
+    
+    local realtime_mark=$(get_class_mark "upload" "$realtime_class" 2>/dev/null)
+    if [ -z "$realtime_mark" ]; then
+        log_error "TCP升级：无法获取类 $realtime_class 的标记，跳过规则生成"
+        return
+    fi
+    
+    cat <<EOF
+        # TCP upgrade for slow connections (using fwmark)
+        meta l4proto tcp ct state established meta nfproto ipv4 add @slowtcp {ct id . ct direction limit rate 150/second burst 150 packets } meta mark set $realtime_mark counter
+        meta l4proto tcp ct state established meta nfproto ipv6 add @slowtcp {ct id . ct direction limit rate 150/second burst 150 packets } meta mark set $realtime_mark counter
+EOF
+}
+
+# ========== 内联规则支持 ==========
+get_custom_include() {
+    local file="$1"
+    local tmp_file="/tmp/qos_gargoyle_custom_check.nft"
+    if [ -s "$file" ]; then
+        {
+            printf '%s\n\t%s\n' "table inet __qos_gargoyle_ctx {" "chain __custom_ctx {"
+            cat "$file"
+            printf '\n\t%s\n%s\n' "}" "}"
+        } > "$tmp_file"
+        if nft --check --file "$tmp_file" 2>/dev/null; then
+            echo "include \"$file\""
+        else
+            log_warn "自定义规则文件 $file 语法错误，已忽略"
+        fi
+        rm -f "$tmp_file"
+    fi
+}
+
+# ========== nft 规则构建 ==========
+build_nft_rule_fast() {
+    local rule_name="$1"
+    local chain="$2"
+    local class_mark="$3"
+    local mask="$4"
+    local family="$5"
+    local proto="$6"
+    local srcport="$7"
+    local dstport="$8"
+    local connbytes_kb="$9"
+    local state="${10}"
+    local src_ip="${11}"
+    local dest_ip="${12}"
+    
+    # 自动检测 IPv4/IPv6
+    local has_ipv4=0 has_ipv6=0
+    local ipv4_cond="" ipv6_cond=""
+    
+    if [ -n "$src_ip" ]; then
+        if echo "$src_ip" | grep -q ':'; then
+            has_ipv6=1
+            ipv6_cond="$ipv6_cond ip6 saddr $src_ip"
+        else
+            has_ipv4=1
+            ipv4_cond="$ipv4_cond ip saddr $src_ip"
+        fi
+    fi
+    if [ -n "$dest_ip" ]; then
+        if echo "$dest_ip" | grep -q ':'; then
+            has_ipv6=1
+            ipv6_cond="$ipv6_cond ip6 daddr $dest_ip"
+        else
+            has_ipv4=1
+            ipv4_cond="$ipv4_cond ip daddr $dest_ip"
+        fi
+    fi
+    
+    # 根据 family 覆盖自动检测
+    case "$family" in
+        ip|inet4|ipv4) has_ipv4=1; has_ipv6=0 ;;
+        ip6|inet6|ipv6) has_ipv4=0; has_ipv6=1 ;;
+        inet) ;; # 保留自动检测
+    esac
+    
+    # 如果没有指定任何 IP，且 family=inet，则生成双栈规则
+    if [ "$has_ipv4" -eq 0 ] && [ "$has_ipv6" -eq 0 ]; then
+        has_ipv4=1
+        has_ipv6=1
+    fi
+    
+    # 公共条件
+    local common_cond=""
+    if [ "$proto" = "tcp" ]; then
+        common_cond="$common_cond meta l4proto tcp"
+    elif [ "$proto" = "udp" ]; then
+        common_cond="$common_cond meta l4proto udp"
+    elif [ "$proto" = "tcp_udp" ]; then
+        common_cond="$common_cond meta l4proto { tcp, udp }"
+    elif [ -n "$proto" ] && [ "$proto" != "all" ]; then
+        common_cond="$common_cond meta l4proto $proto"
+    fi
+    
+    # 端口处理
+    if [ "$proto" = "tcp" ] || [ "$proto" = "udp" ] || [ "$proto" = "tcp_udp" ]; then
+        case "$chain" in
+            *"ingress"*)
+                if [ -n "$dstport" ]; then
+                    common_cond="$common_cond th dport { $(echo "$dstport" | tr -d ' ') }"
+                elif [ -n "$srcport" ]; then
+                    common_cond="$common_cond th sport { $(echo "$srcport" | tr -d ' ') }"
+                fi
+                ;;
+            *)
+                if [ -n "$srcport" ]; then
+                    common_cond="$common_cond th sport { $(echo "$srcport" | tr -d ' ') }"
+                elif [ -n "$dstport" ]; then
+                    common_cond="$common_cond th dport { $(echo "$dstport" | tr -d ' ') }"
+                fi
+                ;;
+        esac
+    fi
+    
+    # 连接状态
+    if [ -n "$state" ]; then
+        local state_value=$(echo "$state" | tr -d '{}')
+        if echo "$state_value" | grep -q ','; then
+            common_cond="$common_cond ct state { $state_value }"
+        else
+            common_cond="$common_cond ct state $state_value"
+        fi
+    fi
+    
+    # 连接字节数
+    if [ -n "$connbytes_kb" ] && [ "$connbytes_kb" != "0" ]; then
+        if echo "$connbytes_kb" | grep -q '-'; then
+            local min_val=$(echo "$connbytes_kb" | cut -d- -f1)
+            local max_val=$(echo "$connbytes_kb" | cut -d- -f2)
+            local min_bytes=$((min_val * 1024))
+            local max_bytes=$((max_val * 1024))
+            common_cond="$common_cond ct bytes >= $min_bytes ct bytes <= $max_bytes"
+        elif echo "$connbytes_kb" | grep -qE '^([<>]?=?|!=)[0-9]+$'; then
+            local operator=$(echo "$connbytes_kb" | sed 's/[0-9]*$//')
+            local value=$(echo "$connbytes_kb" | grep -o '[0-9]\+')
+            [ -z "$operator" ] && operator=">="
+            local bytes_value=$((value * 1024))
+            common_cond="$common_cond ct bytes $operator $bytes_value"
+        fi
+    fi
+    
+    local base_cmd="add rule inet gargoyle-qos-priority $chain"
+    
+    # 生成 IPv4 规则
+    if [ "$has_ipv4" -eq 1 ]; then
+        local cmd="$base_cmd meta nfproto ipv4 $common_cond"
+        [ -n "$ipv4_cond" ] && cmd="$cmd $ipv4_cond"
+        cmd="$cmd meta mark set $class_mark counter"
+        echo "$cmd"
+    fi
+    
+    # 生成 IPv6 规则
+    if [ "$has_ipv6" -eq 1 ]; then
+        local cmd="$base_cmd meta nfproto ipv6 $common_cond"
+        [ -n "$ipv6_cond" ] && cmd="$cmd $ipv6_cond"
+        cmd="$cmd meta mark set $class_mark counter"
+        echo "$cmd"
+    fi
+}
+
+apply_enhanced_direction_rules() {
+    local rule_type="$1"
+    local chain="$2"
+    local mask="$3"
+    
+    log_info "应用增强$rule_type规则到链: $chain, 掩码: $mask"
+    
+    local direction=""
+    [ "$chain" = "filter_qos_egress" ] && direction="upload"
+    [ "$chain" = "filter_qos_ingress" ] && direction="download"
+    
+    local rule_list=$(load_all_config_sections "$CONFIG_FILE" "$rule_type")
+    [ -z "$rule_list" ] && { log_info "未找到$rule_type规则配置"; return 0; }
+    
+    log_info "找到$rule_type规则: $rule_list"
+    
+    local temp_config=$(mktemp /tmp/qos_rule_config_XXXXXX 2>/dev/null)
+    [ -z "$temp_config" ] && { log_error "无法创建配置临时文件"; return 1; }
+    TEMP_FILES="$TEMP_FILES $temp_config"
+    
+    local IFS=' '
+    set -- $rule_list
+    for rule; do
+        [ -n "$rule" ] || continue
+        if load_all_config_options "$CONFIG_FILE" "$rule" "tmp_"; then
+            echo "$rule:$tmp_class:$tmp_order:$tmp_enabled:$tmp_proto:$tmp_srcport:$tmp_dstport:$tmp_connbytes_kb:$tmp_family:$tmp_state:$tmp_src_ip:$tmp_dest_ip" >> "$temp_config"
+        fi
+    done
+    
+    local sorted_rule_list=$(sort_rules_by_priority_fast "$temp_config")
+    if [ -z "$sorted_rule_list" ]; then
+        log_info "没有可用的启用规则"
+        rm -f "$temp_config" 2>/dev/null
+        return 0
+    fi
+    
+    local nft_batch_file=$(mktemp /tmp/qos_nft_batch_XXXXXX 2>/dev/null)
+    [ -z "$nft_batch_file" ] && { log_error "无法创建nft批处理文件"; rm -f "$temp_config"; return 1; }
+    TEMP_FILES="$TEMP_FILES $nft_batch_file"
+    
+    # 为出口链预先添加必需的集合和链定义
+    if [ "$chain" = "filter_qos_egress" ]; then
+        cat <<EOF >> "$nft_batch_file"
+# ACK 限速所需的动态集合
+add set inet gargoyle-qos-priority xfst4ack { typeof ct id . ct direction; flags dynamic; timeout 5m; } 2>/dev/null
+add set inet gargoyle-qos-priority fast4ack { typeof ct id . ct direction; flags dynamic; timeout 5m; } 2>/dev/null
+add set inet gargoyle-qos-priority med4ack { typeof ct id . ct direction; flags dynamic; timeout 5m; } 2>/dev/null
+add set inet gargoyle-qos-priority slow4ack { typeof ct id . ct direction; flags dynamic; timeout 5m; } 2>/dev/null
+# 概率丢包链
+add chain inet gargoyle-qos-priority drop995
+add chain inet gargoyle-qos-priority drop95
+add chain inet gargoyle-qos-priority drop50
+# 概率丢包链内的规则
+add rule inet gargoyle-qos-priority drop995 numgen random mod 1000 ge 995 return
+add rule inet gargoyle-qos-priority drop995 drop
+add rule inet gargoyle-qos-priority drop95 numgen random mod 1000 ge 950 return
+add rule inet gargoyle-qos-priority drop95 drop
+add rule inet gargoyle-qos-priority drop50 numgen random mod 1000 ge 500 return
+add rule inet gargoyle-qos-priority drop50 drop
+EOF
+        if [ "$ENABLE_TCP_UPGRADE" = "1" ]; then
+            cat <<EOF >> "$nft_batch_file"
+# TCP 升级所需的动态集合
+add set inet gargoyle-qos-priority slowtcp { typeof ct id . ct direction; flags dynamic; timeout 5m; } 2>/dev/null
+EOF
+        fi
+    fi
+    
+    log_info "按优先级顺序生成nft规则..."
+    local rule_count=0
+    for rule_name in $sorted_rule_list; do
+        local rule_line=$(grep "^$rule_name:" "$temp_config")
+        IFS=':' read -r r_name r_class r_order r_enabled r_proto r_srcport r_dstport r_connbytes r_family r_state r_src_ip r_dest_ip <<EOF
+$rule_line
+EOF
+        [ "$r_enabled" = "1" ] || continue
+        
+        local class_mark=$(get_class_mark "$direction" "$r_class")
+        [ -z "$class_mark" ] && { log_error "规则 $rule_name 的类 $r_class 无法获取标记，跳过"; continue; }
+        
+        [ -z "$r_family" ] && r_family="inet"
+        
+        build_nft_rule_fast "$rule_name" "$chain" "$class_mark" "$mask" "$r_family" "$r_proto" "$r_srcport" "$r_dstport" "$r_connbytes" "$r_state" "$r_src_ip" "$r_dest_ip" >> "$nft_batch_file"
+        rule_count=$((rule_count + 1))
+    done
+    
+    # 添加内联规则 include
+    local custom_file=""
+    if [ "$chain" = "filter_qos_egress" ]; then
+        custom_file="$CUSTOM_EGRESS_FILE"
+    else
+        custom_file="$CUSTOM_INGRESS_FILE"
+    fi
+    if [ -f "$custom_file" ]; then
+        local include_stmt=$(get_custom_include "$custom_file")
+        [ -n "$include_stmt" ] && echo "$include_stmt" >> "$nft_batch_file"
+    fi
+    
+    # 添加 ACK 限速和 TCP 升级规则（仅 egress 链）
+    if [ "$chain" = "filter_qos_egress" ]; then
+        generate_ack_limit_rules >> "$nft_batch_file"
+        generate_tcp_upgrade_rules >> "$nft_batch_file"
+    fi
+    
+    # 执行批处理
+    local batch_success=0
+    if [ -s "$nft_batch_file" ]; then
+        log_info "执行批量nft规则 (共 $rule_count 条)..."
+        nft_output=$(nft -f "$nft_batch_file" 2>&1)
+        nft_ret=$?
+        if [ $nft_ret -eq 0 ]; then
+            log_info "✅ 批量规则应用成功"
+            if [ "$SAVE_NFT_RULES" = "1" ]; then
+                local nft_save_file="/etc/nftables.d/qos_gargoyle_${chain}.nft"
+                cp "$nft_batch_file" "$nft_save_file"
+                log_info "规则已保存到 $nft_save_file"
+            fi
+        else
+            log_error "❌ 批量规则应用失败 (退出码: $nft_ret)"
+            log_error "nft 错误输出: $nft_output"
+            batch_success=1
+        fi
+    fi
+    
+    rm -f "$nft_batch_file" "$temp_config"
+    return $batch_success
+}
+
+apply_all_rules() {
+    local rule_type="$1"
+    local mask="$2"
+    local chain="$3"
+    log_info "开始应用 $rule_type 规则到链 $chain (掩码: $mask)"
+    apply_enhanced_direction_rules "$rule_type" "$chain" "$mask"
+}
+
+# ========== 健康检查 ==========
+health_check() {
+    local errors=0
+    local status=""
+    
+    # 检查 UCI 配置
+    if uci -q show ${CONFIG_FILE} >/dev/null 2>&1; then
+        status="${status}config:ok;"
+    else
+        status="${status}config:missing;"
+        errors=$((errors+1))
+    fi
+    
+    # 检查 nftables 表
+    if nft list table inet gargoyle-qos-priority >/dev/null 2>&1; then
+        status="${status}nft:ok;"
+    else
+        status="${status}nft:missing;"
+        errors=$((errors+1))
+    fi
+    
+    # 检查 tc 队列（需要接口）
+    local wan_if=$(uci -q get ${CONFIG_FILE}.global.wan_interface 2>/dev/null)
+    if [ -n "$wan_if" ] && tc qdisc show dev "$wan_if" 2>/dev/null | grep -qE "htb|hfsc|cake"; then
+        status="${status}tc:ok;"
+    else
+        status="${status}tc:missing;"
+        errors=$((errors+1))
+    fi
+    
+    # 检查内核模块
+    for mod in ifb sch_htb sch_hfsc sch_cake sch_fq_codel; do
+        if ! lsmod 2>/dev/null | grep -q "^$mod"; then
+            status="${status}module_${mod}:missing;"
+            errors=$((errors+1))
+        fi
+    done
+    
+    # 检查标记文件
+    if [ -f "$CLASS_MARKS_FILE" ]; then
+        status="${status}marks:ok;"
+    else
+        status="${status}marks:missing;"
+        errors=$((errors+1))
+    fi
+    
+    echo "status=$status;errors=$errors"
+    return $((errors == 0 ? 0 : 1))
+}
+
+# ========== 内存限制计算 ==========
 calculate_memory_limit() {
     local config_value="$1"
     local result
@@ -571,9 +1161,7 @@ calculate_memory_limit() {
         fi
         
         if [ -n "$total_mem_mb" ] && [ "$total_mem_mb" -gt 0 ] 2>/dev/null; then
-            # 每256MB内存分配1MB，向上取整
             result="$(((total_mem_mb + 255) / 256))Mb"
-            
             local min_limit=4
             local max_limit=32
             local result_value=$(echo "$result" | sed 's/Mb//')
@@ -582,14 +1170,12 @@ calculate_memory_limit() {
             elif [ "$result_value" -gt "$max_limit" ] 2>/dev/null; then
                 result="${max_limit}Mb"
             fi
-            
             log_info "系统内存 ${total_mem_mb}MB，自动计算 memlimit=${result}"
         else
             log_warn "无法读取内存信息，使用默认值 16Mb"
             result="16Mb"
         fi
     else
-        # 用户自定义值，验证格式（必须为数字+Mb，例如 16Mb）
         if echo "$config_value" | grep -qE '^[0-9]+Mb$'; then
             result="$config_value"
             log_info "使用用户配置的 memlimit: ${result}"
@@ -602,276 +1188,80 @@ calculate_memory_limit() {
     echo "$result"
 }
 
-# ========== 规则排序 ==========
-sort_rules_by_priority_fast() {
-    local config_file="$1"
-    local temp_sort
-    
-    temp_sort=$(mktemp /tmp/qos_sort_XXXXXX) || {
-        log_error "无法创建排序临时文件"
-        return 1
-    }
-    TEMP_FILES="$TEMP_FILES $temp_sort"
-    
-    while IFS= read -r line; do
-        [ -z "$line" ] && continue
-        IFS=':' read -r r_name r_class r_order r_enabled r_proto r_srcport r_dstport r_connbytes r_family r_state <<EOF
-$line
-EOF
-        [ "$r_enabled" != "1" ] && continue
-        
-        local class_priority=$(uci -q get "${CONFIG_FILE}.${r_class}.priority" 2>/dev/null)
-        class_priority=${class_priority:-999}
-        local rule_order=${r_order:-100}
-        
-        local composite=$(( class_priority * 1000 + rule_order ))
-        echo "$composite:$r_name" >> "$temp_sort"
-    done < "$config_file"
-    
-    local result=$(sort -t ':' -k1,1n "$temp_sort" 2>/dev/null | cut -d: -f2- | tr '\n' ' ' | sed 's/ $//')
-    
-    rm -f "$temp_sort" 2>/dev/null
-    
-    echo "$result"
-}
-
-# ========== 构建nft规则 ==========
-build_nft_rule_fast() {
-    local rule_name="$1"
-    local chain="$2"
-    local class_mark="$3"
-    local mask="$4"
-    local family="$5"          # 用户配置的地址族：inet/ip/ip6/...
-    local proto="$6"
-    local srcport="$7"
-    local dstport="$8"
-    local connbytes_kb="$9"
-    local state="${10}"
-    
-    # 固定使用 inet 表，通过 nfproto 区分地址族
-    local nft_cmd="add rule inet gargoyle-qos-priority $chain"
-    
-    # 根据 family 添加 nfproto 条件
-    case "$family" in
-        ip|inet4|ipv4)
-            nft_cmd="$nft_cmd meta nfproto ipv4"
-            ;;
-        ip6|inet6|ipv6)
-            nft_cmd="$nft_cmd meta nfproto ipv6"
-            ;;
-        inet|*)
-            # 不加条件，匹配所有
-            ;;
-    esac
-    
-    # 协议处理
-    if [ "$proto" = "tcp" ]; then
-        nft_cmd="$nft_cmd meta l4proto tcp"
-    elif [ "$proto" = "udp" ]; then
-        nft_cmd="$nft_cmd meta l4proto udp"
-    elif [ "$proto" = "tcp_udp" ]; then
-        nft_cmd="$nft_cmd meta l4proto { tcp, udp }"
-    elif [ -n "$proto" ] && [ "$proto" != "all" ]; then
-        nft_cmd="$nft_cmd meta l4proto $proto"
-    fi
-    
-    # 端口处理（仅当协议为 tcp/udp/tcp_udp 时添加）
-    if [ "$proto" = "tcp" ] || [ "$proto" = "udp" ] || [ "$proto" = "tcp_udp" ]; then
-        case "$chain" in
-            *"ingress"*)
-                # 下载方向：优先使用 dstport（匹配本地端口），否则使用 srcport
-                if [ -n "$dstport" ]; then
-                    local clean_port=$(echo "$dstport" | tr -d ' ')
-                    nft_cmd="$nft_cmd th dport { $clean_port }"
-                    log_debug "规则 $rule_name 在入口链使用目的端口: $dstport"
-                elif [ -n "$srcport" ]; then
-                    local clean_port=$(echo "$srcport" | tr -d ' ')
-                    nft_cmd="$nft_cmd th sport { $clean_port }"
-                    log_debug "规则 $rule_name 在入口链使用源端口: $srcport"
-                fi
-                ;;
-            *)
-                # 上传方向：优先使用 srcport（匹配本地端口），否则使用 dstport
-                if [ -n "$srcport" ]; then
-                    local clean_port=$(echo "$srcport" | tr -d ' ')
-                    nft_cmd="$nft_cmd th sport { $clean_port }"
-                    log_debug "规则 $rule_name 在出口链使用源端口: $srcport"
-                elif [ -n "$dstport" ]; then
-                    local clean_port=$(echo "$dstport" | tr -d ' ')
-                    nft_cmd="$nft_cmd th dport { $clean_port }"
-                    log_debug "规则 $rule_name 在出口链使用目的端口: $dstport"
-                fi
-                ;;
-        esac
-    fi
-    
-    # 连接状态
-    if [ -n "$state" ]; then
-        local state_value=$(echo "$state" | tr -d '{}')
-        if echo "$state_value" | grep -q ','; then
-            nft_cmd="$nft_cmd ct state { $state_value }"
-        else
-            nft_cmd="$nft_cmd ct state $state_value"
-        fi
-    fi
-    
-    # 连接字节数
-    if [ -n "$connbytes_kb" ] && [ "$connbytes_kb" != "0" ]; then
-        if echo "$connbytes_kb" | grep -q '-'; then
-            local min_val=$(echo "$connbytes_kb" | cut -d- -f1)
-            local max_val=$(echo "$connbytes_kb" | cut -d- -f2)
-            if [ "$min_val" -le "$max_val" ] 2>/dev/null; then
-                local min_bytes=$((min_val * 1024))
-                local max_bytes=$((max_val * 1024))
-                nft_cmd="$nft_cmd ct bytes >= $min_bytes ct bytes <= $max_bytes"
-            else
-                log_warn "规则 $rule_name 的 connbytes_kb 范围无效: $connbytes_kb，忽略此条件"
-            fi
-        elif echo "$connbytes_kb" | grep -qE '^([<>]?=?|!=)[0-9]+$'; then
-            local operator=$(echo "$connbytes_kb" | sed 's/[0-9]*$//')
-            local value=$(echo "$connbytes_kb" | grep -o '[0-9]\+')
-            [ -z "$operator" ] && operator=">="
-            local bytes_value=$((value * 1024))
-            nft_cmd="$nft_cmd ct bytes $operator $bytes_value"
-        else
-            log_warn "规则 $rule_name 的 connbytes_kb 格式无效: $connbytes_kb，忽略此条件"
-        fi
-    fi
-    
-    nft_cmd="$nft_cmd meta mark set $class_mark counter"
-    echo "$nft_cmd"
-}
-
-# ========== 增强规则应用 ==========
-# 应用方向规则（上传/下载）
-# 返回：0成功，1失败
-apply_enhanced_direction_rules() {
-    local rule_type="$1"
-    local chain="$2"
-    local mask="$3"
-    
-    log_info "应用增强$rule_type规则到链: $chain, 掩码: $mask"
-    
-    local direction=""
-    [ "$chain" = "filter_qos_egress" ] && direction="upload"
-    [ "$chain" = "filter_qos_ingress" ] && direction="download"
-    
-    local rule_list=$(load_all_config_sections "$CONFIG_FILE" "$rule_type")
-    [ -z "$rule_list" ] && { log_info "未找到$rule_type规则配置"; return 0; }
-    
-    log_info "找到$rule_type规则: $rule_list"
-    
-    local temp_config=$(mktemp /tmp/qos_rule_config_XXXXXX 2>/dev/null)
-    if [ -z "$temp_config" ]; then
-        log_error "无法创建配置临时文件"
-        return 1
-    fi
-    TEMP_FILES="$TEMP_FILES $temp_config"
-    
-    local IFS=' '
-    set -- $rule_list
-    for rule; do
-        [ -n "$rule" ] || continue
-        if load_all_config_options "$CONFIG_FILE" "$rule" "tmp_"; then
-            echo "$rule:$tmp_class:$tmp_order:$tmp_enabled:$tmp_proto:$tmp_srcport:$tmp_dstport:$tmp_connbytes_kb:$tmp_family:$tmp_state" >> "$temp_config"
-        fi
-    done
-    
-    # 检查类数量是否超过16
-    local class_list=$(cut -d: -f2 "$temp_config" | sort -u)
-    local class_count=0
-    for class in $class_list; do
-        [ -n "$class" ] || continue
-        class_count=$((class_count + 1))
-    done
-    
-    if [ $class_count -gt 16 ]; then
-        log_error "方向 $direction 的启用类数量为 $class_count，超过16个，将导致标记冲突，启动中止！"
-        rm -f "$temp_config" 2>/dev/null
-        return 1
-    fi
-    
-    local sorted_rule_list=$(sort_rules_by_priority_fast "$temp_config")
-    if [ -z "$sorted_rule_list" ]; then
-        log_info "没有可用的启用规则"
-        rm -f "$temp_config" 2>/dev/null
+# ========== 规则集合并（原样保留） ==========
+init_ruleset() {
+    local nofix="$1"
+    if [ "$nofix" = "1" ]; then
+        [ -f "$RULESET_MERGED_FLAG" ] && return 0
         return 0
     fi
     
-    local nft_batch_file=$(mktemp /tmp/qos_nft_batch_XXXXXX 2>/dev/null)
-    if [ -z "$nft_batch_file" ]; then
-        log_error "无法创建nft批处理文件"
-        rm -f "$temp_config" 2>/dev/null
+    [ -f "$RULESET_MERGED_FLAG" ] && return 0
+
+    local ruleset ruleset_file
+
+    ruleset=$(uci -q get ${CONFIG_FILE}.global.ruleset 2>/dev/null)
+    [ -z "$ruleset" ] && ruleset="default.conf"
+
+    case "$ruleset" in
+        *.conf) ;;
+        *) ruleset="${ruleset}.conf" ;;
+    esac
+
+    ruleset_file="$RULESET_DIR/$ruleset"
+    if [ ! -f "$ruleset_file" ]; then
+        log_error "规则集文件 $ruleset_file 不存在，无法加载任何规则！"
         return 1
     fi
-    TEMP_FILES="$TEMP_FILES $nft_batch_file"
-    
-    log_info "按优先级顺序生成nft规则..."
-    local rule_count=0
-    for rule_name in $sorted_rule_list; do
-        local rule_line=$(grep "^$rule_name:" "$temp_config")
-        IFS=':' read -r r_name r_class r_order r_enabled r_proto r_srcport r_dstport r_connbytes r_family r_state <<EOF
-$rule_line
-EOF
-        [ "$r_enabled" = "1" ] || continue
-        
-        local class_mark=$(get_class_mark "$direction" "$r_class")
-        if [ -z "$class_mark" ]; then
-            log_error "规则 $rule_name 的类 $r_class 无法获取标记，跳过"
-            continue
-        fi
-        
-        [ -z "$r_family" ] && r_family="inet"
-        
-        build_nft_rule_fast "$rule_name" "$chain" "$class_mark" "$mask" "$r_family" "$r_proto" "$r_srcport" "$r_dstport" "$r_connbytes" "$r_state" >> "$nft_batch_file"
-        rule_count=$((rule_count + 1))
-    done
-    
-    local batch_success=0
-    if [ -s "$nft_batch_file" ]; then
-        log_info "执行批量nft规则 (共 $rule_count 条)..."
-        nft_output=$(nft -f "$nft_batch_file" 2>&1)
-        nft_ret=$?
-        if [ $nft_ret -eq 0 ]; then
-            log_info "✅ 批量规则应用成功"
-            batch_success=0
-        else
-            log_error "❌ 批量规则应用失败 (退出码: $nft_ret)"
-            log_error "nft 错误输出: $nft_output"
-            log_error "批处理文件内容:"
-            cat "$nft_batch_file" | while IFS= read -r line; do
-                log_error "  $line"
-            done
-            batch_success=1
-        fi
+
+    if grep -q "^# === RULESET_${ruleset} ===" /etc/config/${CONFIG_FILE} 2>/dev/null; then
+        log_info "规则集 $ruleset 已合并到主配置文件，跳过"
+        touch "$RULESET_MERGED_FLAG"
+        return 0
     fi
-    
-    rm -f "$nft_batch_file" 2>/dev/null
-    rm -f "$temp_config" 2>/dev/null
-    
-    return $batch_success
-}
 
-# 应用所有规则（主脚本调用）
-# 返回：0成功，1失败
-apply_all_rules() {
-    local rule_type="$1"
-    local mask="$2"
-    local chain="$3"
-    log_info "开始应用 $rule_type 规则到链 $chain (掩码: $mask)"
-    apply_enhanced_direction_rules "$rule_type" "$chain" "$mask"
-}
+    if grep -q "^# === RULESET_" /etc/config/${CONFIG_FILE}; then
+        sed -i '/^# === RULESET_/,/^# === RULESET_END ===/d' "/etc/config/${CONFIG_FILE}"
+        log_info "已清理之前的规则集"
+    fi
 
-# 检测算法，若为CAKE或CAKE_DSCP则直接退出
-ALGORITHM=$(uci -q get ${CONFIG_FILE}.global.algorithm 2>/dev/null || echo "htb_cake")
-if [ "$ALGORITHM" = "cake" ] || [ "$ALGORITHM" = "cake_dscp" ]; then
-    echo "[$(date '+%H:%M:%S')] qos_gargoyle 信息: 当前算法为 $ALGORITHM，无需生成分类规则，退出" >&2
-    logger -t "qos_gargoyle" "信息: 当前算法为 $ALGORITHM，无需生成分类规则，退出"
+    cp "/etc/config/${CONFIG_FILE}" "/etc/config/${CONFIG_FILE}.bak"
+
+    {
+        echo ""
+        echo "# === RULESET_${ruleset} ==="
+        cat "$ruleset_file"
+        echo "# === RULESET_END ==="
+    } >> "/etc/config/${CONFIG_FILE}"
+
+    uci commit ${CONFIG_FILE}
+    touch "$RULESET_MERGED_FLAG"
+    log_info "已将规则集 $ruleset 合并到主配置文件"
     return 0
+}
+
+restore_main_config() {
+    if [ -f "/etc/config/${CONFIG_FILE}.bak" ]; then
+        cp "/etc/config/${CONFIG_FILE}.bak" "/etc/config/${CONFIG_FILE}"
+        rm -f "/etc/config/${CONFIG_FILE}.bak"
+        uci commit ${CONFIG_FILE}
+        log_info "已恢复主配置文件备份"
+    fi
+    rm -f "$RULESET_MERGED_FLAG"
+}
+
+# ========== 自动加载全局配置（当被 source 时） ==========
+if [ -z "$_QOS_RULE_SH_LOADED" ] && [ "$(basename "$0")" != "rule.sh" ]; then
+    load_global_config
+    _QOS_RULE_SH_LOADED=1
 fi
 
-# 脚本被 source 时不会执行任何操作
+# 如果脚本被直接执行
 if [ "$(basename "$0")" = "rule.sh" ]; then
-    echo "此脚本为辅助模块，不应直接执行" >&2
-    exit 1
+    load_global_config
+    case "$1" in
+        health_check) health_check ;;
+        *) echo "此脚本为辅助模块，不应直接执行" >&2 ;;
+    esac
+    exit 0
 fi

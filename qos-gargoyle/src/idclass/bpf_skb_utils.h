@@ -17,6 +17,14 @@
 #include <bpf/bpf_helpers.h>
 #include <bpf/bpf_endian.h>
 
+/* 确保 vlan_hdr 完整定义 */
+#ifndef __LINUX_IF_VLAN_H
+struct vlan_hdr {
+    __be16 h_vlan_TCI;
+    __be16 h_vlan_encapsulated_proto;
+};
+#endif
+
 #ifndef READ_ONCE
 #define READ_ONCE(x) (*(volatile typeof(x) *)&(x))
 #endif
