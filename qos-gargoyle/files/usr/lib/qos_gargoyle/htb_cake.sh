@@ -7,7 +7,7 @@
 : ${CONFIG_FILE:=qos_gargoyle}
 : ${MAX_PHYSICAL_BANDWIDTH:=10000000}
 : ${UPLOAD_MASK:=0xFFFF}
-: ${DOWNLOAD_MASK:=0xFFFF0000}
+: ${DOWNLOAD_MASK:=0xFFFF}
 : ${DELETE_IFB_ON_STOP:=0}
 : ${DEBUG:=0}
 
@@ -828,7 +828,8 @@ set_default_upload_class() {
             default_class_name=$(echo "$upload_class_list" | awk '{print $1}')
             qos_log "INFO" "自动选择第一个类别: $default_class_name"
         else
-            tc qdisc change dev "$qos_interface" root handle 1:0 htb default 2 2>/dev/null || true
+            # 无类别时，直接设置默认类为 2（类 1:2 应为默认）
+            tc qdisc replace dev "$qos_interface" root handle 1:0 htb r2q $HTB_R2Q default 2 2>/dev/null || true
             qos_log "INFO" "上传默认类别设置为TC类ID: 1:2"
             return
         fi
@@ -865,7 +866,11 @@ set_default_upload_class() {
             qos_log "INFO" "无自定义类别，使用默认类ID 1:2"
         fi
     fi
-    tc qdisc change dev "$qos_interface" root handle 1:0 htb default $found_index 2>/dev/null || true
+    # 使用 replace 替代 change，确保 default 生效
+    tc qdisc replace dev "$qos_interface" root handle 1:0 htb r2q $HTB_R2Q default $found_index 2>/dev/null || {
+        qos_log "WARN" "replace 失败，尝试 change 方式"
+        tc qdisc change dev "$qos_interface" root handle 1:0 htb default $found_index 2>/dev/null || true
+    }
     qos_log "INFO" "上传默认类别设置为TC类ID: 1:$found_index"
 }
 
@@ -882,7 +887,8 @@ set_default_download_class() {
             default_class_name=$(echo "$download_class_list" | awk '{print $1}')
             qos_log "INFO" "自动选择第一个类别: $default_class_name"
         else
-            tc qdisc change dev "$IFB_DEVICE" root handle 1:0 htb default 2 2>/dev/null || true
+            # 无类别时，直接设置默认类为 2
+            tc qdisc replace dev "$IFB_DEVICE" root handle 1:0 htb r2q $HTB_R2Q default 2 2>/dev/null || true
             qos_log "INFO" "下载默认类别设置为TC类ID: 1:2"
             return
         fi
@@ -919,7 +925,11 @@ set_default_download_class() {
             qos_log "INFO" "无自定义类别，使用默认类ID 1:2"
         fi
     fi
-    tc qdisc change dev "$IFB_DEVICE" root handle 1:0 htb default $found_index 2>/dev/null || true
+    # 使用 replace 确保 default 生效
+    tc qdisc replace dev "$IFB_DEVICE" root handle 1:0 htb r2q $HTB_R2Q default $found_index 2>/dev/null || {
+        qos_log "WARN" "replace 失败，尝试 change 方式"
+        tc qdisc change dev "$IFB_DEVICE" root handle 1:0 htb default $found_index 2>/dev/null || true
+    }
     qos_log "INFO" "下载默认类别设置为TC类ID: 1:$found_index"
 }
 
@@ -950,8 +960,8 @@ apply_htb_specific_rules() {
         meta mark and 0x007f != 0 counter meta priority set "bulk" 2>/dev/null || true
     nft add rule inet gargoyle-qos-priority filter_qos_ingress_enhance \
         meta mark and 0x7f00 != 0 counter meta priority set "bulk" 2>/dev/null || true
-    nft add rule inet gargoyle-qos-priority filter_qos_egress_enhance \
-        ct state established,related counter meta mark set ct mark 2>/dev/null || true
+    #nft add rule inet gargoyle-qos-priority filter_qos_egress_enhance \
+        #ct state established,related counter meta mark set ct mark 2>/dev/null || true
     nft add rule inet gargoyle-qos-priority filter_qos_egress_enhance \
         meta mark and 0x0010 != 0 counter meta priority set "critical" 2>/dev/null || true
     nft add rule inet gargoyle-qos-priority filter_qos_ingress_enhance \
@@ -1241,6 +1251,31 @@ show_htb_cake_status() {
     else
         echo -e "\n✗ QoS未运行"
     fi
+	
+	echo -e "\n===== 详细队列统计 ====="
+    
+    echo -e "\n上传方向cake队列:"
+    tc -s qdisc show dev "$qos_interface" 2>/dev/null | grep -A 3 "cake" | while read -r line; do
+        if echo "$line" | grep -q "parent"; then
+            echo "  $line"
+        elif echo "$line" | grep -q "Sent" || echo "$line" | grep -q "maxpacket" || \
+             echo "$line" | grep -q "ecn_mark" || echo "$line" | grep -q "memory_used"; then
+            echo "    $line"
+        fi
+    done
+    
+    if [ -n "$qos_ifb" ] && ip link show "$qos_ifb" >/dev/null 2>&1; then
+        echo -e "\n下载方向cake队列:"
+        tc -s qdisc show dev "$qos_ifb" 2>/dev/null | grep -A 3 "cake" | while read -r line; do
+            if echo "$line" | grep -q "parent"; then
+                echo "  $line"
+            elif echo "$line" | grep -q "Sent" || echo "$line" | grep -q "maxpacket" || \
+                 echo "$line" | grep -q "ecn_mark" || echo "$line" | grep -q "memory_used"; then
+                echo "    $line"
+            fi
+        done
+    fi
+	
     echo -e "\n===== 增强特性状态 ====="
     echo "速率限制: $([ "$ENABLE_RATELIMIT" = "1" ] && echo "已启用" || echo "未启用")"
     echo "ACK 限速: $([ "$ENABLE_ACK_LIMIT" = "1" ] && echo "已启用" || echo "未启用")"

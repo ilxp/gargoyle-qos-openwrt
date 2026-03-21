@@ -17,8 +17,8 @@ meta l4proto icmp meta nfproto ipv4 meta mark set 0x7F counter
 meta l4proto icmp meta nfproto ipv6 meta mark set 0x7F counter
 
 # 示例2: 所有 TCP/UDP 流量默认标记为 Bulk (低优先级)
-meta l4proto { tcp, udp } th dport 1-65535 meta nfproto ipv4 meta mark set 0x3F counter
-meta l4proto { tcp, udp } th dport 1-65535 meta nfproto ipv6 meta mark set 0x3F counter
+meta l4proto { tcp, udp } th dport { 1-65535 } meta nfproto ipv4 meta mark set 0x3F counter
+meta l4proto { tcp, udp } th dport { 1-65535 } meta nfproto ipv6 meta mark set 0x3F counter
 
 # 示例3: TCP SYN 标记为实时类
 meta l4proto tcp tcp flags syn ct state new meta nfproto ipv4 meta mark set 0x7F counter

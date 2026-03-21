@@ -1,6 +1,6 @@
 #!/bin/sh
 # 规则辅助模块 (rule.sh)
-# 版本: 2.4.24 - 为 ACK 限速和 TCP 升级的 meter 添加随机后缀，彻底避免名称冲突
+# 版本: 2.5.1 - 修复钩子链重复创建，仅清空分类链，保留主脚本钩子链
 
 : ${DEBUG:=0}
 
@@ -31,7 +31,6 @@ SET_FAMILIES_FILE="/tmp/qos_gargoyle_set_families"
 _IPSET_LOADED=0
 HAVE_LOCK=0
 _QOS_TABLE_FLUSHED=0
-RANDOM_SUFFIX=""   # 全局唯一后缀
 
 # ========== 日志函数 ==========
 log_debug() { [ "$DEBUG" = "1" ] && log "DEBUG" "$@"; }
@@ -271,7 +270,8 @@ allocate_class_marks() {
     local temp_file="${CLASS_MARKS_FILE}.tmp.$$"
 
     init_class_marks_file
-    [ "$direction" = "upload" ] && base_value=1 || base_value=65536
+    # 统一使用低16位标记，上传和下载都从1开始
+    base_value=1
 
     # 第一遍：收集手动指定的索引，并检查冲突
     for class in $class_list; do
@@ -775,7 +775,7 @@ setup_ratelimit_chain() {
     fi
 }
 
-# ========== ACK 限速规则生成（使用随机后缀） ==========
+# ========== ACK 限速规则生成 ==========
 generate_ack_limit_rules() {
     [ "$ENABLE_ACK_LIMIT" != "1" ] && return
     local slow_rate=$(uci -q get ${CONFIG_FILE}.ack_limit.slow_rate 2>/dev/null)
@@ -787,18 +787,16 @@ generate_ack_limit_rules() {
     [ -n "$fast_rate" ] && ACK_FAST="$fast_rate"
     [ -n "$xfast_rate" ] && ACK_XFAST="$xfast_rate"
 
-    # 使用全局唯一后缀，若未设置则用当前进程ID
-    local suffix="${RANDOM_SUFFIX:-$$}"
     cat <<EOF
-# ACK rate limiting using unique meter names
-add rule inet gargoyle-qos-priority filter_qos_egress meta length < 100 tcp flags ack meter qos_xfst4ack_${suffix} { ct id . ct direction limit rate over ${ACK_XFAST}/second } counter jump drop995
-add rule inet gargoyle-qos-priority filter_qos_egress meta length < 100 tcp flags ack meter qos_fast4ack_${suffix} { ct id . ct direction limit rate over ${ACK_FAST}/second } counter jump drop95
-add rule inet gargoyle-qos-priority filter_qos_egress meta length < 100 tcp flags ack meter qos_med4ack_${suffix} { ct id . ct direction limit rate over ${ACK_MED}/second } counter jump drop50
-add rule inet gargoyle-qos-priority filter_qos_egress meta length < 100 tcp flags ack meter qos_slow4ack_${suffix} { ct id . ct direction limit rate over ${ACK_SLOW}/second } counter jump drop50
+# ACK rate limiting using meters
+add rule inet gargoyle-qos-priority filter_qos_egress meta length < 100 tcp flags ack meter xfst4ack { ct id . ct direction limit rate over ${ACK_XFAST}/second } counter jump drop995
+add rule inet gargoyle-qos-priority filter_qos_egress meta length < 100 tcp flags ack meter fast4ack { ct id . ct direction limit rate over ${ACK_FAST}/second } counter jump drop95
+add rule inet gargoyle-qos-priority filter_qos_egress meta length < 100 tcp flags ack meter med4ack { ct id . ct direction limit rate over ${ACK_MED}/second } counter jump drop50
+add rule inet gargoyle-qos-priority filter_qos_egress meta length < 100 tcp flags ack meter slow4ack { ct id . ct direction limit rate over ${ACK_SLOW}/second } counter jump drop50
 EOF
 }
 
-# ========== TCP 升级规则生成（使用随机后缀） ==========
+# ========== TCP 升级规则生成 ==========
 generate_tcp_upgrade_rules() {
     [ "$ENABLE_TCP_UPGRADE" != "1" ] && return
     local realtime_class=""
@@ -843,12 +841,10 @@ generate_tcp_upgrade_rules() {
         return
     fi
 
-    # 使用全局唯一后缀
-    local suffix="${RANDOM_SUFFIX:-$$}"
     cat <<EOF
-# TCP upgrade for slow connections (using unique meter name)
-add rule inet gargoyle-qos-priority filter_qos_egress meta l4proto tcp ct state established meta nfproto ipv4 meter qos_tcp_upgrade_slow_${suffix} { ct id . ct direction limit rate 150/second burst 150 packets } meta mark set $realtime_mark counter
-add rule inet gargoyle-qos-priority filter_qos_egress meta l4proto tcp ct state established meta nfproto ipv6 meter qos_tcp_upgrade_slow_${suffix} { ct id . ct direction limit rate 150/second burst 150 packets } meta mark set $realtime_mark counter
+# TCP upgrade for slow connections (using meter)
+add rule inet gargoyle-qos-priority filter_qos_egress meta l4proto tcp ct state established meta nfproto ipv4 meter slowtcp { ct id . ct direction limit rate 150/second burst 150 packets } meta mark set $realtime_mark counter
+add rule inet gargoyle-qos-priority filter_qos_egress meta l4proto tcp ct state established meta nfproto ipv6 meter slowtcp { ct id . ct direction limit rate 150/second burst 150 packets } meta mark set $realtime_mark counter
 EOF
 }
 
@@ -947,11 +943,17 @@ build_nft_rule_fast() {
     if [ "$proto" = "tcp" ] || [ "$proto" = "udp" ] || [ "$proto" = "tcp_udp" ]; then
         case "$chain" in
             *"ingress"*)
-                if [ -n "$dstport" ]; then common_cond="$common_cond th dport { $(echo "$dstport" | tr -d ' ') }"
-                elif [ -n "$srcport" ]; then common_cond="$common_cond th sport { $(echo "$srcport" | tr -d ' ') }"; fi ;;
+                # 下载方向：匹配源端口（来自外部的端口）
+                if [ -n "$srcport" ]; then
+                    common_cond="$common_cond th sport { $(echo "$srcport" | tr -d ' ') }"
+                fi
+                ;;
             *)
-                if [ -n "$srcport" ]; then common_cond="$common_cond th sport { $(echo "$srcport" | tr -d ' ') }"
-                elif [ -n "$dstport" ]; then common_cond="$common_cond th dport { $(echo "$dstport" | tr -d ' ') }"; fi ;;
+                # 上传方向：匹配目的端口（外部的端口）
+                if [ -n "$dstport" ]; then
+                    common_cond="$common_cond th dport { $(echo "$dstport" | tr -d ' ') }"
+                fi
+                ;;
         esac
     fi
 
@@ -1016,6 +1018,7 @@ apply_enhanced_direction_rules() {
     for rule; do
         [ -n "$rule" ] || continue
         if load_all_config_options "$CONFIG_FILE" "$rule" "tmp_"; then
+            # 使用制表符分隔字段，避免 IPv6 地址中的冒号干扰
             printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n" \
                 "$rule" "$tmp_class" "$tmp_order" "$tmp_enabled" "$tmp_proto" "$tmp_srcport" "$tmp_dstport" \
                 "$tmp_connbytes_kb" "$tmp_family" "$tmp_state" "$tmp_src_ip" "$tmp_dest_ip" >> "$temp_config"
@@ -1044,7 +1047,12 @@ EOF
         local class_mark=$(get_class_mark "$direction" "$r_class")
         [ -z "$class_mark" ] && { log_error "规则 $rule_name 的类 $r_class 无法获取标记，跳过"; continue; }
         [ -z "$r_family" ] && r_family="inet"
-        build_nft_rule_fast "$rule_name" "$chain" "$class_mark" "$mask" "$r_family" "$r_proto" "$r_srcport" "$r_dstport" "$r_connbytes" "$r_state" "$r_src_ip" "$r_dest_ip" >> "$nft_batch_file"
+        
+        # 净化端口字段（只保留数字、逗号、短横线）
+        local clean_srcport=$(echo "$r_srcport" | tr -d '[:space:]' | sed 's/[^0-9,-]//g')
+        local clean_dstport=$(echo "$r_dstport" | tr -d '[:space:]' | sed 's/[^0-9,-]//g')
+        
+        build_nft_rule_fast "$rule_name" "$chain" "$class_mark" "$mask" "$r_family" "$r_proto" "$clean_srcport" "$clean_dstport" "$r_connbytes" "$r_state" "$r_src_ip" "$r_dest_ip" >> "$nft_batch_file"
         rule_count=$((rule_count + 1))
     done
 
@@ -1055,6 +1063,7 @@ EOF
         [ -n "$include_stmt" ] && echo "$include_stmt" >> "$nft_batch_file"
     fi
 
+    # 仅当链为 filter_qos_egress 时添加 ACK 和 TCP 升级规则（只在出口方向添加一次）
     if [ "$chain" = "filter_qos_egress" ]; then
         generate_ack_limit_rules >> "$nft_batch_file"
         generate_tcp_upgrade_rules >> "$nft_batch_file"
@@ -1087,16 +1096,21 @@ apply_all_rules() {
     local rule_type="$1" mask="$2" chain="$3"
     log_info "开始应用 $rule_type 规则到链 $chain (掩码: $mask)"
 
-    if [ "$_QOS_TABLE_FLUSHED" -eq 0 ]; then
-        log_info "初始化 nftables 表"
-        # 彻底删除表（如果存在），确保没有残留对象
-        nft delete table inet gargoyle-qos-priority 2>/dev/null || true
-        nft add table inet gargoyle-qos-priority 2>/dev/null || true
-        # 生成唯一后缀用于 ACK 和 TCP 升级的 meter 名称
-        RANDOM_SUFFIX="$$_$(date +%s)_${RANDOM:-0}"
-        log_info "使用随机后缀: $RANDOM_SUFFIX"
-        generate_ipset_sets
+		if [ "$_QOS_TABLE_FLUSHED" -eq 0 ]; then
+		log_info "初始化 nftables 表"
+		nft add table inet gargoyle-qos-priority 2>/dev/null || true
+		# 只清空分类链和辅助链，保留钩子链的跳转规则
+		nft flush chain inet gargoyle-qos-priority filter_qos_egress 2>/dev/null || true
+		nft flush chain inet gargoyle-qos-priority filter_qos_ingress 2>/dev/null || true
+		nft flush chain inet gargoyle-qos-priority drop995 2>/dev/null || true
+		nft flush chain inet gargoyle-qos-priority drop95 2>/dev/null || true
+		nft flush chain inet gargoyle-qos-priority drop50 2>/dev/null || true
+		# 如果启用了速率限制链，也清空它
+		nft flush chain inet gargoyle-qos-priority $RATELIMIT_CHAIN 2>/dev/null || true
+		# 重新生成 ipset 集合（可能需要先删除再添加）
+		generate_ipset_sets
 
+        # 创建基础链（概率丢包） - 钩子链由主脚本创建，此处不再重复
         nft add chain inet gargoyle-qos-priority drop995 2>/dev/null || true
         nft add chain inet gargoyle-qos-priority drop95 2>/dev/null || true
         nft add chain inet gargoyle-qos-priority drop50 2>/dev/null || true
@@ -1398,6 +1412,7 @@ setup_ipv6_specific_rules() {
 # ========== 规则集合并 ==========
 init_ruleset() {
     local nofix="$1"
+    # 如果 nofix=1 则跳过合并
     if [ "$nofix" = "1" ]; then
         [ -f "$RULESET_MERGED_FLAG" ] && return 0
         return 0
@@ -1414,18 +1429,17 @@ init_ruleset() {
         return 1
     fi
 
-    if grep -q "^# === RULESET_${ruleset} ===" /etc/config/${CONFIG_FILE} 2>/dev/null; then
-        log_info "规则集 $ruleset 已合并到主配置文件，跳过"
-        touch "$RULESET_MERGED_FLAG"
-        return 0
-    fi
-
-    if grep -q "^# === RULESET_" /etc/config/${CONFIG_FILE}; then
-        sed -i '/^# === RULESET_/,/^# === RULESET_END ===/d' "/etc/config/${CONFIG_FILE}"
-        log_info "已清理之前的规则集"
-    fi
-
+    # 备份原配置文件
     cp "/etc/config/${CONFIG_FILE}" "/etc/config/${CONFIG_FILE}.bak"
+    log_info "已备份主配置文件到 ${CONFIG_FILE}.bak"
+
+    # 删除旧的规则集段（如果存在）
+    if grep -q "^# === RULESET_" "/etc/config/${CONFIG_FILE}"; then
+        sed -i '/^# === RULESET_/,/^# === RULESET_END ===/d' "/etc/config/${CONFIG_FILE}"
+        log_info "已清理旧的规则集内容"
+    fi
+
+    # 追加新的规则集
     {
         echo ""
         echo "# === RULESET_${ruleset} ==="
@@ -1440,9 +1454,14 @@ init_ruleset() {
 }
 
 restore_main_config() {
-    rm -f "/etc/config/${CONFIG_FILE}.bak"
+    # 如果存在备份文件，恢复主配置
+    if [ -f "/etc/config/${CONFIG_FILE}.bak" ]; then
+        mv "/etc/config/${CONFIG_FILE}.bak" "/etc/config/${CONFIG_FILE}"
+        uci commit ${CONFIG_FILE}
+        log_info "已恢复主配置文件备份"
+    fi
     rm -f "$RULESET_MERGED_FLAG"
-    log_info "已清理规则集标记和备份文件"
+    log_info "已清理规则集标记"
 }
 
 # ========== 自动加载全局配置 ==========

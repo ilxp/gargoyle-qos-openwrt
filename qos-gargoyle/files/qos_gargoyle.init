@@ -587,34 +587,32 @@ setup_nft_tables() {
         fi
     fi
     
-    # 如果仍然无法确定接口，直接报错退出（避免无条件跳转）
     if [ -z "$qos_interface" ]; then
         echo "错误: 无法确定 WAN 接口，无法设置 nftables 跳转规则，启动中止" >&2
         return 1
     fi
     
-    # 清除现有表（如果存在）
+    # 删除旧表并重建
     nft list table inet gargoyle-qos-priority >/dev/null 2>&1 && nft delete table inet gargoyle-qos-priority
     
-    # 创建新表
     nft add table inet gargoyle-qos-priority
     
-    # 创建出口链
+    # 创建分类链
     nft add chain inet gargoyle-qos-priority filter_qos_egress
     nft add chain inet gargoyle-qos-priority filter_qos_ingress
     
-    # 创建基础链（钩子），优先级设为115（高于fw4的120）
-    nft add chain inet gargoyle-qos-priority filter_postrouting '{ type filter hook postrouting priority 115; }'
-    nft add chain inet gargoyle-qos-priority filter_input '{ type filter hook input priority 115; }'
-    nft add chain inet gargoyle-qos-priority filter_forward '{ type filter hook forward priority 115; }'
-    # 使用 -149 避免与 fw4 mangle 表的默认优先级 -150 冲突
-    nft add chain inet gargoyle-qos-priority filter_prerouting '{ type filter hook prerouting priority -149; }'
+    # 创建钩子链
+    nft add chain inet gargoyle-qos-priority filter_forward '{ type filter hook forward priority 115; policy accept; }'
+    nft add chain inet gargoyle-qos-priority filter_prerouting '{ type filter hook prerouting priority -149; policy accept; }'
+    nft add chain inet gargoyle-qos-priority filter_postrouting '{ type filter hook postrouting priority 115; policy accept; }'
+    nft add chain inet gargoyle-qos-priority filter_input '{ type filter hook input priority 115; policy accept; }'
     
-    # 添加跳转规则（从基础链到分类链），带接口条件
+    # 添加跳转规则
     echo "添加跳转规则，接口: $qos_interface"
     nft add rule inet gargoyle-qos-priority filter_postrouting oifname "$qos_interface" jump filter_qos_egress
     nft add rule inet gargoyle-qos-priority filter_input iifname "$qos_interface" jump filter_qos_ingress
     nft add rule inet gargoyle-qos-priority filter_forward iifname "$qos_interface" jump filter_qos_ingress
+    nft add rule inet gargoyle-qos-priority filter_forward oifname "$qos_interface" jump filter_qos_egress
     
     echo "NFT tables init"
     return 0
