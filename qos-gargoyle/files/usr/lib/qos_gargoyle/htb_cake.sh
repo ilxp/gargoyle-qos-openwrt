@@ -1,16 +1,13 @@
 #!/bin/sh
 # HTB_CAKE算法实现模块
-# 版本: 2.3.1 - 恢复 IPv6 入口重定向三重尝试，完全适配 rule.sh 2.4.3
+# 版本: 2.4.0 - 修复入口重定向 connmark 覆盖问题，移除重复函数依赖 rule.sh 2.4.15
 # 基于HTB与CAKE组合算法实现QoS流量控制。
 
 # ========== 全局配置常量 ==========
 : ${CONFIG_FILE:=qos_gargoyle}
-: ${LOCK_DIR:=/var/run/htb_cake.lock}
-: ${LOCK_PID_FILE:=$LOCK_DIR/pid}
 : ${MAX_PHYSICAL_BANDWIDTH:=10000000}
 : ${UPLOAD_MASK:=0xFFFF}
 : ${DOWNLOAD_MASK:=0xFFFF0000}
-: ${QOS_RUNNING_FILE:=/var/run/htb_cake.running}
 : ${DELETE_IFB_ON_STOP:=0}
 : ${DEBUG:=0}
 
@@ -33,7 +30,7 @@ else
     exit 1
 fi
 
-# 锁持有标志
+# 锁持有标志（由 rule.sh 管理）
 HAVE_LOCK=0
 
 main_cleanup() {
@@ -48,293 +45,7 @@ trap main_cleanup EXIT INT TERM HUP QUIT
 . /lib/functions/network.sh
 include /lib/network
 
-# ========== 辅助函数 ==========
-# 带宽单位转换（支持 kbit, mbit, gbit, KB, MB 等）
-convert_bandwidth_to_kbit() {
-    local bw="$1"
-    local num unit result
-
-    [ -z "$bw" ] && { qos_log "ERROR" "带宽值为空"; return 1; }
-
-    if echo "$bw" | grep -qE '^[0-9]+$'; then
-        echo "$bw"
-        return 0
-    fi
-
-    if echo "$bw" | grep -qiE '^[0-9]+(\.[0-9]+)?[a-zA-Z]+$'; then
-        num=$(echo "$bw" | grep -oE '^[0-9]+(\.[0-9]+)?')
-        unit=$(echo "$bw" | sed 's/[0-9.]//g' | tr '[:lower:]' '[:upper:]')
-
-        case "$unit" in
-            K|KBIT|KILOBIT) result=$(awk "BEGIN {printf \"%.0f\", $num * 1}") ;;
-            M|MBIT|MEGABIT) result=$(awk "BEGIN {printf \"%.0f\", $num * 1000}") ;;
-            G|GBIT|GIGABIT) result=$(awk "BEGIN {printf \"%.0f\", $num * 1000000}") ;;
-            KB|KIB) qos_log "WARN" "检测到字节单位 '$unit'，将自动乘以 8 转换为 kbit"
-                    result=$(awk "BEGIN {printf \"%.0f\", $num * 8}") ;;
-            MB|MIB) qos_log "WARN" "检测到字节单位 '$unit'，将自动乘以 8 转换为 kbit"
-                    result=$(awk "BEGIN {printf \"%.0f\", $num * 8000}") ;;
-            GB|GIB) qos_log "WARN" "检测到字节单位 '$unit'，将自动乘以 8 转换为 kbit"
-                    result=$(awk "BEGIN {printf \"%.0f\", $num * 8000000}") ;;
-            *) qos_log "ERROR" "未知带宽单位: $unit"; return 1 ;;
-        esac
-
-        if [ -z "$result" ] || ! echo "$result" | grep -qE '^[0-9]+$' || [ "$result" -lt 0 ] 2>/dev/null; then
-            qos_log "ERROR" "带宽转换结果无效: $result"
-            return 1
-        fi
-        echo "$result"
-        return 0
-    else
-        qos_log "ERROR" "无效带宽格式: $bw (应为数字或数字+单位，例如 100mbit、10MB)"
-        return 1
-    fi
-}
-
-# 检查 tc 是否支持 action connmark
-check_tc_connmark_support() {
-    tc qdisc del dev lo ingress 2>/dev/null
-    if ! tc qdisc add dev lo ingress 2>/dev/null; then
-        qos_log "WARN" "无法在 lo 上创建 ingress 队列，无法测试 connmark 支持"
-        return 1
-    fi
-    if tc filter add dev lo parent ffff: protocol ip u32 match u32 0 0 action connmark 2>/dev/null; then
-        tc filter del dev lo parent ffff: 2>/dev/null
-        tc qdisc del dev lo ingress 2>/dev/null
-        return 0
-    else
-        tc qdisc del dev lo ingress 2>/dev/null
-        return 1
-    fi
-}
-
-# 检查必需的命令是否存在
-check_required_commands() {
-    local missing=0
-    for cmd in tc nft conntrack ethtool ip; do
-        if ! command -v "$cmd" >/dev/null 2>&1; then
-            qos_log "ERROR" "命令 '$cmd' 未找到，请安装相应软件包"
-            missing=1
-        fi
-    done
-    return $missing
-}
-
-# 检查并加载必需的内核模块
-load_required_modules() {
-    local missing=0
-    for mod in ifb sch_htb sch_cake; do
-        if ! lsmod 2>/dev/null | grep -q "^$mod"; then
-            qos_log "INFO" "尝试加载内核模块: $mod"
-            modprobe "$mod" 2>/dev/null || {
-                qos_log "ERROR" "无法加载内核模块 $mod"
-                missing=1
-            }
-        fi
-    done
-    return $missing
-}
-
-# 检查IFB设备是否存在并启用（不创建）
-ensure_ifb_device() {
-    local dev="$1"
-    if ! ip link show "$dev" >/dev/null 2>&1; then
-        qos_log "ERROR" "IFB设备 $dev 不存在，请检查配置或启动IFB管理脚本"
-        return 1
-    fi
-    ip link set dev "$dev" up || {
-        qos_log "ERROR" "无法启动IFB设备 $dev"
-        return 1
-    }
-    qos_log "INFO" "IFB设备 $dev 已就绪"
-    return 0
-}
-
-# ========== 目录锁机制（支持重入，增强僵尸进程检测）==========
-acquire_lock() {
-    if [ -d "$LOCK_DIR" ]; then
-        if [ -f "$LOCK_PID_FILE" ]; then
-            local old_pid=$(cat "$LOCK_PID_FILE" 2>/dev/null)
-            local now=$(date +%s)
-            local mtime=0
-            if stat -c %Y /tmp >/dev/null 2>&1; then
-                mtime=$(stat -c %Y "$LOCK_PID_FILE" 2>/dev/null || echo 0)
-            fi
-            if [ "$mtime" -gt 0 ] && [ $((now - mtime)) -gt 120 ]; then
-                qos_log "WARN" "锁文件过期（超过120秒），进程 $old_pid 可能僵死，强制清理锁目录"
-                rm -rf "$LOCK_DIR"
-                acquire_lock
-                return $?
-            fi
-            if [ -n "$old_pid" ] && kill -0 "$old_pid" 2>/dev/null; then
-                if [ "$old_pid" -eq "$$" ]; then
-                    qos_log "DEBUG" "已持有锁 (PID: $$)"
-                    return 0
-                fi
-                qos_log "ERROR" "无法获取锁，进程 $old_pid 仍在运行"
-                return 1
-            else
-                qos_log "WARN" "发现残留锁目录，进程 $old_pid 已不存在，清理中"
-                rm -rf "$LOCK_DIR"
-            fi
-        else
-            qos_log "WARN" "锁目录 $LOCK_DIR 存在但无PID文件，尝试强制清理"
-            rm -rf "$LOCK_DIR" 2>/dev/null
-            if [ -d "$LOCK_DIR" ]; then
-                qos_log "ERROR" "无法清理锁目录 $LOCK_DIR"
-                return 1
-            fi
-        fi
-    fi
-
-    mkdir "$LOCK_DIR" || {
-        log_error "无法创建锁目录"
-        return 1
-    }
-    echo "$$" > "$LOCK_PID_FILE"
-    HAVE_LOCK=1
-    log_debug "已获取锁: $LOCK_DIR (PID: $$)"
-    return 0
-}
-
-release_lock() {
-    [ "$HAVE_LOCK" = "1" ] || return
-    rm -f "$LOCK_PID_FILE"
-    rmdir "$LOCK_DIR" 2>/dev/null
-    HAVE_LOCK=0
-    log_debug "锁已释放"
-}
-
-# ========== 幂等性检查 ==========
-check_already_running() {
-    if [ -f "$QOS_RUNNING_FILE" ]; then
-        local pid=$(cat "$QOS_RUNNING_FILE" 2>/dev/null)
-        if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
-            qos_log "ERROR" "HTB+CAKE QoS 已经在运行中 (PID: $pid)"
-            return 1
-        else
-            qos_log "WARN" "发现残留的运行标记文件，清理中"
-            rm -f "$QOS_RUNNING_FILE"
-        fi
-    fi
-    echo "$$" > "$QOS_RUNNING_FILE"
-    return 0
-}
-
-# ========== 配置加载函数 ==========
-get_physical_interface_max_bandwidth() {
-    local interface="$1"
-    local max_bandwidth=""
-    if command -v ethtool >/dev/null 2>&1; then
-        local speed=$(ethtool "$interface" 2>/dev/null | grep -i speed | awk '{print $2}' | sed 's/[^0-9]//g')
-        if [ -n "$speed" ] && [ "$speed" -gt 0 ] 2>/dev/null; then
-            max_bandwidth=$((speed * 1000))
-            qos_log "INFO" "接口 $interface 物理速度: ${speed}Mbps (${max_bandwidth}kbit)"
-        fi
-    fi
-    if [ -z "$max_bandwidth" ] && [ -d "/sys/class/net/$interface" ]; then
-        local speed_file="/sys/class/net/$interface/speed"
-        if [ -f "$speed_file" ]; then
-            local speed=$(cat "$speed_file" 2>/dev/null)
-            if [ -n "$speed" ] && [ "$speed" -gt 0 ] 2>/dev/null; then
-                max_bandwidth=$((speed * 1000))
-                qos_log "INFO" "接口 $interface 物理速度: ${speed}Mbps (${max_bandwidth}kbit)"
-            fi
-        fi
-    fi
-    if [ -z "$max_bandwidth" ]; then
-        max_bandwidth="$MAX_PHYSICAL_BANDWIDTH"
-        qos_log "WARN" "无法获取接口 $interface 的物理速度，使用默认最大值: ${max_bandwidth}kbit"
-    fi
-    echo "$max_bandwidth"
-}
-
-# 验证带宽配置（使用rule.sh的validate_number）
-validate_bandwidth_config() {
-    local config_bw="$1"
-    local param_name="$2"
-    local max_physical_bw="$3"
-    if [ -z "$config_bw" ]; then
-        qos_log "ERROR" "配置项 '$param_name' 未设置，请检查UCI配置"
-        return 1
-    fi
-    if ! validate_number "$config_bw" "$param_name" 1 "$MAX_PHYSICAL_BANDWIDTH"; then
-        return 1
-    fi
-    if [ -n "$max_physical_bw" ] && [ "$config_bw" -gt "$max_physical_bw" ] 2>/dev/null; then
-        qos_log "WARN" "$param_name 配置值(${config_bw}kbit)超过接口物理带宽(${max_physical_bw}kbit)，将使用物理带宽"
-        config_bw="$max_physical_bw"
-    fi
-    echo "$config_bw"
-    return 0
-}
-
-# 加载带宽配置（支持带单位的值）
-load_bandwidth_from_config() {
-    qos_log "INFO" "加载带宽配置"
-    local max_physical_bw=$(get_physical_interface_max_bandwidth "$qos_interface")
-    local config_upload_bw=$(uci -q get qos_gargoyle.upload.total_bandwidth 2>/dev/null)
-    if [ -z "$config_upload_bw" ]; then
-        qos_log "ERROR" "上传总带宽未配置，请检查UCI"
-        return 1
-    fi
-    total_upload_bandwidth=$(convert_bandwidth_to_kbit "$config_upload_bw") || return 1
-    if ! validated_bw=$(validate_bandwidth_config "$total_upload_bandwidth" "upload.total_bandwidth" "$max_physical_bw"); then
-        qos_log "ERROR" "上传总带宽配置无效"
-        return 1
-    fi
-    total_upload_bandwidth="$validated_bw"
-    qos_log "INFO" "上传总带宽: ${total_upload_bandwidth}kbit/s"
-
-    local config_download_bw=$(uci -q get qos_gargoyle.download.total_bandwidth 2>/dev/null)
-    if [ -z "$config_download_bw" ]; then
-        qos_log "ERROR" "下载总带宽未配置，请检查UCI"
-        return 1
-    fi
-    total_download_bandwidth=$(convert_bandwidth_to_kbit "$config_download_bw") || return 1
-    if ! validated_bw=$(validate_bandwidth_config "$total_download_bandwidth" "download.total_bandwidth" "$max_physical_bw"); then
-        qos_log "ERROR" "下载总带宽配置无效"
-        return 1
-    fi
-    total_download_bandwidth="$validated_bw"
-    qos_log "INFO" "下载总带宽: ${total_download_bandwidth}kbit/s"
-    return 0
-}
-
-# 计算HTB的burst参数（添加溢出检查和范围限制）
-calculate_htb_burst() {
-    local rate="$1"  # 单位: kbit
-    local ceil="$2"  # 单位: kbit
-    local mtu="$3"   # MTU大小
-    if [ -z "$mtu" ]; then
-        mtu=1500
-    fi
-    if [ "$rate" -gt 10000000 ] 2>/dev/null; then
-        qos_log "WARN" "带宽值过大 ($rate kbit)，burst计算可能溢出，进行限制"
-        rate=10000000
-    fi
-    local burst_kb=$((rate / 8))
-    if [ "$burst_kb" -lt 1 ]; then
-        burst_kb=1
-    fi
-    if [ "$burst_kb" -gt 1048576 ]; then
-        burst_kb=1048576
-        qos_log "WARN" "burst值超过1GB，已限制为1048576KB"
-    fi
-    local mtu_kb=$((mtu * 3 / 1024))
-    if [ "$mtu_kb" -lt 1 ]; then
-        mtu_kb=1
-    fi
-    if [ "$burst_kb" -lt "$mtu_kb" ]; then
-        burst_kb="$mtu_kb"
-    fi
-    local cburst_kb=$((burst_kb * 2))
-    if [ "$cburst_kb" -gt 1048576 ]; then
-        cburst_kb=1048576
-    fi
-    echo "${burst_kb}kb ${cburst_kb}kb"
-}
-
-# ========== 加载HTB与CAKE专属配置 ==========
+# ========== HTB 与 CAKE 专属配置加载 ==========
 load_htb_cake_config() {
     qos_log "INFO" "加载HTB与CAKE配置"
     if ! load_bandwidth_from_config; then
@@ -349,14 +60,9 @@ load_htb_cake_config() {
         qos_log "INFO" "从配置文件读取IFB设备: $IFB_DEVICE"
     fi
     HTB_R2Q=$(uci -q get qos_gargoyle.htb.r2q 2>/dev/null)
-    if [ -z "$HTB_R2Q" ]; then
-        HTB_R2Q=10
-        qos_log "INFO" "HTB R2Q使用默认值: ${HTB_R2Q}"
-    fi
+    [ -z "$HTB_R2Q" ] && HTB_R2Q=10
     HTB_DRR_QUANTUM=$(uci -q get qos_gargoyle.htb.drr_quantum 2>/dev/null)
-    if [ -z "$HTB_DRR_QUANTUM" ]; then
-        HTB_DRR_QUANTUM="auto"
-    fi
+    [ -z "$HTB_DRR_QUANTUM" ] && HTB_DRR_QUANTUM="auto"
     CAKE_BANDWIDTH=$(uci -q get qos_gargoyle.cake.bandwidth 2>/dev/null)
     if [ -n "$CAKE_BANDWIDTH" ]; then
         qos_log "ERROR" "检测到 CAKE_BANDWIDTH 已配置 (值: $CAKE_BANDWIDTH)，这将导致CAKE二次整形，可能严重影响HTB调度性能。建议删除此配置项以使用HTB主导的整形。"
@@ -396,7 +102,6 @@ load_htb_cake_config() {
     return 0
 }
 
-# 加载HTB类别配置（允许优先级0）
 load_htb_class_config() {
     local class_name="$1"
     local percent_bandwidth per_min_bandwidth per_max_bandwidth priority name
@@ -427,7 +132,6 @@ load_htb_class_config() {
     return 0
 }
 
-# 加载上传类别配置
 load_upload_class_configurations() {
     qos_log "INFO" "正在加载上传类别配置..."
     upload_class_list=$(load_all_config_sections "$CONFIG_FILE" "upload_class")
@@ -440,7 +144,6 @@ load_upload_class_configurations() {
     return 0
 }
 
-# 加载下载类别配置
 load_download_class_configurations() {
     qos_log "INFO" "正在加载下载类别配置..."
     download_class_list=$(load_all_config_sections "$CONFIG_FILE" "download_class")
@@ -453,121 +156,41 @@ load_download_class_configurations() {
     return 0
 }
 
-# ========== IPv6增强支持 ==========
-setup_ipv6_specific_rules() {
-    qos_log "INFO" "设置IPv6特定规则（优化版）"
-    nft add chain inet gargoyle-qos-priority filter_prerouting '{ type filter hook prerouting priority 0; policy accept; }' 2>/dev/null || true
-    nft flush chain inet gargoyle-qos-priority filter_prerouting 2>/dev/null || true
-    local ICMPV6_CRITICAL_TYPES="133,134,135,136,137"
-    nft add rule inet gargoyle-qos-priority filter_prerouting \
-        meta nfproto ipv6 ip6 daddr { ff02::1:2, ff02::1:3 } \
-        meta mark set 0x3F counter 2>/dev/null || true
-    nft add rule inet gargoyle-qos-priority filter_prerouting \
-        meta nfproto ipv6 ip6 daddr ::1 \
-        meta mark set 0x3F counter 2>/dev/null || true
-    nft add rule inet gargoyle-qos-priority filter_prerouting \
-        meta nfproto ipv6 icmpv6 type { $ICMPV6_CRITICAL_TYPES } \
-        meta mark set 0x7F counter 2>/dev/null || true
-    nft add rule inet gargoyle-qos-priority filter_prerouting \
-        meta nfproto ipv6 udp dport { 546, 547 } \
-        meta mark set 0x7F counter 2>/dev/null || true
-    nft add rule inet gargoyle-qos-priority filter_prerouting \
-        meta nfproto ipv6 udp dport 53 \
-        meta mark set 0x7F counter 2>/dev/null || true
-    nft add rule inet gargoyle-qos-priority filter_prerouting \
-        meta nfproto ipv6 tcp dport 53 \
-        meta mark set 0x7F counter 2>/dev/null || true
-    nft add rule inet gargoyle-qos-priority filter_prerouting \
-        meta nfproto ipv6 tcp dport { 80, 443 } \
-        meta mark set 0x7F counter 2>/dev/null || true
-    nft add rule inet gargoyle-qos-priority filter_prerouting \
-        meta nfproto ipv6 udp dport 123 \
-        meta mark set 0x7F counter 2>/dev/null || true
-    qos_log "INFO" "IPv6关键流量规则设置完成"
+# ========== HTB 辅助函数 ==========
+calculate_htb_burst() {
+    local rate="$1"  # 单位: kbit
+    local ceil="$2"  # 单位: kbit
+    local mtu="$3"   # MTU大小
+    if [ -z "$mtu" ]; then
+        mtu=1500
+    fi
+    if [ "$rate" -gt 10000000 ] 2>/dev/null; then
+        qos_log "WARN" "带宽值过大 ($rate kbit)，burst计算可能溢出，进行限制"
+        rate=10000000
+    fi
+    local burst_kb=$((rate / 8))
+    if [ "$burst_kb" -lt 1 ]; then
+        burst_kb=1
+    fi
+    if [ "$burst_kb" -gt 1048576 ]; then
+        burst_kb=1048576
+        qos_log "WARN" "burst值超过1GB，已限制为1048576KB"
+    fi
+    local mtu_kb=$((mtu * 3 / 1024))
+    if [ "$mtu_kb" -lt 1 ]; then
+        mtu_kb=1
+    fi
+    if [ "$burst_kb" -lt "$mtu_kb" ]; then
+        burst_kb="$mtu_kb"
+    fi
+    local cburst_kb=$((burst_kb * 2))
+    if [ "$cburst_kb" -gt 1048576 ]; then
+        cburst_kb=1048576
+    fi
+    echo "${burst_kb}kb ${cburst_kb}kb"
 }
 
-# ========== 增强规则链 ==========
-setup_htb_enhance_chains() {
-    qos_log "INFO" "设置HTB增强规则链"
-    nft add chain inet gargoyle-qos-priority filter_qos_egress_enhance 2>/dev/null || true
-    nft add chain inet gargoyle-qos-priority filter_qos_ingress_enhance 2>/dev/null || true
-    nft insert rule inet gargoyle-qos-priority filter_qos_egress \
-        jump filter_qos_egress_enhance 2>/dev/null || true
-    nft insert rule inet gargoyle-qos-priority filter_qos_ingress \
-        jump filter_qos_ingress_enhance 2>/dev/null || true
-}
-
-apply_htb_specific_rules() {
-    qos_log "INFO" "应用HTB特定增强规则（专用链）"
-    nft flush chain inet gargoyle-qos-priority filter_qos_egress_enhance 2>/dev/null || true
-    nft flush chain inet gargoyle-qos-priority filter_qos_ingress_enhance 2>/dev/null || true
-    nft add rule inet gargoyle-qos-priority filter_qos_egress_enhance \
-        ct state new \
-        limit rate 100/second burst 20 packets \
-        meta mark set 0x7F counter 2>/dev/null || true
-    nft add rule inet gargoyle-qos-priority filter_qos_ingress_enhance \
-        ct state new \
-        limit rate 100/second burst 20 packets \
-        meta mark set 0x7F00 counter 2>/dev/null || true
-    nft add rule inet gargoyle-qos-priority filter_qos_egress_enhance \
-        meta mark and 0x007f != 0 counter meta priority set "bulk" 2>/dev/null || true
-    nft add rule inet gargoyle-qos-priority filter_qos_ingress_enhance \
-        meta mark and 0x7f00 != 0 counter meta priority set "bulk" 2>/dev/null || true
-    nft add rule inet gargoyle-qos-priority filter_qos_egress_enhance \
-        ct state established,related counter meta mark set ct mark 2>/dev/null || true
-    nft add rule inet gargoyle-qos-priority filter_qos_egress_enhance \
-        meta mark and 0x0010 != 0 counter meta priority set "critical" 2>/dev/null || true
-    nft add rule inet gargoyle-qos-priority filter_qos_ingress_enhance \
-        meta mark and 0x1000 != 0 counter meta priority set "critical" 2>/dev/null || true
-    nft add rule inet gargoyle-qos-priority filter_qos_egress_enhance \
-        ct bytes lt 200 counter meta priority set "normal" 2>/dev/null || true
-    nft add rule inet gargoyle-qos-priority filter_qos_ingress_enhance \
-        ct bytes lt 200 counter meta priority set "normal" 2>/dev/null || true
-    nft add rule inet gargoyle-qos-priority filter_qos_egress_enhance \
-        tcp flags syn tcp option maxseg size set rt mtu counter meta mark set 0x3F 2>/dev/null || true
-    qos_log "INFO" "HTB特定增强规则应用完成"
-}
-
-# ========== HTB核心队列函数（使用CAKE） ==========
-create_htb_root_qdisc() {
-    local device="$1"
-    local direction="$2"
-    local root_handle="$3"
-    local root_classid="$4"
-    local bandwidth=""
-    if [ "$direction" = "upload" ]; then
-        bandwidth="$total_upload_bandwidth"
-    elif [ "$direction" = "download" ]; then
-        bandwidth="$total_download_bandwidth"
-    else
-        qos_log "ERROR" "未知方向: $direction"
-        return 1
-    fi
-    if ! validate_number "$bandwidth" "bandwidth" 1 "$MAX_PHYSICAL_BANDWIDTH"; then
-        qos_log "ERROR" "无效的带宽值: $bandwidth"
-        return 1
-    fi
-    qos_log "INFO" "为$device创建$direction方向HTB根队列 (带宽: ${bandwidth}kbit)"
-    tc qdisc del dev "$device" ingress 2>/dev/null || true
-    tc qdisc del dev "$device" root 2>/dev/null || true
-    if ! tc qdisc add dev "$device" root handle $root_handle htb r2q $HTB_R2Q; then
-        qos_log "ERROR" "无法在 $device 上创建HTB根队列"
-        return 1
-    fi
-    local burst_params=$(calculate_htb_burst "$bandwidth" "$bandwidth")
-    local burst=$(echo "$burst_params" | awk '{print $1}')
-    local cburst=$(echo "$burst_params" | awk '{print $2}')
-    if ! tc class add dev "$device" parent $root_handle classid $root_classid htb \
-        rate ${bandwidth}kbit ceil ${bandwidth}kbit burst $burst cburst $cburst; then
-        qos_log "ERROR" "无法在$device上创建HTB根类"
-        tc qdisc del dev "$device" root 2>/dev/null
-        return 1
-    fi
-    qos_log "INFO" "$device的$direction方向HTB根队列创建完成"
-    return 0
-}
-
-# 检测内核是否支持特定 CAKE 参数
+# ========== CAKE 参数支持检查 ==========
 check_cake_param_support() {
     local param="$1"
     tc qdisc del dev lo root 2>/dev/null
@@ -579,7 +202,6 @@ check_cake_param_support() {
     fi
 }
 
-# 构建CAKE参数字符串
 build_cake_params() {
     local params=""
     if [ -n "$CAKE_BANDWIDTH" ]; then
@@ -620,6 +242,45 @@ build_cake_params() {
         fi
     fi
     echo "$params"
+}
+
+# ========== HTB 核心队列函数 ==========
+create_htb_root_qdisc() {
+    local device="$1"
+    local direction="$2"
+    local root_handle="$3"
+    local root_classid="$4"
+    local bandwidth=""
+    if [ "$direction" = "upload" ]; then
+        bandwidth="$total_upload_bandwidth"
+    elif [ "$direction" = "download" ]; then
+        bandwidth="$total_download_bandwidth"
+    else
+        qos_log "ERROR" "未知方向: $direction"
+        return 1
+    fi
+    if ! validate_number "$bandwidth" "bandwidth" 1 "$MAX_PHYSICAL_BANDWIDTH"; then
+        qos_log "ERROR" "无效的带宽值: $bandwidth"
+        return 1
+    fi
+    qos_log "INFO" "为$device创建$direction方向HTB根队列 (带宽: ${bandwidth}kbit)"
+    tc qdisc del dev "$device" ingress 2>/dev/null || true
+    tc qdisc del dev "$device" root 2>/dev/null || true
+    if ! tc qdisc add dev "$device" root handle $root_handle htb r2q $HTB_R2Q; then
+        qos_log "ERROR" "无法在 $device 上创建HTB根队列"
+        return 1
+    fi
+    local burst_params=$(calculate_htb_burst "$bandwidth" "$bandwidth")
+    local burst=$(echo "$burst_params" | awk '{print $1}')
+    local cburst=$(echo "$burst_params" | awk '{print $2}')
+    if ! tc class add dev "$device" parent $root_handle classid $root_classid htb \
+        rate ${bandwidth}kbit ceil ${bandwidth}kbit burst $burst cburst $cburst; then
+        qos_log "ERROR" "无法在$device上创建HTB根类"
+        tc qdisc del dev "$device" root 2>/dev/null
+        return 1
+    fi
+    qos_log "INFO" "$device的$direction方向HTB根队列创建完成"
+    return 0
 }
 
 create_htb_upload_class() {
@@ -935,14 +596,10 @@ create_default_download_class() {
     return 0
 }
 
-# ========== 入口重定向（恢复三重尝试） ==========
+# ========== 入口重定向（修复 connmark 覆盖问题） ==========
 setup_ingress_redirect() {
     if [ -z "$qos_interface" ]; then
         qos_log "ERROR" "无法确定 WAN 接口"
-        return 1
-    fi
-    if ! check_tc_connmark_support; then
-        qos_log "ERROR" "内核不支持 tc action connmark，无法实现下载方向QoS"
         return 1
     fi
     qos_log "INFO" "设置入口重定向: $qos_interface -> $IFB_DEVICE"
@@ -952,10 +609,9 @@ setup_ingress_redirect() {
         return 1
     fi
     tc filter del dev "$qos_interface" parent ffff: 2>/dev/null || true
-    # IPv4 重定向（必须成功）
+    # IPv4 重定向（直接重定向，不使用 connmark）
     if ! tc filter add dev "$qos_interface" parent ffff: protocol ip \
         u32 match u32 0 0 \
-        action connmark \
         action mirred egress redirect dev "$IFB_DEVICE" 2>&1; then
         qos_log "ERROR" "IPv4入口重定向规则添加失败"
         tc qdisc del dev "$qos_interface" ingress 2>/dev/null
@@ -964,7 +620,6 @@ setup_ingress_redirect() {
         qos_log "INFO" "IPv4入口重定向规则添加成功"
     fi
 
-    # 检测接口是否有全局 IPv6 地址，以决定是否强制 IPv6 必须成功
     local has_ipv6_global=0
     if ip -6 addr show dev "$qos_interface" scope global 2>/dev/null | grep -q "inet6"; then
         has_ipv6_global=1
@@ -973,48 +628,36 @@ setup_ingress_redirect() {
         qos_log "INFO" "接口 $qos_interface 无全局 IPv6 地址，IPv6 重定向失败仅警告"
     fi
 
-    # IPv6 重定向：三阶尝试
     local ipv6_success=false
-    local ipv6_attempts=0
-
     # 第一优先：flower 匹配全球单播地址 (2000::/3)
     if tc filter add dev "$qos_interface" parent ffff: protocol ipv6 \
         flower dst_ip 2000::/3 \
-        action connmark \
         action mirred egress redirect dev "$IFB_DEVICE" 2>&1; then
         ipv6_success=true
         qos_log "INFO" "IPv6入口重定向规则（flower 匹配全球单播）添加成功"
     else
         qos_log "WARN" "flower 规则添加失败，尝试 u32 全球单播匹配"
-        ipv6_attempts=$((ipv6_attempts + 1))
-
         # 第二优先：u32 匹配全球单播地址 (2000::/3)
         if tc filter add dev "$qos_interface" parent ffff: protocol ipv6 \
             u32 match u32 0x20000000 0xe0000000 at 24 \
-            action connmark \
             action mirred egress redirect dev "$IFB_DEVICE" 2>&1; then
             ipv6_success=true
             qos_log "INFO" "IPv6入口重定向规则（u32 全球单播）添加成功"
         else
             qos_log "WARN" "u32 全球单播规则添加失败，尝试无过滤规则"
-            ipv6_attempts=$((ipv6_attempts + 1))
-
             # 第三优先：无过滤的 u32 全匹配
             if tc filter add dev "$qos_interface" parent ffff: protocol ipv6 \
                 u32 match u32 0 0 \
-                action connmark \
                 action mirred egress redirect dev "$IFB_DEVICE" 2>&1; then
                 ipv6_success=true
                 qos_log "INFO" "IPv6入口重定向规则（无过滤）添加成功"
             else
                 ipv6_success=false
-                ipv6_attempts=$((ipv6_attempts + 1))
                 qos_log "WARN" "IPv6入口重定向规则添加失败，IPv6流量将不会通过IFB"
             fi
         fi
     fi
 
-    # 根据是否有全局 IPv6 地址决定是否必须成功
     if [ "$has_ipv6_global" = "1" ]; then
         if [ "$ipv6_success" != "true" ]; then
             qos_log "ERROR" "接口存在全局 IPv6 地址，但 IPv6 入口重定向配置失败，QoS 无法正常工作"
@@ -1031,7 +674,6 @@ setup_ingress_redirect() {
         fi
     fi
 
-    # 可选：统计规则数量（仅用于日志）
     local ipv4_rule_count=$(tc filter show dev "$qos_interface" parent ffff: protocol ip 2>/dev/null | grep -c "mirred.*Redirect to device $IFB_DEVICE")
     local ipv6_rule_count=$(tc filter show dev "$qos_interface" parent ffff: protocol ipv6 2>/dev/null | grep -c "mirred.*Redirect to device $IFB_DEVICE")
     if [ "$ipv4_rule_count" -ge 1 ] && [ "$ipv6_rule_count" -ge 1 ]; then
@@ -1039,7 +681,6 @@ setup_ingress_redirect() {
     elif [ "$ipv4_rule_count" -ge 1 ]; then
         qos_log "INFO" "入口重定向已成功设置: 仅IPv4生效"
     fi
-
     return 0
 }
 
@@ -1282,7 +923,49 @@ set_default_download_class() {
     qos_log "INFO" "下载默认类别设置为TC类ID: 1:$found_index"
 }
 
-# ========== 主初始化函数（整合 rule.sh 规则应用） ==========
+# ========== HTB 增强规则链 ==========
+setup_htb_enhance_chains() {
+    qos_log "INFO" "设置HTB增强规则链"
+    nft add chain inet gargoyle-qos-priority filter_qos_egress_enhance 2>/dev/null || true
+    nft add chain inet gargoyle-qos-priority filter_qos_ingress_enhance 2>/dev/null || true
+    nft insert rule inet gargoyle-qos-priority filter_qos_egress \
+        jump filter_qos_egress_enhance 2>/dev/null || true
+    nft insert rule inet gargoyle-qos-priority filter_qos_ingress \
+        jump filter_qos_ingress_enhance 2>/dev/null || true
+}
+
+apply_htb_specific_rules() {
+    qos_log "INFO" "应用HTB特定增强规则（专用链）"
+    nft flush chain inet gargoyle-qos-priority filter_qos_egress_enhance 2>/dev/null || true
+    nft flush chain inet gargoyle-qos-priority filter_qos_ingress_enhance 2>/dev/null || true
+    nft add rule inet gargoyle-qos-priority filter_qos_egress_enhance \
+        ct state new \
+        limit rate 100/second burst 20 packets \
+        meta mark set 0x7F counter 2>/dev/null || true
+    nft add rule inet gargoyle-qos-priority filter_qos_ingress_enhance \
+        ct state new \
+        limit rate 100/second burst 20 packets \
+        meta mark set 0x7F00 counter 2>/dev/null || true
+    nft add rule inet gargoyle-qos-priority filter_qos_egress_enhance \
+        meta mark and 0x007f != 0 counter meta priority set "bulk" 2>/dev/null || true
+    nft add rule inet gargoyle-qos-priority filter_qos_ingress_enhance \
+        meta mark and 0x7f00 != 0 counter meta priority set "bulk" 2>/dev/null || true
+    nft add rule inet gargoyle-qos-priority filter_qos_egress_enhance \
+        ct state established,related counter meta mark set ct mark 2>/dev/null || true
+    nft add rule inet gargoyle-qos-priority filter_qos_egress_enhance \
+        meta mark and 0x0010 != 0 counter meta priority set "critical" 2>/dev/null || true
+    nft add rule inet gargoyle-qos-priority filter_qos_ingress_enhance \
+        meta mark and 0x1000 != 0 counter meta priority set "critical" 2>/dev/null || true
+    nft add rule inet gargoyle-qos-priority filter_qos_egress_enhance \
+        ct bytes lt 200 counter meta priority set "normal" 2>/dev/null || true
+    nft add rule inet gargoyle-qos-priority filter_qos_ingress_enhance \
+        ct bytes lt 200 counter meta priority set "normal" 2>/dev/null || true
+    nft add rule inet gargoyle-qos-priority filter_qos_egress_enhance \
+        tcp flags syn tcp option maxseg size set rt mtu counter meta mark set 0x3F 2>/dev/null || true
+    qos_log "INFO" "HTB特定增强规则应用完成"
+}
+
+# ========== 主初始化函数 ==========
 init_htb_cake_qos() {
     qos_log "INFO" "开始初始化HTB+CAKE QoS系统"
     if ! acquire_lock; then
@@ -1474,7 +1157,7 @@ show_htb_cake_status() {
         qos_interface=$(tc qdisc show 2>/dev/null | grep -E "htb.*root" | awk '{print $5}' | head -1)
         [ -z "$qos_interface" ] && qos_interface="未知"
     fi
-    echo "===== HTB-CAKE QoS 状态报告 (v2.3.1) ====="
+    echo "===== HTB-CAKE QoS 状态报告 (v2.4.0) ====="
     echo "时间: $(date)"
     echo "WAN接口: ${qos_interface}"
     if ! tc qdisc show dev "${qos_interface}" 2>/dev/null | grep -q htb; then

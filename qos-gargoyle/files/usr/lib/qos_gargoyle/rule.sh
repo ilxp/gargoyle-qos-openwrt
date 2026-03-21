@@ -1,6 +1,7 @@
 #!/bin/sh
 # 规则辅助模块 (rule.sh)
-# 版本: 2.4.10 - 修复链创建、UCI加载缺失、增强错误处理
+# 版本: 2.4.15 - 修复 nft 表重复清空、入口重定向 connmark 覆盖、停止时配置丢失、TEMP_FILES 初始化、
+#               以及 build_nft_rule_fast 族匹配逻辑。移除 generate_ipset_sets 中的表清空，由 apply_all_rules 统一处理。
 
 : ${DEBUG:=0}
 
@@ -30,6 +31,9 @@ ACK_XFAST=5000
 SET_FAMILIES_FILE="/tmp/qos_gargoyle_set_families"
 _IPSET_LOADED=0
 HAVE_LOCK=0
+
+# 表清空标志（全局）
+_QOS_TABLE_FLUSHED=0
 
 # ========== 日志函数 ==========
 log_debug() { [ "$DEBUG" = "1" ] && log "DEBUG" "$@"; }
@@ -199,7 +203,7 @@ validate_state() {
     return 0
 }
 
-# 增强 IP/CIDR 验证，支持取反前缀 !=
+# 增强 IP/CIDR 验证，支持取反前缀 !=，IPv6 支持压缩格式（如 ::1），禁止非法格式
 validate_ip() {
     local ip="$1"
     local raw="${ip#!=}"
@@ -221,8 +225,9 @@ validate_ip() {
         return 0
     fi
 
-    # 检测 IPv6
-    if echo "$raw" | grep -qiE '^([0-9a-fA-F]{1,4}:){1,7}[0-9a-fA-F]{0,4}(/[0-9]{1,3})?$'; then
+    # 检测 IPv6（允许压缩格式，如 ::1、2001:db8::1）
+    if echo "$raw" | grep -qiE '^([0-9a-fA-F]{0,4}:){1,7}[0-9a-fA-F]{0,4}(/[0-9]{1,3})?$'; then
+        # 检查双冒号次数（最多一次）
         if echo "$raw" | grep -q '::.*::'; then
             log_error "IPv6地址 '$raw' 包含多个 '::'"
             return 1
@@ -230,6 +235,14 @@ validate_ip() {
         if echo "$raw" | grep -q ':::'; then
             log_error "IPv6地址 '$raw' 包含非法序列 ':::'"
             return 1
+        fi
+        # 禁止以单个冒号开头或结尾（允许 :: 开头或结尾）
+        if echo "$raw" | grep -qE '^:[^:]' || echo "$raw" | grep -qE '[^:]:$'; then
+            # 例外情况：整个地址就是 :: 或 ::/...
+            if ! echo "$raw" | grep -qE '^(::|::/|::/.*)$'; then
+                log_error "IPv6地址 '$raw' 不能以单个冒号开头或结尾"
+                return 1
+            fi
         fi
         if echo "$raw" | grep -q '/'; then
             local prefix="${raw#*/}"
@@ -431,9 +444,11 @@ sort_rules_by_priority_fast() {
 generate_ipset_sets() {
     [ "$_IPSET_LOADED" -eq 1 ] && return 0
 
-    # 确保表存在并清空所有内容，避免残留干扰
-    nft add table inet gargoyle-qos-priority 2>/dev/null || true
-    nft flush table inet gargoyle-qos-priority 2>/dev/null || true
+    # 注意：此函数不再清空表，表清空由 apply_all_rules 在第一次调用时统一完成
+    # 这里只负责创建集合，假设表已经存在且为空（或已清空）
+    if ! nft list table inet gargoyle-qos-priority >/dev/null 2>&1; then
+        nft add table inet gargoyle-qos-priority 2>/dev/null || true
+    fi
 
     if ! type config_get_bool >/dev/null 2>&1; then
         . /lib/functions.sh
@@ -447,6 +462,8 @@ generate_ipset_sets() {
 
     process_ipset_section() {
         local section="$1" name enabled mode family timeout ip4 ip6 ip4_list ip6_list
+        local elements=""
+
         config_get_bool enabled "$section" enabled 1
         [ "$enabled" -eq 0 ] && return 0
         config_get name "$section" name
@@ -469,7 +486,6 @@ generate_ipset_sets() {
         if [ "$mode" = "dynamic" ]; then
             echo "add set inet gargoyle-qos-priority $name { type ${family}_addr; flags dynamic, timeout; timeout $timeout; } 2>/dev/null || true" >> "$sets_file"
         else
-            local elements=""
             if [ "$family" = "ipv6" ]; then
                 [ -n "$ip6_list" ] && elements=$(echo "$ip6_list" | sed 's/ \+/,/g')
             else
@@ -527,7 +543,10 @@ build_ip_conditions_for_direction() {
 }
 
 generate_ratelimit_rules() {
-    # 确保 UCI 配置已加载
+    # 确保 UCI 函数库已加载，以便使用 config_load 和 config_get
+    if ! type config_load >/dev/null 2>&1; then
+        . /lib/functions.sh
+    fi
     config_load "$CONFIG_FILE" 2>/dev/null
 
     local rules=""
@@ -538,6 +557,8 @@ generate_ratelimit_rules() {
         local sets_neg_v4="" sets_pos_v4="" ips_neg_v4="" ips_pos_v4=""
         local sets_neg_v6="" sets_pos_v6="" ips_neg_v6="" ips_pos_v6=""
         local value prefix setname set_family
+        local download_burst_param='' upload_burst_param=''
+        local burst_int burst_dec
 
         config_get_bool enabled "$section" enabled 1
         [ "$enabled" -eq 0 ] && return 0
@@ -555,22 +576,21 @@ generate_ratelimit_rules() {
         download_kbytes=$((download_limit / 8))
         upload_kbytes=$((upload_limit / 8))
 
-        local download_burst_param='' upload_burst_param=''
         case "$burst_factor" in
             0|0.0|0.00) ;;
             *.*) 
-                local burst_int="${burst_factor%.*}" burst_dec="${burst_factor#*.}"
+                burst_int="${burst_factor%.*}" burst_dec="${burst_factor#*.}"
                 [ -z "$burst_int" ] && burst_int='0'
                 [ -z "$burst_dec" ] && burst_dec='0'
                 case "${#burst_dec}" in 1) burst_dec="${burst_dec}0" ;; 2) ;; *) burst_dec="${burst_dec:0:2}" ;; esac
-                local download_burst=$((download_kbytes * burst_int + download_kbytes * burst_dec / 100))
-                local upload_burst=$((upload_kbytes * burst_int + upload_kbytes * burst_dec / 100))
+                download_burst=$((download_kbytes * burst_int + download_kbytes * burst_dec / 100))
+                upload_burst=$((upload_kbytes * burst_int + upload_kbytes * burst_dec / 100))
                 [ "$download_burst" -gt 0 ] && download_burst_param=" burst ${download_burst} kbytes"
                 [ "$upload_burst" -gt 0 ] && upload_burst_param=" burst ${upload_burst} kbytes"
                 ;;
             *)
-                local download_burst=$((download_kbytes * burst_factor))
-                local upload_burst=$((upload_kbytes * burst_factor))
+                download_burst=$((download_kbytes * burst_factor))
+                upload_burst=$((upload_kbytes * burst_factor))
                 download_burst_param=" burst ${download_burst} kbytes"
                 upload_burst_param=" burst ${upload_burst} kbytes"
                 ;;
@@ -884,12 +904,44 @@ build_nft_rule_fast() {
         fi
     fi
 
+    # 根据 family 确定哪些族需要生成规则
+    local do_ipv4=0 do_ipv6=0
     case "$family" in
-        ip|inet4|ipv4) has_ipv4=1; has_ipv6=0; if [ -n "$ipv6_cond" ]; then log_warn "规则 $rule_name 指定 family=ipv4 但包含 IPv6 地址，IPv6 部分将被忽略"; ipv6_cond=""; fi ;;
-        ip6|inet6|ipv6) has_ipv4=0; has_ipv6=1; if [ -n "$ipv4_cond" ]; then log_warn "规则 $rule_name 指定 family=ipv6 但包含 IPv4 地址，IPv4 部分将被忽略"; ipv4_cond=""; fi ;;
-        inet) ;;
+        ip|ipv4|inet4)
+            if [ "$has_ipv4" -eq 1 ]; then
+                do_ipv4=1
+            else
+                # family=ip 但只有 IPv6 地址，不生成规则
+                if [ "$has_ipv6" -eq 1 ]; then
+                    log_warn "规则 $rule_name 指定 family=ipv4 但只包含 IPv6 地址，规则将被忽略"
+                    return
+                fi
+                # 没有 IP 条件，生成默认 IPv4 规则
+                do_ipv4=1
+            fi
+            ;;
+        ip6|ipv6|inet6)
+            if [ "$has_ipv6" -eq 1 ]; then
+                do_ipv6=1
+            else
+                if [ "$has_ipv4" -eq 1 ]; then
+                    log_warn "规则 $rule_name 指定 family=ipv6 但只包含 IPv4 地址，规则将被忽略"
+                    return
+                fi
+                do_ipv6=1
+            fi
+            ;;
+        inet)
+            if [ "$has_ipv4" -eq 1 ]; then do_ipv4=1; fi
+            if [ "$has_ipv6" -eq 1 ]; then do_ipv6=1; fi
+            if [ "$do_ipv4" -eq 0 ] && [ "$do_ipv6" -eq 0 ]; then
+                # 没有 IP 条件，生成双栈规则
+                do_ipv4=1
+                do_ipv6=1
+            fi
+            ;;
+        *) log_error "规则 $rule_name 无效的 family '$family'"; return ;;
     esac
-    if [ "$has_ipv4" -eq 0 ] && [ "$has_ipv6" -eq 0 ]; then has_ipv4=1; has_ipv6=1; fi
 
     local common_cond=""
     if [ "$proto" = "tcp" ]; then common_cond="meta l4proto tcp"
@@ -930,13 +982,13 @@ build_nft_rule_fast() {
     fi
 
     local base_cmd="add rule inet gargoyle-qos-priority $chain"
-    if [ "$has_ipv4" -eq 1 ]; then
+    if [ "$do_ipv4" -eq 1 ]; then
         local cmd="$base_cmd meta nfproto ipv4 $common_cond"
         [ -n "$ipv4_cond" ] && cmd="$cmd $ipv4_cond"
         cmd="$cmd meta mark set $class_mark counter"
         echo "$cmd"
     fi
-    if [ "$has_ipv6" -eq 1 ]; then
+    if [ "$do_ipv6" -eq 1 ]; then
         local cmd="$base_cmd meta nfproto ipv6 $common_cond"
         [ -n "$ipv6_cond" ] && cmd="$cmd $ipv6_cond"
         cmd="$cmd meta mark set $class_mark counter"
@@ -948,14 +1000,13 @@ apply_enhanced_direction_rules() {
     local rule_type="$1" chain="$2" mask="$3"
     log_info "应用增强$rule_type规则到链: $chain, 掩码: $mask"
 
-    # 确保链存在（若不存在则创建）
+    # 注意：ipset 集合已在 apply_all_rules 中生成，此处不再重复生成
+    # 确保链存在
     nft add chain inet gargoyle-qos-priority "$chain" 2>/dev/null || true
 
     local direction=""
     [ "$chain" = "filter_qos_egress" ] && direction="upload"
     [ "$chain" = "filter_qos_ingress" ] && direction="download"
-
-    generate_ipset_sets || log_warn "ipset 集合加载失败"
 
     local rule_list=$(load_all_config_sections "$CONFIG_FILE" "$rule_type")
     [ -z "$rule_list" ] && { log_info "未找到$rule_type规则配置"; return 0; }
@@ -1041,6 +1092,7 @@ EOF
         generate_tcp_upgrade_rules >> "$nft_batch_file"
     fi
 
+    local batch_success=0
     if [ -s "$nft_batch_file" ]; then
         log_info "执行批量nft规则 (共 $rule_count 条)..."
         nft_output=$(nft -f "$nft_batch_file" 2>&1)
@@ -1055,16 +1107,29 @@ EOF
         else
             log_error "❌ 批量规则应用失败 (退出码: $nft_ret)"
             log_error "nft 错误输出: $nft_output"
+            batch_success=1
         fi
     fi
 
     rm -f "$nft_batch_file" "$temp_config"
+    return $batch_success
 }
 
 apply_all_rules() {
     local rule_type="$1" mask="$2" chain="$3"
     log_info "开始应用 $rule_type 规则到链 $chain (掩码: $mask)"
+
+    # 首次调用时清空表并生成 ipset 集合
+    if [ "$_QOS_TABLE_FLUSHED" -eq 0 ]; then
+        log_info "初始化 nftables 表"
+        nft add table inet gargoyle-qos-priority 2>/dev/null || true
+        nft flush table inet gargoyle-qos-priority 2>/dev/null || true
+        generate_ipset_sets
+        _QOS_TABLE_FLUSHED=1
+    fi
+
     apply_enhanced_direction_rules "$rule_type" "$chain" "$mask"
+    return $?
 }
 
 # ========== 健康检查 ==========
@@ -1390,13 +1455,10 @@ init_ruleset() {
 }
 
 restore_main_config() {
-    if [ -f "/etc/config/${CONFIG_FILE}.bak" ]; then
-        cp "/etc/config/${CONFIG_FILE}.bak" "/etc/config/${CONFIG_FILE}"
-        rm -f "/etc/config/${CONFIG_FILE}.bak"
-        uci commit ${CONFIG_FILE}
-        log_info "已恢复主配置文件备份"
-    fi
+    # 仅清理规则集标记和备份文件，不恢复配置（避免覆盖用户修改）
+    rm -f "/etc/config/${CONFIG_FILE}.bak"
     rm -f "$RULESET_MERGED_FLAG"
+    log_info "已清理规则集标记和备份文件"
 }
 
 # ========== 自动加载全局配置 ==========

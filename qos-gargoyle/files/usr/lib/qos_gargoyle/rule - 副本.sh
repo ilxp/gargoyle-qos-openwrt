@@ -571,8 +571,8 @@ calculate_memory_limit() {
         fi
         
         if [ -n "$total_mem_mb" ] && [ "$total_mem_mb" -gt 0 ] 2>/dev/null; then
-            # 每256MB内存分配1MB，向上取整
-            result="$(((total_mem_mb + 255) / 256))Mb"
+            # 每64MB内存分配1MB，向上取整
+			result="$(((total_mem_mb + 63) / 64))Mb"
             
             local min_limit=4
             local max_limit=32

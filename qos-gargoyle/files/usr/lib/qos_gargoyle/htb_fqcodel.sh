@@ -1,16 +1,13 @@
 #!/bin/sh
 # HTB_FQCODEL算法实现模块
-# 版本: 2.3.0 - 完全适配 rule.sh 2.4.3，整合所有新功能（速率限制、ACK限速、TCP升级、内联规则、健康检查等）
+# 版本: 2.4.0 - 修复入口重定向 connmark 覆盖问题，移除重复函数依赖 rule.sh 2.4.15
 # 基于HTB与FQ_CODEL组合算法实现QoS流量控制。
 
 # ========== 全局配置常量 ==========
 : ${CONFIG_FILE:=qos_gargoyle}
-: ${LOCK_DIR:=/var/run/htb_fqcodel.lock}
-: ${LOCK_PID_FILE:=$LOCK_DIR/pid}
 : ${MAX_PHYSICAL_BANDWIDTH:=10000000}
 : ${UPLOAD_MASK:=0xFFFF}
 : ${DOWNLOAD_MASK:=0xFFFF0000}
-: ${QOS_RUNNING_FILE:=/var/run/htb_fqcodel.running}
 : ${DELETE_IFB_ON_STOP:=0}
 : ${DEBUG:=0}
 
@@ -33,7 +30,7 @@ else
     exit 1
 fi
 
-# 锁持有标志
+# 锁持有标志（由 rule.sh 管理）
 HAVE_LOCK=0
 
 main_cleanup() {
@@ -48,7 +45,7 @@ trap main_cleanup EXIT INT TERM HUP QUIT
 . /lib/functions/network.sh
 include /lib/network
 
-# ========== HTB 特有的配置加载 ==========
+# ========== HTB 与 FQ_CODEL 专属配置加载 ==========
 load_htb_fqcodel_config() {
     qos_log "INFO" "加载HTB与fq_codel配置"
     if ! load_bandwidth_from_config; then
@@ -63,14 +60,9 @@ load_htb_fqcodel_config() {
         qos_log "INFO" "从配置文件读取IFB设备: $IFB_DEVICE"
     fi
     HTB_R2Q=$(uci -q get qos_gargoyle.htb.r2q 2>/dev/null)
-    if [ -z "$HTB_R2Q" ]; then
-        HTB_R2Q=10
-        qos_log "INFO" "HTB R2Q使用默认值: ${HTB_R2Q}"
-    fi
+    [ -z "$HTB_R2Q" ] && HTB_R2Q=10
     HTB_DRR_QUANTUM=$(uci -q get qos_gargoyle.htb.drr_quantum 2>/dev/null)
-    if [ -z "$HTB_DRR_QUANTUM" ]; then
-        HTB_DRR_QUANTUM="auto"
-    fi
+    [ -z "$HTB_DRR_QUANTUM" ] && HTB_DRR_QUANTUM="auto"
     FQCODEL_LIMIT=$(uci -q get qos_gargoyle.fq_codel.limit 2>/dev/null)
     if [ -z "$FQCODEL_LIMIT" ]; then
         qos_log "ERROR" "fq_codel limit 未配置"
@@ -170,6 +162,79 @@ load_htb_class_config() {
     return 0
 }
 
+load_upload_class_configurations() {
+    qos_log "INFO" "正在加载上传类别配置..."
+    upload_class_list=$(load_all_config_sections "$CONFIG_FILE" "upload_class")
+    if [ -n "$upload_class_list" ]; then
+        qos_log "INFO" "找到上传类别: $upload_class_list"
+    else
+        qos_log "WARN" "没有找到上传类别配置"
+        upload_class_list=""
+    fi
+    return 0
+}
+
+load_download_class_configurations() {
+    qos_log "INFO" "正在加载下载类别配置..."
+    download_class_list=$(load_all_config_sections "$CONFIG_FILE" "download_class")
+    if [ -n "$download_class_list" ]; then
+        qos_log "INFO" "找到下载类别: $download_class_list"
+    else
+        qos_log "WARN" "没有找到下载类别配置"
+        download_class_list=""
+    fi
+    return 0
+}
+
+# ========== HTB 辅助函数 ==========
+calculate_htb_burst() {
+    local rate="$1"  # 单位: kbit
+    local ceil="$2"  # 单位: kbit
+    local mtu="$3"   # MTU大小
+    if [ -z "$mtu" ]; then
+        mtu=1500
+    fi
+    if [ "$rate" -gt 10000000 ] 2>/dev/null; then
+        qos_log "WARN" "带宽值过大 ($rate kbit)，burst计算可能溢出，进行限制"
+        rate=10000000
+    fi
+    local burst_kb=$((rate / 8))
+    if [ "$burst_kb" -lt 1 ]; then
+        burst_kb=1
+    fi
+    if [ "$burst_kb" -gt 1048576 ]; then
+        burst_kb=1048576
+        qos_log "WARN" "burst值超过1GB，已限制为1048576KB"
+    fi
+    local mtu_kb=$((mtu * 3 / 1024))
+    if [ "$mtu_kb" -lt 1 ]; then
+        mtu_kb=1
+    fi
+    if [ "$burst_kb" -lt "$mtu_kb" ]; then
+        burst_kb="$mtu_kb"
+    fi
+    local cburst_kb=$((burst_kb * 2))
+    if [ "$cburst_kb" -gt 1048576 ]; then
+        cburst_kb=1048576
+    fi
+    echo "${burst_kb}kb ${cburst_kb}kb"
+}
+
+# ========== fq_codel 参数构建 ==========
+build_fq_codel_params() {
+    local params="limit ${FQCODEL_LIMIT} target ${FQCODEL_TARGET} interval ${FQCODEL_INTERVAL} flows ${FQCODEL_FLOWS} quantum ${FQCODEL_QUANTUM}"
+    if [ -n "$FQCODEL_MEMORY_LIMIT" ]; then
+        params="$params memory_limit ${FQCODEL_MEMORY_LIMIT}"
+    fi
+    if [ -n "$FQCODEL_CE_THRESHOLD" ]; then
+        params="$params ce_threshold ${FQCODEL_CE_THRESHOLD}"
+    fi
+    if [ -n "$FQCODEL_ECN" ]; then
+        params="$params $FQCODEL_ECN"
+    fi
+    echo "$params"
+}
+
 # ========== HTB 核心队列函数 ==========
 create_htb_root_qdisc() {
     local device="$1"
@@ -209,22 +274,6 @@ create_htb_root_qdisc() {
     return 0
 }
 
-# 构建 fq_codel 参数字符串
-build_fq_codel_params() {
-    local params="limit ${FQCODEL_LIMIT} target ${FQCODEL_TARGET} interval ${FQCODEL_INTERVAL} flows ${FQCODEL_FLOWS} quantum ${FQCODEL_QUANTUM}"
-    if [ -n "$FQCODEL_MEMORY_LIMIT" ]; then
-        params="$params memory_limit ${FQCODEL_MEMORY_LIMIT}"
-    fi
-    if [ -n "$FQCODEL_CE_THRESHOLD" ]; then
-        params="$params ce_threshold ${FQCODEL_CE_THRESHOLD}"
-    fi
-    if [ -n "$FQCODEL_ECN" ]; then
-        params="$params $FQCODEL_ECN"
-    fi
-    echo "$params"
-}
-
-# 创建单个上传类
 create_htb_upload_class() {
     local class_name="$1"
     local class_index="$2"
@@ -334,7 +383,6 @@ create_htb_upload_class() {
     return 0
 }
 
-# 创建单个下载类（使用IFB设备）
 create_htb_download_class() {
     local class_name="$1"
     local class_index="$2"
@@ -539,14 +587,10 @@ create_default_download_class() {
     return 0
 }
 
-# ========== 入口重定向（三重尝试） ==========
+# ========== 入口重定向（修复 connmark 覆盖问题） ==========
 setup_ingress_redirect() {
     if [ -z "$qos_interface" ]; then
         qos_log "ERROR" "无法确定 WAN 接口"
-        return 1
-    fi
-    if ! check_tc_connmark_support; then
-        qos_log "ERROR" "内核不支持 tc action connmark，无法实现下载方向QoS"
         return 1
     fi
     qos_log "INFO" "设置入口重定向: $qos_interface -> $IFB_DEVICE"
@@ -556,10 +600,9 @@ setup_ingress_redirect() {
         return 1
     fi
     tc filter del dev "$qos_interface" parent ffff: 2>/dev/null || true
-    # IPv4 重定向（必须成功）
+    # IPv4 重定向（直接重定向，不使用 connmark）
     if ! tc filter add dev "$qos_interface" parent ffff: protocol ip \
         u32 match u32 0 0 \
-        action connmark \
         action mirred egress redirect dev "$IFB_DEVICE" 2>&1; then
         qos_log "ERROR" "IPv4入口重定向规则添加失败"
         tc qdisc del dev "$qos_interface" ingress 2>/dev/null
@@ -580,7 +623,6 @@ setup_ingress_redirect() {
     # 第一优先：flower 匹配全球单播地址 (2000::/3)
     if tc filter add dev "$qos_interface" parent ffff: protocol ipv6 \
         flower dst_ip 2000::/3 \
-        action connmark \
         action mirred egress redirect dev "$IFB_DEVICE" 2>&1; then
         ipv6_success=true
         qos_log "INFO" "IPv6入口重定向规则（flower 匹配全球单播）添加成功"
@@ -589,7 +631,6 @@ setup_ingress_redirect() {
         # 第二优先：u32 匹配全球单播地址 (2000::/3)
         if tc filter add dev "$qos_interface" parent ffff: protocol ipv6 \
             u32 match u32 0x20000000 0xe0000000 at 24 \
-            action connmark \
             action mirred egress redirect dev "$IFB_DEVICE" 2>&1; then
             ipv6_success=true
             qos_log "INFO" "IPv6入口重定向规则（u32 全球单播）添加成功"
@@ -598,7 +639,6 @@ setup_ingress_redirect() {
             # 第三优先：无过滤的 u32 全匹配
             if tc filter add dev "$qos_interface" parent ffff: protocol ipv6 \
                 u32 match u32 0 0 \
-                action connmark \
                 action mirred egress redirect dev "$IFB_DEVICE" 2>&1; then
                 ipv6_success=true
                 qos_log "INFO" "IPv6入口重定向规则（无过滤）添加成功"
@@ -932,7 +972,6 @@ init_htb_fqcodel_qos() {
     if ! init_ruleset; then
         qos_log "ERROR" "初始化规则集失败，QoS 无法启动"
         release_lock
-        rm -f "$QOS_RUNNING_FILE"
         return 1
     fi
     nft flush chain inet gargoyle-qos-priority filter_qos_egress 2>/dev/null
@@ -1101,7 +1140,7 @@ stop_htb_fqcodel_qos() {
 # ========== 状态显示函数 ==========
 show_htb_fqcodel_status() {
     if [ -z "$IFB_DEVICE" ]; then
-        IFB_DEVICE=$(uci -q get qos_gargoyle.download.ifb_device)
+        IFB_DEVICE=$(uci -q get qos_gargoyle.download.ifb_device 2>/dev/null)
         [ -z "$IFB_DEVICE" ] && IFB_DEVICE="ifb0"
     fi
     local qos_ifb="$IFB_DEVICE"
@@ -1109,7 +1148,7 @@ show_htb_fqcodel_status() {
         qos_interface=$(tc qdisc show 2>/dev/null | grep -E "htb.*root" | awk '{print $5}' | head -1)
         [ -z "$qos_interface" ] && qos_interface="未知"
     fi
-    echo "===== HTB-FQ_CODEL QoS 状态报告 (v2.3.0) ====="
+    echo "===== HTB-FQ_CODEL QoS 状态报告 (v2.4.0) ====="
     echo "时间: $(date)"
     echo "WAN接口: ${qos_interface}"
     if ! tc qdisc show dev "${qos_interface}" 2>/dev/null | grep -q htb; then
