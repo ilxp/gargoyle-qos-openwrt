@@ -1,6 +1,6 @@
 #!/bin/sh
 # 规则辅助模块 (rule.sh)
-# 版本: 2.6.4 - 修复IPv6地址验证支持 `::` 缩写，修复纯数字比较缺少 `eq` 操作符
+# 版本: 2.6.5 - 修复 build_nft_rule_fast 中局部变量未声明问题，添加 tcp flags 集合语法兼容性注释
 # 注意：算法模块中不应重复定义 load_upload_class_configurations / load_download_class_configurations
 
 : ${DEBUG:=0}
@@ -1053,13 +1053,14 @@ get_custom_include() {
     fi
 }
 
-# ========== nft 规则构建（增强版，修复纯数字比较缺少 eq） ==========
+# ========== nft 规则构建（增强版，修复局部变量未声明问题） ==========
 build_nft_rule_fast() {
     local rule_name="$1" chain="$2" class_mark="$3" mask="$4" family="$5" proto="$6"
     local srcport="$7" dstport="$8" connbytes_kb="$9" state="${10}" src_ip="${11}" dest_ip="${12}"
     local packet_len="${13}" tcp_flags="${14}" iif="${15}" oif="${16}" udp_length="${17}"
     local dscp="${18}" ttl="${19}" icmp_type="${20}"
     local has_ipv4=0 has_ipv6=0 ipv4_cond="" ipv6_cond=""
+    local nft_op   # 声明局部变量
 
     if [ -n "$src_ip" ]; then
         local src_neg=""
@@ -1154,6 +1155,7 @@ build_nft_rule_fast() {
 
     if [ -n "$tcp_flags" ] && [ "$proto" = "tcp" ]; then
         local flags_list=$(echo "$tcp_flags" | tr ',' ' ')
+        # tcp flags { ... } 集合语法要求 nftables >= 0.9.0，但大多数现代系统已支持
         common_cond="$common_cond tcp flags { $flags_list }"
     fi
 
