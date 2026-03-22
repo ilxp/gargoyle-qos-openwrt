@@ -15,21 +15,23 @@
 #include <libubox/avl-cmp.h>
 #include <bpf/bpf.h>
 #include <uci.h>
-#include "idclass.h"
 #include <unistd.h>
 #include <sys/stat.h>
 #include <fcntl.h>
+#include <net/if.h>                 // 新增，用于 if_nametoindex
+#include "idclass.h"
+
 #define PERSISTENT_CLASS_MARKS "/etc/qos_gargoyle/class_marks"
 
 static int idclass_map_fds[__CL_MAP_MAX];
 static AVL_TREE(map_data, idclass_map_entry_cmp, false, NULL);
 static LIST_HEAD(map_files);
-static struct idclass_class *map_class[IDCLASS_MAX_CLASS_ENTRIES];
+static struct idclass_class_entry *map_class[IDCLASS_MAX_CLASS_ENTRIES];
 static uint32_t next_timeout;
 static uint8_t idclass_dscp_default[2] = { 0xff, 0xff };
 int idclass_map_timeout = 3600;
 int idclass_active_timeout = 300;
-struct idclass_global_config global_config;
+struct global_config global_config;          // 修正类型
 struct idclass_flow_config global_flow_config;
 static uint32_t map_dns_seq;
 
@@ -103,6 +105,7 @@ static int read_float_mult100(const char *val)
 	return (int)(d * 100 + 0.5);
 }
 
+/* 比较函数定义前置，避免隐式声明 */
 static int idclass_map_entry_cmp(const void *k1, const void *k2, void *ptr)
 {
     const struct idclass_map_data *d1 = k1;
@@ -572,7 +575,7 @@ static bool idclass_map_entry_refresh_timeout(struct idclass_map_entry *e)
 
     if (e->data.id != CL_MAP_IPV4_ADDR && e->data.id != CL_MAP_IPV6_ADDR)
         return false;
-    if (bpf_map_lookup_elem(fd, &e->data.addr, &val))
+    if (bpf_map_lookup_elem(fd, &e->data.addr, &val) != 0)
         return false;
     if (!val.seen)
         return false;
@@ -760,7 +763,7 @@ void idclass_map_stats(struct blob_buf *b, bool reset)
 
         if (!map_class[i])
             continue;
-        if (bpf_map_lookup_elem(idclass_map_fds[CL_MAP_CLASS], &i, &data) < 0)
+        if (bpf_map_lookup_elem(idclass_map_fds[CL_MAP_CLASS], &i, &data) != 0)
             continue;
         c = blobmsg_open_table(b, map_class[i]->name);
         blobmsg_add_u64(b, "packets", data.packets);
@@ -1144,7 +1147,7 @@ int load_idclass_config(void)
 
 static int idclass_map_create_class(struct blob_attr *attr)
 {
-    struct idclass_class *class;
+    struct idclass_class_entry *class;
     enum {
         MAP_CLASS_INGRESS,
         MAP_CLASS_EGRESS,
@@ -1228,6 +1231,12 @@ void idclass_map_update_config(void)
     bpf_map_update_elem(fd, &key, &global_config, BPF_ANY);
 }
 
+/* 辅助结构体，用于优先级映射 */
+struct class_prio {
+    int class_id;
+    int priority;
+};
+
 static int compare_priority(const void *a, const void *b)
 {
     int pa = ((const struct class_prio *)a)->priority;
@@ -1245,10 +1254,7 @@ static void build_priority_maps(void)
     struct uci_package *pkg;
     struct uci_element *e;
     struct uci_section *s;
-    struct class_prio {
-        int class_id;
-        int priority;
-    } up[16], down[16];
+    struct class_prio up[16], down[16];
     int up_cnt = 0, down_cnt = 0;
 
     uci = uci_alloc_context();
@@ -1340,14 +1346,12 @@ static void load_class_marks_from_file(void)
 {
     FILE *fp = fopen(PERSISTENT_CLASS_MARKS, "r");
     if (!fp) {
-        // 文件不存在时不报错，只是警告（可能由 rule.sh 生成）
         fprintf(stderr, "Info: %s not found, class marks may be missing\n", PERSISTENT_CLASS_MARKS);
         return;
     }
 
     char line[256];
     while (fgets(line, sizeof(line), fp)) {
-        // 去除换行符
         line[strcspn(line, "\n")] = 0;
         if (line[0] == '#' || line[0] == '\0')
             continue;
@@ -1367,7 +1371,6 @@ static void load_class_marks_from_file(void)
                 fprintf(stderr, "Invalid upload class id %d from %s\n", class_id, class_name);
                 continue;
             }
-            // 上传类 class_id 保持不变 (1-16)
         } else if (strncmp(class_name, "dclass_", 7) == 0) {
             class_id = atoi(class_name + 7);
             if (class_id < 1 || class_id > 16) {
@@ -1400,7 +1403,6 @@ static void generate_default_class_marks(void)
     FILE *fp;
     char path[256];
 
-    // 确保目录存在
     mkdir("/etc/qos_gargoyle", 0755);
 
     uci = uci_alloc_context();
@@ -1441,10 +1443,9 @@ static void generate_default_class_marks(void)
         }
 
         if (class_name && direction && class_id >= 1 && class_id <= 16) {
-            uint32_t mark = class_id; // 默认 mark = class_id
+            uint32_t mark = class_id;
             fprintf(fp, "%s:%s:%u\n", direction, class_name, mark);
 
-            // 更新 eBPF map
             int fd = idclass_map_fds[CL_MAP_CLASS_MARK];
             if (fd >= 0) {
                 int map_class_id = (strcmp(direction, "upload") == 0) ? class_id : class_id + 16;
@@ -1464,7 +1465,7 @@ struct ip_key {
     __u8 addr[16];
 };
 
-// 更新 ip_conn_map 的定时器回调（支持完整 IPv6 地址）
+// 更新 ip_conn_map 的定时器回调
 static void idclass_update_ip_conn(struct uloop_timeout *t)
 {
     __u32 key = 0, next_key;
@@ -1472,7 +1473,7 @@ static void idclass_update_ip_conn(struct uloop_timeout *t)
     __u32 cur_time = idclass_gettime();
     int fd = ip_conn_fd;
 
-    // 清空 ip_conn_map（先获取第一个 key，然后循环删除）
+    // 清空 ip_conn_map
     struct ip_key cur_key = {0};
     struct ip_key next_key_ip;
     while (bpf_map_get_next_key(fd, &cur_key, &next_key_ip) == 0) {
@@ -1486,13 +1487,12 @@ static void idclass_update_ip_conn(struct uloop_timeout *t)
         if (bpf_map_lookup_elem(flow_stats_fd, &next_key, &stats) == 0) {
             __u64 last_seen_sec = stats.last_seen / 1000000000ULL;
             if (cur_time - last_seen_sec <= idclass_active_timeout) {
-                // 检查 client_ip 是否非零（简单检查第一个字节即可）
                 if (stats.client_ip[0] != 0 || stats.client_ip[1] != 0) {
                     struct ip_key ipkey;
                     memcpy(ipkey.addr, stats.client_ip, 16);
-                    uint32_t *cnt = bpf_map_lookup_elem(fd, &ipkey);
-                    if (cnt) {
-                        uint32_t new_cnt = *cnt + 1;
+                    uint32_t cnt_val;
+                    if (bpf_map_lookup_elem(fd, &ipkey, &cnt_val) == 0) {
+                        uint32_t new_cnt = cnt_val + 1;
                         bpf_map_update_elem(fd, &ipkey, &new_cnt, BPF_EXIST);
                     } else {
                         uint32_t one = 1;
@@ -1515,21 +1515,17 @@ static void idclass_check_uci_reload(struct uloop_timeout *t)
     if (stat(path, &st) == 0) {
         if (st.st_mtime != last_uci_mtime) {
             last_uci_mtime = st.st_mtime;
-            // 重新加载 UCI 配置
             load_idclass_config();
-			load_class_marks_from_file();
-            // 更新 eBPF maps
+            load_class_marks_from_file();
             idclass_map_update_config();
-            // 同步所有 class 的 config
             sync_class_config();
-            // 重新构建优先级映射
             build_priority_maps();
         }
     }
     uloop_timeout_set(t, 1000);
 }
 
-// 新增：同步所有 class 的 config 为当前 global_flow_config
+// 同步所有 class 的 config 为当前 global_flow_config
 void sync_class_config(void)
 {
     int fd = idclass_map_fds[CL_MAP_CLASS];
@@ -1539,7 +1535,6 @@ void sync_class_config(void)
 
     while (bpf_map_get_next_key(fd, &key, &next_key) == 0) {
         if (bpf_map_lookup_elem(fd, &next_key, &class) == 0) {
-            // 仅更新 config 字段，保留 val 和 flags
             memcpy(&class.config, &global_flow_config, sizeof(global_flow_config));
             bpf_map_update_elem(fd, &next_key, &class, BPF_EXIST);
         }
@@ -1589,12 +1584,11 @@ int idclass_map_init(void)
     idclass_map_reset_config();
 
     load_idclass_config();
-	load_class_marks_from_file();
-    // 如果 class_marks 文件不存在，生成默认的
+    load_class_marks_from_file();
     if (access("/etc/qos_gargoyle/class_marks", F_OK) != 0) {
         generate_default_class_marks();
     }
-	
+
     build_priority_maps();
 
     ip_conn_timer.cb = idclass_update_ip_conn;

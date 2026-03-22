@@ -1,6 +1,7 @@
 #!/bin/sh
 # 规则辅助模块 (rule.sh)
-# 版本: 2.5.9 - 修复多值合并错误，修正动态集合降级语法，完善注释
+# 版本: 2.6.0 - 统一锁机制(flock)，修复动态集合语法、TCP升级规则语法，优化速率限制规则生成，修复各类bug
+# 基于原2.5.9全面优化
 
 : ${DEBUG:=0}
 
@@ -22,8 +23,7 @@ ACK_MED=100
 ACK_FAST=500
 ACK_XFAST=5000
 
-: ${LOCK_DIR:=/var/run/qos_gargoyle.lock}
-: ${LOCK_PID_FILE:=$LOCK_DIR/pid}
+: ${LOCK_DIR:=/var/run/qos_gargoyle.lock}      # flock 锁文件
 : ${QOS_RUNNING_FILE:=/var/run/qos_gargoyle.running}
 : ${MAX_PHYSICAL_BANDWIDTH:=10000000}
 
@@ -245,7 +245,6 @@ validate_ip() {
     return 1
 }
 
-# 验证 TCP 标志
 validate_tcp_flags() {
     local val="$1" param_name="$2"
     local flags="syn ack rst fin urg psh ecn cwr"
@@ -260,7 +259,6 @@ validate_tcp_flags() {
     return 0
 }
 
-# 验证包长度、UDP 长度表达式
 validate_length() {
     local value="$1" param_name="$2"
     [ -z "$value" ] && return 0
@@ -287,7 +285,6 @@ validate_length() {
     return 0
 }
 
-# 验证 DSCP 值
 validate_dscp() {
     local val="$1" param_name="$2"
     local neg=""
@@ -298,7 +295,6 @@ validate_dscp() {
     return 0
 }
 
-# 验证接口名
 validate_ifname() {
     local val="$1" param_name="$2"
     if ! echo "$val" | grep -qE '^[a-zA-Z0-9_.-]+$'; then
@@ -308,7 +304,6 @@ validate_ifname() {
     return 0
 }
 
-# 验证 ICMP 类型
 validate_icmp_type() {
     local val="$1" param_name="$2"
     local neg=""
@@ -326,7 +321,6 @@ validate_icmp_type() {
     return 0
 }
 
-# 验证 TTL 表达式
 validate_ttl() {
     local value="$1" param_name="$2"
     [ -z "$value" ] && return 0
@@ -369,25 +363,22 @@ init_class_marks_file() {
 allocate_class_marks() {
     local direction="$1" class_list="$2"
     local base_value i=1 mark mark_index
-    local used_indexes=""   # 字符串记录已占用的索引
+    local used_indexes=""
     local temp_file="${CLASS_MARKS_FILE}.tmp.$$"
 
     init_class_marks_file
-    # 上传低16位基值=1，下载高16位基值=65536
     if [ "$direction" = "upload" ]; then
         base_value=1
     else
         base_value=65536
     fi
 
-    # 第一遍：收集手动指定的索引，并检查冲突
     for class in $class_list; do
         mark_index=$(uci -q get "${CONFIG_FILE}.${class}.mark_index" 2>/dev/null)
         if [ -n "$mark_index" ]; then
             if ! validate_number "$mark_index" "$class.mark_index" 1 16; then
                 return 1
             fi
-            # 检查是否已经被占用
             case " $used_indexes " in
                 *" $mark_index "*)
                     log_error "类别 $class 指定的标记索引 $mark_index 已被占用"
@@ -398,15 +389,12 @@ allocate_class_marks() {
         fi
     done
 
-    # 第二遍：分配标记
     local next_auto=1
     for class in $class_list; do
         mark_index=$(uci -q get "${CONFIG_FILE}.${class}.mark_index" 2>/dev/null)
         if [ -n "$mark_index" ] && validate_number "$mark_index" "$class.mark_index" 1 16 2>/dev/null; then
-            # 用户已指定且有效
             :
         else
-            # 自动分配下一个可用索引
             while [ $next_auto -le 16 ]; do
                 case " $used_indexes " in
                     *" $next_auto "*) next_auto=$((next_auto + 1)) ;;
@@ -421,13 +409,11 @@ allocate_class_marks() {
             used_indexes="$used_indexes $mark_index"
             next_auto=$((next_auto + 1))
         fi
-        # 使用无符号32位运算，防止溢出
         mark=$(( (base_value << (mark_index - 1)) & 0xFFFFFFFF ))
         echo "$direction:$class:$mark" >> "$temp_file"
         log_info "类别 $class 分配标记索引 $mark_index (值: $mark / 0x$(printf '%X' $mark))"
     done
 
-    # 原子写入文件
     if [ -s "$temp_file" ]; then
         if [ -f "$CLASS_MARKS_FILE" ]; then
             grep -v "^$direction:" "$CLASS_MARKS_FILE" 2>/dev/null > "${temp_file}.merge"
@@ -479,7 +465,6 @@ load_all_config_sections() {
 load_all_config_options() {
     local config_name="$1" section_id="$2" prefix="$3"
     local escaped_section_id=$(printf "%s" "$section_id" | sed 's/[][\.*?^$()+{}|]/\\&/g')
-    # 初始化所有可能用到的变量（包括新增的）
     for var in class order enabled proto srcport dstport connbytes_kb family state src_ip dest_ip \
           tcp_flags packet_len dscp iif oif icmp_type udp_length ttl; do
         eval "${prefix}${var}=''"
@@ -487,7 +472,6 @@ load_all_config_options() {
     local config_data=$(uci show "${config_name}.${section_id}" 2>/dev/null)
     local val
 
-    # 处理 class（必须，且为单值）
     val=$(echo "$config_data" | grep "^${config_name}\\.${escaped_section_id}\\.class=" | cut -d= -f2-)
     if [ -n "$val" ]; then
         val=$(echo "$val" | sed "s/^'//; s/'$//; s/^\"//; s/\"$//" | tr -d '\n\r' | sed 's/[^a-zA-Z0-9_-]//g')
@@ -497,20 +481,16 @@ load_all_config_options() {
         return 1
     fi
 
-    # 定义哪些选项支持多个值（需要合并）
     local multi_opts="srcport dstport connbytes_kb src_ip dest_ip tcp_flags packet_len udp_length"
     
     for opt in order enabled proto srcport dstport connbytes_kb family state src_ip dest_ip \
           tcp_flags packet_len dscp iif oif icmp_type udp_length ttl; do
-        # 收集所有匹配的行
         local lines=$(echo "$config_data" | grep "^${config_name}\\.${escaped_section_id}\\.${opt}=")
         [ -z "$lines" ] && continue
         
         if echo " $multi_opts " | grep -q " $opt "; then
-            # 多值选项：合并所有行，用逗号分隔
             val=$(echo "$lines" | sed -n "s/^.*=//p" | sed "s/^'//; s/'$//; s/^\"//; s/\"$//" | paste -sd ',' -)
         else
-            # 单值选项：只取最后一行（UCI 同名 option 后定义的覆盖前者）
             val=$(echo "$lines" | tail -n1 | sed -n "s/^.*=//p" | sed "s/^'//; s/'$//; s/^\"//; s/\"$//")
         fi
         
@@ -940,10 +920,10 @@ generate_ack_limit_rules() {
 
     cat <<EOF
 # ACK rate limiting using dynamic sets
-add rule inet gargoyle-qos-priority filter_qos_egress meta length < 100 tcp flags ack add @xfst4ack { ct id limit rate over ${ACK_XFAST}/second } counter jump drop995
-add rule inet gargoyle-qos-priority filter_qos_egress meta length < 100 tcp flags ack add @fast4ack { ct id limit rate over ${ACK_FAST}/second } counter jump drop95
-add rule inet gargoyle-qos-priority filter_qos_egress meta length < 100 tcp flags ack add @med4ack { ct id limit rate over ${ACK_MED}/second } counter jump drop50
-add rule inet gargoyle-qos-priority filter_qos_egress meta length < 100 tcp flags ack add @slow4ack { ct id limit rate over ${ACK_SLOW}/second } counter jump drop50
+add rule inet gargoyle-qos-priority filter_qos_egress meta length < 100 tcp flags ack add @xfst4ack { ct id } limit rate over ${ACK_XFAST}/second counter jump drop995
+add rule inet gargoyle-qos-priority filter_qos_egress meta length < 100 tcp flags ack add @fast4ack { ct id } limit rate over ${ACK_FAST}/second counter jump drop95
+add rule inet gargoyle-qos-priority filter_qos_egress meta length < 100 tcp flags ack add @med4ack { ct id } limit rate over ${ACK_MED}/second counter jump drop50
+add rule inet gargoyle-qos-priority filter_qos_egress meta length < 100 tcp flags ack add @slow4ack { ct id } limit rate over ${ACK_SLOW}/second counter jump drop50
 EOF
 }
 
@@ -986,7 +966,6 @@ generate_tcp_upgrade_rules() {
         fi
     fi
 
-    # 检查 realtime_class 是否启用
     local enabled=$(uci -q get ${CONFIG_FILE}.${realtime_class}.enabled 2>/dev/null)
     if [ "$enabled" != "1" ] && [ -n "$enabled" ]; then
         log_warn "TCP升级：realtime 类 $realtime_class 未启用，跳过规则生成"
@@ -1001,8 +980,8 @@ generate_tcp_upgrade_rules() {
 
     cat <<EOF
 # TCP upgrade for slow connections (using dynamic set)
-add rule inet gargoyle-qos-priority filter_qos_egress meta l4proto tcp ct state established meta nfproto ipv4 add @slowtcp { ct id limit rate 150/second burst 150 packets } meta mark set $realtime_mark counter
-add rule inet gargoyle-qos-priority filter_qos_egress meta l4proto tcp ct state established meta nfproto ipv6 add @slowtcp { ct id limit rate 150/second burst 150 packets } meta mark set $realtime_mark counter
+add rule inet gargoyle-qos-priority filter_qos_egress meta l4proto tcp ct state established meta nfproto ipv4 ct id limit rate 150/second burst 150 packets add @slowtcp { ct id } meta mark set $realtime_mark counter
+add rule inet gargoyle-qos-priority filter_qos_egress meta l4proto tcp ct state established meta nfproto ipv6 ct id limit rate 150/second burst 150 packets add @slowtcp { ct id } meta mark set $realtime_mark counter
 EOF
 }
 
@@ -1100,7 +1079,6 @@ build_nft_rule_fast() {
     elif [ "$proto" = "tcp_udp" ]; then common_cond="meta l4proto { tcp, udp }"
     elif [ -n "$proto" ] && [ "$proto" != "all" ]; then common_cond="meta l4proto $proto"; fi
 
-    # 新增通用条件
     if [ -n "$packet_len" ]; then
         if echo "$packet_len" | grep -q '-'; then
             local min=${packet_len%-*} max=${packet_len#*-}
@@ -1157,7 +1135,6 @@ build_nft_rule_fast() {
         fi
     fi
 
-    # 端口匹配
     if [ "$proto" = "tcp" ] || [ "$proto" = "udp" ] || [ "$proto" = "tcp_udp" ]; then
         case "$chain" in
             *"ingress"*)
@@ -1173,7 +1150,6 @@ build_nft_rule_fast() {
         esac
     fi
 
-    # 连接状态
     if [ -n "$state" ]; then
         local state_value=$(echo "$state" | tr -d '{}')
         if echo "$state_value" | grep -q ','; then
@@ -1183,7 +1159,6 @@ build_nft_rule_fast() {
         fi
     fi
 
-    # 连接字节数
     if [ -n "$connbytes_kb" ] && [ "$connbytes_kb" != "0" ]; then
         if echo "$connbytes_kb" | grep -q '-'; then
             local min_val=${connbytes_kb%-*} max_val=${connbytes_kb#*-}
@@ -1201,7 +1176,6 @@ build_nft_rule_fast() {
 
     local base_cmd="add rule inet gargoyle-qos-priority $chain"
 
-    # IPv4 分支
     if [ "$do_ipv4" -eq 1 ]; then
         local cmd="$base_cmd meta nfproto ipv4 $common_cond"
         [ -n "$ipv4_cond" ] && cmd="$cmd $ipv4_cond"
@@ -1249,7 +1223,6 @@ build_nft_rule_fast() {
         echo "$cmd"
     fi
 
-    # IPv6 分支
     if [ "$do_ipv6" -eq 1 ]; then
         local cmd="$base_cmd meta nfproto ipv6 $common_cond"
         [ -n "$ipv6_cond" ] && cmd="$cmd $ipv6_cond"
@@ -1323,7 +1296,6 @@ apply_enhanced_direction_rules() {
     for rule; do
         [ -n "$rule" ] || continue
         if load_all_config_options "$CONFIG_FILE" "$rule" "tmp_"; then
-            # 使用制表符分隔字段，避免 IPv6 地址中的冒号干扰
             printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n" \
                 "$rule" "$tmp_class" "$tmp_order" "$tmp_enabled" "$tmp_proto" "$tmp_srcport" "$tmp_dstport" \
                 "$tmp_connbytes_kb" "$tmp_family" "$tmp_state" "$tmp_src_ip" "$tmp_dest_ip" >> "$temp_config"
@@ -1353,11 +1325,9 @@ EOF
         [ -z "$class_mark" ] && { log_error "规则 $rule_name 的类 $r_class 无法获取标记，跳过"; continue; }
         [ -z "$r_family" ] && r_family="inet"
         
-        # 净化端口字段（只保留数字、逗号、短横线）
         local clean_srcport=$(echo "$r_srcport" | tr -d '[:space:]' | sed 's/[^0-9,-]//g')
         local clean_dstport=$(echo "$r_dstport" | tr -d '[:space:]' | sed 's/[^0-9,-]//g')
         
-        # 调用增强版 build_nft_rule_fast，传递所有新选项
         build_nft_rule_fast "$rule_name" "$chain" "$class_mark" "$mask" "$r_family" "$r_proto" \
             "$clean_srcport" "$clean_dstport" "$r_connbytes" "$r_state" "$r_src_ip" "$r_dest_ip" \
             "$tmp_packet_len" "$tmp_tcp_flags" "$tmp_iif" "$tmp_oif" "$tmp_udp_length" \
@@ -1372,7 +1342,6 @@ EOF
         [ -n "$include_stmt" ] && echo "$include_stmt" >> "$nft_batch_file"
     fi
 
-    # 仅当链为 filter_qos_egress 时添加 ACK 和 TCP 升级规则（只在出口方向添加一次）
     if [ "$chain" = "filter_qos_egress" ]; then
         generate_ack_limit_rules >> "$nft_batch_file"
         generate_tcp_upgrade_rules >> "$nft_batch_file"
@@ -1408,26 +1377,21 @@ apply_all_rules() {
     if [ "$_QOS_TABLE_FLUSHED" -eq 0 ]; then
         log_info "初始化 nftables 表"
         nft add table inet gargoyle-qos-priority 2>/dev/null || true
-        # 只清空分类链和辅助链，保留钩子链的跳转规则
         nft flush chain inet gargoyle-qos-priority filter_qos_egress 2>/dev/null || true
         nft flush chain inet gargoyle-qos-priority filter_qos_ingress 2>/dev/null || true
         nft flush chain inet gargoyle-qos-priority drop995 2>/dev/null || true
         nft flush chain inet gargoyle-qos-priority drop95 2>/dev/null || true
         nft flush chain inet gargoyle-qos-priority drop50 2>/dev/null || true
-        # 如果启用了速率限制链，也清空它
         nft flush chain inet gargoyle-qos-priority $RATELIMIT_CHAIN 2>/dev/null || true
-        # 重新生成 ipset 集合（可能需要先删除再添加）
         generate_ipset_sets
 
-        # 检测 nftables 版本，选择兼容的集合类型
         local nft_version=$(nft --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)
         local set_key="ct id . ct direction"
-        if [ -n "$nft_version" ] && echo "$nft_version" | awk -v ver="$nft_version" '{ if (ver < "0.9.0") exit 0; else exit 1 }'; then
+        if [ -n "$nft_version" ] && echo "$nft_version" | awk -F. '{ if ($1<0 || ($1==0 && $2<9)) exit 0; else exit 1 }'; then
             log_warn "检测到 nftables 版本低于 0.9.0，动态集合将使用简单键 'ct id'（可能影响限速精度）"
             set_key="ct id"
         fi
 
-        # 创建 ACK 限速和 TCP 升级所需的动态集合，并记录成功状态
         local sets_ok=1
         if [ "$set_key" = "ct id" ]; then
             nft add set inet gargoyle-qos-priority xfst4ack '{ type ct id; flags dynamic; timeout 5m; }' 2>/dev/null || sets_ok=0
@@ -1449,7 +1413,6 @@ apply_all_rules() {
             ENABLE_TCP_UPGRADE=0
         fi
 
-        # 创建基础链（概率丢包） - 钩子链由主脚本创建，此处不再重复
         nft add chain inet gargoyle-qos-priority drop995 2>/dev/null || true
         nft add chain inet gargoyle-qos-priority drop95 2>/dev/null || true
         nft add chain inet gargoyle-qos-priority drop50 2>/dev/null || true
@@ -1468,6 +1431,53 @@ apply_all_rules() {
 
     apply_enhanced_direction_rules "$rule_type" "$chain" "$mask"
     return $?
+}
+
+# ========== 锁机制 (flock 实现，支持嵌套) ==========
+LOCK_FILE="/var/run/qos_gargoyle.lock"
+QOS_LOCK_FD=""
+LOCK_DEPTH=0
+
+acquire_lock() {
+    if [ -n "$QOS_LOCK_FD" ]; then
+        LOCK_DEPTH=$((LOCK_DEPTH + 1))
+        log_debug "已持有锁，深度: $LOCK_DEPTH"
+        return 0
+    fi
+
+    exec 100> "$LOCK_FILE"
+    if flock -n 100; then
+        QOS_LOCK_FD=100
+        LOCK_DEPTH=1
+        HAVE_LOCK=1
+        log_debug "成功获取锁 (FD: $QOS_LOCK_FD)"
+    else
+        log_warn "等待锁释放..."
+        flock -x 100
+        QOS_LOCK_FD=100
+        LOCK_DEPTH=1
+        HAVE_LOCK=1
+        log_debug "成功获取锁 (FD: $QOS_LOCK_FD)"
+    fi
+}
+
+release_lock() {
+    if [ -z "$QOS_LOCK_FD" ]; then
+        log_debug "未持有锁，无需释放"
+        return
+    fi
+
+    LOCK_DEPTH=$((LOCK_DEPTH - 1))
+    if [ "$LOCK_DEPTH" -gt 0 ]; then
+        log_debug "锁深度: $LOCK_DEPTH，暂不释放"
+        return
+    fi
+
+    flock -u "$QOS_LOCK_FD" 2>/dev/null
+    exec "$QOS_LOCK_FD"<&-
+    unset QOS_LOCK_FD LOCK_DEPTH
+    HAVE_LOCK=0
+    log_debug "锁已释放"
 }
 
 # ========== 健康检查 ==========
@@ -1562,16 +1572,13 @@ convert_bandwidth_to_kbit() {
     fi
 }
 
-# ========== 检查 tc connmark 支持（增强版） ==========
+# ========== 检查 tc connmark 支持 ==========
 check_tc_connmark_support() {
-    # 尝试加载必要的内核模块
     modprobe sch_ingress 2>/dev/null
     modprobe act_connmark 2>/dev/null
 
-    # 使用 dummy 接口测试（避免影响 lo）
     local dummy_dev="dummy0"
     ip link add "$dummy_dev" type dummy 2>/dev/null || {
-        # 若 dummy 不支持，回退到 lo
         dummy_dev="lo"
     }
     tc qdisc del dev "$dummy_dev" ingress 2>/dev/null
@@ -1654,7 +1661,6 @@ get_physical_interface_max_bandwidth() {
 }
 
 # ========== 加载带宽配置 ==========
-# ========== 加载带宽配置 ==========
 load_bandwidth_from_config() {
     log_info "加载带宽配置"
     local wan_if="$qos_interface"
@@ -1671,7 +1677,6 @@ load_bandwidth_from_config() {
     fi
     local max_physical_bw=$(get_physical_interface_max_bandwidth "$wan_if")
 
-    # 上传带宽：允许空或0，表示禁用上传QoS
     local config_upload_bw=$(uci -q get qos_gargoyle.upload.total_bandwidth 2>/dev/null)
     if [ -z "$config_upload_bw" ]; then
         log_info "上传总带宽未配置，将禁用上传QoS"
@@ -1691,7 +1696,6 @@ load_bandwidth_from_config() {
         fi
     fi
 
-    # 下载带宽：允许空或0，表示禁用下载QoS
     local config_download_bw=$(uci -q get qos_gargoyle.download.total_bandwidth 2>/dev/null)
     if [ -z "$config_download_bw" ]; then
         log_info "下载总带宽未配置，将禁用下载QoS"
@@ -1711,58 +1715,57 @@ load_bandwidth_from_config() {
         fi
     fi
 
-    # 即使两个方向都是0，也允许继续（后续会跳过初始化）
     return 0
 }
 
-# ========== 锁机制 ==========
-acquire_lock() {
-    if [ -d "$LOCK_DIR" ]; then
-        if [ -f "$LOCK_PID_FILE" ]; then
-            local old_pid=$(cat "$LOCK_PID_FILE" 2>/dev/null)
-            if kill -0 "$old_pid" 2>/dev/null; then
-                [ "$old_pid" -eq "$$" ] && { log_debug "已持有锁 (PID: $$)"; return 0; }
-                log_error "无法获取锁，进程 $old_pid 仍在运行"
-                return 1
-            else
-                log_warn "发现残留锁目录，进程 $old_pid 已不存在，清理中"
-                rm -rf "$LOCK_DIR"
-            fi
-        else
-            log_warn "锁目录 $LOCK_DIR 存在但无PID文件，尝试强制清理"
-            rm -rf "$LOCK_DIR" 2>/dev/null
-            [ -d "$LOCK_DIR" ] && { log_error "无法清理锁目录 $LOCK_DIR"; return 1; }
-        fi
+# ========== 规则集合并 ==========
+init_ruleset() {
+    local nofix="$1"
+    if [ "$nofix" = "1" ]; then
+        [ -f "$RULESET_MERGED_FLAG" ] && return 0
+        return 0
     fi
-    mkdir "$LOCK_DIR" || { log_error "无法创建锁目录"; return 1; }
-    echo "$$" > "$LOCK_PID_FILE"
-    HAVE_LOCK=1
-    log_debug "已获取锁: $LOCK_DIR (PID: $$)"
-    return 0
-}
+    [ -f "$RULESET_MERGED_FLAG" ] && return 0
 
-release_lock() {
-    [ "$HAVE_LOCK" = "1" ] || return
-    rm -f "$LOCK_PID_FILE"
-    rmdir "$LOCK_DIR" 2>/dev/null
-    HAVE_LOCK=0
-    log_debug "锁已释放"
-}
-
-# ========== 幂等性检查 ==========
-check_already_running() {
-    if [ -f "$QOS_RUNNING_FILE" ]; then
-        local pid=$(cat "$QOS_RUNNING_FILE" 2>/dev/null)
-        if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
-            log_error "QoS 已经在运行中 (PID: $pid)"
-            return 1
-        else
-            log_warn "发现残留的运行标记文件，清理中"
-            rm -f "$QOS_RUNNING_FILE"
-        fi
+    local ruleset ruleset_file
+    ruleset=$(uci -q get ${CONFIG_FILE}.global.ruleset 2>/dev/null)
+    [ -z "$ruleset" ] && ruleset="default.conf"
+    case "$ruleset" in *.conf) ;; *) ruleset="${ruleset}.conf" ;; esac
+    ruleset_file="$RULESET_DIR/$ruleset"
+    if [ ! -f "$ruleset_file" ]; then
+        log_error "规则集文件 $ruleset_file 不存在，无法加载任何规则！"
+        return 1
     fi
-    echo "$$" > "$QOS_RUNNING_FILE"
+
+    cp "/etc/config/${CONFIG_FILE}" "/etc/config/${CONFIG_FILE}.bak"
+    log_info "已备份主配置文件到 ${CONFIG_FILE}.bak"
+
+    if grep -q "^# === RULESET_" "/etc/config/${CONFIG_FILE}"; then
+        sed -i '/^# === RULESET_/,/^# === RULESET_END ===/d' "/etc/config/${CONFIG_FILE}"
+        log_info "已清理旧的规则集内容"
+    fi
+
+    {
+        echo ""
+        echo "# === RULESET_${ruleset} ==="
+        cat "$ruleset_file"
+        echo "# === RULESET_END ==="
+    } >> "/etc/config/${CONFIG_FILE}"
+
+    uci commit ${CONFIG_FILE}
+    touch "$RULESET_MERGED_FLAG"
+    log_info "已将规则集 $ruleset 合并到主配置文件"
     return 0
+}
+
+restore_main_config() {
+    if [ -f "/etc/config/${CONFIG_FILE}.bak" ]; then
+        mv "/etc/config/${CONFIG_FILE}.bak" "/etc/config/${CONFIG_FILE}"
+        uci commit ${CONFIG_FILE}
+        log_info "已恢复主配置文件备份"
+    fi
+    rm -f "$RULESET_MERGED_FLAG"
+    log_info "已清理规则集标记"
 }
 
 # ========== IPv6增强支持 ==========
@@ -1772,7 +1775,6 @@ setup_ipv6_specific_rules() {
     nft flush chain inet gargoyle-qos-priority filter_prerouting 2>/dev/null || true
     local ICMPV6_CRITICAL_TYPES="133,134,135,136,137"
 
-    # 使用高16位标记，避免与上传低16位冲突
     nft add rule inet gargoyle-qos-priority filter_prerouting \
         meta nfproto ipv6 ip6 daddr { ff02::1:2, ff02::1:3 } meta mark set 0x3F00 counter 2>/dev/null || true
     nft add rule inet gargoyle-qos-priority filter_prerouting \
@@ -1790,61 +1792,6 @@ setup_ipv6_specific_rules() {
     nft add rule inet gargoyle-qos-priority filter_prerouting \
         meta nfproto ipv6 udp dport 123 meta mark set 0x7F00 counter 2>/dev/null || true
     log_info "IPv6关键流量规则设置完成"
-}
-
-# ========== 规则集合并 ==========
-init_ruleset() {
-    local nofix="$1"
-    # 如果 nofix=1 则跳过合并
-    if [ "$nofix" = "1" ]; then
-        [ -f "$RULESET_MERGED_FLAG" ] && return 0
-        return 0
-    fi
-    [ -f "$RULESET_MERGED_FLAG" ] && return 0
-
-    local ruleset ruleset_file
-    ruleset=$(uci -q get ${CONFIG_FILE}.global.ruleset 2>/dev/null)
-    [ -z "$ruleset" ] && ruleset="default.conf"
-    case "$ruleset" in *.conf) ;; *) ruleset="${ruleset}.conf" ;; esac
-    ruleset_file="$RULESET_DIR/$ruleset"
-    if [ ! -f "$ruleset_file" ]; then
-        log_error "规则集文件 $ruleset_file 不存在，无法加载任何规则！"
-        return 1
-    fi
-
-    # 备份原配置文件
-    cp "/etc/config/${CONFIG_FILE}" "/etc/config/${CONFIG_FILE}.bak"
-    log_info "已备份主配置文件到 ${CONFIG_FILE}.bak"
-
-    # 删除旧的规则集段（如果存在）
-    if grep -q "^# === RULESET_" "/etc/config/${CONFIG_FILE}"; then
-        sed -i '/^# === RULESET_/,/^# === RULESET_END ===/d' "/etc/config/${CONFIG_FILE}"
-        log_info "已清理旧的规则集内容"
-    fi
-
-    # 追加新的规则集
-    {
-        echo ""
-        echo "# === RULESET_${ruleset} ==="
-        cat "$ruleset_file"
-        echo "# === RULESET_END ==="
-    } >> "/etc/config/${CONFIG_FILE}"
-
-    uci commit ${CONFIG_FILE}
-    touch "$RULESET_MERGED_FLAG"
-    log_info "已将规则集 $ruleset 合并到主配置文件"
-    return 0
-}
-
-restore_main_config() {
-    # 如果存在备份文件，恢复主配置
-    if [ -f "/etc/config/${CONFIG_FILE}.bak" ]; then
-        mv "/etc/config/${CONFIG_FILE}.bak" "/etc/config/${CONFIG_FILE}"
-        uci commit ${CONFIG_FILE}
-        log_info "已恢复主配置文件备份"
-    fi
-    rm -f "$RULESET_MERGED_FLAG"
-    log_info "已清理规则集标记"
 }
 
 # ========== 自动加载全局配置 ==========

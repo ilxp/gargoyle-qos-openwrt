@@ -1,7 +1,7 @@
 #!/bin/sh
 # HTB_CAKE算法实现模块
-# 版本: 2.4.1 - 修复入口重定向 connmark 覆盖问题，移除重复函数依赖 rule.sh 2.4.15
-# 基于HTB与CAKE组合算法实现QoS流量控制。
+# 版本: 2.6.0 - 统一锁机制(flock)，修复默认类索引计算，优化burst限制，增强错误处理
+# 基于HTB与CAKE组合算法实现QoS流量控制
 
 # ========== 全局配置常量 ==========
 : ${CONFIG_FILE:=qos_gargoyle}
@@ -30,14 +30,12 @@ else
     exit 1
 fi
 
-# 锁持有标志（由 rule.sh 管理）
+# 锁标志（由 rule.sh 管理，不再重复定义）
 HAVE_LOCK=0
 
 main_cleanup() {
     rm -f $TEMP_FILES 2>/dev/null
-    if [ "$HAVE_LOCK" = "1" ]; then
-        release_lock
-    fi
+    # 锁释放由 rule.sh 的 trap 处理，这里不再重复
 }
 trap main_cleanup EXIT INT TERM HUP QUIT
 
@@ -164,6 +162,7 @@ calculate_htb_burst() {
     if [ -z "$mtu" ]; then
         mtu=1500
     fi
+    # 限制带宽最大值避免溢出
     if [ "$rate" -gt 10000000 ] 2>/dev/null; then
         qos_log "WARN" "带宽值过大 ($rate kbit)，burst计算可能溢出，进行限制"
         rate=10000000
@@ -172,6 +171,7 @@ calculate_htb_burst() {
     if [ "$burst_kb" -lt 1 ]; then
         burst_kb=1
     fi
+    # 限制 burst 最大为 1GB，避免 tc 拒绝
     if [ "$burst_kb" -gt 1048576 ]; then
         burst_kb=1048576
         qos_log "WARN" "burst值超过1GB，已限制为1048576KB"
@@ -193,11 +193,18 @@ calculate_htb_burst() {
 # ========== CAKE 参数支持检查 ==========
 check_cake_param_support() {
     local param="$1"
-    tc qdisc del dev lo root 2>/dev/null
-    if tc qdisc add dev lo root cake bandwidth 1mbit "$param" 2>/dev/null; then
-        tc qdisc del dev lo root 2>/dev/null
+    # 使用临时 dummy 接口避免影响 lo
+    local dummy_dev="dummy0"
+    ip link add "$dummy_dev" type dummy 2>/dev/null || {
+        dummy_dev="lo"
+    }
+    tc qdisc del dev "$dummy_dev" root 2>/dev/null
+    if tc qdisc add dev "$dummy_dev" root cake bandwidth 1mbit "$param" 2>/dev/null; then
+        tc qdisc del dev "$dummy_dev" root 2>/dev/null
+        [ "$dummy_dev" != "lo" ] && ip link del "$dummy_dev" 2>/dev/null
         return 0
     else
+        [ "$dummy_dev" != "lo" ] && ip link del "$dummy_dev" 2>/dev/null
         return 1
     fi
 }
@@ -507,7 +514,7 @@ create_htb_download_class() {
     return 0
 }
 
-# ========== 入口重定向（修复 connmark 覆盖问题） ==========
+# ========== 入口重定向 ==========
 setup_ingress_redirect() {
     if [ -z "$qos_interface" ]; then
         qos_log "ERROR" "无法确定 WAN 接口"
@@ -520,10 +527,10 @@ setup_ingress_redirect() {
         return 1
     fi
     tc filter del dev "$qos_interface" parent ffff: 2>/dev/null || true
-    # IPv4 重定向（直接重定向，不使用 connmark）
+    # IPv4 重定向
     if ! tc filter add dev "$qos_interface" parent ffff: protocol ip \
         u32 match u32 0 0 \
-		action connmark \
+        action connmark \
         action mirred egress redirect dev "$IFB_DEVICE" 2>&1; then
         qos_log "ERROR" "IPv4入口重定向规则添加失败"
         tc qdisc del dev "$qos_interface" ingress 2>/dev/null
@@ -544,7 +551,7 @@ setup_ingress_redirect() {
     # 第一优先：flower 匹配全球单播地址 (2000::/3)
     if tc filter add dev "$qos_interface" parent ffff: protocol ipv6 \
         flower dst_ip 2000::/3 \
-		action connmark \
+        action connmark \
         action mirred egress redirect dev "$IFB_DEVICE" 2>&1; then
         ipv6_success=true
         qos_log "INFO" "IPv6入口重定向规则（flower 匹配全球单播）添加成功"
@@ -553,7 +560,7 @@ setup_ingress_redirect() {
         # 第二优先：u32 匹配全球单播地址 (2000::/3)
         if tc filter add dev "$qos_interface" parent ffff: protocol ipv6 \
             u32 match u32 0x20000000 0xe0000000 at 24 \
-			action connmark \
+            action connmark \
             action mirred egress redirect dev "$IFB_DEVICE" 2>&1; then
             ipv6_success=true
             qos_log "INFO" "IPv6入口重定向规则（u32 全球单播）添加成功"
@@ -562,7 +569,7 @@ setup_ingress_redirect() {
             # 第三优先：无过滤的 u32 全匹配
             if tc filter add dev "$qos_interface" parent ffff: protocol ipv6 \
                 u32 match u32 0 0 \
-				action connmark \
+                action connmark \
                 action mirred egress redirect dev "$IFB_DEVICE" 2>&1; then
                 ipv6_success=true
                 qos_log "INFO" "IPv6入口重定向规则（无过滤）添加成功"
@@ -752,6 +759,7 @@ init_htb_cake_download() {
     return 0
 }
 
+# ========== 默认类设置（修复索引计算，只考虑启用的类） ==========
 set_default_upload_class() {
     qos_log "INFO" "设置上传默认类别"
     if ! tc qdisc show dev "$qos_interface" root 2>/dev/null | grep -q "htb"; then
@@ -763,36 +771,41 @@ set_default_upload_class() {
     local found_index=2
     local found=0
     local first_enabled_class=""
+    local class_list=""
 
-    # 遍历所有类，只处理启用的类
+    # 构建启用类列表并计算索引
     for class_name in $upload_class_list; do
         local enabled=$(uci -q get ${CONFIG_FILE}.${class_name}.enabled 2>/dev/null)
         [ "$enabled" = "1" ] || [ -z "$enabled" ] || continue
+        class_list="$class_list $class_name"
         [ -z "$first_enabled_class" ] && first_enabled_class="$class_name"
+    done
+    class_list=$(echo "$class_list" | xargs)
+
+    # 计算默认类的索引
+    local idx=2
+    for class_name in $class_list; do
         if [ -n "$default_class_name" ] && [ "$class_name" = "$default_class_name" ]; then
-            found_index=$class_index
+            found_index=$idx
             found=1
             break
         fi
-        class_index=$((class_index + 1))
+        idx=$((idx + 1))
     done
 
     if [ -z "$default_class_name" ]; then
         qos_log "WARN" "上传默认类别未配置，将使用第一个启用的类别"
         if [ -n "$first_enabled_class" ]; then
             default_class_name="$first_enabled_class"
-            # 重新计算第一个启用类的索引
-            class_index=2
-            found=0
-            for class_name in $upload_class_list; do
-                local enabled=$(uci -q get ${CONFIG_FILE}.${class_name}.enabled 2>/dev/null)
-                [ "$enabled" = "1" ] || [ -z "$enabled" ] || continue
+            # 重新计算索引
+            idx=2
+            for class_name in $class_list; do
                 if [ "$class_name" = "$first_enabled_class" ]; then
-                    found_index=$class_index
+                    found_index=$idx
                     found=1
                     break
                 fi
-                class_index=$((class_index + 1))
+                idx=$((idx + 1))
             done
             qos_log "INFO" "自动选择第一个启用的类别: $default_class_name (ID: 1:$found_index)"
         else
@@ -803,18 +816,14 @@ set_default_upload_class() {
         qos_log "WARN" "未找到上传默认类别 '$default_class_name' 或该类未启用，使用第一个启用的类别"
         if [ -n "$first_enabled_class" ]; then
             default_class_name="$first_enabled_class"
-            # 重新计算第一个启用类的索引
-            class_index=2
-            found=0
-            for class_name in $upload_class_list; do
-                local enabled=$(uci -q get ${CONFIG_FILE}.${class_name}.enabled 2>/dev/null)
-                [ "$enabled" = "1" ] || [ -z "$enabled" ] || continue
+            idx=2
+            for class_name in $class_list; do
                 if [ "$class_name" = "$first_enabled_class" ]; then
-                    found_index=$class_index
+                    found_index=$idx
                     found=1
                     break
                 fi
-                class_index=$((class_index + 1))
+                idx=$((idx + 1))
             done
             qos_log "INFO" "回退使用类别 '$first_enabled_class' (ID: 1:$found_index)"
         else
@@ -842,36 +851,39 @@ set_default_download_class() {
     local found_index=2
     local found=0
     local first_enabled_class=""
+    local class_list=""
 
-    # 遍历所有类，只处理启用的类
+    # 构建启用类列表并计算索引
     for class_name in $download_class_list; do
         local enabled=$(uci -q get ${CONFIG_FILE}.${class_name}.enabled 2>/dev/null)
         [ "$enabled" = "1" ] || [ -z "$enabled" ] || continue
+        class_list="$class_list $class_name"
         [ -z "$first_enabled_class" ] && first_enabled_class="$class_name"
+    done
+    class_list=$(echo "$class_list" | xargs)
+
+    local idx=2
+    for class_name in $class_list; do
         if [ -n "$default_class_name" ] && [ "$class_name" = "$default_class_name" ]; then
-            found_index=$class_index
+            found_index=$idx
             found=1
             break
         fi
-        class_index=$((class_index + 1))
+        idx=$((idx + 1))
     done
 
     if [ -z "$default_class_name" ]; then
         qos_log "WARN" "下载默认类别未配置，将使用第一个启用的类别"
         if [ -n "$first_enabled_class" ]; then
             default_class_name="$first_enabled_class"
-            # 重新计算第一个启用类的索引
-            class_index=2
-            found=0
-            for class_name in $download_class_list; do
-                local enabled=$(uci -q get ${CONFIG_FILE}.${class_name}.enabled 2>/dev/null)
-                [ "$enabled" = "1" ] || [ -z "$enabled" ] || continue
+            idx=2
+            for class_name in $class_list; do
                 if [ "$class_name" = "$first_enabled_class" ]; then
-                    found_index=$class_index
+                    found_index=$idx
                     found=1
                     break
                 fi
-                class_index=$((class_index + 1))
+                idx=$((idx + 1))
             done
             qos_log "INFO" "自动选择第一个启用的类别: $default_class_name (ID: 1:$found_index)"
         else
@@ -882,18 +894,14 @@ set_default_download_class() {
         qos_log "WARN" "未找到下载默认类别 '$default_class_name' 或该类未启用，使用第一个启用的类别"
         if [ -n "$first_enabled_class" ]; then
             default_class_name="$first_enabled_class"
-            # 重新计算第一个启用类的索引
-            class_index=2
-            found=0
-            for class_name in $download_class_list; do
-                local enabled=$(uci -q get ${CONFIG_FILE}.${class_name}.enabled 2>/dev/null)
-                [ "$enabled" = "1" ] || [ -z "$enabled" ] || continue
+            idx=2
+            for class_name in $class_list; do
                 if [ "$class_name" = "$first_enabled_class" ]; then
-                    found_index=$class_index
+                    found_index=$idx
                     found=1
                     break
                 fi
-                class_index=$((class_index + 1))
+                idx=$((idx + 1))
             done
             qos_log "INFO" "回退使用类别 '$first_enabled_class' (ID: 1:$found_index)"
         else
@@ -902,7 +910,6 @@ set_default_download_class() {
         fi
     fi
 
-    # 使用 replace 确保 default 生效
     tc qdisc replace dev "$IFB_DEVICE" root handle 1:0 htb r2q $HTB_R2Q default $found_index 2>/dev/null || {
         qos_log "WARN" "replace 失败，尝试 change 方式"
         tc qdisc change dev "$IFB_DEVICE" root handle 1:0 htb default $found_index 2>/dev/null || true
@@ -929,8 +936,6 @@ apply_htb_specific_rules() {
         meta mark and 0x007f != 0 counter meta priority set "bulk" 2>/dev/null || true
     nft add rule inet gargoyle-qos-priority filter_qos_ingress_enhance \
         meta mark and 0x7f00 != 0 counter meta priority set "bulk" 2>/dev/null || true
-    #nft add rule inet gargoyle-qos-priority filter_qos_egress_enhance \
-        #ct state established,related counter meta mark set ct mark 2>/dev/null || true
     nft add rule inet gargoyle-qos-priority filter_qos_egress_enhance \
         meta mark and 0x0010 != 0 counter meta priority set "critical" 2>/dev/null || true
     nft add rule inet gargoyle-qos-priority filter_qos_ingress_enhance \
@@ -947,11 +952,8 @@ apply_htb_specific_rules() {
 # ========== 主初始化函数 ==========
 init_htb_cake_qos() {
     qos_log "INFO" "开始初始化HTB+CAKE QoS系统"
-    if ! acquire_lock; then
-        qos_log "ERROR" "无法获取并发锁，可能已有其他QoS进程在运行"
-        rm -f "$QOS_RUNNING_FILE"
-        return 1
-    fi
+    # 使用 rule.sh 的统一锁机制（支持嵌套）
+    acquire_lock
     if ! check_already_running; then
         qos_log "ERROR" "HTB+CAKE QoS 已经在运行中"
         release_lock
@@ -1026,11 +1028,13 @@ init_htb_cake_qos() {
     if ! apply_all_rules "upload_rule" "$UPLOAD_MASK" "filter_qos_egress"; then
         qos_log "ERROR" "上传规则应用失败，回滚"
         stop_htb_cake_qos
+        release_lock
         return 1
     fi
     if ! apply_all_rules "download_rule" "$DOWNLOAD_MASK" "filter_qos_ingress"; then
         qos_log "ERROR" "下载规则应用失败，回滚"
         stop_htb_cake_qos
+        release_lock
         return 1
     fi
     qos_log "INFO" "应用自定义规则成功"
@@ -1092,22 +1096,8 @@ init_htb_cake_qos() {
 # ========== 停止函数 ==========
 stop_htb_cake_qos() {
     qos_log "INFO" "停止HTB+CAKE QoS"
-    local got_lock=false
-    local retry=3
-    while [ $retry -gt 0 ]; do
-        if acquire_lock 2>/dev/null; then
-            got_lock=true
-            qos_log "DEBUG" "停止时获取锁成功"
-            break
-        else
-            retry=$((retry - 1))
-            [ $retry -gt 0 ] && sleep 1
-        fi
-    done
-    if ! $got_lock; then
-        qos_log "ERROR" "无法获取锁，停止操作退出，请稍后重试"
-        return 1
-    fi
+    # 获取锁（可能已被其他进程持有，但停止时需要独占）
+    acquire_lock
     rm -f "$QOS_RUNNING_FILE"
     if [ "$SAVE_NFT_RULES" = "1" ]; then
         rm -f /etc/nftables.d/qos_gargoyle_*.nft 2>/dev/null
@@ -1134,9 +1124,7 @@ stop_htb_cake_qos() {
     fi
     qos_log "INFO" "HTB+CAKE QoS停止完成"
     restore_main_config
-    if $got_lock; then
-        release_lock
-    fi
+    release_lock
 }
 
 # ========== 状态显示函数 ==========
@@ -1150,7 +1138,7 @@ show_htb_cake_status() {
         qos_interface=$(tc qdisc show 2>/dev/null | grep -E "htb.*root" | awk '{print $5}' | head -1)
         [ -z "$qos_interface" ] && qos_interface="未知"
     fi
-    echo "===== HTB-CAKE QoS 状态报告 (v2.4.0) ====="
+    echo "===== HTB-CAKE QoS 状态报告 (v2.6.0) ====="
     echo "时间: $(date)"
     echo "WAN接口: ${qos_interface}"
     if ! tc qdisc show dev "${qos_interface}" 2>/dev/null | grep -q htb; then

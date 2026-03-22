@@ -1,8 +1,8 @@
 #!/bin/sh /etc/rc.common
 #
 # QoS Gargoyle 初始化脚本 - 传统 init.d 版本
-# 支持多算法：HFSC, CAKE, FQ_CoDel, HTB, CAKE with DSCPclassify
-# 版本：2.3.0（新增 cake_dscp 算法）
+# 支持多算法：HFSC, CAKE, FQ_CoDel, HTB, CAKE with DSCPclassify, HFSC+CAKE, HTB+CAKE
+# 版本：2.6.0 - 统一锁机制(flock)，修复默认类索引计算，增强错误处理，整合 rule.sh
 #
 
 START=50
@@ -17,17 +17,15 @@ EXTRA_HELP="        show    显示当前 QoS 配置状态
 CONFIG_FILE="qos_gargoyle"
 UPLOAD_MASK="0xFFFF"
 DOWNLOAD_MASK="0xFFFF0000"
-LOCK_DIR="/var/run/qos_gargoyle.lock"          # 锁目录
-LOCK_PID_FILE="$LOCK_DIR/pid"                  # PID 文件
+LOCK_DIR="/var/run/qos_gargoyle.lock"          # 锁文件（flock 使用）
 SERVICE_NAME="qos_gargoyle"
 
 # 算法模块路径
 QOS_MODULES_DIR="/usr/lib/qos_gargoyle"
 CAKE_MODULE="$QOS_MODULES_DIR/cake.sh"
-CAKE_DSCP_MODULE="$QOS_MODULES_DIR/cake_dscp.sh"    # 新增 cake_dscp 模块
+CAKE_DSCP_MODULE="$QOS_MODULES_DIR/cake_dscp.sh"
 HFSC_CAKE_MODULE="$QOS_MODULES_DIR/hfsc_cake.sh"      
 HTB_CAKE_MODULE="$QOS_MODULES_DIR/htb_cake.sh" 
-HFSC_MODULE="$QOS_MODULES_DIR/hfsc_fqcodel.sh"
 HTB_MODULE="$QOS_MODULES_DIR/htb_fqcodel.sh"  
 RULE_HELPER="$QOS_MODULES_DIR/rule.sh"
 
@@ -68,7 +66,6 @@ get_service_status() {
 }
 
 # 检查服务是否正在运行
-# 修复: 使用 grep -E 支持多模式匹配
 is_service_running() {
     # 检查是否有 TC 队列
     if tc qdisc show 2>/dev/null | grep -qE "qdisc hfsc|qdisc cake|qdisc fq_codel|qdisc htb"; then
@@ -168,12 +165,6 @@ stop_qos() {
     # 不删除 IFB 设备
     echo "Note: IFB device $ifb_dev is not deleted to avoid network disruption"
     echo "To manually remove IFB device: ip link delete $ifb_dev"
-    
-    # 删除锁目录（使用目录锁）
-    if [ -d "$LOCK_DIR" ]; then
-        rm -rf "$LOCK_DIR" 2>/dev/null
-        echo "  Lock directory removed"
-    fi
     
     echo "QoS system stopped (network preserved)"
 }
@@ -332,6 +323,13 @@ load_common_libraries() {
     if [ -f "/lib/network" ]; then
         include /lib/network
     fi
+    # 加载 rule.sh 以获取锁函数和其他辅助函数
+    if [ -f "$RULE_HELPER" ]; then
+        . "$RULE_HELPER"
+    else
+        echo "错误: 规则辅助模块 $RULE_HELPER 未找到" >&2
+        exit 1
+    fi
 }
 
 # 加载算法模块
@@ -343,24 +341,21 @@ load_algorithm_module() {
         "hfsc_cake") module="$HFSC_CAKE_MODULE" ;;   
         "htb_cake") module="$HTB_CAKE_MODULE" ;; 
         "cake") module="$CAKE_MODULE" ;;
-        "cake_dscp") module="$CAKE_DSCP_MODULE" ;;    # 新增
-        "hfsc_fqcodel") module="$HFSC_MODULE" ;;
+        "cake_dscp") module="$CAKE_DSCP_MODULE" ;;
         "htb_fqcodel") module="$HTB_MODULE" ;;
         *)
             echo "Unknown algorithm: $algo, using htb_cake as default"
             module="$HTB_CAKE_MODULE"
-            algo="htb_cake"      # 修正算法名与模块一致
+            algo="htb_cake"
             ;;
     esac
     
     if [ -f "$module" ]; then
         . "$module"
-        # 更新 algorithm 变量为实际加载的算法（如果回退则已修改）
         algorithm="$algo"
         return 0
     else
         echo "Error: Algorithm module not found: $module"
-        # 如果默认模块不存在，返回失败
         return 1
     fi
 }
@@ -619,7 +614,6 @@ setup_nft_tables() {
 }
 
 # 创建/检查 IFB 设备（与 ifb.init 配合，不破坏现有设备）
-# 修复: 队列长度从配置读取或根据带宽计算
 create_ifb_device() {
     local ifb="${IFB_DEVICE:-ifb0}"
     echo "Ensuring IFB device $ifb is available..."
@@ -688,51 +682,6 @@ load_bandwidth_config() {
     echo " Download bandwidth: $total_download_bandwidth kbit/s"
 }
 
-# 应用分类规则
-apply_classification_rules() {
-    echo "Applying classification rules..."
-    
-    # 清空规则链（添加 2>/dev/null 避免链不存在时的错误）
-    nft flush chain inet gargoyle-qos-priority filter_qos_egress 2>/dev/null
-    nft flush chain inet gargoyle-qos-priority filter_qos_ingress 2>/dev/null
-    
-    echo "第一步：添加连接标记恢复规则..."
-    nft add rule inet gargoyle-qos-priority filter_qos_egress \
-        ct mark != 0 meta mark set ct mark counter
-    
-    nft add rule inet gargoyle-qos-priority filter_qos_ingress \
-        ct mark != 0 meta mark set ct mark counter
-    
-    echo "第二步：应用分类规则..."
-    if [ -f "$RULE_HELPER" ]; then
-        . "$RULE_HELPER"
-        
-        # 检查函数是否存在
-        if type apply_all_rules >/dev/null 2>&1; then
-            echo "上传分类规则..."
-            apply_all_rules "upload_rule" "$UPLOAD_MASK" "filter_qos_egress"
-        else
-            echo "警告: rule.sh 中未找到 apply_all_rules 函数，跳过上传规则"
-        fi
-        
-        if type apply_all_rules >/dev/null 2>&1; then
-            echo "下载分类规则..."
-            apply_all_rules "download_rule" "$DOWNLOAD_MASK" "filter_qos_ingress"
-        fi
-    else
-        echo "警告: 规则助手模块未找到: $RULE_HELPER"
-    fi
-    
-    echo "第三步：设置连接标记..."
-    nft add rule inet gargoyle-qos-priority filter_qos_egress \
-        meta mark != 0 ct mark set meta mark counter
-    
-    nft add rule inet gargoyle-qos-priority filter_qos_ingress \
-        meta mark != 0 ct mark set meta mark counter
-    
-    echo "分类规则应用完成"
-}
-
 # 启动 QoS 监控（从 UCI 读取参数并传递给 qosacc）
 start_qos_acc() {
     echo "Starting QoS acc..."
@@ -783,57 +732,12 @@ start_qos_acc() {
     echo "QoS acc started"
 }
 
-# ========== 锁函数（使用目录锁，支持 PID 重入）==========
-acquire_lock() {
-    if [ -d "$LOCK_DIR" ]; then
-        if [ -f "$LOCK_PID_FILE" ]; then
-            local old_pid=$(cat "$LOCK_PID_FILE" 2>/dev/null)
-            if [ -n "$old_pid" ] && kill -0 "$old_pid" 2>/dev/null; then
-                if [ "$old_pid" -eq "$$" ]; then
-                    echo "已持有锁 (PID: $$)"
-                    return 0
-                fi
-                echo "错误: 无法获取锁，进程 $old_pid 仍在运行" >&2
-                return 1
-            else
-                echo "警告: 发现残留锁目录，进程 $old_pid 已不存在，清理中" >&2
-                rm -rf "$LOCK_DIR"
-            fi
-        else
-            echo "警告: 锁目录 $LOCK_DIR 存在但无PID文件，尝试强制清理" >&2
-            rm -rf "$LOCK_DIR" 2>/dev/null
-            if [ -d "$LOCK_DIR" ]; then
-                echo "错误: 无法清理锁目录 $LOCK_DIR" >&2
-                return 1
-            fi
-        fi
-    fi
-
-    mkdir "$LOCK_DIR" || {
-        echo "错误: 无法创建锁目录" >&2
-        return 1
-    }
-    echo "$$" > "$LOCK_PID_FILE"
-    trap 'release_lock' EXIT INT TERM HUP QUIT
-    echo "已获取锁: $LOCK_DIR (PID: $$)"
-    return 0
-}
-
-release_lock() {
-    rm -f "$LOCK_PID_FILE"
-    rmdir "$LOCK_DIR" 2>/dev/null
-    echo "锁已释放"
-}
-
 # ========== 主初始化函数 ==========
 init_qos() {
     echo "init QoS system..."
     
-    # 获取锁
-    if ! acquire_lock; then
-        echo "无法获取锁，可能已有其他进程在运行，启动中止" >&2
-        return 1
-    fi
+    # 获取锁（使用 rule.sh 的统一锁函数）
+    acquire_lock
     
     if ! load_qos_config; then
         release_lock
@@ -873,17 +777,6 @@ init_qos() {
     
     load_bandwidth_config
     
-    # 应用分类规则（cake 和 cake_dscp 算法跳过）  #应用规则已经移动到各个算法中，这里不在使用
-    #echo "调用分类规则应用..."    
-    #if [ "$algorithm" = "cake" ] || [ "$algorithm" = "cake_dscp" ]; then
-        #echo "CAKE/Cake_DSCP算法，跳过外部分类规则加载"
-        #echo "CAKE使用内置DiffServ分类机制，无需NFTables分类规则"
-        #nft flush chain inet gargoyle-qos-priority filter_qos_egress 2>/dev/null
-        #nft flush chain inet gargoyle-qos-priority filter_qos_ingress 2>/dev/null
-    #else  
-        #apply_classification_rules
-    #fi
-    
     # 加载算法模块
     if ! load_algorithm_module "$algorithm"; then
         echo "Failed to load algorithm module: $algorithm"
@@ -895,20 +788,7 @@ init_qos() {
     # 调用算法特定的初始化，并捕获返回值
     local ALGO_RET=0
     case "$algorithm" in
-        "hfsc_fqcodel")
-            export RULES_ALREADY_APPLIED=1
-            if type init_hfsc_qos >/dev/null 2>&1; then
-                echo "正在初始化 HFSC QoS..."
-                init_hfsc_qos start
-                ALGO_RET=$?
-            else
-                echo "错误: HFSC 初始化函数未找到"
-                stop_qos
-                release_lock
-                return 1
-            fi
-            ;;
-        "cake"|"cake_dscp")                     # 新增 cake_dscp 分支
+        "cake"|"cake_dscp")
             export RULES_ALREADY_APPLIED=1
             if type init_cake_qos >/dev/null 2>&1; then
                 init_cake_qos start
@@ -1019,15 +899,7 @@ display_algorithm_specific_status() {
     fi
     
     case "$algorithm" in
-        "hfsc_fqcodel")
-            if type show_hfsc_status >/dev/null 2>&1; then
-                show_hfsc_status
-            else
-                echo "HFSC status function not found, showing basic status..."
-                show_basic_status
-            fi
-            ;;
-        "cake"|"cake_dscp")                     # 新增 cake_dscp 分支
+        "cake"|"cake_dscp")
             if type show_cake_status >/dev/null 2>&1; then
                 show_cake_status
             else
@@ -1043,7 +915,7 @@ display_algorithm_specific_status() {
                 show_basic_status
             fi
             ;;
-        "hfsc_cake")                               
+        "hfsc_cake")
             if type show_hfsc_cake_status >/dev/null 2>&1; then
                 show_hfsc_cake_status
             else
@@ -1051,7 +923,7 @@ display_algorithm_specific_status() {
                 show_basic_status
             fi
             ;;
-        "htb_cake")                                 
+        "htb_cake")
             if type show_htb_cake_status >/dev/null 2>&1; then
                 show_htb_cake_status
             else

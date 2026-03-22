@@ -1,6 +1,6 @@
 #!/bin/sh
 # HTB_FQCODEL算法实现模块
-# 版本: 2.4.0 - 修复入口重定向 connmark 覆盖问题，移除重复函数依赖 rule.sh 2.4.15
+# 版本: 2.6.0 - 统一锁机制(flock)，修复默认类索引计算，优化burst限制，增强错误处理
 # 基于HTB与FQ_CODEL组合算法实现QoS流量控制。
 
 # ========== 全局配置常量 ==========
@@ -35,9 +35,7 @@ HAVE_LOCK=0
 
 main_cleanup() {
     rm -f $TEMP_FILES 2>/dev/null
-    if [ "$HAVE_LOCK" = "1" ]; then
-        release_lock
-    fi
+    # 锁释放由 rule.sh 的 trap 处理，这里不再重复
 }
 trap main_cleanup EXIT INT TERM HUP QUIT
 
@@ -63,51 +61,64 @@ load_htb_fqcodel_config() {
     [ -z "$HTB_R2Q" ] && HTB_R2Q=10
     HTB_DRR_QUANTUM=$(uci -q get qos_gargoyle.htb.drr_quantum 2>/dev/null)
     [ -z "$HTB_DRR_QUANTUM" ] && HTB_DRR_QUANTUM="auto"
+
+    # fq_codel 参数：提供合理的默认值，避免因缺失配置而失败
     FQCODEL_LIMIT=$(uci -q get qos_gargoyle.fq_codel.limit 2>/dev/null)
     if [ -z "$FQCODEL_LIMIT" ]; then
-        qos_log "ERROR" "fq_codel limit 未配置"
-        return 1
+        FQCODEL_LIMIT=1000
+        qos_log "WARN" "fq_codel limit 未配置，使用默认值: $FQCODEL_LIMIT"
     fi
     if ! validate_number "$FQCODEL_LIMIT" "fq_codel.limit" 1 65535; then
-        return 1
+        qos_log "ERROR" "fq_codel limit 无效，使用默认值 1000"
+        FQCODEL_LIMIT=1000
     fi
+
     FQCODEL_INTERVAL=$(uci -q get qos_gargoyle.fq_codel.interval 2>/dev/null)
     if [ -z "$FQCODEL_INTERVAL" ]; then
-        qos_log "ERROR" "fq_codel interval 未配置"
-        return 1
+        FQCODEL_INTERVAL=100
+        qos_log "WARN" "fq_codel interval 未配置，使用默认值: ${FQCODEL_INTERVAL}us"
     fi
     if ! validate_number "$FQCODEL_INTERVAL" "fq_codel.interval" 1 1000000; then
-        return 1
+        qos_log "ERROR" "fq_codel interval 无效，使用默认值 100"
+        FQCODEL_INTERVAL=100
     fi
+
     FQCODEL_TARGET=$(uci -q get qos_gargoyle.fq_codel.target 2>/dev/null)
     if [ -z "$FQCODEL_TARGET" ]; then
-        qos_log "ERROR" "fq_codel target 未配置"
-        return 1
+        FQCODEL_TARGET=5
+        qos_log "WARN" "fq_codel target 未配置，使用默认值: ${FQCODEL_TARGET}us"
     fi
     if ! validate_number "$FQCODEL_TARGET" "fq_codel.target" 1 1000000; then
-        return 1
+        qos_log "ERROR" "fq_codel target 无效，使用默认值 5"
+        FQCODEL_TARGET=5
     fi
+
     FQCODEL_FLOWS=$(uci -q get qos_gargoyle.fq_codel.flows 2>/dev/null)
     if [ -z "$FQCODEL_FLOWS" ]; then
-        qos_log "ERROR" "fq_codel flows 未配置"
-        return 1
+        FQCODEL_FLOWS=1024
+        qos_log "WARN" "fq_codel flows 未配置，使用默认值: $FQCODEL_FLOWS"
     fi
     if ! validate_number "$FQCODEL_FLOWS" "fq_codel.flows" 1 65535; then
-        return 1
+        qos_log "ERROR" "fq_codel flows 无效，使用默认值 1024"
+        FQCODEL_FLOWS=1024
     fi
+
     FQCODEL_QUANTUM=$(uci -q get qos_gargoyle.fq_codel.quantum 2>/dev/null)
     if [ -z "$FQCODEL_QUANTUM" ]; then
-        qos_log "ERROR" "fq_codel quantum 未配置"
-        return 1
+        FQCODEL_QUANTUM=300
+        qos_log "WARN" "fq_codel quantum 未配置，使用默认值: $FQCODEL_QUANTUM"
     fi
     if ! validate_number "$FQCODEL_QUANTUM" "fq_codel.quantum" 1 10000; then
-        return 1
+        qos_log "ERROR" "fq_codel quantum 无效，使用默认值 300"
+        FQCODEL_QUANTUM=300
     fi
+
     FQCODEL_MEMORY_LIMIT=$(uci -q get qos_gargoyle.fq_codel.memory_limit 2>/dev/null)
     if [ -n "$FQCODEL_MEMORY_LIMIT" ]; then
         FQCODEL_MEMORY_LIMIT=$(calculate_memory_limit "$FQCODEL_MEMORY_LIMIT")
         FQCODEL_MEMORY_LIMIT=$(echo "$FQCODEL_MEMORY_LIMIT" | tr 'A-Z' 'a-z')
     fi
+
     FQCODEL_CE_THRESHOLD=$(uci -q get qos_gargoyle.fq_codel.ce_threshold 2>/dev/null)
     if [ -n "$FQCODEL_CE_THRESHOLD" ]; then
         if ! echo "$FQCODEL_CE_THRESHOLD" | grep -qiE '^0$|^[0-9]+(\.[0-9]+)?(us|ms)?$'; then
@@ -115,6 +126,7 @@ load_htb_fqcodel_config() {
             FQCODEL_CE_THRESHOLD=""
         fi
     fi
+
     FQCODEL_ECN=$(uci -q get qos_gargoyle.fq_codel.ecn 2>/dev/null)
     if [ -n "$FQCODEL_ECN" ]; then
         case "$FQCODEL_ECN" in
@@ -127,8 +139,9 @@ load_htb_fqcodel_config() {
         FQCODEL_ECN=""
         qos_log "INFO" "fq_codel ECN: 未配置"
     fi
+
     qos_log "INFO" "HTB配置: R2Q=${HTB_R2Q}, DRR量子=${HTB_DRR_QUANTUM}"
-    qos_log "INFO" "fq_codel参数: limit=${FQCODEL_LIMIT}, interval=${FQCODEL_INTERVAL}us, target=${FQCODEL_TARGET}us, flows=${FQCODEL_FLOWS}, quantum=${FQCODEL_QUANTUM}, memory_limit=${FQCODEL_MEMORY_LIMIT}, ce_threshold=${FQCODEL_CE_THRESHOLD}, ecn=${FQCODEL_ECN:-未配置}"
+    qos_log "INFO" "fq_codel参数: limit=${FQCODEL_LIMIT}, interval=${FQCODEL_INTERVAL}us, target=${FQCODEL_TARGET}us, flows=${FQCODEL_FLOWS}, quantum=${FQCODEL_QUANTUM}, memory_limit=${FQCODEL_MEMORY_LIMIT:-未配置}, ce_threshold=${FQCODEL_CE_THRESHOLD:-未配置}, ecn=${FQCODEL_ECN:-未配置}"
     return 0
 }
 
@@ -743,6 +756,7 @@ init_htb_fqcodel_download() {
     return 0
 }
 
+# ========== 默认类设置（修复索引计算，只考虑启用的类） ==========
 set_default_upload_class() {
     qos_log "INFO" "设置上传默认类别"
     if ! tc qdisc show dev "$qos_interface" root 2>/dev/null | grep -q "htb"; then
@@ -754,36 +768,41 @@ set_default_upload_class() {
     local found_index=2
     local found=0
     local first_enabled_class=""
+    local class_list=""
 
-    # 遍历所有类，只处理启用的类
+    # 构建启用类列表并计算索引
     for class_name in $upload_class_list; do
         local enabled=$(uci -q get ${CONFIG_FILE}.${class_name}.enabled 2>/dev/null)
         [ "$enabled" = "1" ] || [ -z "$enabled" ] || continue
+        class_list="$class_list $class_name"
         [ -z "$first_enabled_class" ] && first_enabled_class="$class_name"
+    done
+    class_list=$(echo "$class_list" | xargs)
+
+    # 计算默认类的索引
+    local idx=2
+    for class_name in $class_list; do
         if [ -n "$default_class_name" ] && [ "$class_name" = "$default_class_name" ]; then
-            found_index=$class_index
+            found_index=$idx
             found=1
             break
         fi
-        class_index=$((class_index + 1))
+        idx=$((idx + 1))
     done
 
     if [ -z "$default_class_name" ]; then
         qos_log "WARN" "上传默认类别未配置，将使用第一个启用的类别"
         if [ -n "$first_enabled_class" ]; then
             default_class_name="$first_enabled_class"
-            # 重新计算第一个启用类的索引
-            class_index=2
-            found=0
-            for class_name in $upload_class_list; do
-                local enabled=$(uci -q get ${CONFIG_FILE}.${class_name}.enabled 2>/dev/null)
-                [ "$enabled" = "1" ] || [ -z "$enabled" ] || continue
+            # 重新计算索引
+            idx=2
+            for class_name in $class_list; do
                 if [ "$class_name" = "$first_enabled_class" ]; then
-                    found_index=$class_index
+                    found_index=$idx
                     found=1
                     break
                 fi
-                class_index=$((class_index + 1))
+                idx=$((idx + 1))
             done
             qos_log "INFO" "自动选择第一个启用的类别: $default_class_name (ID: 1:$found_index)"
         else
@@ -794,18 +813,14 @@ set_default_upload_class() {
         qos_log "WARN" "未找到上传默认类别 '$default_class_name' 或该类未启用，使用第一个启用的类别"
         if [ -n "$first_enabled_class" ]; then
             default_class_name="$first_enabled_class"
-            # 重新计算第一个启用类的索引
-            class_index=2
-            found=0
-            for class_name in $upload_class_list; do
-                local enabled=$(uci -q get ${CONFIG_FILE}.${class_name}.enabled 2>/dev/null)
-                [ "$enabled" = "1" ] || [ -z "$enabled" ] || continue
+            idx=2
+            for class_name in $class_list; do
                 if [ "$class_name" = "$first_enabled_class" ]; then
-                    found_index=$class_index
+                    found_index=$idx
                     found=1
                     break
                 fi
-                class_index=$((class_index + 1))
+                idx=$((idx + 1))
             done
             qos_log "INFO" "回退使用类别 '$first_enabled_class' (ID: 1:$found_index)"
         else
@@ -833,36 +848,39 @@ set_default_download_class() {
     local found_index=2
     local found=0
     local first_enabled_class=""
+    local class_list=""
 
-    # 遍历所有类，只处理启用的类
+    # 构建启用类列表并计算索引
     for class_name in $download_class_list; do
         local enabled=$(uci -q get ${CONFIG_FILE}.${class_name}.enabled 2>/dev/null)
         [ "$enabled" = "1" ] || [ -z "$enabled" ] || continue
+        class_list="$class_list $class_name"
         [ -z "$first_enabled_class" ] && first_enabled_class="$class_name"
+    done
+    class_list=$(echo "$class_list" | xargs)
+
+    local idx=2
+    for class_name in $class_list; do
         if [ -n "$default_class_name" ] && [ "$class_name" = "$default_class_name" ]; then
-            found_index=$class_index
+            found_index=$idx
             found=1
             break
         fi
-        class_index=$((class_index + 1))
+        idx=$((idx + 1))
     done
 
     if [ -z "$default_class_name" ]; then
         qos_log "WARN" "下载默认类别未配置，将使用第一个启用的类别"
         if [ -n "$first_enabled_class" ]; then
             default_class_name="$first_enabled_class"
-            # 重新计算第一个启用类的索引
-            class_index=2
-            found=0
-            for class_name in $download_class_list; do
-                local enabled=$(uci -q get ${CONFIG_FILE}.${class_name}.enabled 2>/dev/null)
-                [ "$enabled" = "1" ] || [ -z "$enabled" ] || continue
+            idx=2
+            for class_name in $class_list; do
                 if [ "$class_name" = "$first_enabled_class" ]; then
-                    found_index=$class_index
+                    found_index=$idx
                     found=1
                     break
                 fi
-                class_index=$((class_index + 1))
+                idx=$((idx + 1))
             done
             qos_log "INFO" "自动选择第一个启用的类别: $default_class_name (ID: 1:$found_index)"
         else
@@ -873,18 +891,14 @@ set_default_download_class() {
         qos_log "WARN" "未找到下载默认类别 '$default_class_name' 或该类未启用，使用第一个启用的类别"
         if [ -n "$first_enabled_class" ]; then
             default_class_name="$first_enabled_class"
-            # 重新计算第一个启用类的索引
-            class_index=2
-            found=0
-            for class_name in $download_class_list; do
-                local enabled=$(uci -q get ${CONFIG_FILE}.${class_name}.enabled 2>/dev/null)
-                [ "$enabled" = "1" ] || [ -z "$enabled" ] || continue
+            idx=2
+            for class_name in $class_list; do
                 if [ "$class_name" = "$first_enabled_class" ]; then
-                    found_index=$class_index
+                    found_index=$idx
                     found=1
                     break
                 fi
-                class_index=$((class_index + 1))
+                idx=$((idx + 1))
             done
             qos_log "INFO" "回退使用类别 '$first_enabled_class' (ID: 1:$found_index)"
         else
@@ -893,7 +907,6 @@ set_default_download_class() {
         fi
     fi
 
-    # 使用 replace 确保 default 生效
     tc qdisc replace dev "$IFB_DEVICE" root handle 1:0 htb r2q $HTB_R2Q default $found_index 2>/dev/null || {
         qos_log "WARN" "replace 失败，尝试 change 方式"
         tc qdisc change dev "$IFB_DEVICE" root handle 1:0 htb default $found_index 2>/dev/null || true
@@ -938,11 +951,8 @@ apply_htb_specific_rules() {
 # ========== 主初始化函数 ==========
 init_htb_fqcodel_qos() {
     qos_log "INFO" "开始初始化HTB+FQ_CODEL QoS系统"
-    if ! acquire_lock; then
-        qos_log "ERROR" "无法获取并发锁，可能已有其他QoS进程在运行"
-        rm -f "$QOS_RUNNING_FILE"
-        return 1
-    fi
+    # 使用 rule.sh 的统一锁机制（支持嵌套）
+    acquire_lock
     if ! check_already_running; then
         qos_log "ERROR" "HTB+FQ_CODEL QoS 已经在运行中"
         release_lock
@@ -1017,11 +1027,13 @@ init_htb_fqcodel_qos() {
     if ! apply_all_rules "upload_rule" "$UPLOAD_MASK" "filter_qos_egress"; then
         qos_log "ERROR" "上传规则应用失败，回滚"
         stop_htb_fqcodel_qos
+        release_lock
         return 1
     fi
     if ! apply_all_rules "download_rule" "$DOWNLOAD_MASK" "filter_qos_ingress"; then
         qos_log "ERROR" "下载规则应用失败，回滚"
         stop_htb_fqcodel_qos
+        release_lock
         return 1
     fi
     qos_log "INFO" "应用自定义规则成功"
@@ -1083,22 +1095,8 @@ init_htb_fqcodel_qos() {
 # ========== 停止函数 ==========
 stop_htb_fqcodel_qos() {
     qos_log "INFO" "停止HTB+FQ_CODEL QoS"
-    local got_lock=false
-    local retry=3
-    while [ $retry -gt 0 ]; do
-        if acquire_lock 2>/dev/null; then
-            got_lock=true
-            qos_log "DEBUG" "停止时获取锁成功"
-            break
-        else
-            retry=$((retry - 1))
-            [ $retry -gt 0 ] && sleep 1
-        fi
-    done
-    if ! $got_lock; then
-        qos_log "ERROR" "无法获取锁，停止操作退出，请稍后重试"
-        return 1
-    fi
+    # 获取锁（可能已被其他进程持有，但停止时需要独占）
+    acquire_lock
     rm -f "$QOS_RUNNING_FILE"
     if [ "$SAVE_NFT_RULES" = "1" ]; then
         rm -f /etc/nftables.d/qos_gargoyle_*.nft 2>/dev/null
@@ -1125,9 +1123,7 @@ stop_htb_fqcodel_qos() {
     fi
     qos_log "INFO" "HTB+FQ_CODEL QoS停止完成"
     restore_main_config
-    if $got_lock; then
-        release_lock
-    fi
+    release_lock
 }
 
 # ========== 状态显示函数 ==========
@@ -1141,7 +1137,7 @@ show_htb_fqcodel_status() {
         qos_interface=$(tc qdisc show 2>/dev/null | grep -E "htb.*root" | awk '{print $5}' | head -1)
         [ -z "$qos_interface" ] && qos_interface="未知"
     fi
-    echo "===== HTB-FQ_CODEL QoS 状态报告 (v2.4.0) ====="
+    echo "===== HTB-FQ_CODEL QoS 状态报告 (v2.6.0) ====="
     echo "时间: $(date)"
     echo "WAN接口: ${qos_interface}"
     if ! tc qdisc show dev "${qos_interface}" 2>/dev/null | grep -q htb; then
@@ -1224,32 +1220,8 @@ show_htb_fqcodel_status() {
         echo -e "\n⚠ 部分方向QoS已启用"
     else
         echo -e "\n✗ QoS未运行"
-		
-    echo -e "\n===== 详细队列统计 ====="
-    
-    echo -e "\n上传方向cake队列:"
-    tc -s qdisc show dev "$qos_interface" 2>/dev/null | grep -A 3 "cake" | while read -r line; do
-        if echo "$line" | grep -q "parent"; then
-            echo "  $line"
-        elif echo "$line" | grep -q "Sent" || echo "$line" | grep -q "maxpacket" || \
-             echo "$line" | grep -q "ecn_mark" || echo "$line" | grep -q "memory_used"; then
-            echo "    $line"
-        fi
-    done
-    
-    if [ -n "$qos_ifb" ] && ip link show "$qos_ifb" >/dev/null 2>&1; then
-        echo -e "\n下载方向cake队列:"
-        tc -s qdisc show dev "$qos_ifb" 2>/dev/null | grep -A 3 "cake" | while read -r line; do
-            if echo "$line" | grep -q "parent"; then
-                echo "  $line"
-            elif echo "$line" | grep -q "Sent" || echo "$line" | grep -q "maxpacket" || \
-                 echo "$line" | grep -q "ecn_mark" || echo "$line" | grep -q "memory_used"; then
-                echo "    $line"
-            fi
-        done
     fi
 	
-    fi
     echo -e "\n===== 增强特性状态 ====="
     echo "速率限制: $([ "$ENABLE_RATELIMIT" = "1" ] && echo "已启用" || echo "未启用")"
     echo "ACK 限速: $([ "$ENABLE_ACK_LIMIT" = "1" ] && echo "已启用" || echo "未启用")"
