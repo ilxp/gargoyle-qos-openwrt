@@ -82,8 +82,10 @@ jobs:
 
     - name: Install bpftool
       run: |
-          sudo apt-get update
-          sudo apt-get install -y bpftool
+        sudo apt-get update
+        sudo apt-get install -y linux-tools-common
+        # 如果内核版本工具包可用则安装
+        sudo apt-get install -y linux-tools-$(uname -r) || true
           
     - name: Install Feeds
       working-directory: ${{ github.workspace }}/openwrt
