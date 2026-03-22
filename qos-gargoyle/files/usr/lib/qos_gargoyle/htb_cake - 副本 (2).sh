@@ -1,6 +1,6 @@
 #!/bin/sh
 # HTB_CAKE算法实现模块
-# 版本: 2.7.2 - 修复 check_already_running 函数缺失，整合之前所有修复
+# 版本: 2.6.0 - 统一锁机制(flock)，修复默认类索引计算，优化burst限制，增强错误处理
 # 基于HTB与CAKE组合算法实现QoS流量控制
 
 # ========== 全局配置常量 ==========
@@ -42,15 +42,6 @@ trap main_cleanup EXIT INT TERM HUP QUIT
 . /lib/functions.sh
 . /lib/functions/network.sh
 include /lib/network
-
-# ========== 检查是否已经在运行 ==========
-check_already_running() {
-    if [ -f "$QOS_RUNNING_FILE" ]; then
-        return 1
-    fi
-    echo $$ > "$QOS_RUNNING_FILE"
-    return 0
-}
 
 # ========== HTB 与 CAKE 专属配置加载 ==========
 load_htb_cake_config() {
@@ -139,7 +130,29 @@ load_htb_class_config() {
     return 0
 }
 
-# 注意：load_upload_class_configurations / load_download_class_configurations 已在 rule.sh 中定义，此处不再重复
+load_upload_class_configurations() {
+    qos_log "INFO" "正在加载上传类别配置..."
+    upload_class_list=$(load_all_config_sections "$CONFIG_FILE" "upload_class")
+    if [ -n "$upload_class_list" ]; then
+        qos_log "INFO" "找到上传类别: $upload_class_list"
+    else
+        qos_log "WARN" "没有找到上传类别配置"
+        upload_class_list=""
+    fi
+    return 0
+}
+
+load_download_class_configurations() {
+    qos_log "INFO" "正在加载下载类别配置..."
+    download_class_list=$(load_all_config_sections "$CONFIG_FILE" "download_class")
+    if [ -n "$download_class_list" ]; then
+        qos_log "INFO" "找到下载类别: $download_class_list"
+    else
+        qos_log "WARN" "没有找到下载类别配置"
+        download_class_list=""
+    fi
+    return 0
+}
 
 # ========== HTB 辅助函数 ==========
 calculate_htb_burst() {
@@ -238,13 +251,12 @@ build_cake_params() {
     echo "$params"
 }
 
-# ========== HTB 核心队列函数（增加 default 参数） ==========
+# ========== HTB 核心队列函数 ==========
 create_htb_root_qdisc() {
     local device="$1"
     local direction="$2"
     local root_handle="$3"
     local root_classid="$4"
-    local default_classid="$5"   # 新增：默认类ID，可选
     local bandwidth=""
     if [ "$direction" = "upload" ]; then
         bandwidth="$total_upload_bandwidth"
@@ -261,11 +273,7 @@ create_htb_root_qdisc() {
     qos_log "INFO" "为$device创建$direction方向HTB根队列 (带宽: ${bandwidth}kbit)"
     tc qdisc del dev "$device" ingress 2>/dev/null || true
     tc qdisc del dev "$device" root 2>/dev/null || true
-
-    local default_opt=""
-    [ -n "$default_classid" ] && default_opt="default $default_classid"
-
-    if ! tc qdisc add dev "$device" root handle $root_handle htb r2q $HTB_R2Q $default_opt; then
+    if ! tc qdisc add dev "$device" root handle $root_handle htb r2q $HTB_R2Q; then
         qos_log "ERROR" "无法在 $device 上创建HTB根队列"
         return 1
     fi
@@ -506,7 +514,7 @@ create_htb_download_class() {
     return 0
 }
 
-# ========== 入口重定向（修复 IPv6 flower 规则） ==========
+# ========== 入口重定向 ==========
 setup_ingress_redirect() {
     if [ -z "$qos_interface" ]; then
         qos_log "ERROR" "无法确定 WAN 接口"
@@ -540,9 +548,9 @@ setup_ingress_redirect() {
     fi
 
     local ipv6_success=false
-    # 修复：flower 匹配 IPv6 全球单播地址使用 ip6_dst 而不是 dst_ip
+    # 第一优先：flower 匹配全球单播地址 (2000::/3)
     if tc filter add dev "$qos_interface" parent ffff: protocol ipv6 \
-        flower ip6_dst 2000::/3 \
+        flower dst_ip 2000::/3 \
         action connmark \
         action mirred egress redirect dev "$IFB_DEVICE" 2>&1; then
         ipv6_success=true
@@ -631,83 +639,45 @@ check_ingress_redirect() {
     return 0
 }
 
-# ========== 上传方向初始化（重构：默认类在根队列创建时指定） ==========
+# ========== 上传方向初始化 ==========
 init_htb_cake_upload() {
     qos_log "INFO" "初始化上传方向HTB"
-    # 使用已加载的 upload_class_list（已在 init_htb_cake_qos 中加载）
+    load_upload_class_configurations
     if [ -z "$upload_class_list" ]; then
         qos_log "ERROR" "未找到上传类别配置，请至少配置一个上传类"
         return 1
     fi
 
-    # 检查所有类的数量（包括禁用），防止标记冲突
-    local total_classes=0
-    for class in $upload_class_list; do
-        total_classes=$((total_classes + 1))
-    done
-    if [ $total_classes -gt 16 ]; then
-        qos_log "ERROR" "上传方向总类别数量为 $total_classes，超过16个，将导致标记冲突，启动中止！"
-        return 1
-    fi
-
-    # 构建启用类列表并计算索引
+    # 构建启用类列表
     local enabled_classes=""
-    local class_index=2
-    local default_class_index=""
-    local default_class_name=""
-    local first_enabled_class=""
-
-    # 获取配置的默认类
-    default_class_name=$(uci -q get qos_gargoyle.upload.default_class 2>/dev/null)
-
     for class in $upload_class_list; do
         local enabled=$(uci -q get ${CONFIG_FILE}.${class}.enabled 2>/dev/null)
-        if [ "$enabled" = "1" ] || [ -z "$enabled" ]; then
-            enabled_classes="$enabled_classes $class"
-            [ -z "$first_enabled_class" ] && first_enabled_class="$class"
-            # 记录该类的索引（待创建时使用）
-            eval "class_index_${class}=$class_index"
-            # 判断是否为默认类
-            if [ -n "$default_class_name" ] && [ "$class" = "$default_class_name" ]; then
-                default_class_index=$class_index
-            fi
-            class_index=$((class_index + 1))
-        fi
+        [ "$enabled" = "1" ] || [ -z "$enabled" ] && enabled_classes="$enabled_classes $class"
     done
     enabled_classes=$(echo "$enabled_classes" | xargs)  # 去除多余空格
-
     if [ -z "$enabled_classes" ]; then
         qos_log "ERROR" "没有启用的上传类，请至少启用一个上传类"
         return 1
     fi
 
-    # 确定默认类索引
-    if [ -z "$default_class_index" ]; then
-        if [ -n "$default_class_name" ]; then
-            qos_log "WARN" "未找到上传默认类别 '$default_class_name' 或该类未启用，将使用第一个启用的类别"
-        fi
-        if [ -n "$first_enabled_class" ]; then
-            default_class_index=$(eval echo \$class_index_${first_enabled_class})
-            qos_log "INFO" "自动选择第一个启用的类别: $first_enabled_class (ID: 1:$default_class_index)"
-        else
-            qos_log "ERROR" "没有启用的上传类，无法设置默认类"
-            return 1
-        fi
-    else
-        qos_log "INFO" "上传默认类别: $default_class_name (ID: 1:$default_class_index)"
+    local class_count=0
+    for class in $enabled_classes; do
+        class_count=$((class_count + 1))
+    done
+    if [ $class_count -gt 16 ]; then
+        qos_log "ERROR" "上传方向启用类数量为 $class_count，超过16个，将导致标记冲突，启动中止！"
+        return 1
     fi
 
-    # 创建根队列，直接指定默认类
-    if ! create_htb_root_qdisc "$qos_interface" "upload" "1:0" "1:1" "$default_class_index"; then
+    if ! create_htb_root_qdisc "$qos_interface" "upload" "1:0" "1:1"; then
         qos_log "ERROR" "创建上传根队列失败"
         return 1
     fi
 
-    # 创建各个子类
+    local class_index=2
     upload_class_mark_list=""
     for class_name in $enabled_classes; do
-        local idx=$(eval echo \$class_index_${class_name})
-        if create_htb_upload_class "$class_name" "$idx"; then
+        if create_htb_upload_class "$class_name" "$class_index"; then
             local class_mark_hex=$(get_class_mark "upload" "$class_name")
             upload_class_mark_list="$upload_class_mark_list$class_name:0x$(printf '%X' $class_mark_hex) "
         else
@@ -715,71 +685,42 @@ init_htb_cake_upload() {
             tc qdisc del dev "$qos_interface" root 2>/dev/null
             return 1
         fi
+        class_index=$((class_index + 1))
     done
 
+    set_default_upload_class
     qos_log "INFO" "上传方向HTB初始化完成"
     return 0
 }
 
-# ========== 下载方向初始化（类似重构） ==========
+# ========== 下载方向初始化 ==========
 init_htb_cake_download() {
     qos_log "INFO" "初始化下载方向HTB"
+    load_download_class_configurations
     if [ -z "$download_class_list" ]; then
         qos_log "ERROR" "未找到下载类别配置，请至少配置一个下载类"
         return 1
     fi
 
-    # 检查所有类的数量（包括禁用），防止标记冲突
-    local total_classes=0
-    for class in $download_class_list; do
-        total_classes=$((total_classes + 1))
-    done
-    if [ $total_classes -gt 16 ]; then
-        qos_log "ERROR" "下载方向总类别数量为 $total_classes，超过16个，将导致标记冲突，启动中止！"
-        return 1
-    fi
-
-    # 构建启用类列表并计算索引
+    # 构建启用类列表
     local enabled_classes=""
-    local class_index=2
-    local default_class_index=""
-    local default_class_name=""
-    local first_enabled_class=""
-
-    default_class_name=$(uci -q get qos_gargoyle.download.default_class 2>/dev/null)
-
     for class in $download_class_list; do
         local enabled=$(uci -q get ${CONFIG_FILE}.${class}.enabled 2>/dev/null)
-        if [ "$enabled" = "1" ] || [ -z "$enabled" ]; then
-            enabled_classes="$enabled_classes $class"
-            [ -z "$first_enabled_class" ] && first_enabled_class="$class"
-            eval "class_index_${class}=$class_index"
-            if [ -n "$default_class_name" ] && [ "$class" = "$default_class_name" ]; then
-                default_class_index=$class_index
-            fi
-            class_index=$((class_index + 1))
-        fi
+        [ "$enabled" = "1" ] || [ -z "$enabled" ] && enabled_classes="$enabled_classes $class"
     done
-    enabled_classes=$(echo "$enabled_classes" | xargs)
-
+    enabled_classes=$(echo "$enabled_classes" | xargs)  # 去除多余空格
     if [ -z "$enabled_classes" ]; then
         qos_log "ERROR" "没有启用的下载类，请至少启用一个下载类"
         return 1
     fi
 
-    if [ -z "$default_class_index" ]; then
-        if [ -n "$default_class_name" ]; then
-            qos_log "WARN" "未找到下载默认类别 '$default_class_name' 或该类未启用，将使用第一个启用的类别"
-        fi
-        if [ -n "$first_enabled_class" ]; then
-            default_class_index=$(eval echo \$class_index_${first_enabled_class})
-            qos_log "INFO" "自动选择第一个启用的类别: $first_enabled_class (ID: 1:$default_class_index)"
-        else
-            qos_log "ERROR" "没有启用的下载类，无法设置默认类"
-            return 1
-        fi
-    else
-        qos_log "INFO" "下载默认类别: $default_class_name (ID: 1:$default_class_index)"
+    local class_count=0
+    for class in $enabled_classes; do
+        class_count=$((class_count + 1))
+    done
+    if [ $class_count -gt 16 ]; then
+        qos_log "ERROR" "下载方向启用类数量为 $class_count，超过16个，将导致标记冲突，启动中止！"
+        return 1
     fi
 
     if ! ip link show dev "$IFB_DEVICE" >/dev/null 2>&1; then
@@ -790,16 +731,15 @@ init_htb_cake_download() {
         qos_log "ERROR" "无法启动IFB设备 $IFB_DEVICE"
         return 1
     fi
-    if ! create_htb_root_qdisc "$IFB_DEVICE" "download" "1:0" "1:1" "$default_class_index"; then
+    if ! create_htb_root_qdisc "$IFB_DEVICE" "download" "1:0" "1:1"; then
         qos_log "ERROR" "创建下载根队列失败"
         return 1
     fi
-
+    local class_index=2
     local filter_prio=3
     download_class_mark_list=""
     for class_name in $enabled_classes; do
-        local idx=$(eval echo \$class_index_${class_name})
-        if create_htb_download_class "$class_name" "$idx" "$filter_prio"; then
+        if create_htb_download_class "$class_name" "$class_index" "$filter_prio"; then
             local class_mark_hex=$(get_class_mark "download" "$class_name")
             download_class_mark_list="$download_class_mark_list$class_name:0x$(printf '%X' $class_mark_hex) "
         else
@@ -807,9 +747,10 @@ init_htb_cake_download() {
             tc qdisc del dev "$IFB_DEVICE" root 2>/dev/null
             return 1
         fi
+        class_index=$((class_index + 1))
         filter_prio=$((filter_prio + 2))
     done
-
+    set_default_download_class
     if ! setup_ingress_redirect; then
         qos_log "ERROR" "设置入口重定向失败"
         return 1
@@ -818,9 +759,200 @@ init_htb_cake_download() {
     return 0
 }
 
-# ========== 主初始化函数（调整顺序：先带宽判断，再分配标记和应用规则） ==========
+# ========== 默认类设置（修复索引计算，只考虑启用的类） ==========
+set_default_upload_class() {
+    qos_log "INFO" "设置上传默认类别"
+    if ! tc qdisc show dev "$qos_interface" root 2>/dev/null | grep -q "htb"; then
+        qos_log "ERROR" "上传根队列不存在，无法设置默认类"
+        return
+    fi
+    local default_class_name=$(uci -q get qos_gargoyle.upload.default_class 2>/dev/null)
+    local class_index=2
+    local found_index=2
+    local found=0
+    local first_enabled_class=""
+    local class_list=""
+
+    # 构建启用类列表并计算索引
+    for class_name in $upload_class_list; do
+        local enabled=$(uci -q get ${CONFIG_FILE}.${class_name}.enabled 2>/dev/null)
+        [ "$enabled" = "1" ] || [ -z "$enabled" ] || continue
+        class_list="$class_list $class_name"
+        [ -z "$first_enabled_class" ] && first_enabled_class="$class_name"
+    done
+    class_list=$(echo "$class_list" | xargs)
+
+    # 计算默认类的索引
+    local idx=2
+    for class_name in $class_list; do
+        if [ -n "$default_class_name" ] && [ "$class_name" = "$default_class_name" ]; then
+            found_index=$idx
+            found=1
+            break
+        fi
+        idx=$((idx + 1))
+    done
+
+    if [ -z "$default_class_name" ]; then
+        qos_log "WARN" "上传默认类别未配置，将使用第一个启用的类别"
+        if [ -n "$first_enabled_class" ]; then
+            default_class_name="$first_enabled_class"
+            # 重新计算索引
+            idx=2
+            for class_name in $class_list; do
+                if [ "$class_name" = "$first_enabled_class" ]; then
+                    found_index=$idx
+                    found=1
+                    break
+                fi
+                idx=$((idx + 1))
+            done
+            qos_log "INFO" "自动选择第一个启用的类别: $default_class_name (ID: 1:$found_index)"
+        else
+            qos_log "ERROR" "没有启用的上传类，无法设置默认类"
+            return
+        fi
+    elif [ $found -eq 0 ]; then
+        qos_log "WARN" "未找到上传默认类别 '$default_class_name' 或该类未启用，使用第一个启用的类别"
+        if [ -n "$first_enabled_class" ]; then
+            default_class_name="$first_enabled_class"
+            idx=2
+            for class_name in $class_list; do
+                if [ "$class_name" = "$first_enabled_class" ]; then
+                    found_index=$idx
+                    found=1
+                    break
+                fi
+                idx=$((idx + 1))
+            done
+            qos_log "INFO" "回退使用类别 '$first_enabled_class' (ID: 1:$found_index)"
+        else
+            qos_log "ERROR" "没有启用的上传类，无法设置默认类"
+            return
+        fi
+    fi
+
+    # 使用 replace 确保 default 生效
+    tc qdisc replace dev "$qos_interface" root handle 1:0 htb r2q $HTB_R2Q default $found_index 2>/dev/null || {
+        qos_log "WARN" "replace 失败，尝试 change 方式"
+        tc qdisc change dev "$qos_interface" root handle 1:0 htb default $found_index 2>/dev/null || true
+    }
+    qos_log "INFO" "上传默认类别设置为TC类ID: 1:$found_index"
+}
+
+set_default_download_class() {
+    qos_log "INFO" "设置下载默认类别"
+    if ! tc qdisc show dev "$IFB_DEVICE" root 2>/dev/null | grep -q "htb"; then
+        qos_log "ERROR" "下载根队列不存在，无法设置默认类"
+        return
+    fi
+    local default_class_name=$(uci -q get qos_gargoyle.download.default_class 2>/dev/null)
+    local class_index=2
+    local found_index=2
+    local found=0
+    local first_enabled_class=""
+    local class_list=""
+
+    # 构建启用类列表并计算索引
+    for class_name in $download_class_list; do
+        local enabled=$(uci -q get ${CONFIG_FILE}.${class_name}.enabled 2>/dev/null)
+        [ "$enabled" = "1" ] || [ -z "$enabled" ] || continue
+        class_list="$class_list $class_name"
+        [ -z "$first_enabled_class" ] && first_enabled_class="$class_name"
+    done
+    class_list=$(echo "$class_list" | xargs)
+
+    local idx=2
+    for class_name in $class_list; do
+        if [ -n "$default_class_name" ] && [ "$class_name" = "$default_class_name" ]; then
+            found_index=$idx
+            found=1
+            break
+        fi
+        idx=$((idx + 1))
+    done
+
+    if [ -z "$default_class_name" ]; then
+        qos_log "WARN" "下载默认类别未配置，将使用第一个启用的类别"
+        if [ -n "$first_enabled_class" ]; then
+            default_class_name="$first_enabled_class"
+            idx=2
+            for class_name in $class_list; do
+                if [ "$class_name" = "$first_enabled_class" ]; then
+                    found_index=$idx
+                    found=1
+                    break
+                fi
+                idx=$((idx + 1))
+            done
+            qos_log "INFO" "自动选择第一个启用的类别: $default_class_name (ID: 1:$found_index)"
+        else
+            qos_log "ERROR" "没有启用的下载类，无法设置默认类"
+            return
+        fi
+    elif [ $found -eq 0 ]; then
+        qos_log "WARN" "未找到下载默认类别 '$default_class_name' 或该类未启用，使用第一个启用的类别"
+        if [ -n "$first_enabled_class" ]; then
+            default_class_name="$first_enabled_class"
+            idx=2
+            for class_name in $class_list; do
+                if [ "$class_name" = "$first_enabled_class" ]; then
+                    found_index=$idx
+                    found=1
+                    break
+                fi
+                idx=$((idx + 1))
+            done
+            qos_log "INFO" "回退使用类别 '$first_enabled_class' (ID: 1:$found_index)"
+        else
+            qos_log "ERROR" "没有启用的下载类，无法设置默认类"
+            return
+        fi
+    fi
+
+    tc qdisc replace dev "$IFB_DEVICE" root handle 1:0 htb r2q $HTB_R2Q default $found_index 2>/dev/null || {
+        qos_log "WARN" "replace 失败，尝试 change 方式"
+        tc qdisc change dev "$IFB_DEVICE" root handle 1:0 htb default $found_index 2>/dev/null || true
+    }
+    qos_log "INFO" "下载默认类别设置为TC类ID: 1:$found_index"
+}
+
+# ========== HTB 增强规则链 ==========
+setup_htb_enhance_chains() {
+    qos_log "INFO" "设置HTB增强规则链"
+    nft add chain inet gargoyle-qos-priority filter_qos_egress_enhance 2>/dev/null || true
+    nft add chain inet gargoyle-qos-priority filter_qos_ingress_enhance 2>/dev/null || true
+    nft insert rule inet gargoyle-qos-priority filter_qos_egress \
+        jump filter_qos_egress_enhance 2>/dev/null || true
+    nft insert rule inet gargoyle-qos-priority filter_qos_ingress \
+        jump filter_qos_ingress_enhance 2>/dev/null || true
+}
+
+apply_htb_specific_rules() {
+    qos_log "INFO" "应用HTB特定增强规则（专用链）"
+    nft flush chain inet gargoyle-qos-priority filter_qos_egress_enhance 2>/dev/null || true
+    nft flush chain inet gargoyle-qos-priority filter_qos_ingress_enhance 2>/dev/null || true
+    nft add rule inet gargoyle-qos-priority filter_qos_egress_enhance \
+        meta mark and 0x007f != 0 counter meta priority set "bulk" 2>/dev/null || true
+    nft add rule inet gargoyle-qos-priority filter_qos_ingress_enhance \
+        meta mark and 0x7f00 != 0 counter meta priority set "bulk" 2>/dev/null || true
+    nft add rule inet gargoyle-qos-priority filter_qos_egress_enhance \
+        meta mark and 0x0010 != 0 counter meta priority set "critical" 2>/dev/null || true
+    nft add rule inet gargoyle-qos-priority filter_qos_ingress_enhance \
+        meta mark and 0x1000 != 0 counter meta priority set "critical" 2>/dev/null || true
+    nft add rule inet gargoyle-qos-priority filter_qos_egress_enhance \
+        ct bytes lt 200 counter meta priority set "normal" 2>/dev/null || true
+    nft add rule inet gargoyle-qos-priority filter_qos_ingress_enhance \
+        ct bytes lt 200 counter meta priority set "normal" 2>/dev/null || true
+    nft add rule inet gargoyle-qos-priority filter_qos_egress_enhance \
+        tcp flags syn tcp option maxseg size set rt mtu counter meta mark set 0x3F 2>/dev/null || true
+    qos_log "INFO" "HTB特定增强规则应用完成"
+}
+
+# ========== 主初始化函数 ==========
 init_htb_cake_qos() {
     qos_log "INFO" "开始初始化HTB+CAKE QoS系统"
+    # 使用 rule.sh 的统一锁机制（支持嵌套）
     acquire_lock
     if ! check_already_running; then
         qos_log "ERROR" "HTB+CAKE QoS 已经在运行中"
@@ -830,7 +962,6 @@ init_htb_cake_qos() {
     if ! init_ruleset; then
         qos_log "ERROR" "初始化规则集失败，QoS 无法启动"
         release_lock
-        rm -f "$QOS_RUNNING_FILE"
         return 1
     fi
     nft flush chain inet gargoyle-qos-priority filter_qos_egress 2>/dev/null
@@ -875,31 +1006,9 @@ init_htb_cake_qos() {
         rm -f "$QOS_RUNNING_FILE"
         return 1
     fi
-
-    # 加载类别列表（先加载，以便后续判断）
     load_upload_class_configurations
     load_download_class_configurations
-
-    # 检查上传/下载带宽是否有效，决定是否进行标记分配和规则应用
-    local upload_enabled=0
-    local download_enabled=0
-
-    if [ -n "$total_upload_bandwidth" ] && echo "$total_upload_bandwidth" | grep -q '^[0-9]\+$' && [ "$total_upload_bandwidth" -gt 0 ]; then
-        upload_enabled=1
-        qos_log "INFO" "上传带宽有效，将启用上传QoS"
-    else
-        qos_log "INFO" "上传带宽未配置或为0，禁用上传QoS"
-    fi
-
-    if [ -n "$total_download_bandwidth" ] && echo "$total_download_bandwidth" | grep -q '^[0-9]\+$' && [ "$total_download_bandwidth" -gt 0 ]; then
-        download_enabled=1
-        qos_log "INFO" "下载带宽有效，将启用下载QoS"
-    else
-        qos_log "INFO" "下载带宽未配置或为0，禁用下载QoS"
-    fi
-
-    # 仅在对应方向启用时才分配标记和生成规则
-    if [ "$upload_enabled" -eq 1 ] && [ -n "$upload_class_list" ]; then
+    if [ -n "$upload_class_list" ]; then
         if ! allocate_class_marks "upload" "$upload_class_list"; then
             qos_log "ERROR" "上传方向标记分配失败"
             release_lock
@@ -907,8 +1016,7 @@ init_htb_cake_qos() {
             return 1
         fi
     fi
-
-    if [ "$download_enabled" -eq 1 ] && [ -n "$download_class_list" ]; then
+    if [ -n "$download_class_list" ]; then
         if ! allocate_class_marks "download" "$download_class_list"; then
             qos_log "ERROR" "下载方向标记分配失败"
             release_lock
@@ -916,28 +1024,19 @@ init_htb_cake_qos() {
             return 1
         fi
     fi
-
-    # 应用规则（仅当方向启用时）
-    if [ "$upload_enabled" -eq 1 ]; then
-        echo "调用上传分类规则应用..." 
-        if ! apply_all_rules "upload_rule" "$UPLOAD_MASK" "filter_qos_egress"; then
-            qos_log "ERROR" "上传规则应用失败，回滚"
-            stop_htb_cake_qos
-            release_lock
-            return 1
-        fi
+    echo "调用分类规则应用..." 
+    if ! apply_all_rules "upload_rule" "$UPLOAD_MASK" "filter_qos_egress"; then
+        qos_log "ERROR" "上传规则应用失败，回滚"
+        stop_htb_cake_qos
+        release_lock
+        return 1
     fi
-
-    if [ "$download_enabled" -eq 1 ]; then
-        echo "调用下载分类规则应用..." 
-        if ! apply_all_rules "download_rule" "$DOWNLOAD_MASK" "filter_qos_ingress"; then
-            qos_log "ERROR" "下载规则应用失败，回滚"
-            stop_htb_cake_qos
-            release_lock
-            return 1
-        fi
+    if ! apply_all_rules "download_rule" "$DOWNLOAD_MASK" "filter_qos_ingress"; then
+        qos_log "ERROR" "下载规则应用失败，回滚"
+        stop_htb_cake_qos
+        release_lock
+        return 1
     fi
-
     qos_log "INFO" "应用自定义规则成功"
     if [ "$ENABLE_RATELIMIT" = "1" ]; then
         echo "应用速率限制链..." 
@@ -952,23 +1051,25 @@ init_htb_cake_qos() {
     local download_skipped=0
 
     # 检查上传带宽
-    if [ "$upload_enabled" -eq 1 ]; then
+    if [ -z "$total_upload_bandwidth" ] || ! echo "$total_upload_bandwidth" | grep -q '^[0-9]\+$' || [ "$total_upload_bandwidth" -le 0 ]; then
+        qos_log "INFO" "上传带宽未配置或为0，禁用上传QoS"
+        upload_skipped=1
+    else
         if ! init_htb_cake_upload; then
             qos_log "ERROR" "上传方向初始化失败"
             upload_failed=1
         fi
-    else
-        upload_skipped=1
     fi
 
     # 检查下载带宽
-    if [ "$download_enabled" -eq 1 ]; then
+    if [ -z "$total_download_bandwidth" ] || ! echo "$total_download_bandwidth" | grep -q '^[0-9]\+$' || [ "$total_download_bandwidth" -le 0 ]; then
+        qos_log "INFO" "下载带宽未配置或为0，禁用下载QoS"
+        download_skipped=1
+    else
         if ! init_htb_cake_download; then
             qos_log "ERROR" "下载方向初始化失败"
             download_failed=1
         fi
-    else
-        download_skipped=1
     fi
 
     # 如果有任何方向尝试初始化但失败，则整体失败
@@ -995,6 +1096,7 @@ init_htb_cake_qos() {
 # ========== 停止函数 ==========
 stop_htb_cake_qos() {
     qos_log "INFO" "停止HTB+CAKE QoS"
+    # 获取锁（可能已被其他进程持有，但停止时需要独占）
     acquire_lock
     rm -f "$QOS_RUNNING_FILE"
     if [ "$SAVE_NFT_RULES" = "1" ]; then
@@ -1025,38 +1127,6 @@ stop_htb_cake_qos() {
     release_lock
 }
 
-# ========== HTB 增强规则链 ==========
-setup_htb_enhance_chains() {
-    qos_log "INFO" "设置HTB增强规则链"
-    nft add chain inet gargoyle-qos-priority filter_qos_egress_enhance 2>/dev/null || true
-    nft add chain inet gargoyle-qos-priority filter_qos_ingress_enhance 2>/dev/null || true
-    nft insert rule inet gargoyle-qos-priority filter_qos_egress \
-        jump filter_qos_egress_enhance 2>/dev/null || true
-    nft insert rule inet gargoyle-qos-priority filter_qos_ingress \
-        jump filter_qos_ingress_enhance 2>/dev/null || true
-}
-
-apply_htb_specific_rules() {
-    qos_log "INFO" "应用HTB特定增强规则（专用链）"
-    nft flush chain inet gargoyle-qos-priority filter_qos_egress_enhance 2>/dev/null || true
-    nft flush chain inet gargoyle-qos-priority filter_qos_ingress_enhance 2>/dev/null || true
-    nft add rule inet gargoyle-qos-priority filter_qos_egress_enhance \
-        meta mark and 0x007f != 0 counter meta priority set "bulk" 2>/dev/null || true
-    nft add rule inet gargoyle-qos-priority filter_qos_ingress_enhance \
-        meta mark and 0x7f00 != 0 counter meta priority set "bulk" 2>/dev/null || true
-    nft add rule inet gargoyle-qos-priority filter_qos_egress_enhance \
-        meta mark and 0x0010 != 0 counter meta priority set "critical" 2>/dev/null || true
-    nft add rule inet gargoyle-qos-priority filter_qos_ingress_enhance \
-        meta mark and 0x1000 != 0 counter meta priority set "critical" 2>/dev/null || true
-    nft add rule inet gargoyle-qos-priority filter_qos_egress_enhance \
-        ct bytes lt 200 counter meta priority set "normal" 2>/dev/null || true
-    nft add rule inet gargoyle-qos-priority filter_qos_ingress_enhance \
-        ct bytes lt 200 counter meta priority set "normal" 2>/dev/null || true
-    nft add rule inet gargoyle-qos-priority filter_qos_egress_enhance \
-        tcp flags syn tcp option maxseg size set rt mtu counter meta mark set 0x3F 2>/dev/null || true
-    qos_log "INFO" "HTB特定增强规则应用完成"
-}
-
 # ========== 状态显示函数 ==========
 show_htb_cake_status() {
     if [ -z "$IFB_DEVICE" ]; then
@@ -1068,7 +1138,7 @@ show_htb_cake_status() {
         qos_interface=$(tc qdisc show 2>/dev/null | grep -E "htb.*root" | awk '{print $5}' | head -1)
         [ -z "$qos_interface" ] && qos_interface="未知"
     fi
-    echo "===== HTB-CAKE QoS 状态报告 (v2.7.2) ====="
+    echo "===== HTB-CAKE QoS 状态报告 (v2.6.0) ====="
     echo "时间: $(date)"
     echo "WAN接口: ${qos_interface}"
     if ! tc qdisc show dev "${qos_interface}" 2>/dev/null | grep -q htb; then

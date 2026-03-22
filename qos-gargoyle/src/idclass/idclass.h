@@ -128,7 +128,7 @@ const char *idclass_dscp_to_class_name(uint8_t dscp);
 char *str_skip(char *str, bool space);
 int idclass_map_codepoint(const char *val);
 
-extern const struct {
+extern const struct idclass_map_info_entry {
     const char *name;
     const char *type_name;
 } idclass_map_info[];

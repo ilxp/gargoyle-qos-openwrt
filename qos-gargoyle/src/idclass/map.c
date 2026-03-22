@@ -18,20 +18,17 @@
 #include <unistd.h>
 #include <sys/stat.h>
 #include <fcntl.h>
-#include <net/if.h>                 // 新增，用于 if_nametoindex
+#include <net/if.h>
 #include "idclass.h"
 
 #define PERSISTENT_CLASS_MARKS "/etc/qos_gargoyle/class_marks"
 
 static int idclass_map_fds[__CL_MAP_MAX];
-static AVL_TREE(map_data, idclass_map_entry_cmp, false, NULL);
-static LIST_HEAD(map_files);
-static struct idclass_class_entry *map_class[IDCLASS_MAX_CLASS_ENTRIES];
 static uint32_t next_timeout;
 static uint8_t idclass_dscp_default[2] = { 0xff, 0xff };
 int idclass_map_timeout = 3600;
 int idclass_active_timeout = 300;
-struct global_config global_config;          // 修正类型
+struct global_config global_config;
 struct idclass_flow_config global_flow_config;
 static uint32_t map_dns_seq;
 
@@ -41,71 +38,37 @@ struct uloop_timeout idclass_map_timer;
 static int ip_conn_fd = -1;
 static int flow_stats_fd = -1;
 static struct uloop_timeout ip_conn_timer;
-// UCI 热重载
 static struct uloop_timeout uci_reload_timer;
 static time_t last_uci_mtime = 0;
 
-/* 动态 UCI 配置名 */
 static const char *uci_config_name = "qos_gargoyle";
 
 void idclass_set_config_name(const char *name)
 {
-	uci_config_name = name;
+    uci_config_name = name;
 }
 
-const struct {
-	const char *name;
-	const char *type_name;
-} idclass_map_info[] = {
-	[CL_MAP_TCP_PORTS] = { "tcp_ports", "tcp_port" },
-	[CL_MAP_UDP_PORTS] = { "udp_ports", "udp_port" },
-	[CL_MAP_IPV4_ADDR] = { "ipv4_map", "ipv4_addr" },
-	[CL_MAP_IPV6_ADDR] = { "ipv6_map", "ipv6_addr" },
-	[CL_MAP_CLASS] = { "class_map", "class" },
-	[CL_MAP_GLOBAL_CONFIG] = { "global_config", "config" },
-	[CL_MAP_DNS] = { "dns", "dns" },
-	[CL_MAP_PRIO_CLASS_UP] = { "prio_class_up", "prio_class_up" },
-	[CL_MAP_PRIO_CLASS_DOWN] = { "prio_class_down", "prio_class_down" },
-	[CL_MAP_CLASS_MARK] = { "class_mark", "class_mark" },
-	[CL_MAP_IP_CONN] = { "ip_conn_map", "ip_conn" },
+/* 定义 idclass_map_info_entry 结构体，避免匿名结构体冲突 */
+struct idclass_map_info_entry {
+    const char *name;
+    const char *type_name;
 };
 
-static const struct {
-	const char name[5];
-	uint8_t val;
-} codepoints[] = {
-	{ "CS0", 0 }, { "CS1", 8 }, { "CS2", 16 }, { "CS3", 24 },
-	{ "CS4", 32 }, { "CS5", 40 }, { "CS6", 48 }, { "CS7", 56 },
-	{ "AF11", 10 }, { "AF12", 12 }, { "AF13", 14 },
-	{ "AF21", 18 }, { "AF22", 20 }, { "AF23", 22 },
-	{ "AF31", 26 }, { "AF32", 28 }, { "AF33", 30 },
-	{ "AF41", 34 }, { "AF42", 36 }, { "AF43", 38 },
-	{ "EF", 46 }, { "VA", 44 }, { "LE", 1 }, { "DF", 0 },
+const struct idclass_map_info_entry idclass_map_info[] = {
+    [CL_MAP_TCP_PORTS] = { "tcp_ports", "tcp_port" },
+    [CL_MAP_UDP_PORTS] = { "udp_ports", "udp_port" },
+    [CL_MAP_IPV4_ADDR] = { "ipv4_map", "ipv4_addr" },
+    [CL_MAP_IPV6_ADDR] = { "ipv6_map", "ipv6_addr" },
+    [CL_MAP_CLASS] = { "class_map", "class" },
+    [CL_MAP_GLOBAL_CONFIG] = { "global_config", "config" },
+    [CL_MAP_DNS] = { "dns", "dns" },
+    [CL_MAP_PRIO_CLASS_UP] = { "prio_class_up", "prio_class_up" },
+    [CL_MAP_PRIO_CLASS_DOWN] = { "prio_class_down", "prio_class_down" },
+    [CL_MAP_CLASS_MARK] = { "class_mark", "class_mark" },
+    [CL_MAP_IP_CONN] = { "ip_conn_map", "ip_conn" },
 };
 
-char *str_skip(char *str, bool space)
-{
-	while (*str && isspace(*str) == space)
-		str++;
-	return str;
-}
-
-int idclass_map_codepoint(const char *val)
-{
-	int i;
-	for (i = 0; i < ARRAY_SIZE(codepoints); i++)
-		if (!strcmp(codepoints[i].name, val))
-			return codepoints[i].val;
-	return 0xff;
-}
-
-static int read_float_mult100(const char *val)
-{
-	double d = atof(val);
-	return (int)(d * 100 + 0.5);
-}
-
-/* 比较函数定义前置，避免隐式声明 */
+/* 比较函数必须放在 AVL_TREE 之前 */
 static int idclass_map_entry_cmp(const void *k1, const void *k2, void *ptr)
 {
     const struct idclass_map_data *d1 = k1;
@@ -116,6 +79,46 @@ static int idclass_map_entry_cmp(const void *k1, const void *k2, void *ptr)
     if (d1->id == CL_MAP_DNS)
         return strcmp(d1->addr.dns.pattern, d2->addr.dns.pattern);
     return memcmp(&d1->addr, &d2->addr, sizeof(d1->addr));
+}
+
+/* AVL 树必须在比较函数定义之后 */
+static AVL_TREE(map_data, idclass_map_entry_cmp, false, NULL);
+static LIST_HEAD(map_files);
+static struct idclass_class_entry *map_class[IDCLASS_MAX_CLASS_ENTRIES];
+
+static const struct {
+    const char name[5];
+    uint8_t val;
+} codepoints[] = {
+    { "CS0", 0 }, { "CS1", 8 }, { "CS2", 16 }, { "CS3", 24 },
+    { "CS4", 32 }, { "CS5", 40 }, { "CS6", 48 }, { "CS7", 56 },
+    { "AF11", 10 }, { "AF12", 12 }, { "AF13", 14 },
+    { "AF21", 18 }, { "AF22", 20 }, { "AF23", 22 },
+    { "AF31", 26 }, { "AF32", 28 }, { "AF33", 30 },
+    { "AF41", 34 }, { "AF42", 36 }, { "AF43", 38 },
+    { "EF", 46 }, { "VA", 44 }, { "LE", 1 }, { "DF", 0 },
+};
+
+char *str_skip(char *str, bool space)
+{
+    while (*str && isspace(*str) == space)
+        str++;
+    return str;
+}
+
+int idclass_map_codepoint(const char *val)
+{
+    int i;
+    for (i = 0; i < ARRAY_SIZE(codepoints); i++)
+        if (!strcmp(codepoints[i].name, val))
+            return codepoints[i].val;
+    return 0xff;
+}
+
+static int read_float_mult100(const char *val)
+{
+    double d = atof(val);
+    return (int)(d * 100 + 0.5);
 }
 
 static uint32_t idclass_gettime(void)
@@ -1012,13 +1015,14 @@ int map_parse_flow_config(struct idclass_flow_config *cfg, struct blob_attr *att
     READ_U32(CL_CONFIG_BULK_PPS, bulk_trigger_pps);
     READ_U32(CL_CONFIG_PRIO_PKT_LEN, prio_max_avg_pkt_len);
     READ_U32(CL_CONFIG_GAME_MAX_AVG_PKT_LEN, game_max_avg_pkt_len);
-    READ_U32(CL_CONFIG_GAME_MIN_CONN, game_min_conn);
+    /* 以下两行在 BPF 结构体中不存在，注释掉避免编译错误 */
+    // READ_U32(CL_CONFIG_GAME_MIN_CONN, game_min_conn);
     READ_U32(CL_CONFIG_GAME_MAX_CONN, game_max_conn);
     READ_U32(CL_CONFIG_GAME_MAX_PPS, game_max_pps);
     READ_U32(CL_CONFIG_GAME_SAMPLE_PACKETS, game_sample_packets);
     READ_U32(CL_CONFIG_VIDEO_MIN_AVG_PKT_LEN, video_min_avg_pkt_len);
     READ_U32(CL_CONFIG_VIDEO_MAX_AVG_PKT_LEN, video_max_avg_pkt_len);
-    READ_U32(CL_CONFIG_VIDEO_MIN_CONN, video_min_conn);
+    // READ_U32(CL_CONFIG_VIDEO_MIN_CONN, video_min_conn);
     READ_U32(CL_CONFIG_VIDEO_MAX_CONN, video_max_conn);
     READ_U32(CL_CONFIG_VIDEO_MIN_PPS, video_min_pps);
     READ_U32(CL_CONFIG_VIDEO_MAX_PPS, video_max_pps);
@@ -1231,7 +1235,6 @@ void idclass_map_update_config(void)
     bpf_map_update_elem(fd, &key, &global_config, BPF_ANY);
 }
 
-/* 辅助结构体，用于优先级映射 */
 struct class_prio {
     int class_id;
     int priority;
@@ -1460,12 +1463,10 @@ static void generate_default_class_marks(void)
     ULOG_INFO("Generated default class marks in %s\n", path);
 }
 
-// 定义 ip_key 结构体（与内核态一致）
 struct ip_key {
     __u8 addr[16];
 };
 
-// 更新 ip_conn_map 的定时器回调
 static void idclass_update_ip_conn(struct uloop_timeout *t)
 {
     __u32 key = 0, next_key;
@@ -1473,7 +1474,6 @@ static void idclass_update_ip_conn(struct uloop_timeout *t)
     __u32 cur_time = idclass_gettime();
     int fd = ip_conn_fd;
 
-    // 清空 ip_conn_map
     struct ip_key cur_key = {0};
     struct ip_key next_key_ip;
     while (bpf_map_get_next_key(fd, &cur_key, &next_key_ip) == 0) {
@@ -1481,7 +1481,6 @@ static void idclass_update_ip_conn(struct uloop_timeout *t)
         cur_key = next_key_ip;
     }
 
-    // 遍历 flow_stats_map
     key = 0;
     while (bpf_map_get_next_key(flow_stats_fd, &key, &next_key) == 0) {
         if (bpf_map_lookup_elem(flow_stats_fd, &next_key, &stats) == 0) {
@@ -1506,7 +1505,6 @@ static void idclass_update_ip_conn(struct uloop_timeout *t)
     uloop_timeout_set(t, 1000);
 }
 
-// UCI 文件监控回调
 static void idclass_check_uci_reload(struct uloop_timeout *t)
 {
     struct stat st;
@@ -1525,7 +1523,6 @@ static void idclass_check_uci_reload(struct uloop_timeout *t)
     uloop_timeout_set(t, 1000);
 }
 
-// 同步所有 class 的 config 为当前 global_flow_config
 void sync_class_config(void)
 {
     int fd = idclass_map_fds[CL_MAP_CLASS];
