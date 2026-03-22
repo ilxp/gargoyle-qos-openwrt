@@ -1,6 +1,6 @@
 #!/bin/sh
 # 规则辅助模块 (rule.sh)
-# 版本: 2.6.5 - 修复 build_nft_rule_fast 中局部变量未声明问题，添加 tcp flags 集合语法兼容性注释
+# 版本: 2.6.7 - 移除 conntrack 强制依赖，改进 IPv6 地址验证支持 :: 压缩
 # 注意：算法模块中不应重复定义 load_upload_class_configurations / load_download_class_configurations
 
 : ${DEBUG:=0}
@@ -225,8 +225,9 @@ validate_ip() {
         return 0
     fi
 
-    # IPv6 检查（增强支持 :: 缩写）
-    if echo "$raw" | grep -qiE '^([0-9a-fA-F]{0,4}:){0,7}[0-9a-fA-F]{0,4}(/[0-9]{1,3})?$'; then
+    # IPv6 检查（增强支持 :: 压缩）
+    # 正则允许：一个可选的 '::' 出现 0 或 1 次，前后可以跟最多 7 个段
+    if echo "$raw" | grep -qiE '^(([0-9a-fA-F]{1,4}:){0,7}[0-9a-fA-F]{1,4}|::|([0-9a-fA-F]{1,4}:){1,7}:|([0-9a-fA-F]{1,4}:){0,6}:[0-9a-fA-F]{1,4})(/[0-9]{1,3})?$'; then
         # 禁止多个 '::'
         if echo "$raw" | grep -q '::.*::'; then
             log_error "IPv6地址 '$raw' 包含多个 '::'"
@@ -1224,9 +1225,9 @@ build_nft_rule_fast() {
             local operator=$(echo "$connbytes_kb" | sed 's/[0-9]*$//')
             local value=$(echo "$connbytes_kb" | grep -o '[0-9]\+')
             [ -z "$operator" ] && operator=">="
-            local nft_op=$(map_connbytes_operator "$operator")
+            local op=$(map_connbytes_operator "$operator")   # 使用不同变量名避免与 nft_op 混淆
             local bytes_value=$((value * 1024))
-            common_cond="$common_cond ct bytes $nft_op $bytes_value"
+            common_cond="$common_cond ct bytes $op $bytes_value"
         fi
     fi
 
@@ -1673,7 +1674,8 @@ check_tc_connmark_support() {
 # ========== 检查必需的命令 ==========
 check_required_commands() {
     local missing=0
-    for cmd in tc nft conntrack ethtool ip; do
+    # conntrack 不是核心必需命令，仅用于状态显示和高级功能，因此不作为强制要求
+    for cmd in tc nft ethtool ip; do
         if ! command -v "$cmd" >/dev/null 2>&1; then
             log_error "命令 '$cmd' 未找到，请安装相应软件包"
             missing=1
