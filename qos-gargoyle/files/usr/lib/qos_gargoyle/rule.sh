@@ -1,6 +1,7 @@
 #!/bin/sh
 # 规则辅助模块 (rule.sh)
-# 版本: 2.6.1 - 修复ACK限速规则语法，锁增加超时，速率限制链优先级调整，优化验证函数
+# 版本: 2.6.2 - 修复操作符 '=' 映射，锁超时兼容 BusyBox，验证函数允许 '=' 操作符
+# 全面优化各函数逻辑，确保与各算法模块兼容
 
 : ${DEBUG:=0}
 
@@ -177,11 +178,12 @@ validate_connbytes() {
         if ! validate_number "$num" "$param_name" 0 1048576; then
             return 1
         fi
-        case "$operator" in '>'|'>='|'<'|'<='|'!=') ;; *) log_error "$param_name 无效操作符 '$operator'"; return 1 ;; esac
+        case "$operator" in '>'|'>='|'<'|'<='|'='|'!=') ;; *) log_error "$param_name 无效操作符 '$operator'"; return 1 ;; esac
     elif echo "$value" | grep -qE '^[0-9]+$'; then
         if ! validate_number "$value" "$param_name" 0 1048576; then return 1; fi
     else
-        log_error "$param_name 无效格式 '$value'"; return 1
+        log_error "$param_name 无效格式 '$value'"
+        return 1
     fi
     return 0
 }
@@ -265,7 +267,7 @@ validate_tcp_flags() {
 validate_length() {
     local value="$1" param_name="$2"
     [ -z "$value" ] && return 0
-    # 允许纯数字、范围、比较符
+    # 允许纯数字、范围、比较符（包括 =）
     if echo "$value" | grep -qE '^[0-9]+-[0-9]+$'; then
         local min=${value%-*} max=${value#*-}
         if ! validate_number "$min" "$param_name" 0 65535 ||
@@ -279,7 +281,7 @@ validate_length() {
         if ! validate_number "$num" "$param_name" 0 65535; then
             return 1
         fi
-        case "$operator" in '>'|'>='|'<'|'<='|'!=') ;; *) log_error "$param_name 无效操作符 '$operator'"; return 1 ;; esac
+        case "$operator" in '>'|'>='|'<'|'<='|'='|'!=') ;; *) log_error "$param_name 无效操作符 '$operator'"; return 1 ;; esac
     elif echo "$value" | grep -qE '^[0-9]+$'; then
         if ! validate_number "$value" "$param_name" 0 65535; then return 1; fi
     else
@@ -334,7 +336,7 @@ validate_ttl() {
         if ! validate_number "$num" "$param_name" 1 255; then
             return 1
         fi
-        case "$operator" in '>'|'>='|'<'|'<='|'!=') ;; *) log_error "$param_name 无效操作符 '$operator'"; return 1 ;; esac
+        case "$operator" in '>'|'>='|'<'|'<='|'='|'!=') ;; *) log_error "$param_name 无效操作符 '$operator'"; return 1 ;; esac
     elif echo "$value" | grep -qE '^[0-9]+$'; then
         if ! validate_number "$value" "$param_name" 1 255; then
             return 1
@@ -1123,7 +1125,8 @@ build_nft_rule_fast() {
                 "<") nft_op="lt" ;;
                 "<=") nft_op="le" ;;
                 "!=") nft_op="ne" ;;
-                *) nft_op="$operator" ;;
+                "=")  nft_op="eq" ;;
+                *)   nft_op="$operator" ;;
             esac
             common_cond="$common_cond meta length $nft_op $num"
         else
@@ -1157,7 +1160,8 @@ build_nft_rule_fast() {
                 "<") nft_op="lt" ;;
                 "<=") nft_op="le" ;;
                 "!=") nft_op="ne" ;;
-                *) nft_op="$operator" ;;
+                "=")  nft_op="eq" ;;
+                *)   nft_op="$operator" ;;
             esac
             common_cond="$common_cond udp length $nft_op $num"
         else
@@ -1229,7 +1233,8 @@ build_nft_rule_fast() {
                     "<") nft_op="lt" ;;
                     "<=") nft_op="le" ;;
                     "!=") nft_op="ne" ;;
-                    *) nft_op="$operator" ;;
+                    "=")  nft_op="eq" ;;
+                    *)   nft_op="$operator" ;;
                 esac
                 cmd="$cmd ip ttl $nft_op $num"
             else
@@ -1276,7 +1281,8 @@ build_nft_rule_fast() {
                     "<") nft_op="lt" ;;
                     "<=") nft_op="le" ;;
                     "!=") nft_op="ne" ;;
-                    *) nft_op="$operator" ;;
+                    "=")  nft_op="eq" ;;
+                    *)   nft_op="$operator" ;;
                 esac
                 cmd="$cmd ip6 hoplimit $nft_op $num"
             else
@@ -1463,7 +1469,7 @@ apply_all_rules() {
     return $?
 }
 
-# ========== 锁机制 (flock 实现，支持嵌套，增加超时) ==========
+# ========== 锁机制 (flock 实现，支持嵌套，兼容 BusyBox) ==========
 LOCK_FILE="/var/run/qos_gargoyle.lock"
 QOS_LOCK_FD=""
 LOCK_DEPTH=0
@@ -1476,24 +1482,30 @@ acquire_lock() {
     fi
 
     exec 100> "$LOCK_FILE"
-    # 先尝试非阻塞，失败则带超时等待（5秒）
+    # 先尝试非阻塞获取
     if flock -n 100; then
         QOS_LOCK_FD=100
         LOCK_DEPTH=1
         HAVE_LOCK=1
         log_debug "成功获取锁 (FD: $QOS_LOCK_FD)"
     else
-        log_warn "等待锁释放 (超时5秒)..."
-        if flock -w 5 100; then
-            QOS_LOCK_FD=100
-            LOCK_DEPTH=1
-            HAVE_LOCK=1
-            log_debug "成功获取锁 (FD: $QOS_LOCK_FD)"
-        else
-            log_error "获取锁超时，可能其他进程僵死"
-            exec 100<&-
-            return 1
-        fi
+        log_warn "等待锁释放..."
+        # 手动轮询，每次等待1秒，最多5次
+        local wait=0
+        while [ $wait -lt 5 ]; do
+            sleep 1
+            if flock -n 100; then
+                QOS_LOCK_FD=100
+                LOCK_DEPTH=1
+                HAVE_LOCK=1
+                log_debug "成功获取锁 (FD: $QOS_LOCK_FD)"
+                return 0
+            fi
+            wait=$((wait + 1))
+        done
+        log_error "获取锁超时（5秒），可能其他进程僵死"
+        exec 100<&-
+        return 1
     fi
     return 0
 }
