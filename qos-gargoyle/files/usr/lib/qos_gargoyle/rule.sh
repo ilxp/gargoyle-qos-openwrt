@@ -1,7 +1,6 @@
 #!/bin/sh
 # 规则辅助模块 (rule.sh)
-# 版本: 2.6.0 - 统一锁机制(flock)，修复动态集合语法、TCP升级规则语法，优化速率限制规则生成，修复各类bug
-# 基于原2.5.9全面优化
+# 版本: 2.6.1 - 修复ACK限速规则语法，锁增加超时，速率限制链优先级调整，优化验证函数
 
 : ${DEBUG:=0}
 
@@ -31,6 +30,10 @@ SET_FAMILIES_FILE="/tmp/qos_gargoyle_set_families"
 _IPSET_LOADED=0
 HAVE_LOCK=0
 _QOS_TABLE_FLUSHED=0
+
+# 声明类别列表全局变量（供各算法模块使用）
+upload_class_list=""
+download_class_list=""
 
 # ========== 日志函数 ==========
 log_debug() { [ "$DEBUG" = "1" ] && log "DEBUG" "$@"; }
@@ -262,6 +265,7 @@ validate_tcp_flags() {
 validate_length() {
     local value="$1" param_name="$2"
     [ -z "$value" ] && return 0
+    # 允许纯数字、范围、比较符
     if echo "$value" | grep -qE '^[0-9]+-[0-9]+$'; then
         local min=${value%-*} max=${value#*-}
         if ! validate_number "$min" "$param_name" 0 65535 ||
@@ -460,6 +464,31 @@ load_all_config_sections() {
     else
         echo "$config_output" | grep -E "^${config_name}\\.[a-zA-Z_]+[0-9]*=" | cut -d= -f1 | cut -d. -f2
     fi
+}
+
+# ========== 公共函数：加载上传/下载类别配置 ==========
+load_upload_class_configurations() {
+    log_info "正在加载上传类别配置..."
+    upload_class_list=$(load_all_config_sections "$CONFIG_FILE" "upload_class")
+    if [ -n "$upload_class_list" ]; then
+        log_info "找到上传类别: $upload_class_list"
+    else
+        log_warn "没有找到上传类别配置"
+        upload_class_list=""
+    fi
+    return 0
+}
+
+load_download_class_configurations() {
+    log_info "正在加载下载类别配置..."
+    download_class_list=$(load_all_config_sections "$CONFIG_FILE" "download_class")
+    if [ -n "$download_class_list" ]; then
+        log_info "找到下载类别: $download_class_list"
+    else
+        log_warn "没有找到下载类别配置"
+        download_class_list=""
+    fi
+    return 0
 }
 
 load_all_config_options() {
@@ -893,7 +922,8 @@ setup_ratelimit_chain() {
     if [ -n "$rules" ]; then
         local temp_ratelimit_file=$(mktemp /tmp/qos_ratelimit_XXXXXX)
         TEMP_FILES="$TEMP_FILES $temp_ratelimit_file"
-        echo "add chain inet gargoyle-qos-priority $RATELIMIT_CHAIN '{ type filter hook forward priority 0; policy accept; }' 2>/dev/null || true" > "$temp_ratelimit_file"
+        # 使用更高优先级（-10）避免与系统默认规则冲突
+        echo "add chain inet gargoyle-qos-priority $RATELIMIT_CHAIN '{ type filter hook forward priority -10; policy accept; }' 2>/dev/null || true" > "$temp_ratelimit_file"
         echo "flush chain inet gargoyle-qos-priority $RATELIMIT_CHAIN" >> "$temp_ratelimit_file"
         echo "$rules" | while IFS= read -r rule; do
             [ -z "$rule" ] && continue
@@ -906,7 +936,7 @@ setup_ratelimit_chain() {
     fi
 }
 
-# ========== ACK 限速规则生成 ==========
+# ========== ACK 限速规则生成（修复语法） ==========
 generate_ack_limit_rules() {
     [ "$ENABLE_ACK_LIMIT" != "1" ] && return
     local slow_rate=$(uci -q get ${CONFIG_FILE}.ack_limit.slow_rate 2>/dev/null)
@@ -920,10 +950,10 @@ generate_ack_limit_rules() {
 
     cat <<EOF
 # ACK rate limiting using dynamic sets
-add rule inet gargoyle-qos-priority filter_qos_egress meta length < 100 tcp flags ack add @xfst4ack { ct id } limit rate over ${ACK_XFAST}/second counter jump drop995
-add rule inet gargoyle-qos-priority filter_qos_egress meta length < 100 tcp flags ack add @fast4ack { ct id } limit rate over ${ACK_FAST}/second counter jump drop95
-add rule inet gargoyle-qos-priority filter_qos_egress meta length < 100 tcp flags ack add @med4ack { ct id } limit rate over ${ACK_MED}/second counter jump drop50
-add rule inet gargoyle-qos-priority filter_qos_egress meta length < 100 tcp flags ack add @slow4ack { ct id } limit rate over ${ACK_SLOW}/second counter jump drop50
+add rule inet gargoyle-qos-priority filter_qos_egress meta length < 100 tcp flags ack limit rate over ${ACK_XFAST}/second add @xfst4ack { ct id } counter jump drop995
+add rule inet gargoyle-qos-priority filter_qos_egress meta length < 100 tcp flags ack limit rate over ${ACK_FAST}/second add @fast4ack { ct id } counter jump drop95
+add rule inet gargoyle-qos-priority filter_qos_egress meta length < 100 tcp flags ack limit rate over ${ACK_MED}/second add @med4ack { ct id } counter jump drop50
+add rule inet gargoyle-qos-priority filter_qos_egress meta length < 100 tcp flags ack limit rate over ${ACK_SLOW}/second add @slow4ack { ct id } counter jump drop50
 EOF
 }
 
@@ -1433,7 +1463,7 @@ apply_all_rules() {
     return $?
 }
 
-# ========== 锁机制 (flock 实现，支持嵌套) ==========
+# ========== 锁机制 (flock 实现，支持嵌套，增加超时) ==========
 LOCK_FILE="/var/run/qos_gargoyle.lock"
 QOS_LOCK_FD=""
 LOCK_DEPTH=0
@@ -1446,19 +1476,26 @@ acquire_lock() {
     fi
 
     exec 100> "$LOCK_FILE"
+    # 先尝试非阻塞，失败则带超时等待（5秒）
     if flock -n 100; then
         QOS_LOCK_FD=100
         LOCK_DEPTH=1
         HAVE_LOCK=1
         log_debug "成功获取锁 (FD: $QOS_LOCK_FD)"
     else
-        log_warn "等待锁释放..."
-        flock -x 100
-        QOS_LOCK_FD=100
-        LOCK_DEPTH=1
-        HAVE_LOCK=1
-        log_debug "成功获取锁 (FD: $QOS_LOCK_FD)"
+        log_warn "等待锁释放 (超时5秒)..."
+        if flock -w 5 100; then
+            QOS_LOCK_FD=100
+            LOCK_DEPTH=1
+            HAVE_LOCK=1
+            log_debug "成功获取锁 (FD: $QOS_LOCK_FD)"
+        else
+            log_error "获取锁超时，可能其他进程僵死"
+            exec 100<&-
+            return 1
+        fi
     fi
+    return 0
 }
 
 release_lock() {
