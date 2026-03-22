@@ -31,9 +31,9 @@ all: $(TARGET)
 $(BPF_OBJ): idclass-bpf.c idclass.h idclass-bpf.h
 	clang -target bpf -g -O2 $(BPF_CFLAGS) -c $< -o $@
 
-# 生成 BPF 骨架头文件
-$(SKEL): $(BPF_OBJ)
-	bpftool gen skeleton $(BPF_OBJ) > $(SKEL)
+# 生成空的 skeleton 头文件（避免 bpftool 依赖）
+$(SKEL):
+	touch $@
 
 # 编译用户态程序
 $(TARGET): $(USER_OBJS) $(SKEL)

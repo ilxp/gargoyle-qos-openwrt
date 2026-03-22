@@ -19,7 +19,7 @@ download_class_mark_list=""
 qos_interface=""
 IFB_DEVICE=""
 
-CLASS_MARKS_FILE="/var/run/qos_class_marks"
+CLASS_MARKS_FILE="/etc/qos_gargoyle/class_marks"
 
 # 加载规则辅助模块（必须）
 if [ -f "/usr/lib/qos_gargoyle/rule.sh" ]; then
@@ -498,95 +498,6 @@ create_htb_download_class() {
     return 0
 }
 
-# 创建默认上传类（接收一个标记参数）
-create_default_upload_class() {
-    local default_mark="$1"
-    qos_log "INFO" "创建默认上传类别，使用标记: 0x$(printf '%X' $default_mark)"
-    if ! create_htb_root_qdisc "$qos_interface" "upload" "1:0" "1:1"; then
-        qos_log "ERROR" "创建上传根队列失败"
-        return 1
-    fi
-    local rate="$((total_upload_bandwidth * 80 / 100))kbit"
-    local ceil="${total_upload_bandwidth}kbit"
-    local mtu=$(cat /sys/class/net/$qos_interface/mtu 2>/dev/null || echo 1500)
-    local burst_params=$(calculate_htb_burst "$((total_upload_bandwidth * 80 / 100))" "$total_upload_bandwidth" "$mtu")
-    local burst=$(echo "$burst_params" | awk '{print $1}')
-    local cburst=$(echo "$burst_params" | awk '{print $2}')
-    if ! tc class add dev "$qos_interface" parent 1:1 \
-        classid 1:2 htb rate $rate ceil $ceil burst $burst cburst $cburst prio 4; then
-        qos_log "ERROR" "创建上传类 1:2 失败"
-        return 1
-    fi
-    local fq_codel_params=$(build_fq_codel_params)
-    qos_log "INFO" "添加上传默认fq_codel队列参数: $fq_codel_params"
-    if ! tc qdisc add dev "$qos_interface" parent 1:2 \
-        handle 2:1 fq_codel $fq_codel_params; then
-        qos_log "ERROR" "添加上传默认fq_codel队列失败"
-        return 1
-    fi
-    tc qdisc change dev "$qos_interface" root handle 1:0 htb default 2 2>/dev/null || true
-    if ! tc filter add dev "$qos_interface" parent 1:0 protocol ip \
-        prio 1 handle ${default_mark}/$UPLOAD_MASK fw flowid 1:2 2>/dev/null; then
-        qos_log "WARN" "添加上传默认IPv4过滤器失败"
-    fi
-    if ! tc filter add dev "$qos_interface" parent 1:0 protocol ipv6 \
-        prio 2 handle ${default_mark}/$UPLOAD_MASK fw flowid 1:2 2>/dev/null; then
-        qos_log "WARN" "添加上传默认IPv6过滤器失败"
-    fi
-    upload_class_mark_list="default_class:0x$(printf '%X' $default_mark)"
-    qos_log "INFO" "默认上传类别创建完成 (类ID: 1:2, 标记: 0x$(printf '%X' $default_mark))"
-    return 0
-}
-
-# 创建默认下载类（接收一个标记参数）
-create_default_download_class() {
-    local default_mark="$1"
-    qos_log "INFO" "创建默认下载类别，使用标记: 0x$(printf '%X' $default_mark)"
-    local ifb_dev="$IFB_DEVICE"
-    if ! ip link set dev "$ifb_dev" up; then
-        qos_log "ERROR" "无法启动IFB设备 $ifb_dev"
-        return 1
-    fi
-    if ! create_htb_root_qdisc "$ifb_dev" "download" "1:0" "1:1"; then
-        qos_log "ERROR" "创建下载根队列失败"
-        return 1
-    fi
-    local rate="$((total_download_bandwidth * 80 / 100))kbit"
-    local ceil="${total_download_bandwidth}kbit"
-    local mtu=$(cat /sys/class/net/$ifb_dev/mtu 2>/dev/null || echo 1500)
-    local burst_params=$(calculate_htb_burst "$((total_download_bandwidth * 80 / 100))" "$total_download_bandwidth" "$mtu")
-    local burst=$(echo "$burst_params" | awk '{print $1}')
-    local cburst=$(echo "$burst_params" | awk '{print $2}')
-    if ! tc class add dev "$ifb_dev" parent 1:1 \
-        classid 1:2 htb rate $rate ceil $ceil burst $burst cburst $cburst prio 4; then
-        qos_log "ERROR" "创建下载类 1:2 失败"
-        return 1
-    fi
-    local fq_codel_params=$(build_fq_codel_params)
-    qos_log "INFO" "添加下载默认fq_codel队列参数: $fq_codel_params"
-    if ! tc qdisc add dev "$ifb_dev" parent 1:2 \
-        handle 2:1 fq_codel $fq_codel_params; then
-        qos_log "ERROR" "添加下载默认fq_codel队列失败"
-        return 1
-    fi
-    tc qdisc change dev "$ifb_dev" root handle 1:0 htb default 2 2>/dev/null || true
-    if ! tc filter add dev "$ifb_dev" parent 1:0 protocol ip \
-        prio 1 handle ${default_mark}/$DOWNLOAD_MASK fw flowid 1:2 2>/dev/null; then
-        qos_log "WARN" "添加下载默认IPv4过滤器失败"
-    fi
-    if ! tc filter add dev "$ifb_dev" parent 1:0 protocol ipv6 \
-        prio 2 handle ${default_mark}/$DOWNLOAD_MASK fw flowid 1:2 2>/dev/null; then
-        qos_log "WARN" "添加下载默认IPv6过滤器失败"
-    fi
-    if ! setup_ingress_redirect; then
-        qos_log "ERROR" "设置入口重定向失败"
-        return 1
-    fi
-    download_class_mark_list="default_class:0x$(printf '%X' $default_mark)"
-    qos_log "INFO" "默认下载类别创建完成 (类ID: 1:2, 标记: 0x$(printf '%X' $default_mark))"
-    return 0
-}
-
 # ========== 入口重定向（修复 connmark 覆盖问题） ==========
 setup_ingress_redirect() {
     if [ -z "$qos_interface" ]; then
@@ -603,6 +514,7 @@ setup_ingress_redirect() {
     # IPv4 重定向（直接重定向，不使用 connmark）
     if ! tc filter add dev "$qos_interface" parent ffff: protocol ip \
         u32 match u32 0 0 \
+		action connmark \
         action mirred egress redirect dev "$IFB_DEVICE" 2>&1; then
         qos_log "ERROR" "IPv4入口重定向规则添加失败"
         tc qdisc del dev "$qos_interface" ingress 2>/dev/null
@@ -623,6 +535,7 @@ setup_ingress_redirect() {
     # 第一优先：flower 匹配全球单播地址 (2000::/3)
     if tc filter add dev "$qos_interface" parent ffff: protocol ipv6 \
         flower dst_ip 2000::/3 \
+		action connmark \
         action mirred egress redirect dev "$IFB_DEVICE" 2>&1; then
         ipv6_success=true
         qos_log "INFO" "IPv6入口重定向规则（flower 匹配全球单播）添加成功"
@@ -631,6 +544,7 @@ setup_ingress_redirect() {
         # 第二优先：u32 匹配全球单播地址 (2000::/3)
         if tc filter add dev "$qos_interface" parent ffff: protocol ipv6 \
             u32 match u32 0x20000000 0xe0000000 at 24 \
+			action connmark \
             action mirred egress redirect dev "$IFB_DEVICE" 2>&1; then
             ipv6_success=true
             qos_log "INFO" "IPv6入口重定向规则（u32 全球单播）添加成功"
@@ -639,6 +553,7 @@ setup_ingress_redirect() {
             # 第三优先：无过滤的 u32 全匹配
             if tc filter add dev "$qos_interface" parent ffff: protocol ipv6 \
                 u32 match u32 0 0 \
+				action connmark \
                 action mirred egress redirect dev "$IFB_DEVICE" 2>&1; then
                 ipv6_success=true
                 qos_log "INFO" "IPv6入口重定向规则（无过滤）添加成功"
@@ -713,28 +628,39 @@ init_htb_upload() {
     qos_log "INFO" "初始化上传方向HTB"
     load_upload_class_configurations
     if [ -z "$upload_class_list" ]; then
-        qos_log "WARN" "未找到上传类别配置，使用默认类别"
-        if ! create_default_upload_class 1; then
-            return 1
-        fi
-        return 0
+        qos_log "ERROR" "未找到上传类别配置，请至少配置一个上传类"
+        return 1
     fi
-    local class_count=0
+
+    # 构建启用类列表
+    local enabled_classes=""
     for class in $upload_class_list; do
         local enabled=$(uci -q get ${CONFIG_FILE}.${class}.enabled 2>/dev/null)
-        [ "$enabled" = "1" ] || [ -z "$enabled" ] && class_count=$((class_count + 1))
+        [ "$enabled" = "1" ] || [ -z "$enabled" ] && enabled_classes="$enabled_classes $class"
+    done
+    enabled_classes=$(echo "$enabled_classes" | xargs)  # 去除多余空格
+    if [ -z "$enabled_classes" ]; then
+        qos_log "ERROR" "没有启用的上传类，请至少启用一个上传类"
+        return 1
+    fi
+
+    local class_count=0
+    for class in $enabled_classes; do
+        class_count=$((class_count + 1))
     done
     if [ $class_count -gt 16 ]; then
         qos_log "ERROR" "上传方向启用类数量为 $class_count，超过16个，将导致标记冲突，启动中止！"
         return 1
     fi
+
     if ! create_htb_root_qdisc "$qos_interface" "upload" "1:0" "1:1"; then
         qos_log "ERROR" "创建上传根队列失败"
         return 1
     fi
+
     local class_index=2
     upload_class_mark_list=""
-    for class_name in $upload_class_list; do
+    for class_name in $enabled_classes; do
         if create_htb_upload_class "$class_name" "$class_index"; then
             local class_mark_hex=$(get_class_mark "upload" "$class_name")
             upload_class_mark_list="$upload_class_mark_list$class_name:0x$(printf '%X' $class_mark_hex) "
@@ -745,6 +671,7 @@ init_htb_upload() {
         fi
         class_index=$((class_index + 1))
     done
+
     set_default_upload_class
     qos_log "INFO" "上传方向HTB初始化完成"
     return 0
@@ -755,21 +682,31 @@ init_htb_download() {
     qos_log "INFO" "初始化下载方向HTB"
     load_download_class_configurations
     if [ -z "$download_class_list" ]; then
-        qos_log "WARN" "未找到下载类别配置，使用默认类别"
-        if ! create_default_download_class 65536; then
-            return 1
-        fi
-        return 0
+        qos_log "ERROR" "未找到下载类别配置，请至少配置一个下载类"
+        return 1
     fi
-    local class_count=0
+
+    # 构建启用类列表
+    local enabled_classes=""
     for class in $download_class_list; do
         local enabled=$(uci -q get ${CONFIG_FILE}.${class}.enabled 2>/dev/null)
-        [ "$enabled" = "1" ] || [ -z "$enabled" ] && class_count=$((class_count + 1))
+        [ "$enabled" = "1" ] || [ -z "$enabled" ] && enabled_classes="$enabled_classes $class"
+    done
+    enabled_classes=$(echo "$enabled_classes" | xargs)  # 去除多余空格
+    if [ -z "$enabled_classes" ]; then
+        qos_log "ERROR" "没有启用的下载类，请至少启用一个下载类"
+        return 1
+    fi
+
+    local class_count=0
+    for class in $enabled_classes; do
+        class_count=$((class_count + 1))
     done
     if [ $class_count -gt 16 ]; then
         qos_log "ERROR" "下载方向启用类数量为 $class_count，超过16个，将导致标记冲突，启动中止！"
         return 1
     fi
+
     if ! ip link show dev "$IFB_DEVICE" >/dev/null 2>&1; then
         qos_log "ERROR" "IFB设备 $IFB_DEVICE 不存在"
         return 1
@@ -785,7 +722,7 @@ init_htb_download() {
     local class_index=2
     local filter_prio=3
     download_class_mark_list=""
-    for class_name in $download_class_list; do
+    for class_name in $enabled_classes; do
         if create_htb_download_class "$class_name" "$class_index" "$filter_prio"; then
             local class_mark_hex=$(get_class_mark "download" "$class_name")
             download_class_mark_list="$download_class_mark_list$class_name:0x$(printf '%X' $class_mark_hex) "
@@ -813,50 +750,75 @@ set_default_upload_class() {
         return
     fi
     local default_class_name=$(uci -q get qos_gargoyle.upload.default_class 2>/dev/null)
-    if [ -z "$default_class_name" ]; then
-        qos_log "WARN" "上传默认类别未配置，将使用第一个类别"
-        if [ -n "$upload_class_list" ]; then
-            default_class_name=$(echo "$upload_class_list" | awk '{print $1}')
-            qos_log "INFO" "自动选择第一个类别: $default_class_name"
-        else
-            tc qdisc change dev "$qos_interface" root handle 1:0 htb default 2 2>/dev/null || true
-            qos_log "INFO" "上传默认类别设置为TC类ID: 1:2"
-            return
-        fi
-    fi
-    qos_log "INFO" "用户配置的上传默认类别名称: $default_class_name"
     local class_index=2
     local found_index=2
     local found=0
+    local first_enabled_class=""
+
+    # 遍历所有类，只处理启用的类
     for class_name in $upload_class_list; do
-        if [ "$class_name" = "$default_class_name" ]; then
+        local enabled=$(uci -q get ${CONFIG_FILE}.${class_name}.enabled 2>/dev/null)
+        [ "$enabled" = "1" ] || [ -z "$enabled" ] || continue
+        [ -z "$first_enabled_class" ] && first_enabled_class="$class_name"
+        if [ -n "$default_class_name" ] && [ "$class_name" = "$default_class_name" ]; then
             found_index=$class_index
             found=1
-            qos_log "INFO" "找到上传默认类别 '$default_class_name' 在索引位置 $found_index"
             break
         fi
         class_index=$((class_index + 1))
     done
-    if [ $found -eq 0 ]; then
-        qos_log "WARN" "未找到上传默认类别 '$default_class_name'，使用第一个类别"
-        local first_class=$(echo "$upload_class_list" | awk '{print $1}')
-        if [ -n "$first_class" ]; then
+
+    if [ -z "$default_class_name" ]; then
+        qos_log "WARN" "上传默认类别未配置，将使用第一个启用的类别"
+        if [ -n "$first_enabled_class" ]; then
+            default_class_name="$first_enabled_class"
+            # 重新计算第一个启用类的索引
             class_index=2
-            found_index=2
-            for cn in $upload_class_list; do
-                if [ "$cn" = "$first_class" ]; then
+            found=0
+            for class_name in $upload_class_list; do
+                local enabled=$(uci -q get ${CONFIG_FILE}.${class_name}.enabled 2>/dev/null)
+                [ "$enabled" = "1" ] || [ -z "$enabled" ] || continue
+                if [ "$class_name" = "$first_enabled_class" ]; then
                     found_index=$class_index
+                    found=1
                     break
                 fi
                 class_index=$((class_index + 1))
             done
-            qos_log "INFO" "回退使用类别 '$first_class' (ID: 1:$found_index)"
+            qos_log "INFO" "自动选择第一个启用的类别: $default_class_name (ID: 1:$found_index)"
         else
-            found_index=2
-            qos_log "INFO" "无自定义类别，使用默认类ID 1:2"
+            qos_log "ERROR" "没有启用的上传类，无法设置默认类"
+            return
+        fi
+    elif [ $found -eq 0 ]; then
+        qos_log "WARN" "未找到上传默认类别 '$default_class_name' 或该类未启用，使用第一个启用的类别"
+        if [ -n "$first_enabled_class" ]; then
+            default_class_name="$first_enabled_class"
+            # 重新计算第一个启用类的索引
+            class_index=2
+            found=0
+            for class_name in $upload_class_list; do
+                local enabled=$(uci -q get ${CONFIG_FILE}.${class_name}.enabled 2>/dev/null)
+                [ "$enabled" = "1" ] || [ -z "$enabled" ] || continue
+                if [ "$class_name" = "$first_enabled_class" ]; then
+                    found_index=$class_index
+                    found=1
+                    break
+                fi
+                class_index=$((class_index + 1))
+            done
+            qos_log "INFO" "回退使用类别 '$first_enabled_class' (ID: 1:$found_index)"
+        else
+            qos_log "ERROR" "没有启用的上传类，无法设置默认类"
+            return
         fi
     fi
-    tc qdisc change dev "$qos_interface" root handle 1:0 htb default $found_index 2>/dev/null || true
+
+    # 使用 replace 确保 default 生效
+    tc qdisc replace dev "$qos_interface" root handle 1:0 htb r2q $HTB_R2Q default $found_index 2>/dev/null || {
+        qos_log "WARN" "replace 失败，尝试 change 方式"
+        tc qdisc change dev "$qos_interface" root handle 1:0 htb default $found_index 2>/dev/null || true
+    }
     qos_log "INFO" "上传默认类别设置为TC类ID: 1:$found_index"
 }
 
@@ -867,50 +829,75 @@ set_default_download_class() {
         return
     fi
     local default_class_name=$(uci -q get qos_gargoyle.download.default_class 2>/dev/null)
-    if [ -z "$default_class_name" ]; then
-        qos_log "WARN" "下载默认类别未配置，将使用第一个类别"
-        if [ -n "$download_class_list" ]; then
-            default_class_name=$(echo "$download_class_list" | awk '{print $1}')
-            qos_log "INFO" "自动选择第一个类别: $default_class_name"
-        else
-            tc qdisc change dev "$IFB_DEVICE" root handle 1:0 htb default 2 2>/dev/null || true
-            qos_log "INFO" "下载默认类别设置为TC类ID: 1:2"
-            return
-        fi
-    fi
-    qos_log "INFO" "用户配置的下载默认类别名称: $default_class_name"
     local class_index=2
     local found_index=2
     local found=0
+    local first_enabled_class=""
+
+    # 遍历所有类，只处理启用的类
     for class_name in $download_class_list; do
-        if [ "$class_name" = "$default_class_name" ]; then
+        local enabled=$(uci -q get ${CONFIG_FILE}.${class_name}.enabled 2>/dev/null)
+        [ "$enabled" = "1" ] || [ -z "$enabled" ] || continue
+        [ -z "$first_enabled_class" ] && first_enabled_class="$class_name"
+        if [ -n "$default_class_name" ] && [ "$class_name" = "$default_class_name" ]; then
             found_index=$class_index
             found=1
-            qos_log "INFO" "找到下载默认类别 '$default_class_name' 在索引位置 $found_index"
             break
         fi
         class_index=$((class_index + 1))
     done
-    if [ $found -eq 0 ]; then
-        qos_log "WARN" "未找到下载默认类别 '$default_class_name'，使用第一个类别"
-        local first_class=$(echo "$download_class_list" | awk '{print $1}')
-        if [ -n "$first_class" ]; then
+
+    if [ -z "$default_class_name" ]; then
+        qos_log "WARN" "下载默认类别未配置，将使用第一个启用的类别"
+        if [ -n "$first_enabled_class" ]; then
+            default_class_name="$first_enabled_class"
+            # 重新计算第一个启用类的索引
             class_index=2
-            found_index=2
-            for cn in $download_class_list; do
-                if [ "$cn" = "$first_class" ]; then
+            found=0
+            for class_name in $download_class_list; do
+                local enabled=$(uci -q get ${CONFIG_FILE}.${class_name}.enabled 2>/dev/null)
+                [ "$enabled" = "1" ] || [ -z "$enabled" ] || continue
+                if [ "$class_name" = "$first_enabled_class" ]; then
                     found_index=$class_index
+                    found=1
                     break
                 fi
                 class_index=$((class_index + 1))
             done
-            qos_log "INFO" "回退使用类别 '$first_class' (ID: 1:$found_index)"
+            qos_log "INFO" "自动选择第一个启用的类别: $default_class_name (ID: 1:$found_index)"
         else
-            found_index=2
-            qos_log "INFO" "无自定义类别，使用默认类ID 1:2"
+            qos_log "ERROR" "没有启用的下载类，无法设置默认类"
+            return
+        fi
+    elif [ $found -eq 0 ]; then
+        qos_log "WARN" "未找到下载默认类别 '$default_class_name' 或该类未启用，使用第一个启用的类别"
+        if [ -n "$first_enabled_class" ]; then
+            default_class_name="$first_enabled_class"
+            # 重新计算第一个启用类的索引
+            class_index=2
+            found=0
+            for class_name in $download_class_list; do
+                local enabled=$(uci -q get ${CONFIG_FILE}.${class_name}.enabled 2>/dev/null)
+                [ "$enabled" = "1" ] || [ -z "$enabled" ] || continue
+                if [ "$class_name" = "$first_enabled_class" ]; then
+                    found_index=$class_index
+                    found=1
+                    break
+                fi
+                class_index=$((class_index + 1))
+            done
+            qos_log "INFO" "回退使用类别 '$first_enabled_class' (ID: 1:$found_index)"
+        else
+            qos_log "ERROR" "没有启用的下载类，无法设置默认类"
+            return
         fi
     fi
-    tc qdisc change dev "$IFB_DEVICE" root handle 1:0 htb default $found_index 2>/dev/null || true
+
+    # 使用 replace 确保 default 生效
+    tc qdisc replace dev "$IFB_DEVICE" root handle 1:0 htb r2q $HTB_R2Q default $found_index 2>/dev/null || {
+        qos_log "WARN" "replace 失败，尝试 change 方式"
+        tc qdisc change dev "$IFB_DEVICE" root handle 1:0 htb default $found_index 2>/dev/null || true
+    }
     qos_log "INFO" "下载默认类别设置为TC类ID: 1:$found_index"
 }
 
@@ -929,14 +916,6 @@ apply_htb_specific_rules() {
     qos_log "INFO" "应用HTB特定增强规则（专用链）"
     nft flush chain inet gargoyle-qos-priority filter_qos_egress_enhance 2>/dev/null || true
     nft flush chain inet gargoyle-qos-priority filter_qos_ingress_enhance 2>/dev/null || true
-    nft add rule inet gargoyle-qos-priority filter_qos_egress_enhance \
-        ct state new \
-        limit rate 100/second burst 20 packets \
-        meta mark set 0x7F counter 2>/dev/null || true
-    nft add rule inet gargoyle-qos-priority filter_qos_ingress_enhance \
-        ct state new \
-        limit rate 100/second burst 20 packets \
-        meta mark set 0x7F00 counter 2>/dev/null || true
     nft add rule inet gargoyle-qos-priority filter_qos_egress_enhance \
         meta mark and 0x007f != 0 counter meta priority set "bulk" 2>/dev/null || true
     nft add rule inet gargoyle-qos-priority filter_qos_ingress_enhance \

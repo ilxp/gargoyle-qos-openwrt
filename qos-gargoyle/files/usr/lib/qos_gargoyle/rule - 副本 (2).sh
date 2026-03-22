@@ -1,6 +1,6 @@
 #!/bin/sh
 # 规则辅助模块 (rule.sh)
-# 版本: 2.5.3
+# 版本: 2.5.2
 
 : ${DEBUG:=0}
 
@@ -245,109 +245,6 @@ validate_ip() {
     return 1
 }
 
-# 验证 TCP 标志
-validate_tcp_flags() {
-    local val="$1" param_name="$2"
-    local flags="syn ack rst fin urg psh ecn cwr"
-    local IFS=',' old_ifs="$IFS"
-    for f in $val; do
-        f=$(echo "$f" | tr -d '[:space:]')
-        case " $flags " in
-            *" $f "*) ;;
-            *) log_error "无效的 TCP 标志 '$f' (允许: $flags)"; return 1 ;;
-        esac
-    done
-    return 0
-}
-
-# 验证包长度、UDP 长度表达式
-validate_length() {
-    local value="$1" param_name="$2"
-    [ -z "$value" ] && return 0
-    if echo "$value" | grep -qE '^[0-9]+-[0-9]+$'; then
-        local min=${value%-*} max=${value#*-}
-        if ! validate_number "$min" "$param_name" 0 65535 ||
-           ! validate_number "$max" "$param_name" 0 65535 ||
-           [ "$min" -gt "$max" ]; then
-            return 1
-        fi
-    elif echo "$value" | grep -qE '^([<>]?=?|!=)[0-9]+$'; then
-        local operator=$(echo "$value" | sed 's/[0-9]*$//')
-        local num=$(echo "$value" | grep -o '[0-9]\+')
-        if ! validate_number "$num" "$param_name" 0 65535; then
-            return 1
-        fi
-        case "$operator" in '>'|'>='|'<'|'<='|'!=') ;; *) log_error "$param_name 无效操作符 '$operator'"; return 1 ;; esac
-    elif echo "$value" | grep -qE '^[0-9]+$'; then
-        if ! validate_number "$value" "$param_name" 0 65535; then return 1; fi
-    else
-        log_error "$param_name 无效格式 '$value'"
-        return 1
-    fi
-    return 0
-}
-
-# 验证 DSCP 值
-validate_dscp() {
-    local val="$1" param_name="$2"
-    local neg=""
-    case "$val" in '!='*) neg="!="; val="${val#!=}"; ;; esac
-    if ! validate_number "$val" "$param_name" 0 63; then
-        return 1
-    fi
-    return 0
-}
-
-# 验证接口名
-validate_ifname() {
-    local val="$1" param_name="$2"
-    if ! echo "$val" | grep -qE '^[a-zA-Z0-9_.-]+$'; then
-        log_error "$param_name 接口名无效: $val"
-        return 1
-    fi
-    return 0
-}
-
-# 验证 ICMP 类型
-validate_icmp_type() {
-    local val="$1" param_name="$2"
-    local neg=""
-    case "$val" in '!='*) neg="!="; val="${val#!=}"; ;; esac
-    if echo "$val" | grep -q '/'; then
-        local type=${val%/*} code=${val#*/}
-        if ! validate_number "$type" "$param_name" 0 255 || ! validate_number "$code" "$param_name" 0 255; then
-            return 1
-        fi
-    else
-        if ! validate_number "$val" "$param_name" 0 255; then
-            return 1
-        fi
-    fi
-    return 0
-}
-
-# 验证 TTL 表达式
-validate_ttl() {
-    local value="$1" param_name="$2"
-    [ -z "$value" ] && return 0
-    if echo "$value" | grep -qE '^([<>]?=?|!=)[0-9]+$'; then
-        local operator=$(echo "$value" | sed 's/[0-9]*$//')
-        local num=$(echo "$value" | grep -o '[0-9]\+')
-        if ! validate_number "$num" "$param_name" 1 255; then
-            return 1
-        fi
-        case "$operator" in '>'|'>='|'<'|'<='|'!=') ;; *) log_error "$param_name 无效操作符 '$operator'"; return 1 ;; esac
-    elif echo "$value" | grep -qE '^[0-9]+$'; then
-        if ! validate_number "$value" "$param_name" 1 255; then
-            return 1
-        fi
-    else
-        log_error "$param_name 无效格式 '$value'"
-        return 1
-    fi
-    return 0
-}
-
 map_connbytes_operator() {
     local op="$1"
     case "$op" in
@@ -493,71 +390,45 @@ load_all_config_options() {
         return 1
     fi
 
-    for opt in order enabled proto srcport dstport connbytes_kb family state src_ip dest_ip \
-          tcp_flags packet_len dscp iif oif icmp_type udp_length ttl; do
-    val=$(echo "$config_data" | grep "^${config_name}\\.${escaped_section_id}\\.${opt}=" | cut -d= -f2-)
-    [ -z "$val" ] && continue
-    val=$(echo "$val" | sed "s/^'//; s/'$//; s/^\"//; s/\"$//" | tr -d '\n\r')
-    case "$opt" in
-        order)   val=$(echo "$val" | sed 's/[^0-9]//g'); [ -n "$val" ] && eval "${prefix}order=\"$val\"" ;;
-        enabled) val=$(echo "$val" | grep -o '^[01]'); [ -n "$val" ] && eval "${prefix}enabled=\"$val\"" ;;
-        proto)   if validate_protocol "$val" "${section_id}.proto"; then
-                     val=$(echo "$val" | sed 's/[^a-zA-Z0-9_]//g')
-                     eval "${prefix}proto=\"$val\""
-                 else log_warn "规则 $section_id 协议 '$val' 无效，忽略此字段"; fi ;;
-        srcport) if validate_port "$val" "${section_id}.srcport"; then
-                     val=$(echo "$val" | tr -d '[:space:]' | sed 's/[^0-9,-]//g')
-                     eval "${prefix}srcport=\"$val\""
-                 else log_warn "规则 $section_id 源端口 '$val' 无效，忽略此字段"; fi ;;
-        dstport) if validate_port "$val" "${section_id}.dstport"; then
-                     val=$(echo "$val" | tr -d '[:space:]' | sed 's/[^0-9,-]//g')
-                     eval "${prefix}dstport=\"$val\""
-                 else log_warn "规则 $section_id 目的端口 '$val' 无效，忽略此字段"; fi ;;
-        connbytes_kb) if validate_connbytes "$val" "${section_id}.connbytes_kb"; then
-                          val=$(echo "$val" | sed 's/[^0-9<>!= -]//g' | tr -d ' ')
-                          eval "${prefix}connbytes_kb=\"$val\""
-                      else log_warn "规则 $section_id 连接字节数 '$val' 无效，忽略此字段"; fi ;;
-        family)  if validate_family "$val" "${section_id}.family"; then
-                     val=$(echo "$val" | sed 's/[^a-zA-Z0-9]//g')
-                     eval "${prefix}family=\"$val\""
-                 else log_warn "规则 $section_id 地址族 '$val' 无效，忽略此字段"; fi ;;
-        state)   if validate_state "$val" "${section_id}.state"; then
-                     val=$(echo "$val" | tr -d '[:space:]' | sed 's/[^{},a-zA-Z]//g')
-                     eval "${prefix}state=\"$val\""
-                 else log_warn "规则 $section_id 连接状态 '$val' 无效，忽略此字段"; fi ;;
-        src_ip)  if validate_ip "$val"; then
-                     eval "${prefix}src_ip=\"$val\""
-                 else log_warn "规则 $section_id 源 IP '$val' 格式无效，忽略此字段"; fi ;;
-        dest_ip) if validate_ip "$val"; then
-                     eval "${prefix}dest_ip=\"$val\""
-                 else log_warn "规则 $section_id 目的 IP '$val' 格式无效，忽略此字段"; fi ;;
-        tcp_flags) if validate_tcp_flags "$val" "${section_id}.tcp_flags"; then
-                       val=$(echo "$val" | tr -d '[:space:]')
-                       eval "${prefix}tcp_flags=\"$val\""
-                   else log_warn "规则 $section_id TCP标志 '$val' 无效，忽略此字段"; fi ;;
-        packet_len) if validate_length "$val" "${section_id}.packet_len"; then
-                        eval "${prefix}packet_len=\"$val\""
-                    else log_warn "规则 $section_id 包长度 '$val' 无效，忽略此字段"; fi ;;
-        dscp)       if validate_dscp "$val" "${section_id}.dscp"; then
-                        eval "${prefix}dscp=\"$val\""
-                    else log_warn "规则 $section_id DSCP值 '$val' 无效，忽略此字段"; fi ;;
-        iif)        if validate_ifname "$val" "${section_id}.iif"; then
-                        eval "${prefix}iif=\"$val\""
-                    else log_warn "规则 $section_id 入接口 '$val' 无效，忽略此字段"; fi ;;
-        oif)        if validate_ifname "$val" "${section_id}.oif"; then
-                        eval "${prefix}oif=\"$val\""
-                    else log_warn "规则 $section_id 出接口 '$val' 无效，忽略此字段"; fi ;;
-        icmp_type)  if validate_icmp_type "$val" "${section_id}.icmp_type"; then
-                        eval "${prefix}icmp_type=\"$val\""
-                    else log_warn "规则 $section_id ICMP类型 '$val' 无效，忽略此字段"; fi ;;
-        udp_length) if validate_length "$val" "${section_id}.udp_length"; then
-                        eval "${prefix}udp_length=\"$val\""
-                    else log_warn "规则 $section_id UDP长度 '$val' 无效，忽略此字段"; fi ;;
-        ttl)        if validate_ttl "$val" "${section_id}.ttl"; then
-                        eval "${prefix}ttl=\"$val\""
-                    else log_warn "规则 $section_id TTL值 '$val' 无效，忽略此字段"; fi ;;
-    esac
-done
+    for opt in order enabled proto srcport dstport connbytes_kb family state src_ip dest_ip; do
+        val=$(echo "$config_data" | grep "^${config_name}\\.${escaped_section_id}\\.${opt}=" | cut -d= -f2-)
+        [ -z "$val" ] && continue
+        val=$(echo "$val" | sed "s/^'//; s/'$//; s/^\"//; s/\"$//" | tr -d '\n\r')
+        case "$opt" in
+            order)   val=$(echo "$val" | sed 's/[^0-9]//g'); [ -n "$val" ] && eval "${prefix}order=\"$val\"" ;;
+            enabled) val=$(echo "$val" | grep -o '^[01]'); [ -n "$val" ] && eval "${prefix}enabled=\"$val\"" ;;
+            proto)   if validate_protocol "$val" "${section_id}.proto"; then
+                         val=$(echo "$val" | sed 's/[^a-zA-Z0-9_]//g')
+                         eval "${prefix}proto=\"$val\""
+                     else log_warn "规则 $section_id 协议 '$val' 无效，忽略此字段"; fi ;;
+            srcport) if validate_port "$val" "${section_id}.srcport"; then
+                         val=$(echo "$val" | tr -d '[:space:]' | sed 's/[^0-9,-]//g')
+                         eval "${prefix}srcport=\"$val\""
+                     else log_warn "规则 $section_id 源端口 '$val' 无效，忽略此字段"; fi ;;
+            dstport) if validate_port "$val" "${section_id}.dstport"; then
+                         val=$(echo "$val" | tr -d '[:space:]' | sed 's/[^0-9,-]//g')
+                         eval "${prefix}dstport=\"$val\""
+                     else log_warn "规则 $section_id 目的端口 '$val' 无效，忽略此字段"; fi ;;
+            connbytes_kb) if validate_connbytes "$val" "${section_id}.connbytes_kb"; then
+                              val=$(echo "$val" | sed 's/[^0-9<>!= -]//g' | tr -d ' ')
+                              eval "${prefix}connbytes_kb=\"$val\""
+                          else log_warn "规则 $section_id 连接字节数 '$val' 无效，忽略此字段"; fi ;;
+            family)  if validate_family "$val" "${section_id}.family"; then
+                         val=$(echo "$val" | sed 's/[^a-zA-Z0-9]//g')
+                         eval "${prefix}family=\"$val\""
+                     else log_warn "规则 $section_id 地址族 '$val' 无效，忽略此字段"; fi ;;
+            state)   if validate_state "$val" "${section_id}.state"; then
+                         val=$(echo "$val" | tr -d '[:space:]' | sed 's/[^{},a-zA-Z]//g')
+                         eval "${prefix}state=\"$val\""
+                     else log_warn "规则 $section_id 连接状态 '$val' 无效，忽略此字段"; fi ;;
+            src_ip)  if validate_ip "$val"; then
+                         eval "${prefix}src_ip=\"$val\""
+                     else log_warn "规则 $section_id 源 IP '$val' 格式无效，忽略此字段"; fi ;;
+            dest_ip) if validate_ip "$val"; then
+                         eval "${prefix}dest_ip=\"$val\""
+                     else log_warn "规则 $section_id 目的 IP '$val' 格式无效，忽略此字段"; fi ;;
+        esac
+    done
     return 0
 }
 
@@ -1043,76 +914,16 @@ build_nft_rule_fast() {
     elif [ "$proto" = "tcp_udp" ]; then common_cond="meta l4proto { tcp, udp }"
     elif [ -n "$proto" ] && [ "$proto" != "all" ]; then common_cond="meta l4proto $proto"; fi
 
-    # ========== 新增通用条件（修正变量名） ==========
-    # 包长度 (meta length)
-    if [ -n "$tmp_packet_len" ]; then
-        if echo "$tmp_packet_len" | grep -q '-'; then
-            local min=${tmp_packet_len%-*} max=${tmp_packet_len#*-}
-            common_cond="$common_cond meta length >= $min meta length <= $max"
-        elif echo "$tmp_packet_len" | grep -qE '^([<>]?=?|!=)[0-9]+$'; then
-            local operator=$(echo "$tmp_packet_len" | sed 's/[0-9]*$//')
-            local num=$(echo "$tmp_packet_len" | grep -o '[0-9]\+')
-            [ -z "$operator" ] && operator=">="
-            case "$operator" in
-                ">") nft_op="gt" ;;
-                ">=") nft_op="ge" ;;
-                "<") nft_op="lt" ;;
-                "<=") nft_op="le" ;;
-                "!=") nft_op="ne" ;;
-                *) nft_op="$operator" ;;
-            esac
-            common_cond="$common_cond meta length $nft_op $num"
-        else
-            common_cond="$common_cond meta length $tmp_packet_len"
-        fi
-    fi
-
-    # TCP 标志（仅当协议为 tcp）
-    if [ -n "$tmp_tcp_flags" ] && [ "$proto" = "tcp" ]; then
-        local flags_list=$(echo "$tmp_tcp_flags" | tr ',' ' ')
-        common_cond="$common_cond tcp flags { $flags_list }"
-    fi
-
-    # 接口匹配
-    if [ -n "$tmp_iif" ]; then
-        common_cond="$common_cond iifname \"$tmp_iif\""
-    fi
-    if [ -n "$tmp_oif" ]; then
-        common_cond="$common_cond oifname \"$tmp_oif\""
-    fi
-
-    # UDP 长度（仅当协议为 udp）
-    if [ -n "$tmp_udp_length" ] && [ "$proto" = "udp" ]; then
-        if echo "$tmp_udp_length" | grep -q '-'; then
-            local min=${tmp_udp_length%-*} max=${tmp_udp_length#*-}
-            common_cond="$common_cond udp length >= $min udp length <= $max"
-        elif echo "$tmp_udp_length" | grep -qE '^([<>]?=?|!=)[0-9]+$'; then
-            local operator=$(echo "$tmp_udp_length" | sed 's/[0-9]*$//')
-            local num=$(echo "$tmp_udp_length" | grep -o '[0-9]\+')
-            [ -z "$operator" ] && operator=">="
-            case "$operator" in
-                ">") nft_op="gt" ;;
-                ">=") nft_op="ge" ;;
-                "<") nft_op="lt" ;;
-                "<=") nft_op="le" ;;
-                "!=") nft_op="ne" ;;
-                *) nft_op="$operator" ;;
-            esac
-            common_cond="$common_cond udp length $nft_op $num"
-        else
-            common_cond="$common_cond udp length $tmp_udp_length"
-        fi
-    fi
-
-    # 端口匹配（原有逻辑）
     if [ "$proto" = "tcp" ] || [ "$proto" = "udp" ] || [ "$proto" = "tcp_udp" ]; then
         case "$chain" in
             *"ingress"*)
+                # 下载方向：匹配源端口（来自外部的端口）
                 if [ -n "$srcport" ]; then
                     common_cond="$common_cond th sport { $(echo "$srcport" | tr -d ' ') }"
                 fi
                 ;;
             *)
+                # 上传方向：匹配目的端口（外部的端口）
                 if [ -n "$dstport" ]; then
                     common_cond="$common_cond th dport { $(echo "$dstport" | tr -d ' ') }"
                 fi
@@ -1120,17 +931,12 @@ build_nft_rule_fast() {
         esac
     fi
 
-    # 连接状态
     if [ -n "$state" ]; then
         local state_value=$(echo "$state" | tr -d '{}')
-        if echo "$state_value" | grep -q ','; then
-            common_cond="$common_cond ct state { $state_value }"
-        else
-            common_cond="$common_cond ct state $state_value"
-        fi
+        if echo "$state_value" | grep -q ','; then common_cond="$common_cond ct state { $state_value }"
+        else common_cond="$common_cond ct state $state_value"; fi
     fi
 
-    # 连接字节数
     if [ -n "$connbytes_kb" ] && [ "$connbytes_kb" != "0" ]; then
         if echo "$connbytes_kb" | grep -q '-'; then
             local min_val=${connbytes_kb%-*} max_val=${connbytes_kb#*-}
@@ -1146,109 +952,16 @@ build_nft_rule_fast() {
         fi
     fi
 
-    # 构建最终规则
     local base_cmd="add rule inet gargoyle-qos-priority $chain"
-
-    # IPv4 分支
     if [ "$do_ipv4" -eq 1 ]; then
         local cmd="$base_cmd meta nfproto ipv4 $common_cond"
         [ -n "$ipv4_cond" ] && cmd="$cmd $ipv4_cond"
-
-        # ========== IPv4 专用条件 ==========
-        # DSCP
-        if [ -n "$tmp_dscp" ]; then
-            local dscp_val="$tmp_dscp"
-            local neg=""
-            case "$dscp_val" in '!='*) neg="!="; dscp_val="${dscp_val#!=}"; ;; esac
-            cmd="$cmd ip dscp $neg $dscp_val"
-        fi
-
-        # TTL
-        if [ -n "$tmp_ttl" ]; then
-            local ttl_val="$tmp_ttl"
-            if echo "$ttl_val" | grep -qE '^([<>]?=?|!=)[0-9]+$'; then
-                local operator=$(echo "$ttl_val" | sed 's/[0-9]*$//')
-                local num=$(echo "$ttl_val" | grep -o '[0-9]\+')
-                [ -z "$operator" ] && operator=">="
-                case "$operator" in
-                    ">") nft_op="gt" ;;
-                    ">=") nft_op="ge" ;;
-                    "<") nft_op="lt" ;;
-                    "<=") nft_op="le" ;;
-                    "!=") nft_op="ne" ;;
-                    *) nft_op="$operator" ;;
-                esac
-                cmd="$cmd ip ttl $nft_op $num"
-            else
-                cmd="$cmd ip ttl $ttl_val"
-            fi
-        fi
-
-        # ICMP 类型（仅当协议为 icmp）
-        if [ -n "$tmp_icmp_type" ] && [ "$proto" = "icmp" ]; then
-            local icmp_val="$tmp_icmp_type"
-            local neg=""
-            case "$icmp_val" in '!='*) neg="!="; icmp_val="${icmp_val#!=}"; ;; esac
-            if echo "$icmp_val" | grep -q '/'; then
-                local type=${icmp_val%/*} code=${icmp_val#*/}
-                cmd="$cmd icmp type $neg $type icmp code $code"
-            else
-                cmd="$cmd icmp type $neg $icmp_val"
-            fi
-        fi
-
         cmd="$cmd meta mark set $class_mark counter"
         echo "$cmd"
     fi
-
-    # IPv6 分支
     if [ "$do_ipv6" -eq 1 ]; then
         local cmd="$base_cmd meta nfproto ipv6 $common_cond"
         [ -n "$ipv6_cond" ] && cmd="$cmd $ipv6_cond"
-
-        # ========== IPv6 专用条件 ==========
-        # DSCP
-        if [ -n "$tmp_dscp" ]; then
-            local dscp_val="$tmp_dscp"
-            local neg=""
-            case "$dscp_val" in '!='*) neg="!="; dscp_val="${dscp_val#!=}"; ;; esac
-            cmd="$cmd ip6 dscp $neg $dscp_val"
-        fi
-
-        # Hop Limit (IPv6 的 TTL)
-        if [ -n "$tmp_ttl" ]; then
-            local hop_val="$tmp_ttl"
-            if echo "$hop_val" | grep -qE '^([<>]?=?|!=)[0-9]+$'; then
-                local operator=$(echo "$hop_val" | sed 's/[0-9]*$//')
-                local num=$(echo "$hop_val" | grep -o '[0-9]\+')
-                [ -z "$operator" ] && operator=">="
-                case "$operator" in
-                    ">") nft_op="gt" ;;
-                    ">=") nft_op="ge" ;;
-                    "<") nft_op="lt" ;;
-                    "<=") nft_op="le" ;;
-                    "!=") nft_op="ne" ;;
-                    *) nft_op="$operator" ;;
-                esac
-                cmd="$cmd ip6 hoplimit $nft_op $num"
-            else
-                cmd="$cmd ip6 hoplimit $hop_val"
-            fi
-        fi
-
-        # ICMPv6 类型（仅当协议为 icmpv6）
-        if [ -n "$tmp_icmp_type" ] && [ "$proto" = "icmpv6" ]; then
-            local icmp_val="$tmp_icmp_type"
-            local neg=""
-            case "$icmp_val" in '!='*) neg="!="; icmp_val="${icmp_val#!=}"; ;; esac
-            if echo "$icmp_val" | grep -q '/'; then
-                local type=${icmp_val%/*} code=${icmp_val#*/}
-                cmd="$cmd icmpv6 type $neg $type icmpv6 code $code"
-            else
-                cmd="$cmd icmpv6 type $neg $icmp_val"
-            fi
-        fi
-
         cmd="$cmd meta mark set $class_mark counter"
         echo "$cmd"
     fi
