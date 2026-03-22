@@ -1,7 +1,7 @@
 #!/bin/sh
 # 规则辅助模块 (rule.sh)
-# 版本: 2.6.2 - 修复操作符 '=' 映射，锁超时兼容 BusyBox，验证函数允许 '=' 操作符
-# 全面优化各函数逻辑，确保与各算法模块兼容
+# 版本: 2.6.3 - 修复多值选项合并逻辑（改为后者覆盖），加强 IPv6 地址验证，调整 IPv6 标记位避免冲突
+# 注意：算法模块中不应重复定义 load_upload_class_configurations / load_download_class_configurations
 
 : ${DEBUG:=0}
 
@@ -182,8 +182,7 @@ validate_connbytes() {
     elif echo "$value" | grep -qE '^[0-9]+$'; then
         if ! validate_number "$value" "$param_name" 0 1048576; then return 1; fi
     else
-        log_error "$param_name 无效格式 '$value'"
-        return 1
+        log_error "$param_name 无效格式 '$value'"; return 1
     fi
     return 0
 }
@@ -209,6 +208,7 @@ validate_ip() {
     local ip="$1"
     local raw="${ip#!=}"
 
+    # IPv4 检查
     if echo "$raw" | grep -qE '^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}(/[0-9]{1,2})?$'; then
         local ipnum="${raw%%/*}"
         local oct1=$(echo "$ipnum" | cut -d. -f1)
@@ -225,21 +225,34 @@ validate_ip() {
         return 0
     fi
 
+    # IPv6 检查（加强）
     if echo "$raw" | grep -qiE '^([0-9a-fA-F]{0,4}:){1,7}[0-9a-fA-F]{0,4}(/[0-9]{1,3})?$'; then
+        # 禁止多个 '::'
         if echo "$raw" | grep -q '::.*::'; then
             log_error "IPv6地址 '$raw' 包含多个 '::'"
             return 1
         fi
+        # 禁止 ':::'
         if echo "$raw" | grep -q ':::'; then
             log_error "IPv6地址 '$raw' 包含非法序列 ':::'"
             return 1
         fi
+        # 禁止以单个冒号开头或结尾（除了 '::' 或 '::/...'）
         if echo "$raw" | grep -qE '^:[^:]' || echo "$raw" | grep -qE '[^:]:$'; then
             if ! echo "$raw" | grep -qE '^(::|::/|::/.*)$'; then
                 log_error "IPv6地址 '$raw' 不能以单个冒号开头或结尾"
                 return 1
             fi
         fi
+        # 检查段长度（每个段最多4个十六进制字符）
+        local segments=$(echo "$raw" | cut -d/ -f1 | tr ':' ' ' | sed 's/  */ /g')
+        local seg
+        for seg in $segments; do
+            if [ -n "$seg" ] && [ ${#seg} -gt 4 ]; then
+                log_error "IPv6地址段 '$seg' 长度超过4个十六进制字符"
+                return 1
+            fi
+        done
         if echo "$raw" | grep -q '/'; then
             local prefix="${raw#*/}"
             if ! validate_number "$prefix" "CIDR前缀" 0 128; then return 1; fi
@@ -469,6 +482,7 @@ load_all_config_sections() {
 }
 
 # ========== 公共函数：加载上传/下载类别配置 ==========
+# 注意：算法模块中不应重复定义以下两个函数，否则会覆盖此处的版本
 load_upload_class_configurations() {
     log_info "正在加载上传类别配置..."
     upload_class_list=$(load_all_config_sections "$CONFIG_FILE" "upload_class")
@@ -512,6 +526,7 @@ load_all_config_options() {
         return 1
     fi
 
+    # 多值选项（已改为取最后一个值，符合 UCI 常规行为）
     local multi_opts="srcport dstport connbytes_kb src_ip dest_ip tcp_flags packet_len udp_length"
     
     for opt in order enabled proto srcport dstport connbytes_kb family state src_ip dest_ip \
@@ -519,8 +534,9 @@ load_all_config_options() {
         local lines=$(echo "$config_data" | grep "^${config_name}\\.${escaped_section_id}\\.${opt}=")
         [ -z "$lines" ] && continue
         
+        # 对于多值选项，取最后一行（后者覆盖），不再合并所有行
         if echo " $multi_opts " | grep -q " $opt "; then
-            val=$(echo "$lines" | sed -n "s/^.*=//p" | sed "s/^'//; s/'$//; s/^\"//; s/\"$//" | paste -sd ',' -)
+            val=$(echo "$lines" | tail -n1 | sed -n "s/^.*=//p" | sed "s/^'//; s/'$//; s/^\"//; s/\"$//")
         else
             val=$(echo "$lines" | tail -n1 | sed -n "s/^.*=//p" | sed "s/^'//; s/'$//; s/^\"//; s/\"$//")
         fi
@@ -1817,29 +1833,30 @@ restore_main_config() {
     log_info "已清理规则集标记"
 }
 
-# ========== IPv6增强支持 ==========
+# ========== IPv6增强支持（调整标记位避免与上传类冲突） ==========
 setup_ipv6_specific_rules() {
     log_info "设置IPv6特定规则（优化版）"
     nft add chain inet gargoyle-qos-priority filter_prerouting '{ type filter hook prerouting priority 0; policy accept; }' 2>/dev/null || true
     nft flush chain inet gargoyle-qos-priority filter_prerouting 2>/dev/null || true
     local ICMPV6_CRITICAL_TYPES="133,134,135,136,137"
 
+    # 使用高16位标记，避免与上传类低16位冲突
     nft add rule inet gargoyle-qos-priority filter_prerouting \
-        meta nfproto ipv6 ip6 daddr { ff02::1:2, ff02::1:3 } meta mark set 0x3F00 counter 2>/dev/null || true
+        meta nfproto ipv6 ip6 daddr { ff02::1:2, ff02::1:3 } meta mark set 0x3F0000 counter 2>/dev/null || true
     nft add rule inet gargoyle-qos-priority filter_prerouting \
-        meta nfproto ipv6 ip6 daddr ::1 meta mark set 0x3F00 counter 2>/dev/null || true
+        meta nfproto ipv6 ip6 daddr ::1 meta mark set 0x3F0000 counter 2>/dev/null || true
     nft add rule inet gargoyle-qos-priority filter_prerouting \
-        meta nfproto ipv6 icmpv6 type { $ICMPV6_CRITICAL_TYPES } meta mark set 0x7F00 counter 2>/dev/null || true
+        meta nfproto ipv6 icmpv6 type { $ICMPV6_CRITICAL_TYPES } meta mark set 0x7F0000 counter 2>/dev/null || true
     nft add rule inet gargoyle-qos-priority filter_prerouting \
-        meta nfproto ipv6 udp dport { 546, 547 } meta mark set 0x7F00 counter 2>/dev/null || true
+        meta nfproto ipv6 udp dport { 546, 547 } meta mark set 0x7F0000 counter 2>/dev/null || true
     nft add rule inet gargoyle-qos-priority filter_prerouting \
-        meta nfproto ipv6 udp dport 53 meta mark set 0x7F00 counter 2>/dev/null || true
+        meta nfproto ipv6 udp dport 53 meta mark set 0x7F0000 counter 2>/dev/null || true
     nft add rule inet gargoyle-qos-priority filter_prerouting \
-        meta nfproto ipv6 tcp dport 53 meta mark set 0x7F00 counter 2>/dev/null || true
+        meta nfproto ipv6 tcp dport 53 meta mark set 0x7F0000 counter 2>/dev/null || true
     nft add rule inet gargoyle-qos-priority filter_prerouting \
-        meta nfproto ipv6 tcp dport { 80, 443 } meta mark set 0x7F00 counter 2>/dev/null || true
+        meta nfproto ipv6 tcp dport { 80, 443 } meta mark set 0x7F0000 counter 2>/dev/null || true
     nft add rule inet gargoyle-qos-priority filter_prerouting \
-        meta nfproto ipv6 udp dport 123 meta mark set 0x7F00 counter 2>/dev/null || true
+        meta nfproto ipv6 udp dport 123 meta mark set 0x7F0000 counter 2>/dev/null || true
     log_info "IPv6关键流量规则设置完成"
 }
 
