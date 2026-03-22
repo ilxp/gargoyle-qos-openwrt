@@ -1,6 +1,6 @@
 #!/bin/sh
 # 规则辅助模块 (rule.sh)
-# 版本: 2.6.3 - 修复多值选项合并逻辑（改为后者覆盖），加强 IPv6 地址验证，调整 IPv6 标记位避免冲突
+# 版本: 2.6.4 - 修复IPv6地址验证支持 `::` 缩写，修复纯数字比较缺少 `eq` 操作符
 # 注意：算法模块中不应重复定义 load_upload_class_configurations / load_download_class_configurations
 
 : ${DEBUG:=0}
@@ -225,8 +225,8 @@ validate_ip() {
         return 0
     fi
 
-    # IPv6 检查（加强）
-    if echo "$raw" | grep -qiE '^([0-9a-fA-F]{0,4}:){1,7}[0-9a-fA-F]{0,4}(/[0-9]{1,3})?$'; then
+    # IPv6 检查（增强支持 :: 缩写）
+    if echo "$raw" | grep -qiE '^([0-9a-fA-F]{0,4}:){0,7}[0-9a-fA-F]{0,4}(/[0-9]{1,3})?$'; then
         # 禁止多个 '::'
         if echo "$raw" | grep -q '::.*::'; then
             log_error "IPv6地址 '$raw' 包含多个 '::'"
@@ -954,7 +954,7 @@ setup_ratelimit_chain() {
     fi
 }
 
-# ========== ACK 限速规则生成（修复语法） ==========
+# ========== ACK 限速规则生成 ==========
 generate_ack_limit_rules() {
     [ "$ENABLE_ACK_LIMIT" != "1" ] && return
     local slow_rate=$(uci -q get ${CONFIG_FILE}.ack_limit.slow_rate 2>/dev/null)
@@ -1053,7 +1053,7 @@ get_custom_include() {
     fi
 }
 
-# ========== nft 规则构建（增强版，显式传递新选项） ==========
+# ========== nft 规则构建（增强版，修复纯数字比较缺少 eq） ==========
 build_nft_rule_fast() {
     local rule_name="$1" chain="$2" class_mark="$3" mask="$4" family="$5" proto="$6"
     local srcport="$7" dstport="$8" connbytes_kb="$9" state="${10}" src_ip="${11}" dest_ip="${12}"
@@ -1127,6 +1127,7 @@ build_nft_rule_fast() {
     elif [ "$proto" = "tcp_udp" ]; then common_cond="meta l4proto { tcp, udp }"
     elif [ -n "$proto" ] && [ "$proto" != "all" ]; then common_cond="meta l4proto $proto"; fi
 
+    # 处理 packet_len
     if [ -n "$packet_len" ]; then
         if echo "$packet_len" | grep -q '-'; then
             local min=${packet_len%-*} max=${packet_len#*-}
@@ -1146,7 +1147,8 @@ build_nft_rule_fast() {
             esac
             common_cond="$common_cond meta length $nft_op $num"
         else
-            common_cond="$common_cond meta length $packet_len"
+            # 纯数字 -> 视为 eq
+            common_cond="$common_cond meta length eq $packet_len"
         fi
     fi
 
@@ -1162,6 +1164,7 @@ build_nft_rule_fast() {
         common_cond="$common_cond oifname \"$oif\""
     fi
 
+    # 处理 udp_length
     if [ -n "$udp_length" ] && [ "$proto" = "udp" ]; then
         if echo "$udp_length" | grep -q '-'; then
             local min=${udp_length%-*} max=${udp_length#*-}
@@ -1181,7 +1184,8 @@ build_nft_rule_fast() {
             esac
             common_cond="$common_cond udp length $nft_op $num"
         else
-            common_cond="$common_cond udp length $udp_length"
+            # 纯数字 -> 视为 eq
+            common_cond="$common_cond udp length eq $udp_length"
         fi
     fi
 
@@ -1254,7 +1258,8 @@ build_nft_rule_fast() {
                 esac
                 cmd="$cmd ip ttl $nft_op $num"
             else
-                cmd="$cmd ip ttl $ttl_val"
+                # 纯数字 -> 视为 eq
+                cmd="$cmd ip ttl eq $ttl_val"
             fi
         fi
 
@@ -1302,7 +1307,8 @@ build_nft_rule_fast() {
                 esac
                 cmd="$cmd ip6 hoplimit $nft_op $num"
             else
-                cmd="$cmd ip6 hoplimit $hop_val"
+                # 纯数字 -> 视为 eq
+                cmd="$cmd ip6 hoplimit eq $hop_val"
             fi
         fi
 
