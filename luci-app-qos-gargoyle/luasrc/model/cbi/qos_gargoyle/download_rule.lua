@@ -1,6 +1,7 @@
 -- Copyright 2017 Xingwang Liao <kuoruan@gmail.com>
 -- Licensed to the public under the Apache License 2.0.
 -- Modified 2026 by ilxp <https://github.com/ilxp/gargoyle-qos-openwrt>
+-- 增加新版 rule.sh 支持的参数：tcp_flags, packet_len, dscp, iif, oif, icmp_type, udp_length, ttl
 
 local wa  = require "luci.tools.webadmin"
 local uci = require "luci.model.uci".cursor()
@@ -105,14 +106,68 @@ o:value("", translate("All"))
 o.placeholder = "e.g., 80,443,8000-9000"
 o.datatype  = "string"
 
--- 数据包大小限制
-o = s:option(Value, "min_pkt_size", translate("Min Packet"),
-	translate("Packet's minimum size (in bytes)."))
+-- ========== 新增字段 ==========
+-- TCP标志（仅对TCP协议有效）
+o = s:option(Value, "tcp_flags", translate("TCP Flags"),
+	translate("Match TCP flags (comma-separated, e.g., syn,ack). Allowed: syn, ack, rst, fin, urg, psh, ecn, cwr"))
+o:depends("proto", "tcp")
+o.placeholder = "e.g., syn,ack"
+o.datatype = "string"
+
+-- 包长度
+o = s:option(Value, "packet_len", translate("Packet Length"),
+	translate("Match packet length (in bytes). Supports: <100, >500, 100-200, !=1500"))
+o.placeholder = "e.g., <100 or 64-1500"
+o.datatype = "string"
+
+-- DSCP值
+o = s:option(Value, "dscp", translate("DSCP Value"),
+	translate("Match DSCP value (0-63). Use != for negation (e.g., !=46)."))
+o.placeholder = "e.g., 46 or !=0"
+o.datatype = "string"
+
+-- 入接口
+o = s:option(Value, "iif", translate("Input Interface"),
+	translate("Match input interface name (e.g., eth0, pppoe-wan)."))
+o.placeholder = "e.g., pppoe-wan"
+o.datatype = "string"
+
+-- 出接口
+o = s:option(Value, "oif", translate("Output Interface"),
+	translate("Match output interface name (e.g., eth0, br-lan)."))
+o.placeholder = "e.g., br-lan"
+o.datatype = "string"
+
+-- ICMP类型（自定义，覆盖旧icmptype）
+o = s:option(Value, "icmp_type", translate("ICMP Type (Advanced)"),
+	translate("Match ICMP/ICMPv6 type/code. Format: type/code (e.g., 8/0) or just type. Use != for negation."))
+o:depends("proto", "icmp")
+o:depends("proto", "icmpv6")
+o.placeholder = "e.g., 8/0 or !=3"
+o.datatype = "string"
+
+-- UDP长度
+o = s:option(Value, "udp_length", translate("UDP Length"),
+	translate("Match UDP packet length (in bytes). Supports comparison and ranges."))
+o:depends("proto", "udp")
+o.placeholder = "e.g., >100 or 64-1500"
+o.datatype = "string"
+
+-- TTL/Hop Limit
+o = s:option(Value, "ttl", translate("TTL / Hop Limit"),
+	translate("Match TTL (IPv4) or Hop Limit (IPv6). Supports: >64, <128, !=255, etc."))
+o.placeholder = "e.g., >64"
+o.datatype = "string"
+
+-- ========== 原有字段（保持兼容） ==========
+-- 数据包大小限制（旧字段，保留但不推荐）
+o = s:option(Value, "min_pkt_size", translate("Min Packet (deprecated)"),
+	translate("Packet's minimum size (in bytes). Use 'Packet Length' instead."))
 o.datatype = "range(1, 1500)"
 o.placeholder = "e.g., 64"
 
-o = s:option(Value, "max_pkt_size", translate("Max Packet"),
-	translate("Packet's maximum size (in bytes)."))
+o = s:option(Value, "max_pkt_size", translate("Max Packet (deprecated)"),
+	translate("Packet's maximum size (in bytes). Use 'Packet Length' instead."))
 o.datatype = "range(1, 1500)"
 o.placeholder = "e.g., 1500"
 

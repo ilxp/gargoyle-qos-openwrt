@@ -41,11 +41,6 @@ enum idclass_map_id {
 	__CL_MAP_MAX,
 };
 
-struct idclass_ip_map_val {
-	uint8_t dscp;
-	uint8_t seen;
-};
-
 struct idclass_map_data {
 	enum idclass_map_id id;
 	bool file : 1;

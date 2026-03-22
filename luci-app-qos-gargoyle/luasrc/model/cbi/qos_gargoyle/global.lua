@@ -1,6 +1,7 @@
 -- Copyright 2017 Xingwang Liao <kuoruan@gmail.com>
 -- Licensed to the public under the Apache License 2.0.
 -- Modified 2026 by ilxp <https://github.com/ilxp/gargoyle-qos-openwrt>
+-- 版本: 支持带宽为 0（禁用对应方向），新增 ACK/TCP 升级开关
 
 local sys = require "luci.sys"
 local uci = require "luci.model.uci".cursor()
@@ -111,7 +112,26 @@ o = s:option(Flag, "auto_adjust_percentages", translate("Auto Adjust Percentages
 o.default = "1"
 o.rmempty = false
 
--- 上传带宽配置
+-- ========== 新增开关 ==========
+-- ACK 限速开关
+o = s:option(Flag, "enable_ack_limit", translate("Enable ACK Limit"),
+             translate("Limit ACK packets to prevent bufferbloat. Recommended for asymmetric links."))
+o.default = "1"
+o.rmempty = false
+
+-- TCP 升级开关
+o = s:option(Flag, "enable_tcp_upgrade", translate("Enable TCP Upgrade"),
+             translate("Prioritize slow TCP connections (e.g., web browsing) to improve responsiveness."))
+o.default = "1"
+o.rmempty = false
+
+-- 速率限制开关（可选，若需要可在页面中启用）
+-- o = s:option(Flag, "enable_ratelimit", translate("Enable Rate Limit"),
+--              translate("Rate limit specific IPs or networks as defined in the 'ratelimit' sections."))
+-- o.default = "0"
+-- o.rmempty = false
+
+-- ========== 上传带宽配置 ==========
 s = m:section(NamedSection, "upload", "upload", translate("Upload Settings"))
 s.anonymous = true
 
@@ -126,8 +146,9 @@ o = s:option(Value, "total_bandwidth", translate("Total Upload Bandwidth"),
     .. "program (with QoS off) to determine available upload bandwidth. Note that bandwidth is "
     .. "specified in kbps, leave blank to disable update QoS. There are 8 kilobits per kilobyte."))
 o.datatype = "uinteger"
+-- 允许 0 或空值（0 表示禁用上传 QoS）
 
--- 下载带宽配置
+-- ========== 下载带宽配置 ==========
 s = m:section(NamedSection, "download", "download", translate("Download Settings"))
 s.anonymous = true
 
@@ -139,6 +160,7 @@ o = s:option(Value, "total_bandwidth", translate("Total Download Bandwidth"),
     translate("Specifying correctly is crucial to making QoS work. Note that bandwidth is specified "
     .. "in kbps, leave blank to disable download QoS. There are 8 kilobits per kilobyte."))
 o.datatype = "uinteger"
+-- 允许 0 或空值（0 表示禁用下载 QoS）
 
 -- 配置IFB设备
 local function get_ifb_devices()
@@ -158,12 +180,10 @@ local ifb_devices_list = get_ifb_devices()
 o = s:option(Value, "ifb_device", translate("IFB Device"),
     translate("Select or enter the IFB (Intermediate Functional Block) device used for ingress shaping. Typically ifb0."))
 
--- 添加现有 IFB 设备作为建议值
 for _, ifb in ipairs(ifb_devices_list) do
     o:value(ifb)
 end
 
--- 设置默认值：优先使用当前 UCI 配置值，否则使用第一个存在的 IFB 设备，否则 ifb0
 local current_ifb = uci:get(qos_gargoyle, "download", "ifb_device")
 if current_ifb and current_ifb ~= "" then
     o.default = current_ifb
@@ -231,6 +251,11 @@ end
 
 -- 修改后的应用百分比函数，接受 UCI 游标作为参数
 local function apply_class_percentages(cursor, direction, bw, linklayer, adjust_minmax)
+    -- 如果带宽为 0 或空，跳过调整
+    if not bw or bw == 0 then
+        sys.call("logger -t qos_gargoyle '警告：方向 " .. direction .. " 带宽为 0 或未配置，跳过自动调整'")
+        return
+    end
     local percents = get_percentages(direction, bw, linklayer)
     local class_names = { "realtime", "normal", "bulk" }
     
@@ -311,12 +336,21 @@ local function after_apply(self)
     -- 检查自动调整开关
     local auto_adjust = self.uci:get(qos_gargoyle, "global", "auto_adjust_percentages") or "1"
     if auto_adjust == "1" then
-        local upload_bw = tonumber(self.uci:get(qos_gargoyle, "upload", "total_bandwidth")) or 50000
-        local download_bw = tonumber(self.uci:get(qos_gargoyle, "download", "total_bandwidth")) or 100000
+        local upload_bw = tonumber(self.uci:get(qos_gargoyle, "upload", "total_bandwidth")) or 0
+        local download_bw = tonumber(self.uci:get(qos_gargoyle, "download", "total_bandwidth")) or 0
         local linklayer = self.uci:get(qos_gargoyle, "global", "linklayer") or "atm"
         
-        apply_class_percentages(self.uci, "upload", upload_bw, linklayer, true)
-        apply_class_percentages(self.uci, "download", download_bw, linklayer, true)
+        -- 仅当带宽 > 0 时才调整，避免除零或负数
+        if upload_bw > 0 then
+            apply_class_percentages(self.uci, "upload", upload_bw, linklayer, true)
+        else
+            sys.call("logger -t qos_gargoyle '上传带宽为 0，跳过自动调整'")
+        end
+        if download_bw > 0 then
+            apply_class_percentages(self.uci, "download", download_bw, linklayer, true)
+        else
+            sys.call("logger -t qos_gargoyle '下载带宽为 0，跳过自动调整'")
+        end
         
         self.uci:commit(qos_gargoyle)
     else

@@ -624,7 +624,7 @@ check_ingress_redirect() {
 }
 
 # ========== 上传方向初始化 ==========
-init_htb_upload() {
+init_htb_fqcodel_upload() {
     qos_log "INFO" "初始化上传方向HTB"
     load_upload_class_configurations
     if [ -z "$upload_class_list" ]; then
@@ -678,7 +678,7 @@ init_htb_upload() {
 }
 
 # ========== 下载方向初始化 ==========
-init_htb_download() {
+init_htb_fqcodel_download() {
     qos_log "INFO" "初始化下载方向HTB"
     load_download_class_configurations
     if [ -z "$download_class_list" ]; then
@@ -1031,33 +1031,47 @@ init_htb_fqcodel_qos() {
     fi
     echo "应用ipv6特别规则..." 
     setup_ipv6_specific_rules
-    local upload_success=0
-    local download_success=0
-    if [ "$total_upload_bandwidth" -gt 0 ] 2>/dev/null; then
-        if ! init_htb_upload; then
+	
+    local upload_failed=0
+    local download_failed=0
+    local upload_skipped=0
+    local download_skipped=0
+
+    # 检查上传带宽
+    if [ -z "$total_upload_bandwidth" ] || ! echo "$total_upload_bandwidth" | grep -q '^[0-9]\+$' || [ "$total_upload_bandwidth" -le 0 ]; then
+        qos_log "INFO" "上传带宽未配置或为0，禁用上传QoS"
+        upload_skipped=1
+    else
+        if ! init_htb_fqcodel_upload; then
             qos_log "ERROR" "上传方向初始化失败"
-            upload_success=1
+            upload_failed=1
         fi
-    else
-        qos_log "ERROR" "上传带宽未配置"
-        upload_success=1
     fi
-    if [ "$total_download_bandwidth" -gt 0 ] 2>/dev/null; then
-        if ! init_htb_download; then
+
+    # 检查下载带宽
+    if [ -z "$total_download_bandwidth" ] || ! echo "$total_download_bandwidth" | grep -q '^[0-9]\+$' || [ "$total_download_bandwidth" -le 0 ]; then
+        qos_log "INFO" "下载带宽未配置或为0，禁用下载QoS"
+        download_skipped=1
+    else
+        if ! init_htb_fqcodel_download; then
             qos_log "ERROR" "下载方向初始化失败"
-            download_success=1
+            download_failed=1
         fi
-    else
-        qos_log "ERROR" "下载带宽未配置"
-        download_success=1
     fi
-    if [ $upload_success -eq 1 ] || [ $download_success -eq 1 ]; then
-        qos_log "ERROR" "HTB+FQ_CODEL QoS 初始化部分失败"
+
+    # 如果有任何方向尝试初始化但失败，则整体失败
+    if [ $upload_failed -eq 1 ] || [ $download_failed -eq 1 ]; then
+        qos_log "ERROR" "HTB+FQCODEL QoS 初始化部分失败"
         stop_htb_fqcodel_qos
         release_lock
         rm -f "$QOS_RUNNING_FILE"
         return 1
     fi
+
+    if [ $upload_skipped -eq 1 ] && [ $download_skipped -eq 1 ]; then
+        qos_log "WARN" "上传和下载带宽均为0或未配置，QoS未启动任何方向"
+    fi
+	
     echo "应用HTB特别规则..." 
     setup_htb_enhance_chains
     apply_htb_specific_rules
@@ -1210,6 +1224,31 @@ show_htb_fqcodel_status() {
         echo -e "\n⚠ 部分方向QoS已启用"
     else
         echo -e "\n✗ QoS未运行"
+		
+    echo -e "\n===== 详细队列统计 ====="
+    
+    echo -e "\n上传方向cake队列:"
+    tc -s qdisc show dev "$qos_interface" 2>/dev/null | grep -A 3 "cake" | while read -r line; do
+        if echo "$line" | grep -q "parent"; then
+            echo "  $line"
+        elif echo "$line" | grep -q "Sent" || echo "$line" | grep -q "maxpacket" || \
+             echo "$line" | grep -q "ecn_mark" || echo "$line" | grep -q "memory_used"; then
+            echo "    $line"
+        fi
+    done
+    
+    if [ -n "$qos_ifb" ] && ip link show "$qos_ifb" >/dev/null 2>&1; then
+        echo -e "\n下载方向cake队列:"
+        tc -s qdisc show dev "$qos_ifb" 2>/dev/null | grep -A 3 "cake" | while read -r line; do
+            if echo "$line" | grep -q "parent"; then
+                echo "  $line"
+            elif echo "$line" | grep -q "Sent" || echo "$line" | grep -q "maxpacket" || \
+                 echo "$line" | grep -q "ecn_mark" || echo "$line" | grep -q "memory_used"; then
+                echo "    $line"
+            fi
+        done
+    fi
+	
     fi
     echo -e "\n===== 增强特性状态 ====="
     echo "速率限制: $([ "$ENABLE_RATELIMIT" = "1" ] && echo "已启用" || echo "未启用")"
