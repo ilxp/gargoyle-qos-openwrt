@@ -1,6 +1,6 @@
 #!/bin/bash
 # 规则辅助模块 (rule.sh)
-# 版本: 3.1.0 - 修复速率限制链定义引号问题，优化带宽单位处理，完善错误处理
+# 版本: 3.1.2 - 最终稳定版，修复所有已知问题，与算法模块协同工作
 # 基于 HTB 与 CAKE 组合算法实现 QoS 流量控制
 
 # ========== 全局配置常量 ==========
@@ -1151,7 +1151,7 @@ setup_ratelimit_chain() {
     if [[ -n "$rules" ]]; then
         local temp_ratelimit_file=$(mktemp /tmp/qos_ratelimit_XXXXXX)
         TEMP_FILES+=("$temp_ratelimit_file")
-        # 修复：用单引号包裹大括号内容，避免 shell 解释
+        # 用单引号包裹大括号内容，避免 shell 解释
         echo "add chain inet gargoyle-qos-priority $RATELIMIT_CHAIN '{ type filter hook forward priority -10; policy accept; }'" > "$temp_ratelimit_file"
         echo "flush chain inet gargoyle-qos-priority $RATELIMIT_CHAIN" >> "$temp_ratelimit_file"
         echo "$rules" | while IFS= read -r rule; do
@@ -1379,6 +1379,7 @@ build_nft_rule_fast() {
         fi
     fi
 
+    # 端口匹配：上传（非ingress）使用 dstport，下载（ingress）使用 srcport
     if [[ "$proto" =~ ^(tcp|udp|tcp_udp)$ ]]; then
         if [[ "$chain" == *"ingress"* ]]; then
             [[ -n "$srcport" ]] && common_cond="$common_cond th sport { $(echo "$srcport" | tr -d ' ') }"
@@ -1427,7 +1428,8 @@ build_nft_rule_fast() {
     local base_cmd="add rule inet gargoyle-qos-priority $chain meta mark == 0"
 
     if (( do_ipv4 )); then
-        local cmd="$base_cmd meta nfproto ipv4 $common_cond"
+        local cmd="$base_cmd meta nfproto ipv4"
+        [[ -n "$common_cond" ]] && cmd="$cmd $common_cond"
         [[ -n "$ipv4_cond" ]] && cmd="$cmd $ipv4_cond"
 
         if [[ -n "$dscp" ]]; then
@@ -1474,7 +1476,8 @@ build_nft_rule_fast() {
     fi
 
     if (( do_ipv6 )); then
-        local cmd="$base_cmd meta nfproto ipv6 $common_cond"
+        local cmd="$base_cmd meta nfproto ipv6"
+        [[ -n "$common_cond" ]] && cmd="$cmd $common_cond"
         [[ -n "$ipv6_cond" ]] && cmd="$cmd $ipv6_cond"
 
         if [[ -n "$dscp" ]]; then

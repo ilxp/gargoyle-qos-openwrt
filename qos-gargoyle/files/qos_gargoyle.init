@@ -2,7 +2,7 @@
 #
 # QoS Gargoyle 初始化脚本 - 传统 init.d 版本
 # 支持多算法：HFSC, CAKE, FQ_CoDel, HTB, CAKE with DSCPclassify, HFSC+CAKE, HTB+CAKE
-# 版本：2.6.0 - 统一锁机制(flock)，修复默认类索引计算，增强错误处理，整合 rule.sh
+# 版本：2.6.2 - 修复 wait_interface 兼容性，统一算法模块初始化调用，优化停止逻辑
 #
 
 START=50
@@ -17,7 +17,6 @@ EXTRA_HELP="        show    显示当前 QoS 配置状态
 CONFIG_FILE="qos_gargoyle"
 UPLOAD_MASK="0xFFFF"
 DOWNLOAD_MASK="0xFFFF0000"
-LOCK_DIR="/var/run/qos_gargoyle.lock"          # 锁文件（flock 使用）
 SERVICE_NAME="qos_gargoyle"
 
 # 算法模块路径
@@ -100,8 +99,12 @@ update_config_state() {
 stop_qos() {
     echo "Stopping QoS system..."
     
-    # 停止监控进程
-    killall qosacc 2>/dev/null
+    # 停止监控进程（使用 start-stop-daemon 优雅停止）
+    if command -v start-stop-daemon >/dev/null 2>&1; then
+        start-stop-daemon -K -x /usr/sbin/qosacc 2>/dev/null
+    else
+        killall qosacc 2>/dev/null
+    fi
     sleep 1
     
     # 检查服务是否真的在运行
@@ -143,21 +146,25 @@ stop_qos() {
         fi
     fi
     
-    # 清理 IFB 设备的队列
+    # 清理 IFB 设备的队列（包括 ingress）
     echo "Cleaning IFB device queues..."
     if ip link show dev "$ifb_dev" >/dev/null 2>&1; then
         if tc qdisc show dev "$ifb_dev" root 2>/dev/null | grep -qE "hfsc|cake|fq_codel|htb"; then
             echo "  Deleting root queue on $ifb_dev..."
             tc qdisc del dev "$ifb_dev" root 2>/dev/null
         fi
+        if tc qdisc show dev "$ifb_dev" ingress 2>/dev/null; then
+            echo "  Deleting ingress queue on $ifb_dev..."
+            tc qdisc del dev "$ifb_dev" ingress 2>/dev/null
+        fi
     fi
     
-    # 只清除 QoS 特定的 NFT 规则，不删除整个表
+    # 清除 QoS 特定的 NFT 规则（由算法模块负责清理，此处只确保清空）
     echo "Clearing QoS-specific NFT rules..."
-    
     if nft list table inet gargoyle-qos-priority >/dev/null 2>&1; then
         echo "  Flushing QoS NFT rules..."
         nft flush table inet gargoyle-qos-priority 2>/dev/null
+        # 注意：不删除表，因为算法模块停止时会删除表
     else
         echo "  QoS NFT table not found, skipping"
     fi
@@ -206,31 +213,47 @@ start() {
 }
 
 stop() {
+    # 获取锁，防止与启动并发
+    acquire_lock || {
+        echo "无法获取锁，停止操作可能冲突" >&2
+        return 1
+    }
+    
     echo "Stopping QoS Gargoyle service..."
     
     # 获取当前算法
-    local algo=$(uci -q get qos_gargoyle.global.algorithm 2>/dev/null)
+    local algo=$(uci -q get "$CONFIG_FILE.global.algorithm" 2>/dev/null)
     algo=${algo:-htb_cake}
     local module="/usr/lib/qos_gargoyle/${algo}.sh"
     
-    if [ -f "$module" ]; then
-        # 加载算法模块并调用其停止函数
-        . "$module"
-        # 调用对应的停止函数，例如 stop_htb_cake_qos
-        stop_${algo}_qos
-    else
-        # 模块不存在时使用通用清理
-        echo "Warning: Algorithm module $module not found, using generic cleanup"
-        # 仍然需要加载必要的变量
-        if [ -z "$IFB_DEVICE" ]; then
-            IFB_DEVICE=$(uci -q get "$CONFIG_FILE.download.ifb_device" 2>/dev/null)
-            IFB_DEVICE="${IFB_DEVICE:-ifb0}"
+    # 先检查停止函数是否存在，若不存在再加载模块（避免重复 source 导致变量重置）
+    if ! type stop_${algo}_qos >/dev/null 2>&1; then
+        if [ -f "$module" ]; then
+            . "$module"
+        else
+            echo "Warning: Algorithm module $module not found, using generic cleanup"
+            # 仍然需要加载必要的变量
+            if [ -z "$IFB_DEVICE" ]; then
+                IFB_DEVICE=$(uci -q get "$CONFIG_FILE.download.ifb_device" 2>/dev/null)
+                IFB_DEVICE="${IFB_DEVICE:-ifb0}"
+            fi
+            stop_qos
+            release_lock
+            echo "QoS Gargoyle stopped (generic)"
+            save_service_status "stopped"
+            return 0
         fi
-        stop_qos
     fi
+    
+    # 调用对应的停止函数
+    stop_${algo}_qos 2>/dev/null || {
+        echo "停止函数 stop_${algo}_qos 执行失败，使用通用清理"
+        stop_qos
+    }
     
     echo "QoS Gargoyle stopped"
     save_service_status "stopped"
+    release_lock
     return 0
 }
 
@@ -394,7 +417,7 @@ load_qos_config() {
             if [ -n "$qos_interface" ]; then
                 echo "提示: 从默认路由检测到接口 '$qos_interface'" >&2
             else
-                echo "错误: 自动检测 WAN 接口失败，请手动配置 qos_gargoyle.global.wan_interface" >&2
+                echo "错误: 自动检测 WAN 接口失败，请手动配置 $CONFIG_FILE.global.wan_interface" >&2
                 return 1
             fi
         else
@@ -417,7 +440,7 @@ get_network_info() {
     # --- 确定 WAN 接口 ---
     if [ -z "$qos_interface" ]; then
         # 1. 从 UCI 读取用户配置的 WAN 接口（优先）
-        qos_interface=$(uci -q get qos_gargoyle.global.wan_interface)
+        qos_interface=$(uci -q get "$CONFIG_FILE.global.wan_interface")
 
         # 2. 如果未配置，使用 network_find_wan 自动查找
         if [ -z "$qos_interface" ]; then
@@ -444,7 +467,7 @@ get_network_info() {
     # --- 获取 WAN IPv4 地址 ---
     wan_ip=""
     if ! network_get_ipaddr wan_ip "$qos_interface" 2>/dev/null; then
-        # 后备：使用 ip 命令手动获取，不使用 grep -P
+        # 后备：使用 ip 命令手动获取
         wan_ip=$(ip -4 addr show dev "$qos_interface" 2>/dev/null | \
                  awk '/inet / {split($2, a, "/"); print a[1]; exit}')
     fi
@@ -506,12 +529,11 @@ check_configuration() {
     return 0
 }
 
-# 等待网络接口就绪（支持 IPv4/IPv6，可配置超时）
+# 等待网络接口就绪（使用简单循环计数，避免依赖 date +%s）
 wait_interface() {
     local iface="$1"
     local timeout="${2:-15}"
     local proto="${3:-ipv4}"
-    local start_time=$(date +%s)
     local elapsed=0
     local found=0
 
@@ -522,6 +544,7 @@ wait_interface() {
 
     echo "等待接口 $iface 就绪 (超时 ${timeout}秒, 协议: $proto)..."
 
+    # 等待设备出现
     local wait_exists=$((timeout / 3))
     [ $wait_exists -lt 1 ] && wait_exists=1
     while [ $elapsed -lt $wait_exists ]; do
@@ -529,7 +552,7 @@ wait_interface() {
             break
         fi
         sleep 1
-        elapsed=$(( $(date +%s) - start_time ))
+        elapsed=$((elapsed + 1))
     done
 
     if ! ip link show dev "$iface" >/dev/null 2>&1; then
@@ -537,7 +560,9 @@ wait_interface() {
         return 1
     fi
 
+    # 等待获得地址
     local addr_ok=0
+    elapsed=0
     while [ $elapsed -lt $timeout ]; do
         case "$proto" in
             ipv4)
@@ -555,7 +580,7 @@ wait_interface() {
         esac
         [ $addr_ok -eq 1 ] && break
         sleep 1
-        elapsed=$(( $(date +%s) - start_time ))
+        elapsed=$((elapsed + 1))
     done
 
     if [ $addr_ok -eq 1 ]; then
@@ -565,52 +590,6 @@ wait_interface() {
         echo "错误: 接口 $iface 在 ${timeout} 秒内未获得 $proto 地址" >&2
         return 1
     fi
-}
-
-# 初始化 NFT 表（修复跳转规则问题）
-setup_nft_tables() {
-    echo "Setting up nftables..."
-    
-    if [ -z "$qos_interface" ]; then
-        echo "警告: qos_interface 为空，尝试重新获取..." >&2
-        qos_interface=$(uci -q get "$CONFIG_FILE.global.wan_interface")
-        if [ -z "$qos_interface" ] || [ "$qos_interface" = "auto" ]; then
-            network_find_wan qos_interface 2>/dev/null
-        fi
-        if [ -z "$qos_interface" ]; then
-            qos_interface=$(ip route show default 2>/dev/null | awk '/default/ {print $5}' | head -1)
-        fi
-    fi
-    
-    if [ -z "$qos_interface" ]; then
-        echo "错误: 无法确定 WAN 接口，无法设置 nftables 跳转规则，启动中止" >&2
-        return 1
-    fi
-    
-    # 删除旧表并重建
-    nft list table inet gargoyle-qos-priority >/dev/null 2>&1 && nft delete table inet gargoyle-qos-priority
-    
-    nft add table inet gargoyle-qos-priority
-    
-    # 创建分类链
-    nft add chain inet gargoyle-qos-priority filter_qos_egress
-    nft add chain inet gargoyle-qos-priority filter_qos_ingress
-    
-    # 创建钩子链
-    nft add chain inet gargoyle-qos-priority filter_forward '{ type filter hook forward priority 115; policy accept; }'
-    nft add chain inet gargoyle-qos-priority filter_prerouting '{ type filter hook prerouting priority -149; policy accept; }'
-    nft add chain inet gargoyle-qos-priority filter_postrouting '{ type filter hook postrouting priority 115; policy accept; }'
-    nft add chain inet gargoyle-qos-priority filter_input '{ type filter hook input priority 115; policy accept; }'
-    
-    # 添加跳转规则
-    echo "添加跳转规则，接口: $qos_interface"
-    nft add rule inet gargoyle-qos-priority filter_postrouting oifname "$qos_interface" jump filter_qos_egress
-    nft add rule inet gargoyle-qos-priority filter_input iifname "$qos_interface" jump filter_qos_ingress
-    nft add rule inet gargoyle-qos-priority filter_forward iifname "$qos_interface" jump filter_qos_ingress
-    nft add rule inet gargoyle-qos-priority filter_forward oifname "$qos_interface" jump filter_qos_egress
-    
-    echo "NFT tables init"
-    return 0
 }
 
 # 创建/检查 IFB 设备（与 ifb.init 配合，不破坏现有设备）
@@ -682,7 +661,7 @@ load_bandwidth_config() {
     echo " Download bandwidth: $total_download_bandwidth kbit/s"
 }
 
-# 启动 QoS 监控（从 UCI 读取参数并传递给 qosacc）
+# 启动 QoS 监控（使用 start-stop-daemon）
 start_qos_acc() {
     echo "Starting QoS acc..."
     
@@ -720,13 +699,20 @@ start_qos_acc() {
         fi
     fi
     
-    # 修复: 检查必要参数非空
-    if [ -n "$ptarget_ip" ] && [ -n "$total_download_bandwidth" ] && [ -n "$pinglimit" ]; then
-        echo "启动 QoS 监控: qosacc -a -b 800 $ptarget_ip $total_download_bandwidth $pinglimit"
-        qosacc -a -b 800 "$ptarget_ip" "$total_download_bandwidth" "$pinglimit" &
+    # 使用 start-stop-daemon 启动 qosacc
+    if command -v start-stop-daemon >/dev/null 2>&1; then
+        if [ -n "$ptarget_ip" ] && [ -n "$total_download_bandwidth" ] && [ -n "$pinglimit" ]; then
+            start-stop-daemon -S -x /usr/sbin/qosacc -- -a -b 800 "$ptarget_ip" "$total_download_bandwidth" "$pinglimit"
+        else
+            start-stop-daemon -S -x /usr/sbin/qosacc
+        fi
     else
-        echo "Warning: Missing parameters for qosacc, starting with defaults"
-        qosacc &
+        # 降级方案
+        if [ -n "$ptarget_ip" ] && [ -n "$total_download_bandwidth" ] && [ -n "$pinglimit" ]; then
+            qosacc -a -b 800 "$ptarget_ip" "$total_download_bandwidth" "$pinglimit" &
+        else
+            qosacc &
+        fi
     fi
     
     echo "QoS acc started"
@@ -737,14 +723,17 @@ init_qos() {
     echo "init QoS system..."
     
     # 获取锁（使用 rule.sh 的统一锁函数）
-    acquire_lock
+    if ! acquire_lock; then
+        echo "无法获取锁，启动中止" >&2
+        return 1
+    fi
     
     if ! load_qos_config; then
         release_lock
         return 1
     fi
     
-    # 增强: 等待接口同时具有 IPv4 和 IPv6 地址（使用 both）
+    # 等待接口同时具有 IPv4 和 IPv6 地址（使用 both）
     if ! wait_interface "$qos_interface" 15 both; then
         echo "WAN 接口未就绪（无 IP 地址），启动中止" >&2
         release_lock
@@ -762,12 +751,8 @@ init_qos() {
     # 先停止现有队列（确保干净状态）
     stop_qos
     
-    # 设置 nftables，如果失败则中止
-    if ! setup_nft_tables; then
-        echo "nftables 初始化失败，启动中止" >&2
-        release_lock
-        return 1
-    fi
+    # 注意：nftables 基础结构（表、钩子链）完全由算法模块（通过 rule.sh）负责初始化，
+    # 主脚本不再单独创建，避免与算法模块重复。
     
     if ! create_ifb_device; then
         echo "IFB 设备创建失败，启动中止" >&2
@@ -785,7 +770,7 @@ init_qos() {
         return 1
     fi
     
-    # 调用算法特定的初始化，并捕获返回值
+    # 调用算法特定的初始化，统一传递一个参数（无参数也可，但为了兼容性传递 start）
     local ALGO_RET=0
     case "$algorithm" in
         "cake"|"cake_dscp")

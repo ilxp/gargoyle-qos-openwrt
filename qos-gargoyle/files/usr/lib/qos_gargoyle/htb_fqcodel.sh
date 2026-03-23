@@ -1,6 +1,6 @@
 #!/bin/bash
 # HTB_FQCODEL算法实现模块
-# 版本: 3.0.2 - 与 rule.sh 3.0.8 协同优化，修复 PID 检查、eval 安全隐患、burst 计算、默认类范围
+# 版本: 3.0.4 - 直接使用主脚本导出的环境变量，避免重复读取 UCI，优化变量使用
 # 基于HTB与FQ_CODEL组合算法实现QoS流量控制。
 
 # ========== 全局配置常量 ==========
@@ -33,8 +33,9 @@ fi
 # 锁持有标志（由 rule.sh 管理）
 HAVE_LOCK=0
 
+# 清理函数：合并 rule.sh 的临时文件清理和锁释放
 main_cleanup() {
-    rm -f "$TEMP_FILES" 2>/dev/null
+    cleanup_temp_files 2>/dev/null
     release_lock 2>/dev/null
 }
 trap main_cleanup EXIT INT TERM HUP QUIT
@@ -51,7 +52,7 @@ strip_leading_zeros() {
     echo "$val"
 }
 
-# ========== 检查是否已经在运行（增强版） ==========
+# ========== 检查是否已经在运行 ==========
 check_already_running() {
     if [[ -f "$QOS_RUNNING_FILE" ]]; then
         local old_pid=$(cat "$QOS_RUNNING_FILE" 2>/dev/null)
@@ -68,24 +69,29 @@ check_already_running() {
 # ========== HTB 与 FQ_CODEL 专属配置加载 ==========
 load_htb_fqcodel_config() {
     qos_log "INFO" "加载HTB与fq_codel配置"
-    if ! load_bandwidth_from_config; then
-        echo "带宽配置加载失败" >&2
+    # 带宽已由主脚本加载并导出为环境变量，直接使用
+    if [[ -z "$total_upload_bandwidth" ]] || [[ -z "$total_download_bandwidth" ]]; then
+        qos_log "ERROR" "带宽环境变量未设置，请确保主脚本已正确加载带宽配置"
         return 1
     fi
-    IFB_DEVICE=$(uci -q get qos_gargoyle.download.ifb_device 2>/dev/null)
-    if [[ -z "$IFB_DEVICE" ]]; then
-        IFB_DEVICE="ifb0"
-        qos_log "WARN" "IFB设备未配置，使用默认值: $IFB_DEVICE"
+    qos_log "INFO" "使用主脚本提供的带宽: 上传=${total_upload_bandwidth}kbit, 下载=${total_download_bandwidth}kbit"
+
+    # IFB 设备：优先使用环境变量，否则从 UCI 读取或使用默认值
+    if [[ -n "$IFB_DEVICE" ]]; then
+        qos_log "INFO" "使用环境变量 IFB_DEVICE=$IFB_DEVICE"
     else
-        qos_log "INFO" "从配置文件读取IFB设备: $IFB_DEVICE"
+        IFB_DEVICE=$(uci -q get ${CONFIG_FILE}.download.ifb_device 2>/dev/null)
+        [[ -z "$IFB_DEVICE" ]] && IFB_DEVICE="ifb0"
+        qos_log "WARN" "IFB设备未通过环境变量传递，从 UCI 读取: $IFB_DEVICE"
     fi
-    HTB_R2Q=$(uci -q get qos_gargoyle.htb.r2q 2>/dev/null)
+
+    HTB_R2Q=$(uci -q get ${CONFIG_FILE}.htb.r2q 2>/dev/null)
     [[ -z "$HTB_R2Q" ]] && HTB_R2Q=10
-    HTB_DRR_QUANTUM=$(uci -q get qos_gargoyle.htb.drr_quantum 2>/dev/null)
+    HTB_DRR_QUANTUM=$(uci -q get ${CONFIG_FILE}.htb.drr_quantum 2>/dev/null)
     [[ -z "$HTB_DRR_QUANTUM" ]] && HTB_DRR_QUANTUM="auto"
 
     # fq_codel 参数：提供合理的默认值
-    FQCODEL_LIMIT=$(uci -q get qos_gargoyle.fq_codel.limit 2>/dev/null)
+    FQCODEL_LIMIT=$(uci -q get ${CONFIG_FILE}.fq_codel.limit 2>/dev/null)
     if [[ -z "$FQCODEL_LIMIT" ]]; then
         FQCODEL_LIMIT=1000
         qos_log "WARN" "fq_codel limit 未配置，使用默认值: $FQCODEL_LIMIT"
@@ -95,7 +101,7 @@ load_htb_fqcodel_config() {
         FQCODEL_LIMIT=1000
     fi
 
-    FQCODEL_INTERVAL=$(uci -q get qos_gargoyle.fq_codel.interval 2>/dev/null)
+    FQCODEL_INTERVAL=$(uci -q get ${CONFIG_FILE}.fq_codel.interval 2>/dev/null)
     if [[ -z "$FQCODEL_INTERVAL" ]]; then
         FQCODEL_INTERVAL=100
         qos_log "WARN" "fq_codel interval 未配置，使用默认值: ${FQCODEL_INTERVAL}us"
@@ -105,7 +111,7 @@ load_htb_fqcodel_config() {
         FQCODEL_INTERVAL=100
     fi
 
-    FQCODEL_TARGET=$(uci -q get qos_gargoyle.fq_codel.target 2>/dev/null)
+    FQCODEL_TARGET=$(uci -q get ${CONFIG_FILE}.fq_codel.target 2>/dev/null)
     if [[ -z "$FQCODEL_TARGET" ]]; then
         FQCODEL_TARGET=5
         qos_log "WARN" "fq_codel target 未配置，使用默认值: ${FQCODEL_TARGET}us"
@@ -115,7 +121,7 @@ load_htb_fqcodel_config() {
         FQCODEL_TARGET=5
     fi
 
-    FQCODEL_FLOWS=$(uci -q get qos_gargoyle.fq_codel.flows 2>/dev/null)
+    FQCODEL_FLOWS=$(uci -q get ${CONFIG_FILE}.fq_codel.flows 2>/dev/null)
     if [[ -z "$FQCODEL_FLOWS" ]]; then
         FQCODEL_FLOWS=1024
         qos_log "WARN" "fq_codel flows 未配置，使用默认值: $FQCODEL_FLOWS"
@@ -125,7 +131,7 @@ load_htb_fqcodel_config() {
         FQCODEL_FLOWS=1024
     fi
 
-    FQCODEL_QUANTUM=$(uci -q get qos_gargoyle.fq_codel.quantum 2>/dev/null)
+    FQCODEL_QUANTUM=$(uci -q get ${CONFIG_FILE}.fq_codel.quantum 2>/dev/null)
     if [[ -z "$FQCODEL_QUANTUM" ]]; then
         FQCODEL_QUANTUM=300
         qos_log "WARN" "fq_codel quantum 未配置，使用默认值: $FQCODEL_QUANTUM"
@@ -135,13 +141,13 @@ load_htb_fqcodel_config() {
         FQCODEL_QUANTUM=300
     fi
 
-    FQCODEL_MEMORY_LIMIT=$(uci -q get qos_gargoyle.fq_codel.memory_limit 2>/dev/null)
+    FQCODEL_MEMORY_LIMIT=$(uci -q get ${CONFIG_FILE}.fq_codel.memory_limit 2>/dev/null)
     if [[ -n "$FQCODEL_MEMORY_LIMIT" ]]; then
         FQCODEL_MEMORY_LIMIT=$(calculate_memory_limit "$FQCODEL_MEMORY_LIMIT")
         FQCODEL_MEMORY_LIMIT=$(echo "$FQCODEL_MEMORY_LIMIT" | tr 'A-Z' 'a-z')
     fi
 
-    FQCODEL_CE_THRESHOLD=$(uci -q get qos_gargoyle.fq_codel.ce_threshold 2>/dev/null)
+    FQCODEL_CE_THRESHOLD=$(uci -q get ${CONFIG_FILE}.fq_codel.ce_threshold 2>/dev/null)
     if [[ -n "$FQCODEL_CE_THRESHOLD" ]]; then
         if ! echo "$FQCODEL_CE_THRESHOLD" | grep -qiE '^0$|^[0-9]+(\.[0-9]+)?(us|ms)?$'; then
             qos_log "WARN" "无效的 ce_threshold 格式 '$FQCODEL_CE_THRESHOLD'，将忽略此设置"
@@ -149,7 +155,7 @@ load_htb_fqcodel_config() {
         fi
     fi
 
-    FQCODEL_ECN=$(uci -q get qos_gargoyle.fq_codel.ecn 2>/dev/null)
+    FQCODEL_ECN=$(uci -q get ${CONFIG_FILE}.fq_codel.ecn 2>/dev/null)
     if [[ -n "$FQCODEL_ECN" ]]; then
         case "$FQCODEL_ECN" in
             yes|1|enable|on|true) FQCODEL_ECN="ecn"; qos_log "INFO" "fq_codel ECN: 启用" ;;
@@ -167,16 +173,16 @@ load_htb_fqcodel_config() {
     return 0
 }
 
-# 修改：使用全局变量传递配置，避免 eval
+# 加载HTB类别配置（使用全局变量传递）
 load_htb_class_config() {
     local class_name="$1"
     local percent_bandwidth per_min_bandwidth per_max_bandwidth priority name
     qos_log "INFO" "加载HTB类别配置: $class_name"
-    percent_bandwidth=$(uci -q get qos_gargoyle.$class_name.percent_bandwidth 2>/dev/null)
-    per_min_bandwidth=$(uci -q get qos_gargoyle.$class_name.per_min_bandwidth 2>/dev/null)
-    per_max_bandwidth=$(uci -q get qos_gargoyle.$class_name.per_max_bandwidth 2>/dev/null)
-    priority=$(uci -q get qos_gargoyle.$class_name.priority 2>/dev/null)
-    name=$(uci -q get qos_gargoyle.$class_name.name 2>/dev/null)
+    percent_bandwidth=$(uci -q get ${CONFIG_FILE}.$class_name.percent_bandwidth 2>/dev/null)
+    per_min_bandwidth=$(uci -q get ${CONFIG_FILE}.$class_name.per_min_bandwidth 2>/dev/null)
+    per_max_bandwidth=$(uci -q get ${CONFIG_FILE}.$class_name.per_max_bandwidth 2>/dev/null)
+    priority=$(uci -q get ${CONFIG_FILE}.$class_name.priority 2>/dev/null)
+    name=$(uci -q get ${CONFIG_FILE}.$class_name.name 2>/dev/null)
 
     # 验证并去除前导零
     if [[ -n "$percent_bandwidth" ]]; then
@@ -570,7 +576,7 @@ create_htb_download_class() {
     return 0
 }
 
-# ========== 入口重定向（修复 connmark 覆盖问题） ==========
+# ========== 入口重定向 ==========
 setup_ingress_redirect() {
     if [[ -z "$qos_interface" ]]; then
         qos_log "ERROR" "无法确定 WAN 接口"
@@ -588,7 +594,7 @@ setup_ingress_redirect() {
         return 1
     fi
     tc filter del dev "$qos_interface" parent ffff: 2>/dev/null || true
-    # IPv4 重定向（直接重定向，不使用 connmark）
+    # IPv4 重定向
     if ! tc filter add dev "$qos_interface" parent ffff: protocol ip \
         u32 match u32 0 0 \
         action connmark \
@@ -727,7 +733,7 @@ init_htb_fqcodel_upload() {
     local first_enabled_class=""
 
     # 获取配置的默认类
-    default_class_name=$(uci -q get qos_gargoyle.upload.default_class 2>/dev/null)
+    default_class_name=$(uci -q get ${CONFIG_FILE}.upload.default_class 2>/dev/null)
 
     for class in $upload_class_list; do
         local enabled=$(uci -q get ${CONFIG_FILE}.${class}.enabled 2>/dev/null)
@@ -816,7 +822,7 @@ init_htb_fqcodel_download() {
     local default_class_name=""
     local first_enabled_class=""
 
-    default_class_name=$(uci -q get qos_gargoyle.download.default_class 2>/dev/null)
+    default_class_name=$(uci -q get ${CONFIG_FILE}.download.default_class 2>/dev/null)
 
     for class in $download_class_list; do
         local enabled=$(uci -q get ${CONFIG_FILE}.${class}.enabled 2>/dev/null)
@@ -907,6 +913,7 @@ apply_htb_specific_rules() {
         meta mark and 0x007f != 0 counter meta priority set "bulk" 2>/dev/null || true
     nft add rule inet gargoyle-qos-priority filter_qos_ingress_enhance \
         meta mark and 0x7f00 != 0 counter meta priority set "bulk" 2>/dev/null || true
+    # 将连接跟踪标记复制到包标记（用于保持标记连续性）
     nft add rule inet gargoyle-qos-priority filter_qos_egress_enhance \
         ct state established,related counter meta mark set ct mark 2>/dev/null || true
     nft add rule inet gargoyle-qos-priority filter_qos_egress_enhance \
@@ -924,7 +931,8 @@ apply_htb_specific_rules() {
 
 # ========== 主初始化函数 ==========
 init_htb_fqcodel_qos() {
-    qos_log "INFO" "开始初始化HTB+FQ_CODEL QoS系统"
+    local action="${1:-start}"
+    qos_log "INFO" "开始初始化HTB+FQ_CODEL QoS系统 (action=$action)"
     acquire_lock
     if ! check_already_running; then
         qos_log "ERROR" "HTB+FQ_CODEL QoS 已经在运行中"
@@ -954,7 +962,7 @@ init_htb_fqcodel_qos() {
     fi
     nft add table inet gargoyle-qos-priority 2>/dev/null || true
     if [[ -z "$qos_interface" ]]; then
-        qos_interface=$(uci -q get qos_gargoyle.global.wan_interface 2>/dev/null)
+        qos_interface=$(uci -q get ${CONFIG_FILE}.global.wan_interface 2>/dev/null)
         if [[ -z "$qos_interface" ]] && [[ -f "/lib/functions/network.sh" ]]; then
             . /lib/functions/network.sh
             network_find_wan qos_interface
@@ -1149,7 +1157,7 @@ stop_htb_fqcodel_qos() {
 # ========== 状态显示函数 ==========
 show_htb_fqcodel_status() {
     if [[ -z "$IFB_DEVICE" ]]; then
-        IFB_DEVICE=$(uci -q get qos_gargoyle.download.ifb_device 2>/dev/null)
+        IFB_DEVICE=$(uci -q get ${CONFIG_FILE}.download.ifb_device 2>/dev/null)
         [[ -z "$IFB_DEVICE" ]] && IFB_DEVICE="ifb0"
     fi
     local qos_ifb="$IFB_DEVICE"
@@ -1157,7 +1165,7 @@ show_htb_fqcodel_status() {
         qos_interface=$(tc qdisc show 2>/dev/null | grep -E "htb.*root" | awk '{print $5}' | head -1)
         [[ -z "$qos_interface" ]] && qos_interface="未知"
     fi
-    echo "===== HTB-FQ_CODEL QoS 状态报告 (v3.0.2) ====="
+    echo "===== HTB-FQ_CODEL QoS 状态报告 (v3.0.4) ====="
     echo "时间: $(date)"
     echo "WAN接口: ${qos_interface}"
     if ! tc qdisc show dev "${qos_interface}" 2>/dev/null | grep -q htb; then
