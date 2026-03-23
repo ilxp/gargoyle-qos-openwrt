@@ -1212,7 +1212,7 @@ show_hfsc_cake_status() {
         qos_interface=$(tc qdisc show 2>/dev/null | grep -E "hfsc.*root" | awk '{print $5}' | head -1)
         [[ -z "$qos_interface" ]] && qos_interface="未知"
     fi
-    echo "===== HFSC-CAKE QoS 状态报告 (v3.0.5) ====="
+    echo "===== HFSC-CAKE QoS 状态报告 ====="
     echo "时间: $(date)"
     echo "WAN接口: ${qos_interface}"
     if ! tc qdisc show dev "${qos_interface}" 2>/dev/null | grep -q hfsc; then
@@ -1286,16 +1286,16 @@ show_hfsc_cake_status() {
     local upload_active=0
     local download_active=0
     tc qdisc show dev "$qos_interface" 2>/dev/null | grep -q "htb" && upload_active=1
-    [[ -n "$qos_ifb" ]] && tc qdisc show dev "$qos_ifb" 2>/dev/null | grep -q "htb" && download_active=1
+    [[ -n "$qos_ifb" ]] && tc qdisc show dev "$qos_ifb" 2>/dev/null | grep -q "hfsc" && download_active=1
 
     if (( upload_active == 1 )); then
-        echo "上传QoS: 已启用 (HTB+cake)"
+        echo "上传QoS: 已启用 (HFSC+cake)"
     else
         echo "上传QoS: 未启用"
     fi
 
     if (( download_active == 1 )); then
-        echo "下载QoS: 已启用 (HTB+cake)"
+        echo "下载QoS: 已启用 (HFSC+cake)"
     else
         echo "下载QoS: 未启用"
     fi
