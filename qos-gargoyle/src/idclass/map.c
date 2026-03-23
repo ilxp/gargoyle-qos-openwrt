@@ -48,12 +48,6 @@ void idclass_set_config_name(const char *name)
     uci_config_name = name;
 }
 
-/* 定义 idclass_map_info_entry 结构体，避免匿名结构体冲突 */
-struct idclass_map_info_entry {
-    const char *name;
-    const char *type_name;
-};
-
 const struct idclass_map_info_entry idclass_map_info[] = {
     [CL_MAP_TCP_PORTS] = { "tcp_ports", "tcp_port" },
     [CL_MAP_UDP_PORTS] = { "udp_ports", "udp_port" },

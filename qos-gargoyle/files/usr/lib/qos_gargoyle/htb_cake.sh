@@ -1,6 +1,6 @@
 #!/bin/sh
 # HTB_CAKE算法实现模块
-# 版本: 2.7.2 - 修复 check_already_running 函数缺失，整合之前所有修复
+# 版本: 2.7.5 - 修复 flower 规则中 IPv6 匹配语法 (dst_ip)
 # 基于HTB与CAKE组合算法实现QoS流量控制
 
 # ========== 全局配置常量 ==========
@@ -512,6 +512,12 @@ setup_ingress_redirect() {
         qos_log "ERROR" "无法确定 WAN 接口"
         return 1
     fi
+
+    # 检查 tc connmark 动作支持
+    if ! check_tc_connmark_support; then
+        qos_log "WARN" "tc connmark 动作不受支持，入口重定向可能无法正常工作。请确保内核支持 connmark 且已加载 act_connmark 模块。"
+    fi
+
     qos_log "INFO" "设置入口重定向: $qos_interface -> $IFB_DEVICE"
     tc qdisc del dev "$qos_interface" ingress 2>/dev/null || true
     if ! tc qdisc add dev "$qos_interface" handle ffff: ingress; then
@@ -540,9 +546,9 @@ setup_ingress_redirect() {
     fi
 
     local ipv6_success=false
-    # 修复：flower 匹配 IPv6 全球单播地址使用 ip6_dst 而不是 dst_ip
+    # 修复：flower 匹配 IPv6 全球单播地址使用 dst_ip (而非 ip6_dst)
     if tc filter add dev "$qos_interface" parent ffff: protocol ipv6 \
-        flower ip6_dst 2000::/3 \
+        flower dst_ip 2000::/3 \
         action connmark \
         action mirred egress redirect dev "$IFB_DEVICE" 2>&1; then
         ipv6_success=true
@@ -1068,7 +1074,7 @@ show_htb_cake_status() {
         qos_interface=$(tc qdisc show 2>/dev/null | grep -E "htb.*root" | awk '{print $5}' | head -1)
         [ -z "$qos_interface" ] && qos_interface="未知"
     fi
-    echo "===== HTB-CAKE QoS 状态报告 (v2.7.2) ====="
+    echo "===== HTB-CAKE QoS 状态报告 (v2.7.5) ====="
     echo "时间: $(date)"
     echo "WAN接口: ${qos_interface}"
     if ! tc qdisc show dev "${qos_interface}" 2>/dev/null | grep -q htb; then
@@ -1265,10 +1271,22 @@ show_htb_cake_status() {
     echo -e "\n===== 网络接口统计 ====="
     echo -e "\n接口流量统计:"
     echo "WAN接口 ($qos_interface):"
-    ifconfig "$qos_interface" 2>/dev/null | grep "RX bytes\|TX bytes" | sed 's/^/  /'
+    if command -v ip >/dev/null 2>&1; then
+        ip -s link show "$qos_interface" 2>/dev/null | grep -E "RX:|TX:" | sed 's/^/  /'
+    elif command -v ifconfig >/dev/null 2>&1; then
+        ifconfig "$qos_interface" 2>/dev/null | grep "RX bytes\|TX bytes" | sed 's/^/  /'
+    else
+        echo "  无法获取接口统计（缺少 ip 或 ifconfig 命令）"
+    fi
     if [ -n "$qos_ifb" ] && ip link show "$qos_ifb" >/dev/null 2>&1; then
         echo -e "\nIFB接口 ($qos_ifb):"
-        ifconfig "$qos_ifb" 2>/dev/null | grep "RX bytes\|TX bytes" | sed 's/^/  /'
+        if command -v ip >/dev/null 2>&1; then
+            ip -s link show "$qos_ifb" 2>/dev/null | grep -E "RX:|TX:" | sed 's/^/  /'
+        elif command -v ifconfig >/dev/null 2>&1; then
+            ifconfig "$qos_ifb" 2>/dev/null | grep "RX bytes\|TX bytes" | sed 's/^/  /'
+        else
+            echo "  无法获取接口统计（缺少 ip 或 ifconfig 命令）"
+        fi
     fi
     echo -e "\n===== HTB-CAKE 状态报告结束 ====="
     return 0

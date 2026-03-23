@@ -27,6 +27,13 @@
 
 #define IDCLASS_PRIO_BASE   0x110
 
+struct idclass_map_info_entry {
+    const char *name;
+    const char *type_name;
+};
+
+extern const struct idclass_map_info_entry idclass_map_info[];
+
 enum idclass_map_id {
     CL_MAP_TCP_PORTS,
     CL_MAP_UDP_PORTS,
