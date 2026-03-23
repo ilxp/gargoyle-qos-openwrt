@@ -1,6 +1,6 @@
 #!/bin/bash
 # 规则辅助模块 (rule.sh)
-# 版本: 3.0.9 - 修复硬编码配置名、带宽单位转换、模块加载逻辑等
+# 版本: 3.1.0 - 修复速率限制链定义引号问题，优化带宽单位处理，完善错误处理
 # 基于 HTB 与 CAKE 组合算法实现 QoS 流量控制
 
 # ========== 全局配置常量 ==========
@@ -756,7 +756,7 @@ generate_ipset_sets() {
         echo "$name $family" >> "$families_file"
 
         if [[ "$mode" == "dynamic" ]]; then
-            echo "add set inet gargoyle-qos-priority $name { type ${family}_addr; flags dynamic, timeout; timeout $timeout; } 2>/dev/null || true" >> "$sets_file"
+            echo "add set inet gargoyle-qos-priority $name { type ${family}_addr; flags dynamic, timeout; timeout $timeout; }" >> "$sets_file"
         else
             if [[ "$family" == "ipv6" ]]; then
                 [[ -n "$ip6_list" ]] && elements=$(echo "$ip6_list" | tr -s ' ' ',' | sed 's/^,//;s/,$//')
@@ -764,9 +764,9 @@ generate_ipset_sets() {
                 [[ -n "$ip4_list" ]] && elements=$(echo "$ip4_list" | tr -s ' ' ',' | sed 's/^,//;s/,$//')
             fi
             if [[ -n "$elements" ]]; then
-                echo "add set inet gargoyle-qos-priority $name { type ${family}_addr; flags interval; elements = { $elements }; } 2>/dev/null || true" >> "$sets_file"
+                echo "add set inet gargoyle-qos-priority $name { type ${family}_addr; flags interval; elements = { $elements }; }" >> "$sets_file"
             else
-                echo "add set inet gargoyle-qos-priority $name { type ${family}_addr; flags interval; } 2>/dev/null || true" >> "$sets_file"
+                echo "add set inet gargoyle-qos-priority $name { type ${family}_addr; flags interval; }" >> "$sets_file"
             fi
         fi
         log_info "已生成 ipset: $name ($family, mode=$mode)"
@@ -873,7 +873,6 @@ generate_ratelimit_rules() {
                 download_burst=$(awk "BEGIN {printf \"%.0f\", $download_kbytes * $burst_factor}")
                 upload_burst=$(awk "BEGIN {printf \"%.0f\", $upload_kbytes * $burst_factor}")
             fi
-            # 确保 burst 至少为 1
             (( download_burst < 1 )) && download_burst=1
             (( upload_burst < 1 )) && upload_burst=1
             download_burst_param=" burst ${download_burst} kbytes"
@@ -1022,13 +1021,13 @@ generate_ratelimit_rules() {
 
             if [[ $download_limit -gt 0 ]]; then
                 rules="${rules}
-add set inet gargoyle-qos-priority ${set_name_dl4} { type ipv4_addr; flags dynamic, timeout; timeout ${timeout}; } 2>/dev/null || true
-add set inet gargoyle-qos-priority ${set_name_dl6} { type ipv6_addr; flags dynamic, timeout; timeout ${timeout}; } 2>/dev/null || true"
+add set inet gargoyle-qos-priority ${set_name_dl4} { type ipv4_addr; flags dynamic, timeout; timeout ${timeout}; }
+add set inet gargoyle-qos-priority ${set_name_dl6} { type ipv6_addr; flags dynamic, timeout; timeout ${timeout}; }"
             fi
             if [[ $upload_limit -gt 0 ]]; then
                 rules="${rules}
-add set inet gargoyle-qos-priority ${set_name_ul4} { type ipv4_addr; flags dynamic, timeout; timeout ${timeout}; } 2>/dev/null || true
-add set inet gargoyle-qos-priority ${set_name_ul6} { type ipv6_addr; flags dynamic, timeout; timeout ${timeout}; } 2>/dev/null || true"
+add set inet gargoyle-qos-priority ${set_name_ul4} { type ipv4_addr; flags dynamic, timeout; timeout ${timeout}; }
+add set inet gargoyle-qos-priority ${set_name_ul6} { type ipv6_addr; flags dynamic, timeout; timeout ${timeout}; }"
             fi
 
             if [[ $download_limit -gt 0 ]]; then
@@ -1152,7 +1151,8 @@ setup_ratelimit_chain() {
     if [[ -n "$rules" ]]; then
         local temp_ratelimit_file=$(mktemp /tmp/qos_ratelimit_XXXXXX)
         TEMP_FILES+=("$temp_ratelimit_file")
-        echo "add chain inet gargoyle-qos-priority $RATELIMIT_CHAIN '{ type filter hook forward priority -10; policy accept; }' 2>/dev/null || true" > "$temp_ratelimit_file"
+        # 修复：用单引号包裹大括号内容，避免 shell 解释
+        echo "add chain inet gargoyle-qos-priority $RATELIMIT_CHAIN '{ type filter hook forward priority -10; policy accept; }'" > "$temp_ratelimit_file"
         echo "flush chain inet gargoyle-qos-priority $RATELIMIT_CHAIN" >> "$temp_ratelimit_file"
         echo "$rules" | while IFS= read -r rule; do
             [[ -z "$rule" ]] && continue
@@ -1756,7 +1756,6 @@ health_check() {
         status="${status}tc:missing;"; ((errors++))
     fi
     for mod in ifb sch_htb sch_hfsc sch_cake sch_fq_codel; do
-        # 检查模块是否已加载，若未加载则尝试加载
         if ! lsmod 2>/dev/null | grep -q "^$mod"; then
             modprobe "$mod" 2>/dev/null || true
             if ! lsmod 2>/dev/null | grep -q "^$mod"; then
