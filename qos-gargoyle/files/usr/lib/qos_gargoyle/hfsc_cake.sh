@@ -1285,10 +1285,21 @@ show_hfsc_cake_status() {
     echo -e "\n===== QoS运行状态 ====="
     local upload_active=0
     local download_active=0
-    tc qdisc show dev "$qos_interface" 2>/dev/null | grep -q "hfsc" && upload_active=1
-    [[ -n "$qos_ifb" ]] && tc qdisc show dev "$qos_ifb" 2>/dev/null | grep -q "hfsc" && download_active=1
-    echo "上传QoS: $(( upload_active == 1 )) && echo "已启用 (HFSC+cake)" || echo "未启用")"
-    echo "下载QoS: $(( download_active == 1 )) && echo "已启用 (HFSC+cake)" || echo "未启用")"
+    tc qdisc show dev "$qos_interface" 2>/dev/null | grep -q "htb" && upload_active=1
+    [[ -n "$qos_ifb" ]] && tc qdisc show dev "$qos_ifb" 2>/dev/null | grep -q "htb" && download_active=1
+
+    if (( upload_active == 1 )); then
+        echo "上传QoS: 已启用 (HTB+cake)"
+    else
+        echo "上传QoS: 未启用"
+    fi
+
+    if (( download_active == 1 )); then
+        echo "下载QoS: 已启用 (HTB+cake)"
+    else
+        echo "下载QoS: 未启用"
+    fi
+
     if (( upload_active == 1 )) && (( download_active == 1 )); then
         echo -e "\n✓ QoS双向流量整形已启用"
     elif (( upload_active == 1 )) || (( download_active == 1 )); then
@@ -1322,11 +1333,30 @@ show_hfsc_cake_status() {
     fi
 
     echo -e "\n===== 增强特性状态 ====="
-    echo "速率限制: $(( ENABLE_RATELIMIT == 1 )) && echo "已启用" || echo "未启用")"
-    echo "ACK 限速: $(( ENABLE_ACK_LIMIT == 1 )) && echo "已启用" || echo "未启用")"
-    echo "TCP 升级: $(( ENABLE_TCP_UPGRADE == 1 )) && echo "已启用" || echo "未启用")"
-    echo "自定义内联规则: $([ -f "$CUSTOM_EGRESS_FILE" ] && echo "存在" || echo "不存在") (出口) / $([ -f "$CUSTOM_INGRESS_FILE" ] && echo "存在" || echo "不存在") (入口)"
-    echo "规则持久化: $(( SAVE_NFT_RULES == 1 )) && echo "已启用" || echo "未启用")"
+    if (( ENABLE_RATELIMIT == 1 )); then
+        echo "速率限制: 已启用"
+    else
+        echo "速率限制: 未启用"
+    fi
+
+    if (( ENABLE_ACK_LIMIT == 1 )); then
+        echo "ACK 限速: 已启用"
+    else
+        echo "ACK 限速: 未启用"
+    fi
+
+    if (( ENABLE_TCP_UPGRADE == 1 )); then
+        echo "TCP 升级: 已启用"
+    else
+        echo "TCP 升级: 未启用"
+    fi
+
+    if (( SAVE_NFT_RULES == 1 )); then
+        echo "规则持久化: 已启用"
+    else
+        echo "规则持久化: 未启用"
+    fi
+	
     echo -e "\n===== 健康检查 ====="
     health_check
     echo -e "\n===== 活动连接标记 ========"
