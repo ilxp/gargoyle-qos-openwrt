@@ -1,6 +1,6 @@
 #!/bin/bash
 # 规则辅助模块 (rule.sh)
-# 版本: 3.1.2 - 最终稳定版，修复所有已知问题，与算法模块协同工作
+# 版本: 3.1.3 - 针对 nftables >= 0.9 优化，修复 0 带宽日志、虚拟接口速率检测、钩子重置逻辑
 # 基于 HTB 与 CAKE 组合算法实现 QoS 流量控制
 
 # ========== 全局配置常量 ==========
@@ -27,8 +27,6 @@ ACK_SLOW=50
 ACK_MED=100
 ACK_FAST=500
 ACK_XFAST=5000
-_NFT_VERSION_MAJOR=0
-_NFT_VERSION_MINOR=0
 _QOS_TABLE_FLUSHED=0
 _IPSET_LOADED=0
 _HOOKS_SETUP=0
@@ -189,20 +187,6 @@ load_global_config() {
 
     SAVE_NFT_RULES=$(uci -q get ${CONFIG_FILE}.global.save_nft_rules 2>/dev/null)
     [[ -z "$SAVE_NFT_RULES" ]] && SAVE_NFT_RULES=0
-}
-
-# ========== nftables 版本获取 ==========
-get_nft_version() {
-    local version_str
-    version_str=$(nft --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)
-    if [[ -n "$version_str" ]]; then
-        _NFT_VERSION_MAJOR=${version_str%%.*}
-        _NFT_VERSION_MINOR=${version_str#*.}
-        _NFT_VERSION_MINOR=${_NFT_VERSION_MINOR%%.*}
-    else
-        _NFT_VERSION_MAJOR=0
-        _NFT_VERSION_MINOR=0
-    fi
 }
 
 # ========== 数字验证（处理前导零） ==========
@@ -823,18 +807,8 @@ generate_ratelimit_rules() {
     config_load "$CONFIG_FILE" 2>/dev/null
 
     local rules=""
+    # 移除版本检测，默认使用动态集合模式（nftables >= 0.9）
     local use_meter=0
-
-    get_nft_version
-    if (( _NFT_VERSION_MAJOR == 0 && _NFT_VERSION_MINOR < 9 )); then
-        use_meter=1
-        log_info "nftables 版本低于 0.9.0，速率限制使用 meter 模式"
-    elif (( _NFT_VERSION_MAJOR == 0 && _NFT_VERSION_MINOR >= 9 )) || (( _NFT_VERSION_MAJOR >= 1 )); then
-        use_meter=0
-        log_info "nftables 版本 $_NFT_VERSION_MAJOR.$_NFT_VERSION_MINOR，速率限制使用动态集合 + limit 模式"
-    else
-        use_meter=0
-    fi
 
     process_ratelimit_section() {
         local section="$1" name enabled download_limit upload_limit burst_factor target_values
@@ -908,235 +882,132 @@ generate_ratelimit_rules() {
 
         local prefix_set="rl_"
 
-        if [[ $use_meter -eq 1 ]]; then
-            # meter 模式（旧版）
-            if [[ $download_limit -gt 0 ]]; then
-                for grp in "pos:$ips_pos_v4" "neg:$ips_neg_v4"; do
-                    local type="${grp%:*}" iplist="${grp#*:}"
-                    [[ -z "$iplist" ]] && continue
-                    local cond=""
-                    build_ip_conditions_for_direction "$iplist" "daddr" cond
-                    if [[ -n "$cond" ]]; then
-                        local meter_name="${meter_suffix}_dl4_ip_${type}"
-                        rules="${rules}
-        # ${name} - Download limit (IPv4 IP ${type})
-        ${cond} meter ${meter_name} { ip daddr limit rate over ${download_kbytes} kbytes/second${download_burst_param} } counter drop comment \"${name} download\""
-                    fi
-                done
-                for set in $sets_pos_v4; do
-                    rules="${rules}
-        # ${name} - Download limit (IPv4 set @${set})
-        ip daddr @${set} meter ${meter_suffix}_dl4_set_${set} { ip daddr limit rate over ${download_kbytes} kbytes/second${download_burst_param} } counter drop comment \"${name} download\""
-                done
-                for set in $sets_neg_v4; do
-                    rules="${rules}
-        # ${name} - Download limit (IPv4 set != @${set})
-        ip daddr != @${set} meter ${meter_suffix}_dl4_set_neg_${set} { ip daddr limit rate over ${download_kbytes} kbytes/second${download_burst_param} } counter drop comment \"${name} download\""
-                done
-            fi
+        # 动态集合模式（nftables >= 0.9）
+        local timeout=60
+        local set_timeout=$(uci -q get ${CONFIG_FILE}.${section}.timeout 2>/dev/null)
+        [[ -n "$set_timeout" ]] && timeout="$set_timeout"
+        local set_name_dl4="${prefix_set}${meter_suffix}_dl4"
+        local set_name_ul4="${prefix_set}${meter_suffix}_ul4"
+        local set_name_dl6="${prefix_set}${meter_suffix}_dl6"
+        local set_name_ul6="${prefix_set}${meter_suffix}_ul6"
 
-            if [[ $upload_limit -gt 0 ]]; then
-                for grp in "pos:$ips_pos_v4" "neg:$ips_neg_v4"; do
-                    local type="${grp%:*}" iplist="${grp#*:}"
-                    [[ -z "$iplist" ]] && continue
-                    local cond=""
-                    build_ip_conditions_for_direction "$iplist" "saddr" cond
-                    if [[ -n "$cond" ]]; then
-                        local meter_name="${meter_suffix}_ul4_ip_${type}"
-                        rules="${rules}
-        # ${name} - Upload limit (IPv4 IP ${type})
-        ${cond} meter ${meter_name} { ip saddr limit rate over ${upload_kbytes} kbytes/second${upload_burst_param} } counter drop comment \"${name} upload\""
-                    fi
-                done
-                for set in $sets_pos_v4; do
-                    rules="${rules}
-        # ${name} - Upload limit (IPv4 set @${set})
-        ip saddr @${set} meter ${meter_suffix}_ul4_set_${set} { ip saddr limit rate over ${upload_kbytes} kbytes/second${upload_burst_param} } counter drop comment \"${name} upload\""
-                done
-                for set in $sets_neg_v4; do
-                    rules="${rules}
-        # ${name} - Upload limit (IPv4 set != @${set})
-        ip saddr != @${set} meter ${meter_suffix}_ul4_set_neg_${set} { ip saddr limit rate over ${upload_kbytes} kbytes/second${upload_burst_param} } counter drop comment \"${name} upload\""
-                done
-            fi
-
-            if [[ $download_limit -gt 0 ]]; then
-                for grp in "pos:$ips_pos_v6" "neg:$ips_neg_v6"; do
-                    local type="${grp%:*}" iplist="${grp#*:}"
-                    [[ -z "$iplist" ]] && continue
-                    local cond=""
-                    build_ip_conditions_for_direction "$iplist" "daddr" cond
-                    if [[ -n "$cond" ]]; then
-                        local meter_name="${meter_suffix}_dl6_ip_${type}"
-                        rules="${rules}
-        # ${name} - Download limit (IPv6 IP ${type})
-        ${cond} meter ${meter_name} { ip6 daddr limit rate over ${download_kbytes} kbytes/second${download_burst_param} } counter drop comment \"${name} download\""
-                    fi
-                done
-                for set in $sets_pos_v6; do
-                    rules="${rules}
-        # ${name} - Download limit (IPv6 set @${set})
-        ip6 daddr @${set} meter ${meter_suffix}_dl6_set_${set} { ip6 daddr limit rate over ${download_kbytes} kbytes/second${download_burst_param} } counter drop comment \"${name} download\""
-                done
-                for set in $sets_neg_v6; do
-                    rules="${rules}
-        # ${name} - Download limit (IPv6 set != @${set})
-        ip6 daddr != @${set} meter ${meter_suffix}_dl6_set_neg_${set} { ip6 daddr limit rate over ${download_kbytes} kbytes/second${download_burst_param} } counter drop comment \"${name} download\""
-                done
-            fi
-
-            if [[ $upload_limit -gt 0 ]]; then
-                for grp in "pos:$ips_pos_v6" "neg:$ips_neg_v6"; do
-                    local type="${grp%:*}" iplist="${grp#*:}"
-                    [[ -z "$iplist" ]] && continue
-                    local cond=""
-                    build_ip_conditions_for_direction "$iplist" "saddr" cond
-                    if [[ -n "$cond" ]]; then
-                        local meter_name="${meter_suffix}_ul6_ip_${type}"
-                        rules="${rules}
-        # ${name} - Upload limit (IPv6 IP ${type})
-        ${cond} meter ${meter_name} { ip6 saddr limit rate over ${upload_kbytes} kbytes/second${upload_burst_param} } counter drop comment \"${name} upload\""
-                    fi
-                done
-                for set in $sets_pos_v6; do
-                    rules="${rules}
-        # ${name} - Upload limit (IPv6 set @${set})
-        ip6 saddr @${set} meter ${meter_suffix}_ul6_set_${set} { ip6 saddr limit rate over ${upload_kbytes} kbytes/second${upload_burst_param} } counter drop comment \"${name} upload\""
-                done
-                for set in $sets_neg_v6; do
-                    rules="${rules}
-        # ${name} - Upload limit (IPv6 set != @${set})
-        ip6 saddr != @${set} meter ${meter_suffix}_ul6_set_neg_${set} { ip6 saddr limit rate over ${upload_kbytes} kbytes/second${upload_burst_param} } counter drop comment \"${name} upload\""
-                done
-            fi
-        else
-            # 动态集合模式
-            local timeout=60
-            local set_timeout=$(uci -q get ${CONFIG_FILE}.${section}.timeout 2>/dev/null)
-            [[ -n "$set_timeout" ]] && timeout="$set_timeout"
-            local set_name_dl4="${prefix_set}${meter_suffix}_dl4"
-            local set_name_ul4="${prefix_set}${meter_suffix}_ul4"
-            local set_name_dl6="${prefix_set}${meter_suffix}_dl6"
-            local set_name_ul6="${prefix_set}${meter_suffix}_ul6"
-
-            if [[ $download_limit -gt 0 ]]; then
-                rules="${rules}
+        if [[ $download_limit -gt 0 ]]; then
+            rules="${rules}
 add set inet gargoyle-qos-priority ${set_name_dl4} { type ipv4_addr; flags dynamic, timeout; timeout ${timeout}; }
 add set inet gargoyle-qos-priority ${set_name_dl6} { type ipv6_addr; flags dynamic, timeout; timeout ${timeout}; }"
-            fi
-            if [[ $upload_limit -gt 0 ]]; then
-                rules="${rules}
+        fi
+        if [[ $upload_limit -gt 0 ]]; then
+            rules="${rules}
 add set inet gargoyle-qos-priority ${set_name_ul4} { type ipv4_addr; flags dynamic, timeout; timeout ${timeout}; }
 add set inet gargoyle-qos-priority ${set_name_ul6} { type ipv6_addr; flags dynamic, timeout; timeout ${timeout}; }"
-            fi
+        fi
 
-            if [[ $download_limit -gt 0 ]]; then
-                for grp in "pos:$ips_pos_v4" "neg:$ips_neg_v4"; do
-                    local type="${grp%:*}" iplist="${grp#*:}"
-                    [[ -z "$iplist" ]] && continue
-                    local cond=""
-                    build_ip_conditions_for_direction "$iplist" "daddr" cond
-                    if [[ -n "$cond" ]]; then
-                        rules="${rules}
+        if [[ $download_limit -gt 0 ]]; then
+            for grp in "pos:$ips_pos_v4" "neg:$ips_neg_v4"; do
+                local type="${grp%:*}" iplist="${grp#*:}"
+                [[ -z "$iplist" ]] && continue
+                local cond=""
+                build_ip_conditions_for_direction "$iplist" "daddr" cond
+                if [[ -n "$cond" ]]; then
+                    rules="${rules}
         # ${name} - Download limit (IPv4 IP ${type}) - in set drop
         ${cond} ip daddr @${set_name_dl4} counter drop comment \"${name} download (in set)\"
         # ${name} - Download limit (IPv4 IP ${type}) - rate limit
         ${cond} ip daddr limit rate over ${download_kbytes} kbytes/second${download_burst_param} add @${set_name_dl4} { ip daddr } counter drop comment \"${name} download (rate limit)\""
-                    fi
-                done
-                for set in $sets_pos_v4; do
-                    rules="${rules}
+                fi
+            done
+            for set in $sets_pos_v4; do
+                rules="${rules}
         # ${name} - Download limit (IPv4 set @${set})
         ip daddr @${set} ip daddr @${set_name_dl4} counter drop comment \"${name} download (in set)\"
         ip daddr @${set} ip daddr limit rate over ${download_kbytes} kbytes/second${download_burst_param} add @${set_name_dl4} { ip daddr } counter drop comment \"${name} download (rate limit)\""
-                done
-                for set in $sets_neg_v4; do
-                    rules="${rules}
+            done
+            for set in $sets_neg_v4; do
+                rules="${rules}
         # ${name} - Download limit (IPv4 set != @${set})
         ip daddr != @${set} ip daddr @${set_name_dl4} counter drop comment \"${name} download (in set)\"
         ip daddr != @${set} ip daddr limit rate over ${download_kbytes} kbytes/second${download_burst_param} add @${set_name_dl4} { ip daddr } counter drop comment \"${name} download (rate limit)\""
-                done
+            done
 
-                for grp in "pos:$ips_pos_v6" "neg:$ips_neg_v6"; do
-                    local type="${grp%:*}" iplist="${grp#*:}"
-                    [[ -z "$iplist" ]] && continue
-                    local cond=""
-                    build_ip_conditions_for_direction "$iplist" "daddr" cond
-                    if [[ -n "$cond" ]]; then
-                        rules="${rules}
+            for grp in "pos:$ips_pos_v6" "neg:$ips_neg_v6"; do
+                local type="${grp%:*}" iplist="${grp#*:}"
+                [[ -z "$iplist" ]] && continue
+                local cond=""
+                build_ip_conditions_for_direction "$iplist" "daddr" cond
+                if [[ -n "$cond" ]]; then
+                    rules="${rules}
         # ${name} - Download limit (IPv6 IP ${type}) - in set drop
         ${cond} ip6 daddr @${set_name_dl6} counter drop comment \"${name} download (in set)\"
         # ${name} - Download limit (IPv6 IP ${type}) - rate limit
         ${cond} ip6 daddr limit rate over ${download_kbytes} kbytes/second${download_burst_param} add @${set_name_dl6} { ip6 daddr } counter drop comment \"${name} download (rate limit)\""
-                    fi
-                done
-                for set in $sets_pos_v6; do
-                    rules="${rules}
+                fi
+            done
+            for set in $sets_pos_v6; do
+                rules="${rules}
         # ${name} - Download limit (IPv6 set @${set})
         ip6 daddr @${set} ip6 daddr @${set_name_dl6} counter drop comment \"${name} download (in set)\"
         ip6 daddr @${set} ip6 daddr limit rate over ${download_kbytes} kbytes/second${download_burst_param} add @${set_name_dl6} { ip6 daddr } counter drop comment \"${name} download (rate limit)\""
-                done
-                for set in $sets_neg_v6; do
-                    rules="${rules}
+            done
+            for set in $sets_neg_v6; do
+                rules="${rules}
         # ${name} - Download limit (IPv6 set != @${set})
         ip6 daddr != @${set} ip6 daddr @${set_name_dl6} counter drop comment \"${name} download (in set)\"
         ip6 daddr != @${set} ip6 daddr limit rate over ${download_kbytes} kbytes/second${download_burst_param} add @${set_name_dl6} { ip6 daddr } counter drop comment \"${name} download (rate limit)\""
-                done
-            fi
+            done
+        fi
 
-            if [[ $upload_limit -gt 0 ]]; then
-                for grp in "pos:$ips_pos_v4" "neg:$ips_neg_v4"; do
-                    local type="${grp%:*}" iplist="${grp#*:}"
-                    [[ -z "$iplist" ]] && continue
-                    local cond=""
-                    build_ip_conditions_for_direction "$iplist" "saddr" cond
-                    if [[ -n "$cond" ]]; then
-                        rules="${rules}
+        if [[ $upload_limit -gt 0 ]]; then
+            for grp in "pos:$ips_pos_v4" "neg:$ips_neg_v4"; do
+                local type="${grp%:*}" iplist="${grp#*:}"
+                [[ -z "$iplist" ]] && continue
+                local cond=""
+                build_ip_conditions_for_direction "$iplist" "saddr" cond
+                if [[ -n "$cond" ]]; then
+                    rules="${rules}
         # ${name} - Upload limit (IPv4 IP ${type}) - in set drop
         ${cond} ip saddr @${set_name_ul4} counter drop comment \"${name} upload (in set)\"
         # ${name} - Upload limit (IPv4 IP ${type}) - rate limit
         ${cond} ip saddr limit rate over ${upload_kbytes} kbytes/second${upload_burst_param} add @${set_name_ul4} { ip saddr } counter drop comment \"${name} upload (rate limit)\""
-                    fi
-                done
-                for set in $sets_pos_v4; do
-                    rules="${rules}
+                fi
+            done
+            for set in $sets_pos_v4; do
+                rules="${rules}
         # ${name} - Upload limit (IPv4 set @${set})
         ip saddr @${set} ip saddr @${set_name_ul4} counter drop comment \"${name} upload (in set)\"
         ip saddr @${set} ip saddr limit rate over ${upload_kbytes} kbytes/second${upload_burst_param} add @${set_name_ul4} { ip saddr } counter drop comment \"${name} upload (rate limit)\""
-                done
-                for set in $sets_neg_v4; do
-                    rules="${rules}
+            done
+            for set in $sets_neg_v4; do
+                rules="${rules}
         # ${name} - Upload limit (IPv4 set != @${set})
         ip saddr != @${set} ip saddr @${set_name_ul4} counter drop comment \"${name} upload (in set)\"
         ip saddr != @${set} ip saddr limit rate over ${upload_kbytes} kbytes/second${upload_burst_param} add @${set_name_ul4} { ip saddr } counter drop comment \"${name} upload (rate limit)\""
-                done
+            done
 
-                for grp in "pos:$ips_pos_v6" "neg:$ips_neg_v6"; do
-                    local type="${grp%:*}" iplist="${grp#*:}"
-                    [[ -z "$iplist" ]] && continue
-                    local cond=""
-                    build_ip_conditions_for_direction "$iplist" "saddr" cond
-                    if [[ -n "$cond" ]]; then
-                        rules="${rules}
+            for grp in "pos:$ips_pos_v6" "neg:$ips_neg_v6"; do
+                local type="${grp%:*}" iplist="${grp#*:}"
+                [[ -z "$iplist" ]] && continue
+                local cond=""
+                build_ip_conditions_for_direction "$iplist" "saddr" cond
+                if [[ -n "$cond" ]]; then
+                    rules="${rules}
         # ${name} - Upload limit (IPv6 IP ${type}) - in set drop
         ${cond} ip6 saddr @${set_name_ul6} counter drop comment \"${name} upload (in set)\"
         # ${name} - Upload limit (IPv6 IP ${type}) - rate limit
         ${cond} ip6 saddr limit rate over ${upload_kbytes} kbytes/second${upload_burst_param} add @${set_name_ul6} { ip6 saddr } counter drop comment \"${name} upload (rate limit)\""
-                    fi
-                done
-                for set in $sets_pos_v6; do
-                    rules="${rules}
+                fi
+            done
+            for set in $sets_pos_v6; do
+                rules="${rules}
         # ${name} - Upload limit (IPv6 set @${set})
         ip6 saddr @${set} ip6 saddr @${set_name_ul6} counter drop comment \"${name} upload (in set)\"
         ip6 saddr @${set} ip6 saddr limit rate over ${upload_kbytes} kbytes/second${upload_burst_param} add @${set_name_ul6} { ip6 saddr } counter drop comment \"${name} upload (rate limit)\""
-                done
-                for set in $sets_neg_v6; do
-                    rules="${rules}
+            done
+            for set in $sets_neg_v6; do
+                rules="${rules}
         # ${name} - Upload limit (IPv6 set != @${set})
         ip6 saddr != @${set} ip6 saddr @${set_name_ul6} counter drop comment \"${name} upload (in set)\"
         ip6 saddr != @${set} ip6 saddr limit rate over ${upload_kbytes} kbytes/second${upload_burst_param} add @${set_name_ul6} { ip6 saddr } counter drop comment \"${name} upload (rate limit)\""
-                done
-            fi
+            done
         fi
     }
 
@@ -1151,7 +1022,6 @@ setup_ratelimit_chain() {
     if [[ -n "$rules" ]]; then
         local temp_ratelimit_file=$(mktemp /tmp/qos_ratelimit_XXXXXX)
         TEMP_FILES+=("$temp_ratelimit_file")
-        # 用单引号包裹大括号内容，避免 shell 解释
         echo "add chain inet gargoyle-qos-priority $RATELIMIT_CHAIN '{ type filter hook forward priority -10; policy accept; }'" > "$temp_ratelimit_file"
         echo "flush chain inet gargoyle-qos-priority $RATELIMIT_CHAIN" >> "$temp_ratelimit_file"
         echo "$rules" | while IFS= read -r rule; do
@@ -1936,9 +1806,19 @@ ensure_ifb_device() {
     return 1
 }
 
-# ========== 获取物理接口最大带宽 ==========
+# ========== 获取物理接口最大带宽（增强虚拟接口处理） ==========
 get_physical_interface_max_bandwidth() {
     local interface="$1" max_bandwidth=""
+    
+    # 检测是否为虚拟接口（常见前缀）
+    case "$interface" in
+        ppp*|tun*|tap*|veth*|gre*|gretap*)
+            log_info "接口 $interface 为虚拟接口，跳过物理带宽检测"
+            echo "$MAX_PHYSICAL_BANDWIDTH"
+            return 0
+            ;;
+    esac
+
     if command -v ethtool >/dev/null 2>&1; then
         local speed=$(ethtool "$interface" 2>/dev/null | grep -i speed | awk '{print $2}' | sed 's/[^0-9]//g')
         if [[ -n "$speed" ]] && (( speed > 0 )); then
