@@ -9,14 +9,14 @@
 # 调试: 查看规则是否生效: nft list chain inet gargoyle-qos-priority filter_qos_egress
 # ====================================================================
 
-meta mark 0 meta l4proto icmp meta nfproto ipv4 meta mark set 0x1 counter
-meta mark 0 meta l4proto icmp meta nfproto ipv6 meta mark set 0x1 counter
-meta mark 0 meta l4proto { tcp, udp } th dport 53 meta nfproto ipv4 meta mark set 0x1 counter
-meta mark 0 meta l4proto { tcp, udp } th dport 53 meta nfproto ipv6 meta mark set 0x1 counter
-meta mark 0 meta l4proto tcp th dport { 80, 443 } ct bytes < 1048576 meta nfproto ipv4 meta mark set 0x4 counter
-meta mark 0 meta l4proto tcp th dport { 80, 443 } ct bytes < 1048576 meta nfproto ipv6 meta mark set 0x4 counter
-meta mark 0 meta l4proto tcp th dport { 80, 443 } ct bytes > 20971520 meta nfproto ipv4 meta mark set 0x8 counter
-meta mark 0 meta l4proto tcp th dport { 80, 443 } ct bytes > 20971520 meta nfproto ipv6 meta mark set 0x8 counter
+#meta mark 0 meta l4proto icmp meta nfproto ipv4 meta mark set 0x1 counter
+#meta mark 0 meta l4proto icmp meta nfproto ipv6 meta mark set 0x1 counter
+#meta mark 0 meta l4proto { tcp, udp } th dport 53 meta nfproto ipv4 meta mark set 0x1 counter
+#meta mark 0 meta l4proto { tcp, udp } th dport 53 meta nfproto ipv6 meta mark set 0x1 counter
+#meta mark 0 meta l4proto tcp th dport { 80, 443 } ct bytes < 1048576 meta nfproto ipv4 meta mark set 0x4 counter
+#meta mark 0 meta l4proto tcp th dport { 80, 443 } ct bytes < 1048576 meta nfproto ipv6 meta mark set 0x4 counter
+#meta mark 0 meta l4proto tcp th dport { 80, 443 } ct bytes > 20971520 meta nfproto ipv4 meta mark set 0x8 counter
+#meta mark 0 meta l4proto tcp th dport { 80, 443 } ct bytes > 20971520 meta nfproto ipv6 meta mark set 0x8 counter
 
 # ICMP 实时（使用标记 0x1）
 #meta mark 0 meta l4proto icmp meta nfproto { ipv4, ipv6 } meta mark set 0x00000001 counter
@@ -31,5 +31,5 @@ meta mark 0 meta l4proto tcp th dport { 80, 443 } ct bytes > 20971520 meta nfpro
 #meta mark 0 meta l4proto tcp th dport { 80, 443 } ct bytes > 20971520 meta nfproto { ipv4, ipv6 } meta mark set 0x00000008 counter
 
 #ack小包
-meta mark 0 meta l4proto tcp meta length < 100 tcp flags { ack } meta nfproto ipv4 meta mark set 0x1 counter
-meta mark 0 meta l4proto tcp meta length < 100 tcp flags { ack } meta nfproto ipv6 meta mark set 0x1 counter
+#meta mark 0 meta l4proto tcp meta length < 100 tcp flags { ack } meta nfproto ipv4 meta mark set 0x1 counter
+#meta mark 0 meta l4proto tcp meta length < 100 tcp flags { ack } meta nfproto ipv6 meta mark set 0x1 counter

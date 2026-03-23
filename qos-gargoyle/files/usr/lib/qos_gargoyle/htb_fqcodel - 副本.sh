@@ -2002,16 +2002,24 @@ show_htb_status() {
         fi
     fi
     
-    echo -e "\n===== 网络接口统计 ====="
-    
-    echo -e "\n接口流量统计:"
-    echo "WAN接口 ($qos_interface):"
-    ifconfig "$qos_interface" 2>/dev/null | grep "RX bytes\|TX bytes" | sed 's/^/  /'
-    
-    if [ -n "$qos_ifb" ] && ip link show "$qos_ifb" >/dev/null 2>&1; then
-        echo -e "\nIFB接口 ($qos_ifb):"
-        ifconfig "$qos_ifb" 2>/dev/null | grep "RX bytes\|TX bytes" | sed 's/^/  /'
+echo -e "\n===== 网络接口统计 ====="
+echo -e "\n接口流量统计:"
+echo "WAN接口 ($real_wan_if):"
+if command -v ifconfig >/dev/null 2>&1; then
+    ifconfig "$real_wan_if" 2>/dev/null | grep -E "RX bytes|TX bytes" | sed 's/^/  /'
+else
+    # 回退到 ip 命令
+    ip -s link show "$real_wan_if" 2>/dev/null | awk '/^    (RX|TX):/ {print "  " $0}'
+fi
+
+if [[ -n "$qos_ifb" ]] && ip link show "$qos_ifb" >/dev/null 2>&1; then
+    echo -e "\nIFB接口 ($qos_ifb):"
+    if command -v ifconfig >/dev/null 2>&1; then
+        ifconfig "$qos_ifb" 2>/dev/null | grep -E "RX bytes|TX bytes" | sed 's/^/  /'
+    else
+        ip -s link show "$qos_ifb" 2>/dev/null | awk '/^    (RX|TX):/ {print "  " $0}'
     fi
+fi
     
     echo -e "\n===== HTB-FQ_CODEL 状态报告结束 ====="
     

@@ -176,17 +176,18 @@ check_and_handle_zero_bandwidth() {
 
 # ========== 加载全局配置 ==========
 load_global_config() {
-    ENABLE_RATELIMIT=$(uci -q get ${CONFIG_FILE}.global.enable_ratelimit 2>/dev/null)
-    [[ -z "$ENABLE_RATELIMIT" ]] && ENABLE_RATELIMIT=0
+    local val
+    val=$(uci -q get ${CONFIG_FILE}.global.enable_ratelimit 2>/dev/null)
+    case "$val" in 1|yes|true|on) ENABLE_RATELIMIT=1 ;; *) ENABLE_RATELIMIT=0 ;; esac
 
-    ENABLE_ACK_LIMIT=$(uci -q get ${CONFIG_FILE}.global.enable_ack_limit 2>/dev/null)
-    [[ -z "$ENABLE_ACK_LIMIT" ]] && ENABLE_ACK_LIMIT=0
+    val=$(uci -q get ${CONFIG_FILE}.global.enable_ack_limit 2>/dev/null)
+    case "$val" in 1|yes|true|on) ENABLE_ACK_LIMIT=1 ;; *) ENABLE_ACK_LIMIT=0 ;; esac
 
-    ENABLE_TCP_UPGRADE=$(uci -q get ${CONFIG_FILE}.global.enable_tcp_upgrade 2>/dev/null)
-    [[ -z "$ENABLE_TCP_UPGRADE" ]] && ENABLE_TCP_UPGRADE=0
+    val=$(uci -q get ${CONFIG_FILE}.global.enable_tcp_upgrade 2>/dev/null)
+    case "$val" in 1|yes|true|on) ENABLE_TCP_UPGRADE=1 ;; *) ENABLE_TCP_UPGRADE=0 ;; esac
 
-    SAVE_NFT_RULES=$(uci -q get ${CONFIG_FILE}.global.save_nft_rules 2>/dev/null)
-    [[ -z "$SAVE_NFT_RULES" ]] && SAVE_NFT_RULES=0
+    val=$(uci -q get ${CONFIG_FILE}.global.save_nft_rules 2>/dev/null)
+    case "$val" in 1|yes|true|on) SAVE_NFT_RULES=1 ;; *) SAVE_NFT_RULES=0 ;; esac
 }
 
 # ========== 数字验证（处理前导零） ==========
@@ -338,8 +339,14 @@ validate_ip() {
 # ========== TCP 标志验证 ==========
 validate_tcp_flags() {
     local val="$1" param_name="$2"
-    val=$(echo "$val" | tr -d '[:space:]')
+    # 去除所有空白字符
+    val=$(echo "$val" | tr -d '[:space:]' | tr -d '\r\n')
     [[ -z "$val" ]] && return 0
+
+    # 如果值中包含字母 'k'，视为 'ack' 并直接通过
+    if [[ "$val" == *k* ]]; then
+        return 0
+    fi
 
     IFS=',' read -ra flags <<< "$val"
     for f in "${flags[@]}"; do
@@ -637,17 +644,14 @@ load_all_config_options() {
                          eval "${prefix}dest_ip=$(printf "%q" "$val")"
                      else log_warn "规则 $section_id 目的 IP '$val' 格式无效，忽略此字段"; fi ;;
             tcp_flags)
-                val=$(echo "$val" | tr -d '[:space:]')
-                case "$val" in
-                    k|k,*) val="ack"; log_debug "规则 $section_id TCP标志从 '$val' 修正为 'ack'" ;;
-                    *k*) val="ack"; log_debug "规则 $section_id TCP标志包含 'k'，已修正为 'ack'" ;;
-                esac
-                if [[ -n "$val" ]] && validate_tcp_flags "$val" "${section_id}.tcp_flags"; then
-                    eval "${prefix}tcp_flags=$(printf "%q" "$val")"
-                else
-                    log_warn "规则 $section_id TCP标志 '$val' 无效，忽略此字段"
-                fi
-                ;;
+				val=$(echo "$val" | tr -d '[:space:]')
+				# 让 validate_tcp_flags 自行处理
+				if [[ -n "$val" ]] && validate_tcp_flags "$val" "${section_id}.tcp_flags"; then
+					eval "${prefix}tcp_flags=$(printf "%q" "$val")"
+				else
+					log_warn "规则 $section_id TCP标志 '$val' 无效，忽略此字段"
+				fi
+				;;
             packet_len) if validate_length "$val" "${section_id}.packet_len"; then
                             eval "${prefix}packet_len=$(printf "%q" "$val")"
                         else log_warn "规则 $section_id 包长度 '$val' 无效，忽略此字段"; fi ;;
@@ -1048,11 +1052,11 @@ generate_ack_limit_rules() {
     [[ -n "$xfast_rate" ]] && ACK_XFAST="$xfast_rate"
 
     cat <<EOF
-# ACK rate limiting using dynamic sets (ct id key)
-add rule inet gargoyle-qos-priority filter_qos_egress meta length < 100 tcp flags ack limit rate over ${ACK_XFAST}/second add @_qos_xfst4ack { ct id } counter jump drop995
-add rule inet gargoyle-qos-priority filter_qos_egress meta length < 100 tcp flags ack limit rate over ${ACK_FAST}/second add @_qos_fast4ack { ct id } counter jump drop95
-add rule inet gargoyle-qos-priority filter_qos_egress meta length < 100 tcp flags ack limit rate over ${ACK_MED}/second add @_qos_med4ack { ct id } counter jump drop50
-add rule inet gargoyle-qos-priority filter_qos_egress meta length < 100 tcp flags ack limit rate over ${ACK_SLOW}/second add @_qos_slow4ack { ct id } counter jump drop50
+# ACK rate limiting using dynamic sets (ct id . ct direction key)
+add rule inet gargoyle-qos-priority filter_qos_egress meta length < 100 tcp flags ack limit rate over ${ACK_XFAST}/second add @_qos_xfst4ack { ct id . ct direction } counter jump drop995
+add rule inet gargoyle-qos-priority filter_qos_egress meta length < 100 tcp flags ack limit rate over ${ACK_FAST}/second add @_qos_fast4ack { ct id . ct direction } counter jump drop95
+add rule inet gargoyle-qos-priority filter_qos_egress meta length < 100 tcp flags ack limit rate over ${ACK_MED}/second add @_qos_med4ack { ct id . ct direction } counter jump drop50
+add rule inet gargoyle-qos-priority filter_qos_egress meta length < 100 tcp flags ack limit rate over ${ACK_SLOW}/second add @_qos_slow4ack { ct id . ct direction } counter jump drop50
 EOF
 }
 
@@ -1060,37 +1064,32 @@ EOF
 generate_tcp_upgrade_rules() {
     [[ $ENABLE_TCP_UPGRADE != 1 ]] && return
     local realtime_class=""
-    local class_id=$(uci -q get ${CONFIG_FILE}.idclass.class_realtime 2>/dev/null)
-
-    if [[ -n "$class_id" ]]; then
-        for prefix in upload_class uclass; do
-            local candidate="${prefix}_${class_id}"
-            uci -q get ${CONFIG_FILE}.${candidate} >/dev/null 2>&1 && { realtime_class="$candidate"; break; }
-        done
-        if [[ -z "$realtime_class" ]]; then
-            for prefix in upload_class uclass; do
-                local candidate="${prefix}_realtime"
-                uci -q get ${CONFIG_FILE}.${candidate} >/dev/null 2>&1 && { realtime_class="$candidate"; break; }
-            done
-        fi
-    fi
+    
+    # 查找 name=realtime 的上传类
+    local upload_classes=$(load_all_config_sections "$CONFIG_FILE" "upload_class")
+    for cls in $upload_classes; do
+        local name=$(uci -q get ${CONFIG_FILE}.${cls}.name 2>/dev/null)
+        [[ "$name" == "realtime" ]] && { realtime_class="$cls"; break; }
+    done
+    
+    # 如果未找到 realtime，使用第一个启用的上传类
     if [[ -z "$realtime_class" ]]; then
-        local upload_classes=$(load_all_config_sections "$CONFIG_FILE" "upload_class")
         for cls in $upload_classes; do
-            local name=$(uci -q get ${CONFIG_FILE}.${cls}.name 2>/dev/null)
-            [[ "$name" == "realtime" ]] && { realtime_class="$cls"; break; }
+            local enabled=$(uci -q get ${CONFIG_FILE}.${cls}.enabled 2>/dev/null)
+            if [[ "$enabled" == "1" ]] || [[ -z "$enabled" ]]; then
+                realtime_class="$cls"
+                log_warn "TCP升级：未找到 realtime 类，将使用第一个启用的上传类 $realtime_class"
+                break
+            fi
         done
     fi
+
     if [[ -z "$realtime_class" ]]; then
-        local first_upload=$(load_all_config_sections "$CONFIG_FILE" "upload_class" | head -1)
-        if [[ -n "$first_upload" ]]; then
-            realtime_class="$first_upload"
-            log_warn "TCP升级：未找到 realtime 类，将使用第一个上传类 $realtime_class"
-        else
-            log_warn "TCP升级：未找到任何上传类，将禁用此功能"; return
-        fi
+        log_warn "TCP升级：未找到任何上传类，将禁用此功能"
+        return
     fi
 
+    # 检查类是否启用
     local enabled=$(uci -q get ${CONFIG_FILE}.${realtime_class}.enabled 2>/dev/null)
     if [[ "$enabled" != "1" ]] && [[ -n "$enabled" ]]; then
         log_warn "TCP升级：realtime 类 $realtime_class 未启用，跳过规则生成"
@@ -1098,15 +1097,15 @@ generate_tcp_upgrade_rules() {
     fi
 
     local realtime_mark=$(get_class_mark "upload" "$realtime_class" 2>/dev/null)
-    if [[ -z "$realtime_mark" ]]; then
-        log_error "TCP升级：无法获取类 $realtime_class 的标记，跳过规则生成"
+    if [[ -z "$realtime_mark" || "$realtime_mark" == "0" || "$realtime_mark" == "0x0" ]]; then
+        log_error "TCP升级：realtime 类 $realtime_class 的标记无效（值为 $realtime_mark），跳过规则生成"
         return
     fi
 
     cat <<EOF
-# TCP upgrade for slow connections (using dynamic set, ct id key)
-add rule inet gargoyle-qos-priority filter_qos_egress meta l4proto tcp ct state established meta nfproto ipv4 ct id limit rate 150/second burst 150 packets add @_qos_slowtcp { ct id } meta mark set $realtime_mark counter
-add rule inet gargoyle-qos-priority filter_qos_egress meta l4proto tcp ct state established meta nfproto ipv6 ct id limit rate 150/second burst 150 packets add @_qos_slowtcp { ct id } meta mark set $realtime_mark counter
+# TCP upgrade for slow connections (using dynamic set, ct id . ct direction key)
+add rule inet gargoyle-qos-priority filter_qos_egress meta l4proto tcp ct state established meta nfproto ipv4 add @_qos_slowtcp { ct id . ct direction limit rate 150/second burst 150 packets } meta mark set $realtime_mark counter
+add rule inet gargoyle-qos-priority filter_qos_egress meta l4proto tcp ct state established meta nfproto ipv6 add @_qos_slowtcp { ct id . ct direction limit rate 150/second burst 150 packets } meta mark set $realtime_mark counter
 EOF
 }
 
@@ -1206,21 +1205,25 @@ build_nft_rule_fast() {
     fi
 
     if [[ -n "$tcp_flags" ]] && [[ "$proto" == "tcp" ]]; then
-        local clean_flags=""
-        IFS=',' read -ra flags <<< "$tcp_flags"
-        for flag in "${flags[@]}"; do
-            flag=$(echo "$flag" | tr -d '[:space:]')
-            case "$flag" in
-                syn|ack|rst|fin|urg|psh|ecn|cwr)
-                    [[ -z "$clean_flags" ]] && clean_flags="$flag" || clean_flags="$clean_flags,$flag"
-                    ;;
-                *) log_warn "规则 $rule_name TCP标志 '$flag' 无效，已忽略" ;;
-            esac
-        done
-        if [[ -n "$clean_flags" ]]; then
-            common_cond="$common_cond tcp flags { $clean_flags }"
-        fi
-    fi
+		local clean_flags=""
+		IFS=',' read -ra flags <<< "$tcp_flags"
+		for flag in "${flags[@]}"; do
+			flag=$(echo "$flag" | tr -d '[:space:]')
+			# 如果 flag 包含 'k'，则视为 'ack'
+			if [[ "$flag" == *k* ]]; then
+				flag="ack"
+			fi
+			case "$flag" in
+				syn|ack|rst|fin|urg|psh|ecn|cwr)
+					[[ -z "$clean_flags" ]] && clean_flags="$flag" || clean_flags="$clean_flags,$flag"
+					;;
+				*) log_warn "规则 $rule_name TCP标志 '$flag' 无效，已忽略" ;;
+			esac
+		done
+		if [[ -n "$clean_flags" ]]; then
+			common_cond="$common_cond tcp flags { $clean_flags }"
+		fi
+	fi
 
     [[ -n "$iif" ]] && common_cond="$common_cond iifname \"$iif\""
     [[ -n "$oif" ]] && common_cond="$common_cond oifname \"$oif\""
@@ -1341,8 +1344,12 @@ build_nft_rule_fast() {
             fi
         fi
 
-        cmd="$cmd meta mark set $class_mark counter"
-        echo "$cmd"
+        if [[ "$chain" == *"ingress"* ]]; then
+			cmd="$cmd meta mark set $class_mark ct mark set meta mark counter"
+		else
+			cmd="$cmd meta mark set $class_mark counter"
+		fi
+		echo "$cmd"
     fi
 
     if (( do_ipv6 )); then
@@ -1389,8 +1396,12 @@ build_nft_rule_fast() {
             fi
         fi
 
-        cmd="$cmd meta mark set $class_mark counter"
-        echo "$cmd"
+        if [[ "$chain" == *"ingress"* ]]; then
+			cmd="$cmd meta mark set $class_mark ct mark set meta mark counter"
+		else
+			cmd="$cmd meta mark set $class_mark counter"
+		fi
+		echo "$cmd"
     fi
 }
 
@@ -1458,13 +1469,13 @@ apply_enhanced_direction_rules() {
     [[ "$chain" == "filter_qos_egress" ]] && custom_file="$CUSTOM_EGRESS_FILE" || custom_file="$CUSTOM_INGRESS_FILE"
     if [[ -s "$custom_file" ]]; then
         log_info "验证自定义规则: $custom_file"
-        local check_file=$(mktemp /tmp/qos_custom_check_$$.nft)
-        TEMP_FILES+=("$check_file")
-        {
-            printf '%s\n\t%s\n' "table inet __qos_custom_check {" "chain __temp_chain {"
-            cat "$custom_file"
-            printf '\n\t%s\n%s\n' "}" "}"
-        } > "$check_file"
+        local check_file=$(mktemp)
+		TEMP_FILES+=("$check_file")
+		{
+			printf '%s\n\t%s\n' "table inet __qos_custom_check {" "chain __temp_chain {"
+			cat "$custom_file"
+			printf '\n\t%s\n%s\n' "}" "}"
+		} > "$check_file"
         if nft --check --file "$check_file" 2>/dev/null; then
             log_info "自定义规则语法正确: $custom_file"
             while IFS= read -r line || [[ -n "$line" ]]; do
@@ -1553,7 +1564,8 @@ apply_all_rules() {
         local sets_ok=1
         for set in _qos_xfst4ack _qos_fast4ack _qos_med4ack _qos_slow4ack _qos_slowtcp; do
             if ! nft list set inet gargoyle-qos-priority "$set" &>/dev/null; then
-                nft add set inet gargoyle-qos-priority "$set" '{ type ct id; flags dynamic; timeout 5m; }' 2>/dev/null || sets_ok=0
+                #nft add set inet gargoyle-qos-priority "$set" '{ type ct id; flags dynamic; timeout 5m; }' 2>/dev/null || sets_ok=0
+				nft add set inet gargoyle-qos-priority "$set" '{ typeof ct id . ct direction; flags dynamic; timeout 5m; }'
             fi
         done
 
@@ -1609,6 +1621,26 @@ apply_all_rules() {
         nft add rule inet gargoyle-qos-priority filter_input jump filter_qos_ingress 2>/dev/null || true
 
         _HOOKS_SETUP=1
+		
+	# 确保动态集合存在，并同步 ACK/TCP 启用标志
+	local sets_ok=1
+	for set in _qos_xfst4ack _qos_fast4ack _qos_med4ack _qos_slow4ack _qos_slowtcp; do
+		if ! nft list set inet gargoyle-qos-priority "$set" &>/dev/null; then
+			nft add set inet gargoyle-qos-priority "$set" '{ typeof ct id . ct direction; flags dynamic; timeout 5m; }' 2>/dev/null || sets_ok=0
+		fi
+	done
+
+	if [[ $sets_ok -eq 0 ]]; then
+		log_error "动态集合创建失败，ACK 限速和 TCP 升级功能将被禁用"
+		ENABLE_ACK_LIMIT=0
+		ENABLE_TCP_UPGRADE=0
+	else
+		# 从 UCI 重新获取启用状态（确保与配置一致）
+		local ack_val=$(uci -q get ${CONFIG_FILE}.global.enable_ack_limit 2>/dev/null)
+		case "$ack_val" in 1|yes|true|on) ENABLE_ACK_LIMIT=1 ;; *) ENABLE_ACK_LIMIT=0 ;; esac
+		local tcp_val=$(uci -q get ${CONFIG_FILE}.global.enable_tcp_upgrade 2>/dev/null)
+		case "$tcp_val" in 1|yes|true|on) ENABLE_TCP_UPGRADE=1 ;; *) ENABLE_TCP_UPGRADE=0 ;; esac
+	fi
         log_info "nftables 钩子链挂载完成"
     fi
 

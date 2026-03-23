@@ -1189,8 +1189,8 @@ stop_hfsc_cake_qos() {
     nft delete table inet gargoyle-qos-priority 2>/dev/null || true
     clear_class_marks
     qos_log "INFO" "HFSC+CAKE QoS停止完成"
-    # 移除配置恢复，防止覆盖用户配置
-    # restore_main_config   # 已删除
+    # 恢复主配置文件（删除追加的规则集）
+    restore_main_config
     # 重置 nftables 表刷新标志
     _QOS_TABLE_FLUSHED=0
     _IPSET_LOADED=0
@@ -1203,22 +1203,38 @@ stop_hfsc_cake_qos() {
 
 # ========== 状态显示函数 ==========
 show_hfsc_cake_status() {
+     # 从 UCI 获取真实 WAN 接口
+    local real_wan_if=$(uci -q get ${CONFIG_FILE}.global.wan_interface 2>/dev/null)
+    if [[ -z "$real_wan_if" ]] || [[ "$real_wan_if" == "auto" ]]; then
+        # 如果未配置或为 auto，尝试自动检测
+        if command -v network_find_wan >/dev/null 2>&1; then
+            network_find_wan real_wan_if 2>/dev/null
+        fi
+        if [[ -z "$real_wan_if" ]]; then
+            real_wan_if=$(ip route show default 2>/dev/null | awk '/default/ {print $5}' | head -1)
+        fi
+        [[ -z "$real_wan_if" ]] && real_wan_if="未知"
+    fi
+
     if [[ -z "$IFB_DEVICE" ]]; then
         IFB_DEVICE=$(uci -q get ${CONFIG_FILE}.download.ifb_device 2>/dev/null)
         [[ -z "$IFB_DEVICE" ]] && IFB_DEVICE="ifb0"
     fi
     local qos_ifb="$IFB_DEVICE"
-    if [[ -z "$qos_interface" ]]; then
-        qos_interface=$(tc qdisc show 2>/dev/null | grep -E "hfsc.*root" | awk '{print $5}' | head -1)
-        [[ -z "$qos_interface" ]] && qos_interface="未知"
-    fi
+
     echo "===== HFSC-CAKE QoS 状态报告 ====="
     echo "时间: $(date)"
-    echo "WAN接口: ${qos_interface}"
-    if ! tc qdisc show dev "${qos_interface}" 2>/dev/null | grep -q hfsc; then
-        echo "警告: QoS 未在接口 ${qos_interface} 上激活"
-        return 1
+    echo "WAN接口: ${real_wan_if}"
+
+    # 如果 WAN 接口无效，则跳过依赖接口的检查
+    if [[ "$real_wan_if" == "未知" ]] || ! ip link show "$real_wan_if" >/dev/null 2>&1; then
+        echo "警告: 无法确定有效的 WAN 接口，部分信息可能无法显示。"
+    else
+        if ! tc qdisc show dev "$real_wan_if" 2>/dev/null | grep -q hfsc; then
+            echo "警告: 出口 QoS 未在接口 ${real_wan_if} 上激活"
+        fi
     fi
+
     if [[ -n "$qos_ifb" ]] && ip link show "$qos_ifb" >/dev/null 2>&1; then
         if tc qdisc show dev "$qos_ifb" 2>/dev/null | grep -q "qdisc"; then
             echo "IFB设备: 已启动且运行中 ($qos_ifb)"
@@ -1228,31 +1244,37 @@ show_hfsc_cake_status() {
     else
         echo "IFB设备: 未创建"
     fi
-    echo -e "\n======== 出口QoS ($qos_interface) ========"
-    echo -e "\nTC队列:"
-    tc -s qdisc show dev "$qos_interface" 2>/dev/null | while read -r line; do
-        if echo "$line" | grep -q "hfsc\|cake"; then
-            echo "  $line"
-        fi
-    done
-    if tc class show dev "$qos_interface" >/dev/null 2>&1; then
-        echo -e "\nTC类别:"
-        tc -s class show dev "$qos_interface" 2>/dev/null | while read -r line; do
-            if echo "$line" | grep -q "hfsc"; then
+
+    # 以下部分仅在 WAN 接口有效时显示
+    if [[ "$real_wan_if" != "未知" ]] && ip link show "$real_wan_if" >/dev/null 2>&1; then
+        echo -e "\n======== 出口QoS ($real_wan_if) ========"
+        echo -e "\nTC队列:"
+        tc -s qdisc show dev "$real_wan_if" 2>/dev/null | while read -r line; do
+            if echo "$line" | grep -q "hfsc\|cake"; then
                 echo "  $line"
             fi
         done
+        if tc class show dev "$real_wan_if" >/dev/null 2>&1; then
+            echo -e "\nTC类别:"
+            tc -s class show dev "$real_wan_if" 2>/dev/null | while read -r line; do
+                if echo "$line" | grep -q "hfsc"; then
+                    echo "  $line"
+                fi
+            done
+        fi
+        echo -e "\nTC过滤器:"
+        tc -s filter show dev "$real_wan_if" 2>/dev/null | while read -r line; do
+            echo "  $line"
+        done
     fi
-    echo -e "\nTC过滤器:"
-    tc -s filter show dev "$qos_interface" 2>/dev/null | while read -r line; do
-        echo "  $line"
-    done
+
     echo -e "\n======== nftables 分类规则 ========"
     if nft list table inet gargoyle-qos-priority &>/dev/null; then
         nft list table inet gargoyle-qos-priority 2>/dev/null | sed 's/^/  /'
     else
         echo "  nftables 表不存在"
     fi
+
     echo -e "\n======== 入口QoS ($qos_ifb) ========"
     if [[ -n "$qos_ifb" ]] && ip link show "$qos_ifb" >/dev/null 2>&1; then
         echo -e "\nTC队列:"
@@ -1273,19 +1295,27 @@ show_hfsc_cake_status() {
         tc -s filter show dev "$qos_ifb" 2>/dev/null | while read -r line; do
             echo "  $line"
         done
+
         echo -e "\n入口重定向检查:"
-        if tc qdisc show dev "$qos_interface" 2>/dev/null | grep -q "ingress"; then
-            check_ingress_redirect "$qos_interface" "$qos_ifb"
+        if [[ "$real_wan_if" != "未知" ]] && ip link show "$real_wan_if" >/dev/null 2>&1; then
+            if tc qdisc show dev "$real_wan_if" 2>/dev/null | grep -q "ingress"; then
+                check_ingress_redirect "$real_wan_if" "$qos_ifb"
+            else
+                echo "  ✗ 入口队列未配置"
+            fi
         else
-            echo "  ✗ 入口队列未配置"
+            echo "  ✗ 无法检查入口重定向（WAN接口无效）"
         fi
     else
         echo "  IFB设备不存在，无入口配置"
     fi
+
     echo -e "\n===== QoS运行状态 ====="
     local upload_active=0
     local download_active=0
-    tc qdisc show dev "$qos_interface" 2>/dev/null | grep -q "htb" && upload_active=1
+    if [[ "$real_wan_if" != "未知" ]] && ip link show "$real_wan_if" >/dev/null 2>&1; then
+        tc qdisc show dev "$real_wan_if" 2>/dev/null | grep -q "hfsc" && upload_active=1
+    fi
     [[ -n "$qos_ifb" ]] && tc qdisc show dev "$qos_ifb" 2>/dev/null | grep -q "hfsc" && download_active=1
 
     if (( upload_active == 1 )); then
@@ -1309,17 +1339,18 @@ show_hfsc_cake_status() {
     fi
 
     echo -e "\n===== 详细队列统计 ====="
-    
-    echo -e "\n上传方向cake队列:"
-    tc -s qdisc show dev "$qos_interface" 2>/dev/null | grep -A 3 "cake" | while read -r line; do
-        if echo "$line" | grep -q "parent"; then
-            echo "  $line"
-        elif echo "$line" | grep -q "Sent" || echo "$line" | grep -q "maxpacket" || \
-             echo "$line" | grep -q "ecn_mark" || echo "$line" | grep -q "memory_used"; then
-            echo "    $line"
-        fi
-    done
-    
+    if [[ "$real_wan_if" != "未知" ]] && ip link show "$real_wan_if" >/dev/null 2>&1; then
+        echo -e "\n上传方向cake队列:"
+        tc -s qdisc show dev "$real_wan_if" 2>/dev/null | grep -A 3 "cake" | while read -r line; do
+            if echo "$line" | grep -q "parent"; then
+                echo "  $line"
+            elif echo "$line" | grep -q "Sent" || echo "$line" | grep -q "maxpacket" || \
+                 echo "$line" | grep -q "ecn_mark" || echo "$line" | grep -q "memory_used"; then
+                echo "    $line"
+            fi
+        done
+    fi
+
     if [[ -n "$qos_ifb" ]] && ip link show "$qos_ifb" >/dev/null 2>&1; then
         echo -e "\n下载方向cake队列:"
         tc -s qdisc show dev "$qos_ifb" 2>/dev/null | grep -A 3 "cake" | while read -r line; do
@@ -1333,32 +1364,20 @@ show_hfsc_cake_status() {
     fi
 
     echo -e "\n===== 增强特性状态 ====="
-    if (( ENABLE_RATELIMIT == 1 )); then
-        echo "速率限制: 已启用"
-    else
-        echo "速率限制: 未启用"
-    fi
+    # 直接从 UCI 读取，避免依赖可能未同步的全局变量
+    local rate_val=$(uci -q get ${CONFIG_FILE}.global.enable_ratelimit 2>/dev/null)
+    local ack_val=$(uci -q get ${CONFIG_FILE}.global.enable_ack_limit 2>/dev/null)
+    local tcp_val=$(uci -q get ${CONFIG_FILE}.global.enable_tcp_upgrade 2>/dev/null)
+    local save_val=$(uci -q get ${CONFIG_FILE}.global.save_nft_rules 2>/dev/null)
 
-    if (( ENABLE_ACK_LIMIT == 1 )); then
-        echo "ACK 限速: 已启用"
-    else
-        echo "ACK 限速: 未启用"
-    fi
+    case "$rate_val" in 1|yes|true|on) echo "速率限制: 已启用" ;; *) echo "速率限制: 未启用" ;; esac
+    case "$ack_val"  in 1|yes|true|on) echo "ACK 限速: 已启用" ;; *) echo "ACK 限速: 未启用" ;; esac
+    case "$tcp_val"  in 1|yes|true|on) echo "TCP 升级: 已启用" ;; *) echo "TCP 升级: 未启用" ;; esac
+    case "$save_val" in 1|yes|true|on) echo "规则持久化: 已启用" ;; *) echo "规则持久化: 未启用" ;; esac
 
-    if (( ENABLE_TCP_UPGRADE == 1 )); then
-        echo "TCP 升级: 已启用"
-    else
-        echo "TCP 升级: 未启用"
-    fi
-
-    if (( SAVE_NFT_RULES == 1 )); then
-        echo "规则持久化: 已启用"
-    else
-        echo "规则持久化: 未启用"
-    fi
-	
     echo -e "\n===== 健康检查 ====="
     health_check
+
     echo -e "\n===== 活动连接标记 ========"
     if ! command -v conntrack >/dev/null 2>&1; then
         echo "  conntrack 命令未安装，无法显示连接标记信息。"
@@ -1366,10 +1385,12 @@ show_hfsc_cake_status() {
     else
         local wan_ipv4=""
         local wan_ipv6=""
-        wan_ipv4=$(ip -4 addr show dev "$qos_interface" 2>/dev/null | grep "inet " | awk '{print $2}' | cut -d/ -f1 | head -1)
-        [[ -z "$wan_ipv4" ]] && wan_ipv4=$(ifconfig "$qos_interface" 2>/dev/null | grep "inet addr:" | awk '{print $2}' | cut -d: -f2)
-        wan_ipv6=$(ip -6 addr show dev "$qos_interface" 2>/dev/null | grep "inet6 " | grep -v "fe80::" | awk '{print $2}' | cut -d/ -f1 | head -1)
-        [[ -z "$wan_ipv6" ]] && wan_ipv6=$(ifconfig "$qos_interface" 2>/dev/null | grep "inet6 addr:" | grep -v "fe80::" | awk '{print $3}' | cut -d/ -f1)
+        if [[ "$real_wan_if" != "未知" ]] && ip link show "$real_wan_if" >/dev/null 2>&1; then
+            wan_ipv4=$(ip -4 addr show dev "$real_wan_if" 2>/dev/null | grep "inet " | awk '{print $2}' | cut -d/ -f1 | head -1)
+            [[ -z "$wan_ipv4" ]] && wan_ipv4=$(ifconfig "$real_wan_if" 2>/dev/null | grep "inet addr:" | awk '{print $2}' | cut -d: -f2)
+            wan_ipv6=$(ip -6 addr show dev "$real_wan_if" 2>/dev/null | grep "inet6 " | grep -v "fe80::" | awk '{print $2}' | cut -d/ -f1 | head -1)
+            [[ -z "$wan_ipv6" ]] && wan_ipv6=$(ifconfig "$real_wan_if" 2>/dev/null | grep "inet6 addr:" | grep -v "fe80::" | awk '{print $3}' | cut -d/ -f1)
+        fi
         echo -e "\nIPv4 连接标记 (目标地址为 WAN):"
         if [[ -n "$wan_ipv4" ]]; then
             echo "WAN IPv4: $wan_ipv4"
@@ -1436,29 +1457,11 @@ show_hfsc_cake_status() {
             fi
         fi
     fi
-    echo -e "\n===== 网络接口统计 ====="
-    echo -e "\n接口流量统计:"
-    echo "WAN接口 ($qos_interface):"
-    if command -v ip >/dev/null 2>&1; then
-        ip -s link show "$qos_interface" 2>/dev/null | grep -E "RX:|TX:" | sed 's/^/  /'
-    elif command -v ifconfig >/dev/null 2>&1; then
-        ifconfig "$qos_interface" 2>/dev/null | grep "RX bytes\|TX bytes" | sed 's/^/  /'
-    else
-        echo "  无法获取接口统计（缺少 ip 或 ifconfig 命令）"
-    fi
-    if [[ -n "$qos_ifb" ]] && ip link show "$qos_ifb" >/dev/null 2>&1; then
-        echo -e "\nIFB接口 ($qos_ifb):"
-        if command -v ip >/dev/null 2>&1; then
-            ip -s link show "$qos_ifb" 2>/dev/null | grep -E "RX:|TX:" | sed 's/^/  /'
-        elif command -v ifconfig >/dev/null 2>&1; then
-            ifconfig "$qos_ifb" 2>/dev/null | grep "RX bytes\|TX bytes" | sed 's/^/  /'
-        else
-            echo "  无法获取接口统计（缺少 ip 或 ifconfig 命令）"
-        fi
-    fi
+	
     echo -e "\n===== HFSC-CAKE 状态报告结束 ====="
     return 0
 }
+
 
 # ========== 主入口 ==========
 main_hfsc_cake_qos() {
