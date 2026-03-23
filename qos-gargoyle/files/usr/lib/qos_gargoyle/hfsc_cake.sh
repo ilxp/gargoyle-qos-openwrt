@@ -1,6 +1,6 @@
 #!/bin/bash
 # HFSC_CAKE算法实现模块
-# 版本: 3.0.4 - 直接使用主脚本导出的环境变量，避免重复读取 UCI，优化变量使用
+# 版本: 3.0.5 - 修复默认类处理、移除eval、改进connmark回退、优化停止逻辑
 # 基于HFSC与CAKE组合算法实现QoS流量控制。
 
 # ========== 全局配置常量 ==========
@@ -549,7 +549,7 @@ create_hfsc_download_class() {
     return 0
 }
 
-# ========== 入口重定向 ==========
+# ========== 入口重定向（改进 connmark 回退） ==========
 setup_ingress_redirect() {
     if [[ -z "$qos_interface" ]]; then
         qos_log "ERROR" "无法确定 WAN 接口"
@@ -557,8 +557,12 @@ setup_ingress_redirect() {
     fi
 
     # 检查 tc connmark 动作支持
-    if ! check_tc_connmark_support; then
-        qos_log "WARN" "tc connmark 动作不受支持，入口重定向可能无法正常工作。请确保内核支持 connmark 且已加载 act_connmark 模块。"
+    local connmark_ok=0
+    if check_tc_connmark_support; then
+        connmark_ok=1
+        qos_log "INFO" "tc connmark 动作受支持"
+    else
+        qos_log "WARN" "tc connmark 动作不受支持，入口重定向将不使用 connmark，标记可能无法传递"
     fi
 
     qos_log "INFO" "设置入口重定向: $qos_interface -> $IFB_DEVICE"
@@ -568,16 +572,30 @@ setup_ingress_redirect() {
         return 1
     fi
     tc filter del dev "$qos_interface" parent ffff: 2>/dev/null || true
+
     # IPv4 重定向
-    if ! tc filter add dev "$qos_interface" parent ffff: protocol ip \
-        u32 match u32 0 0 \
-        action connmark \
-        action mirred egress redirect dev "$IFB_DEVICE" 2>&1; then
-        qos_log "ERROR" "IPv4入口重定向规则添加失败"
-        tc qdisc del dev "$qos_interface" ingress 2>/dev/null
-        return 1
+    if (( connmark_ok )); then
+        if ! tc filter add dev "$qos_interface" parent ffff: protocol ip \
+            u32 match u32 0 0 \
+            action connmark \
+            action mirred egress redirect dev "$IFB_DEVICE" 2>&1; then
+            qos_log "ERROR" "IPv4入口重定向规则添加失败（使用 connmark）"
+            tc qdisc del dev "$qos_interface" ingress 2>/dev/null
+            return 1
+        else
+            qos_log "INFO" "IPv4入口重定向规则添加成功（使用 connmark）"
+        fi
     else
-        qos_log "INFO" "IPv4入口重定向规则添加成功"
+        # 降级：不使用 connmark，仅重定向
+        if ! tc filter add dev "$qos_interface" parent ffff: protocol ip \
+            u32 match u32 0 0 \
+            action mirred egress redirect dev "$IFB_DEVICE" 2>&1; then
+            qos_log "ERROR" "IPv4入口重定向规则添加失败（无 connmark）"
+            tc qdisc del dev "$qos_interface" ingress 2>/dev/null
+            return 1
+        else
+            qos_log "WARN" "IPv4入口重定向规则添加成功（未使用 connmark，标记将丢失）"
+        fi
     fi
 
     local has_ipv6_global=0
@@ -588,38 +606,61 @@ setup_ingress_redirect() {
         qos_log "INFO" "接口 $qos_interface 无全局 IPv6 地址，IPv6 重定向失败仅警告"
     fi
 
-    # 清理现有 IPv6 过滤器，避免重复
-    tc filter del dev "$qos_interface" parent ffff: protocol ipv6 2>/dev/null || true
-
+    # IPv6 重定向，尝试多种匹配方式
     local ipv6_success=false
-    # 第一优先：flower 匹配全球单播地址 (2000::/3)
-    if tc filter add dev "$qos_interface" parent ffff: protocol ipv6 \
-        flower dst_ip 2000::/3 \
-        action connmark \
-        action mirred egress redirect dev "$IFB_DEVICE" 2>&1; then
-        ipv6_success=true
-        qos_log "INFO" "IPv6入口重定向规则（flower 匹配全球单播）添加成功"
-    else
-        qos_log "WARN" "flower 规则添加失败，尝试 u32 全球单播匹配"
-        # 第二优先：u32 匹配全球单播地址 (2000::/3)
+    if (( connmark_ok )); then
+        # 第一优先：flower 匹配全球单播地址 (2000::/3)
         if tc filter add dev "$qos_interface" parent ffff: protocol ipv6 \
-            u32 match u32 0x20000000 0xe0000000 at 24 \
+            flower dst_ip 2000::/3 \
             action connmark \
             action mirred egress redirect dev "$IFB_DEVICE" 2>&1; then
             ipv6_success=true
-            qos_log "INFO" "IPv6入口重定向规则（u32 全球单播）添加成功"
+            qos_log "INFO" "IPv6入口重定向规则（flower 匹配全球单播，带 connmark）添加成功"
         else
-            qos_log "WARN" "u32 全球单播规则添加失败，尝试无过滤规则"
-            # 第三优先：无过滤的 u32 全匹配
+            qos_log "WARN" "flower 规则添加失败，尝试 u32 全球单播匹配"
             if tc filter add dev "$qos_interface" parent ffff: protocol ipv6 \
-                u32 match u32 0 0 \
+                u32 match u32 0x20000000 0xe0000000 at 24 \
                 action connmark \
                 action mirred egress redirect dev "$IFB_DEVICE" 2>&1; then
                 ipv6_success=true
-                qos_log "INFO" "IPv6入口重定向规则（无过滤）添加成功"
+                qos_log "INFO" "IPv6入口重定向规则（u32 全球单播，带 connmark）添加成功"
             else
-                ipv6_success=false
-                qos_log "WARN" "IPv6入口重定向规则添加失败，IPv6流量将不会通过IFB"
+                qos_log "WARN" "u32 全球单播规则添加失败，尝试无过滤规则"
+                if tc filter add dev "$qos_interface" parent ffff: protocol ipv6 \
+                    u32 match u32 0 0 \
+                    action connmark \
+                    action mirred egress redirect dev "$IFB_DEVICE" 2>&1; then
+                    ipv6_success=true
+                    qos_log "INFO" "IPv6入口重定向规则（无过滤，带 connmark）添加成功"
+                else
+                    ipv6_success=false
+                    qos_log "WARN" "IPv6入口重定向规则添加失败，IPv6流量将不会通过IFB"
+                fi
+            fi
+        fi
+    else
+        # 不使用 connmark
+        if tc filter add dev "$qos_interface" parent ffff: protocol ipv6 \
+            flower dst_ip 2000::/3 \
+            action mirred egress redirect dev "$IFB_DEVICE" 2>&1; then
+            ipv6_success=true
+            qos_log "INFO" "IPv6入口重定向规则（flower 匹配全球单播，无 connmark）添加成功"
+        else
+            if tc filter add dev "$qos_interface" parent ffff: protocol ipv6 \
+                u32 match u32 0x20000000 0xe0000000 at 24 \
+                action mirred egress redirect dev "$IFB_DEVICE" 2>&1; then
+                ipv6_success=true
+                qos_log "INFO" "IPv6入口重定向规则（u32 全球单播，无 connmark）添加成功"
+            else
+                if tc filter add dev "$qos_interface" parent ffff: protocol ipv6 \
+                    u32 match u32 0 0 \
+                    action mirred egress redirect dev "$IFB_DEVICE" 2>&1; then
+                    ipv6_success=true
+                    qos_log "INFO" "IPv6入口重定向规则（无过滤，无 connmark）添加成功"
+                else
+                    ipv6_success=false
+                    qos_log "WARN" "IPv6入口重定向规则添加失败，IPv6流量将不会通过IFB"
+                fi
             fi
         fi
     fi
@@ -683,7 +724,7 @@ check_ingress_redirect() {
     return 0
 }
 
-# ========== 上传方向初始化（增加类数量检查） ==========
+# ========== 上传方向初始化（使用关联数组替换 eval） ==========
 init_hfsc_cake_upload() {
     qos_log "INFO" "初始化上传方向HFSC"
     load_upload_class_configurations
@@ -709,6 +750,9 @@ init_hfsc_cake_upload() {
     local default_class_name=""
     local first_enabled_class=""
 
+    # 使用关联数组存储类索引
+    declare -A class_index_map
+
     # 获取配置的默认类
     default_class_name=$(uci -q get ${CONFIG_FILE}.upload.default_class 2>/dev/null)
 
@@ -718,7 +762,7 @@ init_hfsc_cake_upload() {
             enabled_classes="$enabled_classes $class"
             [[ -z "$first_enabled_class" ]] && first_enabled_class="$class"
             # 记录该类的索引
-            eval "class_index_${class}=$class_index"
+            class_index_map["$class"]=$class_index
             # 判断是否为默认类
             if [[ -n "$default_class_name" ]] && [[ "$class" == "$default_class_name" ]]; then
                 default_class_index=$class_index
@@ -739,7 +783,7 @@ init_hfsc_cake_upload() {
             qos_log "WARN" "未找到上传默认类别 '$default_class_name' 或该类未启用，将使用第一个启用的类别"
         fi
         if [[ -n "$first_enabled_class" ]]; then
-            default_class_index=$(eval echo \$class_index_${first_enabled_class})
+            default_class_index=${class_index_map["$first_enabled_class"]}
             qos_log "INFO" "自动选择第一个启用的类别: $first_enabled_class (ID: 1:$default_class_index)"
         else
             qos_log "ERROR" "没有启用的上传类，无法设置默认类"
@@ -758,7 +802,7 @@ init_hfsc_cake_upload() {
     # 创建各个子类
     upload_class_mark_list=""
     for class_name in $enabled_classes; do
-        local idx=$(eval echo \$class_index_${class_name})
+        local idx=${class_index_map["$class_name"]}
         if create_hfsc_upload_class "$class_name" "$idx"; then
             local class_mark_hex=$(get_class_mark "upload" "$class_name")
             upload_class_mark_list="$upload_class_mark_list$class_name:0x$(printf '%X' $class_mark_hex) "
@@ -777,7 +821,7 @@ init_hfsc_cake_upload() {
     return 0
 }
 
-# ========== 下载方向初始化（增加类数量检查） ==========
+# ========== 下载方向初始化（使用关联数组替换 eval） ==========
 init_hfsc_cake_download() {
     qos_log "INFO" "初始化下载方向HFSC"
     load_download_class_configurations
@@ -803,6 +847,8 @@ init_hfsc_cake_download() {
     local default_class_name=""
     local first_enabled_class=""
 
+    declare -A class_index_map
+
     default_class_name=$(uci -q get ${CONFIG_FILE}.download.default_class 2>/dev/null)
 
     for class in $download_class_list; do
@@ -810,7 +856,7 @@ init_hfsc_cake_download() {
         if [[ "$enabled" == "1" ]] || [[ -z "$enabled" ]]; then
             enabled_classes="$enabled_classes $class"
             [[ -z "$first_enabled_class" ]] && first_enabled_class="$class"
-            eval "class_index_${class}=$class_index"
+            class_index_map["$class"]=$class_index
             if [[ -n "$default_class_name" ]] && [[ "$class" == "$default_class_name" ]]; then
                 default_class_index=$class_index
             fi
@@ -829,7 +875,7 @@ init_hfsc_cake_download() {
             qos_log "WARN" "未找到下载默认类别 '$default_class_name' 或该类未启用，将使用第一个启用的类别"
         fi
         if [[ -n "$first_enabled_class" ]]; then
-            default_class_index=$(eval echo \$class_index_${first_enabled_class})
+            default_class_index=${class_index_map["$first_enabled_class"]}
             qos_log "INFO" "自动选择第一个启用的类别: $first_enabled_class (ID: 1:$default_class_index)"
         else
             qos_log "ERROR" "没有启用的下载类，无法设置默认类"
@@ -855,7 +901,7 @@ init_hfsc_cake_download() {
     local filter_prio=3
     download_class_mark_list=""
     for class_name in $enabled_classes; do
-        local idx=$(eval echo \$class_index_${class_name})
+        local idx=${class_index_map["$class_name"]}
         if create_hfsc_download_class "$class_name" "$idx" "$filter_prio"; then
             local class_mark_hex=$(get_class_mark "download" "$class_name")
             download_class_mark_list="$download_class_mark_list$class_name:0x$(printf '%X' $class_mark_hex) "
@@ -907,6 +953,11 @@ apply_hfsc_specific_rules() {
         ct bytes lt 200 counter meta priority set "normal" 2>/dev/null || true
     nft add rule inet gargoyle-qos-priority filter_qos_ingress_enhance \
         ct bytes lt 200 counter meta priority set "normal" 2>/dev/null || true
+    # 将连接跟踪标记复制到包标记（用于保持标记连续性）
+    nft add rule inet gargoyle-qos-priority filter_qos_egress_enhance \
+        ct state established,related counter meta mark set ct mark 2>/dev/null || true
+    nft add rule inet gargoyle-qos-priority filter_qos_egress_enhance \
+        tcp flags syn tcp option maxseg size set rt mtu counter meta mark set 0x3F 2>/dev/null || true
     qos_log "INFO" "HFSC特定增强规则应用完成"
 }
 
@@ -968,6 +1019,15 @@ init_hfsc_cake_qos() {
         rm -f "$QOS_RUNNING_FILE"
         return 1
     fi
+
+    # 验证掩码有效性
+    if [[ "$UPLOAD_MASK" == "0" ]] || [[ "$DOWNLOAD_MASK" == "0" ]]; then
+        qos_log "ERROR" "UPLOAD_MASK 或 DOWNLOAD_MASK 为 0，无法正确匹配标记"
+        release_lock
+        rm -f "$QOS_RUNNING_FILE"
+        return 1
+    fi
+
     load_upload_class_configurations
     load_download_class_configurations
 
@@ -1092,7 +1152,7 @@ init_hfsc_cake_qos() {
     return 0
 }
 
-# ========== 停止函数 ==========
+# ========== 停止函数（移除配置恢复） ==========
 stop_hfsc_cake_qos() {
     qos_log "INFO" "停止HFSC+CAKE QoS"
     acquire_lock
@@ -1112,8 +1172,13 @@ stop_hfsc_cake_qos() {
             tc qdisc del dev "$IFB_DEVICE" root 2>/dev/null || true
             ip link set dev "$IFB_DEVICE" down
             if [[ "${DELETE_IFB_ON_STOP:-0}" == "1" ]]; then
-                ip link del dev "$IFB_DEVICE" 2>/dev/null
-                qos_log "INFO" "IFB设备 $IFB_DEVICE 已删除"
+                # 简单检查是否有其他 qdisc 使用该 IFB（通常没有）
+                if ! tc qdisc show dev "$IFB_DEVICE" 2>/dev/null | grep -q .; then
+                    ip link del dev "$IFB_DEVICE" 2>/dev/null
+                    qos_log "INFO" "IFB设备 $IFB_DEVICE 已删除"
+                else
+                    qos_log "INFO" "IFB设备 $IFB_DEVICE 仍有队列，保留"
+                fi
             else
                 qos_log "INFO" "IFB设备 $IFB_DEVICE 已停用（保留）"
             fi
@@ -1124,7 +1189,8 @@ stop_hfsc_cake_qos() {
     nft delete table inet gargoyle-qos-priority 2>/dev/null || true
     clear_class_marks
     qos_log "INFO" "HFSC+CAKE QoS停止完成"
-    restore_main_config
+    # 移除配置恢复，防止覆盖用户配置
+    # restore_main_config   # 已删除
     # 重置 nftables 表刷新标志
     _QOS_TABLE_FLUSHED=0
     _IPSET_LOADED=0
@@ -1146,7 +1212,7 @@ show_hfsc_cake_status() {
         qos_interface=$(tc qdisc show 2>/dev/null | grep -E "hfsc.*root" | awk '{print $5}' | head -1)
         [[ -z "$qos_interface" ]] && qos_interface="未知"
     fi
-    echo "===== HFSC-CAKE QoS 状态报告 (v3.0.4) ====="
+    echo "===== HFSC-CAKE QoS 状态报告 (v3.0.5) ====="
     echo "时间: $(date)"
     echo "WAN接口: ${qos_interface}"
     if ! tc qdisc show dev "${qos_interface}" 2>/dev/null | grep -q hfsc; then
