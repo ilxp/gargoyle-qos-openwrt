@@ -1,8 +1,7 @@
-#!/bin/sh /etc/rc.common
-#
+#!/bin/bash
 # QoS Gargoyle 初始化脚本 - 传统 init.d 版本
 # 支持多算法：HFSC, CAKE, FQ_CoDel, HTB, CAKE with DSCPclassify, HFSC+CAKE, HTB+CAKE
-# 版本：2.6.2 - 修复 wait_interface 兼容性，统一算法模块初始化调用，优化停止逻辑
+# 版本：2.6.3 - 修复解释器兼容性、sed 用法、锁保护、MTU 处理等
 #
 
 START=50
@@ -96,6 +95,7 @@ update_config_state() {
 }
 
 # ========== 核心清理函数 ==========
+# 注意：调用此函数前必须已经获取锁（由上层函数负责）
 stop_qos() {
     echo "Stopping QoS system..."
     
@@ -181,11 +181,11 @@ stop_qos() {
 start() {
     echo "Starting QoS Gargoyle service..."
     
-    # 修复: 将 sed 清理移到此处，避免全局执行
+    # 修复：使用临时文件方式处理 Windows 换行符（BusyBox sed 不支持 -i）
     if [ -d "$QOS_MODULES_DIR" ]; then
         echo "Removing Windows line endings from scripts..."
         for f in "$QOS_MODULES_DIR"/*.sh; do
-            [ -f "$f" ] && sed -i 's/\r$//' "$f" 2>/dev/null || echo "Warning: Failed to process $f"
+            [ -f "$f" ] && sed 's/\r$//' "$f" > "$f.tmp" && mv "$f.tmp" "$f" 2>/dev/null || echo "Warning: Failed to process $f"
         done
     fi
     
@@ -662,6 +662,7 @@ load_bandwidth_config() {
 }
 
 # 启动 QoS 监控（使用 start-stop-daemon）
+# 返回值：0=成功或未启用，1=启动失败
 start_qos_acc() {
     echo "Starting QoS acc..."
     
@@ -700,22 +701,32 @@ start_qos_acc() {
     fi
     
     # 使用 start-stop-daemon 启动 qosacc
+    local ret=0
     if command -v start-stop-daemon >/dev/null 2>&1; then
         if [ -n "$ptarget_ip" ] && [ -n "$total_download_bandwidth" ] && [ -n "$pinglimit" ]; then
             start-stop-daemon -S -x /usr/sbin/qosacc -- -a -b 800 "$ptarget_ip" "$total_download_bandwidth" "$pinglimit"
+            ret=$?
         else
             start-stop-daemon -S -x /usr/sbin/qosacc
+            ret=$?
         fi
     else
         # 降级方案
         if [ -n "$ptarget_ip" ] && [ -n "$total_download_bandwidth" ] && [ -n "$pinglimit" ]; then
             qosacc -a -b 800 "$ptarget_ip" "$total_download_bandwidth" "$pinglimit" &
+            ret=$?
         else
             qosacc &
+            ret=$?
         fi
     fi
     
-    echo "QoS acc started"
+    if [ $ret -ne 0 ]; then
+        echo "Warning: Failed to start QoS acc (exit code $ret)"
+    else
+        echo "QoS acc started"
+    fi
+    return $ret
 }
 
 # ========== 主初始化函数 ==========
@@ -838,7 +849,11 @@ init_qos() {
         return 1
     fi
     
+    # 启动 QoS 监控（失败仅记录警告，不影响主流程）
     start_qos_acc
+    if [ $? -ne 0 ]; then
+        echo "Warning: QoS acc failed to start, but QoS core is running."
+    fi
     
     release_lock
     
