@@ -1,6 +1,6 @@
 #!/bin/bash
 # 核心库模块 (lib.sh)
-# 版本: 3.2.8
+# 版本: 3.2.9
 # 提供 QoS 系统基础功能
 
 # ========== 全局配置常量 ==========
@@ -760,6 +760,7 @@ generate_ipset_sets() {
 
     nft add table inet gargoyle-qos-priority 2>/dev/null || true
 
+    # 确保 /lib/functions.sh 已加载，以便使用 config_get_bool
     if ! type config_get_bool >/dev/null 2>&1; then
         . /lib/functions.sh
     fi
@@ -1711,3 +1712,9 @@ auto_speedtest() {
     log_info "自动设置完成。请重启 QoS 服务生效（/etc/init.d/qos_gargoyle restart）。"
     return 0
 }
+
+# ========== 自动加载全局配置 ==========
+if [[ -z "$_QOS_LIB_SH_LOADED" ]] && [[ "$(basename "$0")" != "lib.sh" ]]; then
+    load_global_config
+    _QOS_LIB_SH_LOADED=1
+fi
