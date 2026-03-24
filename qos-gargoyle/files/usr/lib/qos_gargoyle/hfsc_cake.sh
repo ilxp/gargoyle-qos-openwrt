@@ -1,6 +1,6 @@
 #!/bin/bash
 # HFSC_CAKE算法实现模块
-# 版本: 3.2.5 - 修复启用类数量检查、无效速率保护
+# 版本: 3.3.0 - 优化公共函数，统一测试设备名，完善上限带宽保护
 # 基于HFSC与CAKE组合算法实现QoS流量控制。
 
 # ========== 全局配置常量 ==========
@@ -43,18 +43,6 @@ trap main_cleanup EXIT INT TERM HUP QUIT
 . /lib/functions.sh
 . /lib/functions/network.sh
 include /lib/network
-
-# ========== 辅助函数：去除前导零（空字符串返回空） ==========
-strip_leading_zeros() {
-    local val="$1"
-    if [[ -z "$val" ]]; then
-        echo ""
-        return
-    fi
-    val=$(echo "$val" | sed 's/^0*//')
-    [[ -z "$val" ]] && val=0
-    echo "$val"
-}
 
 # ========== 检查是否已经在运行 ==========
 check_already_running() {
@@ -248,10 +236,10 @@ create_hfsc_root_qdisc() {
     return 0
 }
 
-# 检测内核是否支持特定 CAKE 参数（使用临时 dummy 接口，确保清理）
+# 检测内核是否支持特定 CAKE 参数（使用唯一 dummy 设备）
 check_cake_param_support() {
     local param="$1"
-    local dummy_dev="dummy0"
+    local dummy_dev="qos_test_dummy_$$"
     local created=0
     if ! ip link show "$dummy_dev" >/dev/null 2>&1; then
         ip link add "$dummy_dev" type dummy 2>/dev/null || {
@@ -813,7 +801,7 @@ check_ingress_redirect() {
     return 0
 }
 
-# ========== 上传方向初始化（使用关联数组替换 eval） ==========
+# ========== 上传方向初始化 ==========
 init_hfsc_cake_upload() {
     qos_log "INFO" "初始化上传方向HFSC"
     load_upload_class_configurations
@@ -914,7 +902,7 @@ init_hfsc_cake_upload() {
     return 0
 }
 
-# ========== 下载方向初始化（使用关联数组替换 eval） ==========
+# ========== 下载方向初始化 ==========
 init_hfsc_cake_download() {
     qos_log "INFO" "初始化下载方向HFSC"
     load_download_class_configurations
@@ -1269,7 +1257,7 @@ init_hfsc_cake_qos() {
     return 0
 }
 
-# ========== 停止函数（移除配置恢复） ==========
+# ========== 停止函数 ==========
 stop_hfsc_cake_qos() {
     qos_log "INFO" "停止HFSC+CAKE QoS"
     acquire_lock
@@ -1313,7 +1301,7 @@ stop_hfsc_cake_qos() {
     release_lock
 }
 
-# ========== 状态显示函数（同原版，仅版本号更新） ==========
+# ========== 状态显示函数 ==========
 show_hfsc_cake_status() {
      # 从 UCI 获取真实 WAN 接口
     local real_wan_if=$(uci -q get ${CONFIG_FILE}.global.wan_interface 2>/dev/null)

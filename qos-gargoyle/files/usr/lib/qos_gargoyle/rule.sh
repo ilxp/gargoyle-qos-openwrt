@@ -1,6 +1,6 @@
 #!/bin/bash
 # 规则辅助模块 (rule.sh)
-# 版本: 3.2.9
+# 版本: 3.3.0 - 优化协议族匹配，统一临时文件管理，完善规则生成
 # 提供 nftables 规则生成与系统钩子挂载
 
 # 加载核心库
@@ -805,79 +805,6 @@ health_check() {
     [[ -f "$CLASS_MARKS_FILE" ]] && status="${status}marks:ok;" || { status="${status}marks:missing;"; ((errors++)); }
     echo "status=$status;errors=$errors"
     return $((errors == 0 ? 0 : 1))
-}
-
-# ========== 内存限制计算 ==========
-calculate_memory_limit() {
-    local config_value="$1" result
-    [[ -z "$config_value" ]] && { echo ""; return; }
-    if [[ "$config_value" == "auto" ]]; then
-        local total_mem_mb=0
-        if [[ -f /sys/fs/cgroup/memory.max ]]; then
-            local total_mem_bytes=$(cat /sys/fs/cgroup/memory.max 2>/dev/null)
-            if [[ "$total_mem_bytes" =~ ^[0-9]+$ ]] && (( total_mem_bytes > 0 )); then
-                total_mem_mb=$(( total_mem_bytes / 1024 / 1024 ))
-                log_info "从 cgroup v2 memory.max 获取内存限制: ${total_mem_mb}MB"
-            fi
-        fi
-        if (( total_mem_mb == 0 )) && [[ -f /sys/fs/cgroup/memory/memory.limit_in_bytes ]]; then
-            local total_mem_bytes=$(cat /sys/fs/cgroup/memory/memory.limit_in_bytes 2>/dev/null)
-            if [[ -n "$total_mem_bytes" ]] && (( total_mem_bytes > 0 )); then
-                total_mem_mb=$(( total_mem_bytes / 1024 / 1024 ))
-                log_info "从 cgroup v1 memory.limit_in_bytes 获取内存限制: ${total_mem_mb}MB"
-            fi
-        fi
-        if (( total_mem_mb == 0 )); then
-            local total_mem_kb=$(grep MemTotal /proc/meminfo 2>/dev/null | awk '{print $2}')
-            if [[ -n "$total_mem_kb" ]] && (( total_mem_kb > 0 )); then
-                total_mem_mb=$(( total_mem_kb / 1024 ))
-                log_info "从 /proc/meminfo 获取内存: ${total_mem_mb}MB"
-            fi
-        fi
-        if (( total_mem_mb > 0 )); then
-            result="$(((total_mem_mb + 63) / 64))Mb"
-            local min_limit=8 max_limit=32
-            local result_value=${result%Mb}
-            if (( result_value < min_limit )); then result="${min_limit}Mb"
-            elif (( result_value > max_limit )); then result="${max_limit}Mb"; fi
-            log_info "系统内存 ${total_mem_mb}MB，自动计算 memlimit=${result}"
-        else
-            log_warn "无法读取内存信息，使用默认值 16Mb"; result="16Mb"
-        fi
-    else
-        if [[ "$config_value" =~ ^[0-9]+Mb$ ]]; then
-            result="$config_value"; log_info "使用用户配置的 memlimit: ${result}"
-        else
-            log_warn "无效的 memlimit 格式 '$config_value'，使用默认值 16Mb"; result="16Mb"
-        fi
-    fi
-    echo "$result"
-}
-
-# ========== IPv6增强支持 ==========
-setup_ipv6_specific_rules() {
-    log_info "设置IPv6特定规则（优化版）"
-    nft add chain inet gargoyle-qos-priority filter_prerouting '{ type filter hook prerouting priority 0; policy accept; }' 2>/dev/null || true
-    nft flush chain inet gargoyle-qos-priority filter_prerouting 2>/dev/null || true
-    local ICMPV6_CRITICAL_TYPES="133,134,135,136,137"
-
-    nft add rule inet gargoyle-qos-priority filter_prerouting \
-        meta nfproto ipv6 ip6 daddr { ff02::1:2, ff02::1:3 } meta mark set 0x80000000 counter 2>/dev/null || true
-    nft add rule inet gargoyle-qos-priority filter_prerouting \
-        meta nfproto ipv6 ip6 daddr ::1 meta mark set 0x80000000 counter 2>/dev/null || true
-    nft add rule inet gargoyle-qos-priority filter_prerouting \
-        meta nfproto ipv6 icmpv6 type { $ICMPV6_CRITICAL_TYPES } meta mark set 0x40000000 counter 2>/dev/null || true
-    nft add rule inet gargoyle-qos-priority filter_prerouting \
-        meta nfproto ipv6 udp dport { 546, 547 } meta mark set 0x40000000 counter 2>/dev/null || true
-    nft add rule inet gargoyle-qos-priority filter_prerouting \
-        meta nfproto ipv6 udp dport 53 meta mark set 0x40000000 counter 2>/dev/null || true
-    nft add rule inet gargoyle-qos-priority filter_prerouting \
-        meta nfproto ipv6 tcp dport 53 meta mark set 0x40000000 counter 2>/dev/null || true
-    nft add rule inet gargoyle-qos-priority filter_prerouting \
-        meta nfproto ipv6 tcp dport { 80, 443 } meta mark set 0x40000000 counter 2>/dev/null || true
-    nft add rule inet gargoyle-qos-priority filter_prerouting \
-        meta nfproto ipv6 udp dport 123 meta mark set 0x40000000 counter 2>/dev/null || true
-    log_info "IPv6关键流量规则设置完成"
 }
 
 # ========== 自动加载全局配置 ==========

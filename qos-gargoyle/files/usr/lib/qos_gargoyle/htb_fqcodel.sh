@@ -1,6 +1,6 @@
 #!/bin/bash
 # HTB_FQCODEL算法实现模块
-# 版本: 3.2.5 - 修复启用类数量检查、无效速率保护、fq_codel参数构建函数缺失
+# 版本: 3.3.0 - 优化公共函数，统一测试设备名，完善规则生成
 # 基于HTB与FQ_CODEL组合算法实现QoS流量控制。
 
 # ========== 全局配置常量 ==========
@@ -43,18 +43,6 @@ trap main_cleanup EXIT INT TERM HUP QUIT
 . /lib/functions.sh
 . /lib/functions/network.sh
 include /lib/network
-
-# ========== 辅助函数：去除前导零（空字符串返回空） ==========
-strip_leading_zeros() {
-    local val="$1"
-    if [[ -z "$val" ]]; then
-        echo ""
-        return
-    fi
-    val=$(echo "$val" | sed 's/^0*//')
-    [[ -z "$val" ]] && val=0
-    echo "$val"
-}
 
 # ========== 检查是否已经在运行 ==========
 check_already_running() {
@@ -253,7 +241,7 @@ load_download_class_configurations() {
     return 0
 }
 
-# ========== HTB 辅助函数（优化 burst 计算） ==========
+# ========== HTB 辅助函数 ==========
 calculate_htb_burst() {
     local rate="$1"  # 单位: kbit
     local ceil="$2"  # 单位: kbit
@@ -289,7 +277,7 @@ build_fq_codel_params() {
     echo "$params"
 }
 
-# ========== HTB 核心队列函数（修正默认类顺序） ==========
+# ========== HTB 核心队列函数 ==========
 # 先创建根队列（不带 default），创建子类后最后设置 default
 create_htb_root_qdisc() {
     local device="$1"
@@ -410,7 +398,7 @@ create_htb_upload_class() {
         qos_log "INFO" "类别 $class_name 使用类别总带宽作为上限带宽: $ceil"
     fi
     local ceil_value=$(echo "$ceil" | sed 's/kbit//')
-    # 确保 ceil 至少为 1kbit（如果总带宽为0已提前返回，但防御）
+    # 确保 ceil 至少为 1kbit
     (( ceil_value < 1 )) && { ceil="1kbit"; ceil_value=1; qos_log "WARN" "上限带宽为0，调整为1kbit"; }
     if (( rate_value > ceil_value )); then
         qos_log "WARN" "类别 $class_name 保证带宽($rate)超过上限带宽($ceil)，调整为上限带宽"

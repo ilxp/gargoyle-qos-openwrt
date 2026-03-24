@@ -1,6 +1,6 @@
 #!/bin/bash
 # HTB_CAKE算法实现模块
-# 版本: 3.2.5 - 修复启用类数量检查、无效速率保护、默认类创建顺序等
+# 版本: 3.3.0 - 优化公共函数，统一测试设备名
 # 基于 HTB 与 CAKE 组合算法实现 QoS 流量控制
 
 # ========== 全局配置常量 ==========
@@ -43,18 +43,6 @@ trap main_cleanup EXIT INT TERM HUP QUIT
 . /lib/functions.sh
 . /lib/functions/network.sh
 include /lib/network
-
-# ========== 辅助函数：去除前导零（空字符串返回空） ==========
-strip_leading_zeros() {
-    local val="$1"
-    if [[ -z "$val" ]]; then
-        echo ""
-        return
-    fi
-    val=$(echo "$val" | sed 's/^0*//')
-    [[ -z "$val" ]] && val=0
-    echo "$val"
-}
 
 # ========== 检查是否已经在运行 ==========
 check_already_running() {
@@ -231,10 +219,10 @@ calculate_htb_burst() {
     echo "${burst_kb}kb ${cburst_kb}kb"
 }
 
-# ========== CAKE 参数支持检查（修复 dummy 设备残留） ==========
+# ========== CAKE 参数支持检查（使用唯一 dummy 设备） ==========
 check_cake_param_support() {
     local param="$1"
-    local dummy_dev="dummy0"
+    local dummy_dev="qos_test_dummy_$$"
     local created=0
     if ! ip link show "$dummy_dev" >/dev/null 2>&1; then
         ip link add "$dummy_dev" type dummy 2>/dev/null || {
