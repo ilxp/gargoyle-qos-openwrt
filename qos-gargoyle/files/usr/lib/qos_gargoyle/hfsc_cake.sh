@@ -1,6 +1,6 @@
 #!/bin/bash
 # HFSC_CAKE算法实现模块
-# 版本: 3.2.5 - 修复规则生产函数
+# 版本: 3.2.5 - 修复启用类数量检查、无效速率保护
 # 基于HFSC与CAKE组合算法实现QoS流量控制。
 
 # ========== 全局配置常量 ==========
@@ -379,8 +379,14 @@ create_hfsc_upload_class() {
         ul_m2="${class_total_bw}kbit"
         qos_log "INFO" "类别 $class_name 使用类别总带宽作为上限带宽: $ul_m2"
     fi
-    local m2_value=$(echo "$m2" | sed 's/kbit//')
+    # 确保 ul_m2 至少为 1kbit（防止为0）
     local ul_m2_value=$(echo "$ul_m2" | sed 's/kbit//')
+    if (( ul_m2_value < 1 )); then
+        ul_m2="1kbit"
+        ul_m2_value=1
+        qos_log "WARN" "类别 $class_name 上限带宽为0，调整为1kbit"
+    fi
+    local m2_value=$(echo "$m2" | sed 's/kbit//')
     if (( m2_value > ul_m2_value )); then
         qos_log "WARN" "类别 $class_name 保证带宽($m2)超过上限带宽($ul_m2)，调整为上限带宽"
         m2="$ul_m2"
@@ -501,8 +507,14 @@ create_hfsc_download_class() {
         ul_m2="${class_total_bw}kbit"
         qos_log "INFO" "类别 $class_name 使用类别总带宽作为上限带宽: $ul_m2"
     fi
-    local m2_value=$(echo "$m2" | sed 's/kbit//')
+    # 确保 ul_m2 至少为 1kbit（防止为0）
     local ul_m2_value=$(echo "$ul_m2" | sed 's/kbit//')
+    if (( ul_m2_value < 1 )); then
+        ul_m2="1kbit"
+        ul_m2_value=1
+        qos_log "WARN" "类别 $class_name 上限带宽为0，调整为1kbit"
+    fi
+    local m2_value=$(echo "$m2" | sed 's/kbit//')
     if (( m2_value > ul_m2_value )); then
         qos_log "WARN" "类别 $class_name 保证带宽($m2)超过上限带宽($ul_m2)，调整为上限带宽"
         m2="$ul_m2"
@@ -810,13 +822,17 @@ init_hfsc_cake_upload() {
         return 1
     fi
 
-    # 检查所有类的数量（包括禁用），防止标记冲突
-    local total_classes=0
-    for class in $upload_class_list; do
-        ((total_classes++))
+    # 统计启用的类数量，而不是所有类
+    local enabled_class_count=0
+    local class_list="$upload_class_list"
+    for class in $class_list; do
+        local enabled=$(uci -q get ${CONFIG_FILE}.${class}.enabled 2>/dev/null)
+        if [[ "$enabled" == "1" ]] || [[ -z "$enabled" ]]; then
+            ((enabled_class_count++))
+        fi
     done
-    if (( total_classes > 16 )); then
-        qos_log "ERROR" "上传方向总类别数量为 $total_classes，超过16个，将导致标记冲突，启动中止！"
+    if (( enabled_class_count > 16 )); then
+        qos_log "ERROR" "上传方向启用的类别数量为 $enabled_class_count，超过16个，将导致标记冲突，启动中止！"
         return 1
     fi
 
@@ -907,13 +923,17 @@ init_hfsc_cake_download() {
         return 1
     fi
 
-    # 检查所有类的数量（包括禁用），防止标记冲突
-    local total_classes=0
-    for class in $download_class_list; do
-        ((total_classes++))
+    # 统计启用的类数量，而不是所有类
+    local enabled_class_count=0
+    local class_list="$download_class_list"
+    for class in $class_list; do
+        local enabled=$(uci -q get ${CONFIG_FILE}.${class}.enabled 2>/dev/null)
+        if [[ "$enabled" == "1" ]] || [[ -z "$enabled" ]]; then
+            ((enabled_class_count++))
+        fi
     done
-    if (( total_classes > 16 )); then
-        qos_log "ERROR" "下载方向总类别数量为 $total_classes，超过16个，将导致标记冲突，启动中止！"
+    if (( enabled_class_count > 16 )); then
+        qos_log "ERROR" "下载方向启用的类别数量为 $enabled_class_count，超过16个，将导致标记冲突，启动中止！"
         return 1
     fi
 
@@ -1549,7 +1569,6 @@ show_hfsc_cake_status() {
     echo -e "\n===== HFSC-CAKE 状态报告结束 ====="
     return 0
 }
-
 
 # ========== 主入口 ==========
 main_hfsc_cake_qos() {
