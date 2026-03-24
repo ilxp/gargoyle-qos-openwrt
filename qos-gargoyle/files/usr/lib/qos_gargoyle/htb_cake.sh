@@ -1,6 +1,6 @@
 #!/bin/bash
 # HTB_CAKE算法实现模块
-# 版本: 3.2.4 - 修复默认类创建顺序、dummy设备残留、带宽单位解析、类存在性验证等
+# 版本: 3.2.5 - 修复启用类数量检查、无效速率保护、默认类创建顺序等
 # 基于 HTB 与 CAKE 组合算法实现 QoS 流量控制
 
 # ========== 全局配置常量 ==========
@@ -420,6 +420,8 @@ create_htb_upload_class() {
         qos_log "INFO" "类别 $class_name 使用类别总带宽作为上限带宽: $ceil"
     fi
     local ceil_value=$(echo "$ceil" | sed 's/kbit//')
+    # 确保 ceil 至少为 1kbit（如果总带宽为0已提前返回，但防御）
+    (( ceil_value < 1 )) && { ceil="1kbit"; ceil_value=1; qos_log "WARN" "上限带宽为0，调整为1kbit"; }
     if (( rate_value > ceil_value )); then
         qos_log "WARN" "类别 $class_name 保证带宽($rate)超过上限带宽($ceil)，调整为上限带宽"
         rate="$ceil"
@@ -538,6 +540,7 @@ create_htb_download_class() {
         qos_log "INFO" "类别 $class_name 使用类别总带宽作为上限带宽: $ceil"
     fi
     local ceil_value=$(echo "$ceil" | sed 's/kbit//')
+    (( ceil_value < 1 )) && { ceil="1kbit"; ceil_value=1; qos_log "WARN" "上限带宽为0，调整为1kbit"; }
     if (( rate_value > ceil_value )); then
         qos_log "WARN" "类别 $class_name 保证带宽($rate)超过上限带宽($ceil)，调整为上限带宽"
         rate="$ceil"
@@ -830,7 +833,6 @@ check_ingress_redirect() {
     return 0
 }
 
-
 # ========== 上传方向初始化 ==========
 init_htb_cake_upload() {
     qos_log "INFO" "初始化上传方向HTB"
@@ -840,12 +842,17 @@ init_htb_cake_upload() {
         return 1
     fi
 
-    local total_classes=0
-    for class in $upload_class_list; do
-        ((total_classes++))
+    # 统计启用的类数量，而不是所有类
+    local enabled_class_count=0
+    local class_list="$upload_class_list"
+    for class in $class_list; do
+        local enabled=$(uci -q get ${CONFIG_FILE}.${class}.enabled 2>/dev/null)
+        if [[ "$enabled" == "1" ]] || [[ -z "$enabled" ]]; then
+            ((enabled_class_count++))
+        fi
     done
-    if (( total_classes > 16 )); then
-        qos_log "ERROR" "上传方向总类别数量为 $total_classes，超过16个，将导致标记冲突，启动中止！"
+    if (( enabled_class_count > 16 )); then
+        qos_log "ERROR" "上传方向启用的类别数量为 $enabled_class_count，超过16个，将导致标记冲突，启动中止！"
         return 1
     fi
 
@@ -932,12 +939,17 @@ init_htb_cake_download() {
         return 1
     fi
 
-    local total_classes=0
-    for class in $download_class_list; do
-        ((total_classes++))
+    # 统计启用的类数量，而不是所有类
+    local enabled_class_count=0
+    local class_list="$download_class_list"
+    for class in $class_list; do
+        local enabled=$(uci -q get ${CONFIG_FILE}.${class}.enabled 2>/dev/null)
+        if [[ "$enabled" == "1" ]] || [[ -z "$enabled" ]]; then
+            ((enabled_class_count++))
+        fi
     done
-    if (( total_classes > 16 )); then
-        qos_log "ERROR" "下载方向总类别数量为 $total_classes，超过16个，将导致标记冲突，启动中止！"
+    if (( enabled_class_count > 16 )); then
+        qos_log "ERROR" "下载方向启用的类别数量为 $enabled_class_count，超过16个，将导致标记冲突，启动中止！"
         return 1
     fi
 
