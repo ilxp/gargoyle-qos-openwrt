@@ -1,6 +1,6 @@
 #!/bin/bash
 # HFSC_CAKE算法实现模块
-# 版本: 3.0.5 - 修复默认类处理、移除eval、改进connmark回退、优化停止逻辑
+# 版本: 3.2.5 - 修复规则生产函数
 # 基于HFSC与CAKE组合算法实现QoS流量控制。
 
 # ========== 全局配置常量 ==========
@@ -44,9 +44,13 @@ trap main_cleanup EXIT INT TERM HUP QUIT
 . /lib/functions/network.sh
 include /lib/network
 
-# ========== 辅助函数：去除前导零 ==========
+# ========== 辅助函数：去除前导零（空字符串返回空） ==========
 strip_leading_zeros() {
     local val="$1"
+    if [[ -z "$val" ]]; then
+        echo ""
+        return
+    fi
     val=$(echo "$val" | sed 's/^0*//')
     [[ -z "$val" ]] && val=0
     echo "$val"
@@ -69,14 +73,12 @@ check_already_running() {
 # ========== HFSC 与 CAKE 专属配置加载 ==========
 load_hfsc_cake_config() {
     qos_log "INFO" "加载HFSC与CAKE配置"
-    # 带宽已由主脚本加载并导出为环境变量，直接使用
     if [[ -z "$total_upload_bandwidth" ]] || [[ -z "$total_download_bandwidth" ]]; then
         qos_log "ERROR" "带宽环境变量未设置，请确保主脚本已正确加载带宽配置"
         return 1
     fi
     qos_log "INFO" "使用主脚本提供的带宽: 上传=${total_upload_bandwidth}kbit, 下载=${total_download_bandwidth}kbit"
 
-    # IFB 设备：优先使用环境变量，否则从 UCI 读取或使用默认值
     if [[ -n "$IFB_DEVICE" ]]; then
         qos_log "INFO" "使用环境变量 IFB_DEVICE=$IFB_DEVICE"
     else
@@ -246,20 +248,28 @@ create_hfsc_root_qdisc() {
     return 0
 }
 
-# 检测内核是否支持特定 CAKE 参数（使用临时 dummy 接口）
+# 检测内核是否支持特定 CAKE 参数（使用临时 dummy 接口，确保清理）
 check_cake_param_support() {
     local param="$1"
     local dummy_dev="dummy0"
-    ip link add "$dummy_dev" type dummy 2>/dev/null || {
-        dummy_dev="lo"
-    }
+    local created=0
+    if ! ip link show "$dummy_dev" >/dev/null 2>&1; then
+        ip link add "$dummy_dev" type dummy 2>/dev/null || {
+            dummy_dev="lo"
+        }
+        created=1
+    fi
     tc qdisc del dev "$dummy_dev" root 2>/dev/null
     if tc qdisc add dev "$dummy_dev" root cake bandwidth 1mbit "$param" 2>/dev/null; then
         tc qdisc del dev "$dummy_dev" root 2>/dev/null
-        [[ "$dummy_dev" != "lo" ]] && ip link del "$dummy_dev" 2>/dev/null
+        if [[ $created -eq 1 && "$dummy_dev" != "lo" ]]; then
+            ip link del "$dummy_dev" 2>/dev/null
+        fi
         return 0
     else
-        [[ "$dummy_dev" != "lo" ]] && ip link del "$dummy_dev" 2>/dev/null
+        if [[ $created -eq 1 && "$dummy_dev" != "lo" ]]; then
+            ip link del "$dummy_dev" 2>/dev/null
+        fi
         return 1
     fi
 }
@@ -549,11 +559,18 @@ create_hfsc_download_class() {
     return 0
 }
 
-# ========== 入口重定向（改进 connmark 回退） ==========
+# ========== 入口重定向（SFO 兼容，支持 ctinfo 和 connmark 回退） ==========
 setup_ingress_redirect() {
     if [[ -z "$qos_interface" ]]; then
         qos_log "ERROR" "无法确定 WAN 接口"
         return 1
+    fi
+
+    # 检测 SFO 是否启用
+    local sfo_enabled=0
+    if check_sfo_enabled; then
+        sfo_enabled=1
+        qos_log "INFO" "SFO 已启用，将使用 ctinfo 恢复标记"
     fi
 
     # 检查 tc connmark 动作支持
@@ -562,7 +579,18 @@ setup_ingress_redirect() {
         connmark_ok=1
         qos_log "INFO" "tc connmark 动作受支持"
     else
-        qos_log "WARN" "tc connmark 动作不受支持，入口重定向将不使用 connmark，标记可能无法传递"
+        qos_log "WARN" "tc connmark 动作不受支持"
+    fi
+
+    # 检查 tc ctinfo 动作支持（如果 SFO 启用）
+    local ctinfo_ok=0
+    if (( sfo_enabled )); then
+        if check_tc_ctinfo_support; then
+            ctinfo_ok=1
+            qos_log "INFO" "tc ctinfo 动作受支持"
+        else
+            qos_log "WARN" "tc ctinfo 动作不受支持，将回退到 connmark"
+        fi
     fi
 
     qos_log "INFO" "设置入口重定向: $qos_interface -> $IFB_DEVICE"
@@ -574,7 +602,20 @@ setup_ingress_redirect() {
     tc filter del dev "$qos_interface" parent ffff: 2>/dev/null || true
 
     # IPv4 重定向
-    if (( connmark_ok )); then
+    local ipv4_success=false
+    if (( sfo_enabled && ctinfo_ok )); then
+        if ! tc filter add dev "$qos_interface" parent ffff: protocol ip \
+            u32 match u32 0 0 \
+            action ctinfo mark 0xffffffff 0xffffffff \
+            action mirred egress redirect dev "$IFB_DEVICE" 2>&1; then
+            qos_log "ERROR" "IPv4入口重定向规则添加失败（使用 ctinfo）"
+            tc qdisc del dev "$qos_interface" ingress 2>/dev/null
+            return 1
+        else
+            ipv4_success=true
+            qos_log "INFO" "IPv4入口重定向规则添加成功（使用 ctinfo，SFO 兼容）"
+        fi
+    elif (( connmark_ok )); then
         if ! tc filter add dev "$qos_interface" parent ffff: protocol ip \
             u32 match u32 0 0 \
             action connmark \
@@ -583,6 +624,7 @@ setup_ingress_redirect() {
             tc qdisc del dev "$qos_interface" ingress 2>/dev/null
             return 1
         else
+            ipv4_success=true
             qos_log "INFO" "IPv4入口重定向规则添加成功（使用 connmark）"
         fi
     else
@@ -590,76 +632,113 @@ setup_ingress_redirect() {
         if ! tc filter add dev "$qos_interface" parent ffff: protocol ip \
             u32 match u32 0 0 \
             action mirred egress redirect dev "$IFB_DEVICE" 2>&1; then
-            qos_log "ERROR" "IPv4入口重定向规则添加失败（无 connmark）"
+            qos_log "ERROR" "IPv4入口重定向规则添加失败（无标记）"
             tc qdisc del dev "$qos_interface" ingress 2>/dev/null
             return 1
         else
-            qos_log "WARN" "IPv4入口重定向规则添加成功（未使用 connmark，标记将丢失）"
+            ipv4_success=true
+            qos_log "WARN" "IPv4入口重定向规则添加成功（未使用标记，标记将丢失）"
         fi
     fi
 
+    if [[ "$ipv4_success" != "true" ]]; then
+        qos_log "ERROR" "IPv4入口重定向配置失败"
+        return 1
+    fi
+
+    # 检查 IPv6 全局地址
     local has_ipv6_global=0
     if ip -6 addr show dev "$qos_interface" scope global 2>/dev/null | grep -q "inet6"; then
         has_ipv6_global=1
-        qos_log "INFO" "接口 $qos_interface 拥有全局 IPv6 地址，将强制 IPv6 重定向必须成功"
+        qos_log "INFO" "接口 $qos_interface 拥有全局 IPv6 地址，将尝试配置 IPv6 重定向"
     else
         qos_log "INFO" "接口 $qos_interface 无全局 IPv6 地址，IPv6 重定向失败仅警告"
     fi
 
-    # IPv6 重定向，尝试多种匹配方式
+    # IPv6 重定向
     local ipv6_success=false
-    if (( connmark_ok )); then
-        # 第一优先：flower 匹配全球单播地址 (2000::/3)
+    if (( sfo_enabled && ctinfo_ok )); then
+        # 尝试使用 ctinfo
+        if tc filter add dev "$qos_interface" parent ffff: protocol ipv6 \
+            flower dst_ip 2000::/3 \
+            action ctinfo mark 0xffffffff 0xffffffff \
+            action mirred egress redirect dev "$IFB_DEVICE" 2>&1; then
+            ipv6_success=true
+            qos_log "INFO" "IPv6入口重定向规则（flower 全球单播，ctinfo）添加成功"
+        else
+            qos_log "WARN" "flower ctinfo 规则失败，尝试 u32"
+            if tc filter add dev "$qos_interface" parent ffff: protocol ipv6 \
+                u32 match u32 0x20000000 0xe0000000 at 24 \
+                action ctinfo mark 0xffffffff 0xffffffff \
+                action mirred egress redirect dev "$IFB_DEVICE" 2>&1; then
+                ipv6_success=true
+                qos_log "INFO" "IPv6入口重定向规则（u32 全球单播，ctinfo）添加成功"
+            else
+                qos_log "WARN" "u32 ctinfo 规则失败，尝试无过滤"
+                if tc filter add dev "$qos_interface" parent ffff: protocol ipv6 \
+                    u32 match u32 0 0 \
+                    action ctinfo mark 0xffffffff 0xffffffff \
+                    action mirred egress redirect dev "$IFB_DEVICE" 2>&1; then
+                    ipv6_success=true
+                    qos_log "INFO" "IPv6入口重定向规则（无过滤，ctinfo）添加成功"
+                else
+                    ipv6_success=false
+                    qos_log "WARN" "IPv6入口重定向规则添加失败（ctinfo）"
+                fi
+            fi
+        fi
+    elif (( connmark_ok )); then
+        # 使用 connmark
         if tc filter add dev "$qos_interface" parent ffff: protocol ipv6 \
             flower dst_ip 2000::/3 \
             action connmark \
             action mirred egress redirect dev "$IFB_DEVICE" 2>&1; then
             ipv6_success=true
-            qos_log "INFO" "IPv6入口重定向规则（flower 匹配全球单播，带 connmark）添加成功"
+            qos_log "INFO" "IPv6入口重定向规则（flower 全球单播，connmark）添加成功"
         else
-            qos_log "WARN" "flower 规则添加失败，尝试 u32 全球单播匹配"
+            qos_log "WARN" "flower connmark 规则失败，尝试 u32"
             if tc filter add dev "$qos_interface" parent ffff: protocol ipv6 \
                 u32 match u32 0x20000000 0xe0000000 at 24 \
                 action connmark \
                 action mirred egress redirect dev "$IFB_DEVICE" 2>&1; then
                 ipv6_success=true
-                qos_log "INFO" "IPv6入口重定向规则（u32 全球单播，带 connmark）添加成功"
+                qos_log "INFO" "IPv6入口重定向规则（u32 全球单播，connmark）添加成功"
             else
-                qos_log "WARN" "u32 全球单播规则添加失败，尝试无过滤规则"
+                qos_log "WARN" "u32 connmark 规则失败，尝试无过滤"
                 if tc filter add dev "$qos_interface" parent ffff: protocol ipv6 \
                     u32 match u32 0 0 \
                     action connmark \
                     action mirred egress redirect dev "$IFB_DEVICE" 2>&1; then
                     ipv6_success=true
-                    qos_log "INFO" "IPv6入口重定向规则（无过滤，带 connmark）添加成功"
+                    qos_log "INFO" "IPv6入口重定向规则（无过滤，connmark）添加成功"
                 else
                     ipv6_success=false
-                    qos_log "WARN" "IPv6入口重定向规则添加失败，IPv6流量将不会通过IFB"
+                    qos_log "WARN" "IPv6入口重定向规则添加失败（connmark）"
                 fi
             fi
         fi
     else
-        # 不使用 connmark
+        # 不使用标记，仅重定向
         if tc filter add dev "$qos_interface" parent ffff: protocol ipv6 \
             flower dst_ip 2000::/3 \
             action mirred egress redirect dev "$IFB_DEVICE" 2>&1; then
             ipv6_success=true
-            qos_log "INFO" "IPv6入口重定向规则（flower 匹配全球单播，无 connmark）添加成功"
+            qos_log "INFO" "IPv6入口重定向规则（flower 全球单播，无标记）添加成功"
         else
             if tc filter add dev "$qos_interface" parent ffff: protocol ipv6 \
                 u32 match u32 0x20000000 0xe0000000 at 24 \
                 action mirred egress redirect dev "$IFB_DEVICE" 2>&1; then
                 ipv6_success=true
-                qos_log "INFO" "IPv6入口重定向规则（u32 全球单播，无 connmark）添加成功"
+                qos_log "INFO" "IPv6入口重定向规则（u32 全球单播，无标记）添加成功"
             else
                 if tc filter add dev "$qos_interface" parent ffff: protocol ipv6 \
                     u32 match u32 0 0 \
                     action mirred egress redirect dev "$IFB_DEVICE" 2>&1; then
                     ipv6_success=true
-                    qos_log "INFO" "IPv6入口重定向规则（无过滤，无 connmark）添加成功"
+                    qos_log "INFO" "IPv6入口重定向规则（无过滤，无标记）添加成功"
                 else
                     ipv6_success=false
-                    qos_log "WARN" "IPv6入口重定向规则添加失败，IPv6流量将不会通过IFB"
+                    qos_log "WARN" "IPv6入口重定向规则添加失败（无标记）"
                 fi
             fi
         fi
@@ -667,11 +746,9 @@ setup_ingress_redirect() {
 
     if (( has_ipv6_global == 1 )); then
         if [[ "$ipv6_success" != "true" ]]; then
-            qos_log "ERROR" "接口存在全局 IPv6 地址，但 IPv6 入口重定向配置失败，QoS 无法正常工作"
-            tc qdisc del dev "$qos_interface" ingress 2>/dev/null
-            return 1
+            qos_log "WARN" "接口存在全局 IPv6 地址，但 IPv6 入口重定向配置失败，IPv6 流量可能不受 QoS 控制，但 IPv4 QoS 将继续工作"
         else
-            qos_log "INFO" "IPv6 入口重定向成功（强制）"
+            qos_log "INFO" "IPv6 入口重定向成功"
         fi
     else
         if [[ "$ipv6_success" == "true" ]]; then
@@ -1007,6 +1084,26 @@ init_hfsc_cake_qos() {
         fi
     fi
     qos_log "INFO" "使用WAN接口: $qos_interface"
+	
+	# ========== 自动测速与带宽加载 ==========
+    # 自动测速开关处理（需要在加载带宽配置之前执行）
+    if [[ "$AUTO_SPEEDTEST" == "1" ]]; then
+        qos_log "INFO" "自动测速开关已开启，正在执行速度测试..."
+        # 非交互模式，强制覆盖现有配置
+        if ! auto_speedtest -n -f; then
+            qos_log "WARN" "自动测速失败，将使用原有带宽配置（若有）"
+        fi
+    fi
+
+    # 加载带宽配置（会设置 total_upload_bandwidth 和 total_download_bandwidth）
+    if ! load_bandwidth_from_config; then
+        qos_log "ERROR" "加载带宽配置失败"
+        release_lock
+        rm -f "$QOS_RUNNING_FILE"
+        return 1
+    fi
+    # ====================================
+	
     if ! load_hfsc_cake_config; then
         qos_log "ERROR" "加载HFSC+CAKE配置失败"
         release_lock
@@ -1172,7 +1269,6 @@ stop_hfsc_cake_qos() {
             tc qdisc del dev "$IFB_DEVICE" root 2>/dev/null || true
             ip link set dev "$IFB_DEVICE" down
             if [[ "${DELETE_IFB_ON_STOP:-0}" == "1" ]]; then
-                # 简单检查是否有其他 qdisc 使用该 IFB（通常没有）
                 if ! tc qdisc show dev "$IFB_DEVICE" 2>/dev/null | grep -q .; then
                     ip link del dev "$IFB_DEVICE" 2>/dev/null
                     qos_log "INFO" "IFB设备 $IFB_DEVICE 已删除"
@@ -1189,24 +1285,19 @@ stop_hfsc_cake_qos() {
     nft delete table inet gargoyle-qos-priority 2>/dev/null || true
     clear_class_marks
     qos_log "INFO" "HFSC+CAKE QoS停止完成"
-    # 恢复主配置文件（删除追加的规则集）
     restore_main_config
-    # 重置 nftables 表刷新标志
     _QOS_TABLE_FLUSHED=0
     _IPSET_LOADED=0
-    # 清理临时状态文件
     cleanup_qos_state
-    # 清理临时文件
     cleanup_temp_files
     release_lock
 }
 
-# ========== 状态显示函数 ==========
+# ========== 状态显示函数（同原版，仅版本号更新） ==========
 show_hfsc_cake_status() {
      # 从 UCI 获取真实 WAN 接口
     local real_wan_if=$(uci -q get ${CONFIG_FILE}.global.wan_interface 2>/dev/null)
     if [[ -z "$real_wan_if" ]] || [[ "$real_wan_if" == "auto" ]]; then
-        # 如果未配置或为 auto，尝试自动检测
         if command -v network_find_wan >/dev/null 2>&1; then
             network_find_wan real_wan_if 2>/dev/null
         fi
@@ -1226,7 +1317,6 @@ show_hfsc_cake_status() {
     echo "时间: $(date)"
     echo "WAN接口: ${real_wan_if}"
 
-    # 如果 WAN 接口无效，则跳过依赖接口的检查
     if [[ "$real_wan_if" == "未知" ]] || ! ip link show "$real_wan_if" >/dev/null 2>&1; then
         echo "警告: 无法确定有效的 WAN 接口，部分信息可能无法显示。"
     else
@@ -1245,7 +1335,6 @@ show_hfsc_cake_status() {
         echo "IFB设备: 未创建"
     fi
 
-    # 以下部分仅在 WAN 接口有效时显示
     if [[ "$real_wan_if" != "未知" ]] && ip link show "$real_wan_if" >/dev/null 2>&1; then
         echo -e "\n======== 出口QoS ($real_wan_if) ========"
         echo -e "\nTC队列:"
@@ -1364,7 +1453,6 @@ show_hfsc_cake_status() {
     fi
 
     echo -e "\n===== 增强特性状态 ====="
-    # 直接从 UCI 读取，避免依赖可能未同步的全局变量
     local rate_val=$(uci -q get ${CONFIG_FILE}.global.enable_ratelimit 2>/dev/null)
     local ack_val=$(uci -q get ${CONFIG_FILE}.global.enable_ack_limit 2>/dev/null)
     local tcp_val=$(uci -q get ${CONFIG_FILE}.global.enable_tcp_upgrade 2>/dev/null)
@@ -1490,6 +1578,12 @@ main_hfsc_cake_qos() {
         "health_check")
             health_check
             ;;
+		"auto_speedtest")
+			if ! auto_speedtest; then
+				qos_log "ERROR" "自动速率测试失败"
+				exit 1
+			fi
+			;;
         *)
             echo "用法: $0 {start|stop|restart|status|health_check}"
             echo ""
@@ -1499,6 +1593,7 @@ main_hfsc_cake_qos() {
             echo "  restart      重启HFSC+CAKE QoS"
             echo "  status       显示状态"
             echo "  health_check 执行健康检查"
+			echo "  auto_speedtest   自动配置（测速或手动输入带宽）"
             exit 1
             ;;
     esac

@@ -1,6 +1,6 @@
 #!/bin/bash
 # HTB_CAKE算法实现模块
-# 版本: 3.0.5 - 修复默认类ID范围、移除eval、改进connmark回退、优化停止逻辑
+# 版本: 3.2.4 - 修复默认类创建顺序、dummy设备残留、带宽单位解析、类存在性验证等
 # 基于 HTB 与 CAKE 组合算法实现 QoS 流量控制
 
 # ========== 全局配置常量 ==========
@@ -44,6 +44,18 @@ trap main_cleanup EXIT INT TERM HUP QUIT
 . /lib/functions/network.sh
 include /lib/network
 
+# ========== 辅助函数：去除前导零（空字符串返回空） ==========
+strip_leading_zeros() {
+    local val="$1"
+    if [[ -z "$val" ]]; then
+        echo ""
+        return
+    fi
+    val=$(echo "$val" | sed 's/^0*//')
+    [[ -z "$val" ]] && val=0
+    echo "$val"
+}
+
 # ========== 检查是否已经在运行 ==========
 check_already_running() {
     if [[ -f "$QOS_RUNNING_FILE" ]]; then
@@ -61,14 +73,12 @@ check_already_running() {
 # ========== HTB 与 CAKE 专属配置加载 ==========
 load_htb_cake_config() {
     qos_log "INFO" "加载HTB与CAKE配置"
-    # 带宽已由主脚本加载并导出为环境变量，直接使用
     if [[ -z "$total_upload_bandwidth" ]] || [[ -z "$total_download_bandwidth" ]]; then
         qos_log "ERROR" "带宽环境变量未设置，请确保主脚本已正确加载带宽配置"
         return 1
     fi
     qos_log "INFO" "使用主脚本提供的带宽: 上传=${total_upload_bandwidth}kbit, 下载=${total_download_bandwidth}kbit"
 
-    # IFB 设备：优先使用环境变量，否则从 UCI 读取或使用默认值
     if [[ -n "$IFB_DEVICE" ]]; then
         qos_log "INFO" "使用环境变量 IFB_DEVICE=$IFB_DEVICE"
     else
@@ -132,7 +142,6 @@ load_htb_class_config() {
     priority=$(uci -q get ${CONFIG_FILE}.$class_name.priority 2>/dev/null)
     name=$(uci -q get ${CONFIG_FILE}.$class_name.name 2>/dev/null)
     
-    # 验证并清理数字值（去除前导零）
     if [[ -n "$percent_bandwidth" ]]; then
         if validate_number "$percent_bandwidth" "$class_name.percent_bandwidth" 0 100; then
             percent_bandwidth=$(strip_leading_zeros "$percent_bandwidth")
@@ -176,14 +185,28 @@ load_htb_class_config() {
     return 0
 }
 
-# 注意：load_upload_class_configurations / load_download_class_configurations 已在 rule.sh 中定义，此处不再重复
+load_upload_class_configurations() {
+    qos_log "INFO" "正在加载上传类别配置..."
+    upload_class_list=$(load_all_config_sections "$CONFIG_FILE" "upload_class")
+    if [[ -n "$upload_class_list" ]]; then
+        qos_log "INFO" "找到上传类别: $upload_class_list"
+    else
+        qos_log "WARN" "没有找到上传类别配置"
+        upload_class_list=""
+    fi
+    return 0
+}
 
-# ========== 辅助函数：去除前导零 ==========
-strip_leading_zeros() {
-    local val="$1"
-    val=$(echo "$val" | sed 's/^0*//')
-    [[ -z "$val" ]] && val=0
-    echo "$val"
+load_download_class_configurations() {
+    qos_log "INFO" "正在加载下载类别配置..."
+    download_class_list=$(load_all_config_sections "$CONFIG_FILE" "download_class")
+    if [[ -n "$download_class_list" ]]; then
+        qos_log "INFO" "找到下载类别: $download_class_list"
+    else
+        qos_log "WARN" "没有找到下载类别配置"
+        download_class_list=""
+    fi
+    return 0
 }
 
 # ========== HTB 辅助函数 ==========
@@ -195,13 +218,10 @@ calculate_htb_burst() {
         mtu=1500
     fi
 
-    # 使用 ceil 确保 burst 不小于 MTU 的三倍
-    local burst_kb=$(awk "BEGIN {printf \"%.0f\", ($rate + 7) / 8}")  # 向上取整
-    # 确保最小值为 MTU 的 3 倍（转换为 KB）
+    local burst_kb=$(awk "BEGIN {printf \"%.0f\", ($rate + 7) / 8}")
     local min_burst_kb=$((mtu * 3 / 1024))
     (( min_burst_kb < 1 )) && min_burst_kb=1
     (( burst_kb < min_burst_kb )) && burst_kb=$min_burst_kb
-    # 限制 burst 最大为 1GB，避免 tc 拒绝
     if (( burst_kb > 1048576 )); then
         burst_kb=1048576
         qos_log "WARN" "burst值超过1GB，已限制为1048576KB"
@@ -211,21 +231,28 @@ calculate_htb_burst() {
     echo "${burst_kb}kb ${cburst_kb}kb"
 }
 
-# ========== CAKE 参数支持检查 ==========
+# ========== CAKE 参数支持检查（修复 dummy 设备残留） ==========
 check_cake_param_support() {
     local param="$1"
-    # 使用临时 dummy 接口避免影响 lo
     local dummy_dev="dummy0"
-    ip link add "$dummy_dev" type dummy 2>/dev/null || {
-        dummy_dev="lo"
-    }
+    local created=0
+    if ! ip link show "$dummy_dev" >/dev/null 2>&1; then
+        ip link add "$dummy_dev" type dummy 2>/dev/null || {
+            dummy_dev="lo"
+        }
+        created=1
+    fi
     tc qdisc del dev "$dummy_dev" root 2>/dev/null
     if tc qdisc add dev "$dummy_dev" root cake bandwidth 1mbit "$param" 2>/dev/null; then
         tc qdisc del dev "$dummy_dev" root 2>/dev/null
-        [[ "$dummy_dev" != "lo" ]] && ip link del "$dummy_dev" 2>/dev/null
+        if [[ $created -eq 1 && "$dummy_dev" != "lo" ]]; then
+            ip link del "$dummy_dev" 2>/dev/null
+        fi
         return 0
     else
-        [[ "$dummy_dev" != "lo" ]] && ip link del "$dummy_dev" 2>/dev/null
+        if [[ $created -eq 1 && "$dummy_dev" != "lo" ]]; then
+            ip link del "$dummy_dev" 2>/dev/null
+        fi
         return 1
     fi
 }
@@ -272,13 +299,13 @@ build_cake_params() {
     echo "$params"
 }
 
-# ========== HTB 核心队列函数 ==========
+# ========== HTB 核心队列函数（修正默认类顺序） ==========
+# 先创建根队列（不带 default），创建子类后最后设置 default
 create_htb_root_qdisc() {
     local device="$1"
     local direction="$2"
     local root_handle="$3"
     local root_classid="$4"
-    local default_classid="$5"   # 默认类ID
     local bandwidth=""
     if [[ "$direction" == "upload" ]]; then
         bandwidth="$total_upload_bandwidth"
@@ -296,21 +323,8 @@ create_htb_root_qdisc() {
     tc qdisc del dev "$device" ingress 2>/dev/null || true
     tc qdisc del dev "$device" root 2>/dev/null || true
 
-    local default_opt=""
-    # 验证默认类ID：必须为 2-17 之间（1 已被根类占用，最多支持 16 个子类，索引最大 17）
-    if [[ -n "$default_classid" ]]; then
-        if validate_number "$default_classid" "default_classid" 2 17; then
-            default_opt="default $default_classid"
-        else
-            qos_log "ERROR" "无效的默认类ID: $default_classid (有效范围 2-17)"
-            return 1
-        fi
-    else
-        qos_log "ERROR" "未指定默认类ID"
-        return 1
-    fi
-
-    if ! tc qdisc add dev "$device" root handle $root_handle htb r2q $HTB_R2Q $default_opt; then
+    # 先不带 default 参数创建根队列
+    if ! tc qdisc add dev "$device" root handle $root_handle htb r2q $HTB_R2Q; then
         qos_log "ERROR" "无法在 $device 上创建HTB根队列"
         return 1
     fi
@@ -323,10 +337,28 @@ create_htb_root_qdisc() {
         tc qdisc del dev "$device" root 2>/dev/null
         return 1
     fi
-    qos_log "INFO" "$device的$direction方向HTB根队列创建完成"
+    qos_log "INFO" "$device的$direction方向HTB根队列创建完成（默认类待后续设置）"
     return 0
 }
 
+# 设置根队列的默认类
+set_htb_default_class() {
+    local device="$1"
+    local default_classid="$2"
+    if ! validate_number "$default_classid" "default_classid" 2 17; then
+        qos_log "ERROR" "无效的默认类ID: $default_classid (有效范围 2-17)"
+        return 1
+    fi
+    # 使用 tc qdisc change 修改默认类
+    if ! tc qdisc change dev "$device" root handle 1: htb r2q $HTB_R2Q default $default_classid 2>/dev/null; then
+        qos_log "ERROR" "无法设置HTB根队列默认类为 $default_classid"
+        return 1
+    fi
+    qos_log "INFO" "已设置HTB根队列默认类为 $default_classid"
+    return 0
+}
+
+# 创建单个上传类
 create_htb_upload_class() {
     local class_name="$1"
     local class_index="$2"
@@ -335,7 +367,6 @@ create_htb_upload_class() {
         qos_log "ERROR" "加载HTB配置失败: $class_name"
         return 1
     fi
-    # 使用全局变量（避免 eval）
     local percent_bandwidth="$HTB_CLASS_PERCENT"
     local per_min_bandwidth="$HTB_CLASS_MIN"
     local per_max_bandwidth="$HTB_CLASS_MAX"
@@ -353,7 +384,6 @@ create_htb_upload_class() {
     local ceil=""
     local rate_value=0
     local class_total_bw=0
-    # 必须配置 percent_bandwidth 且大于0
     if [[ -z "$percent_bandwidth" ]] || (( percent_bandwidth <= 0 )); then
         qos_log "ERROR" "类别 $class_name 未配置有效的 percent_bandwidth (>0)"
         return 1
@@ -440,6 +470,7 @@ create_htb_upload_class() {
     return 0
 }
 
+# 创建单个下载类
 create_htb_download_class() {
     local class_name="$1"
     local class_index="$2"
@@ -454,7 +485,6 @@ create_htb_download_class() {
         qos_log "ERROR" "加载HTB配置失败: $class_name"
         return 1
     fi
-    # 使用全局变量
     local percent_bandwidth="$HTB_CLASS_PERCENT"
     local per_min_bandwidth="$HTB_CLASS_MIN"
     local per_max_bandwidth="$HTB_CLASS_MAX"
@@ -472,7 +502,6 @@ create_htb_download_class() {
     local ceil=""
     local rate_value=0
     local class_total_bw=0
-    # 必须配置 percent_bandwidth 且大于0
     if [[ -z "$percent_bandwidth" ]] || (( percent_bandwidth <= 0 )); then
         qos_log "ERROR" "类别 $class_name 未配置有效的 percent_bandwidth (>0)"
         return 1
@@ -559,11 +588,18 @@ create_htb_download_class() {
     return 0
 }
 
-# ========== 入口重定向 ==========
+# ========== 入口重定向（SFO 兼容，支持 ctinfo 和 connmark 回退） ==========
 setup_ingress_redirect() {
     if [[ -z "$qos_interface" ]]; then
         qos_log "ERROR" "无法确定 WAN 接口"
         return 1
+    fi
+
+    # 检测 SFO 是否启用
+    local sfo_enabled=0
+    if check_sfo_enabled; then
+        sfo_enabled=1
+        qos_log "INFO" "SFO 已启用，将使用 ctinfo 恢复标记"
     fi
 
     # 检查 tc connmark 动作支持
@@ -572,7 +608,18 @@ setup_ingress_redirect() {
         connmark_ok=1
         qos_log "INFO" "tc connmark 动作受支持"
     else
-        qos_log "WARN" "tc connmark 动作不受支持，入口重定向将不使用 connmark，标记可能无法传递"
+        qos_log "WARN" "tc connmark 动作不受支持"
+    fi
+
+    # 检查 tc ctinfo 动作支持（如果 SFO 启用）
+    local ctinfo_ok=0
+    if (( sfo_enabled )); then
+        if check_tc_ctinfo_support; then
+            ctinfo_ok=1
+            qos_log "INFO" "tc ctinfo 动作受支持"
+        else
+            qos_log "WARN" "tc ctinfo 动作不受支持，将回退到 connmark"
+        fi
     fi
 
     qos_log "INFO" "设置入口重定向: $qos_interface -> $IFB_DEVICE"
@@ -582,8 +629,22 @@ setup_ingress_redirect() {
         return 1
     fi
     tc filter del dev "$qos_interface" parent ffff: 2>/dev/null || true
+
     # IPv4 重定向
-    if (( connmark_ok )); then
+    local ipv4_success=false
+    if (( sfo_enabled && ctinfo_ok )); then
+        if ! tc filter add dev "$qos_interface" parent ffff: protocol ip \
+            u32 match u32 0 0 \
+            action ctinfo mark 0xffffffff 0xffffffff \
+            action mirred egress redirect dev "$IFB_DEVICE" 2>&1; then
+            qos_log "ERROR" "IPv4入口重定向规则添加失败（使用 ctinfo）"
+            tc qdisc del dev "$qos_interface" ingress 2>/dev/null
+            return 1
+        else
+            ipv4_success=true
+            qos_log "INFO" "IPv4入口重定向规则添加成功（使用 ctinfo，SFO 兼容）"
+        fi
+    elif (( connmark_ok )); then
         if ! tc filter add dev "$qos_interface" parent ffff: protocol ip \
             u32 match u32 0 0 \
             action connmark \
@@ -592,6 +653,7 @@ setup_ingress_redirect() {
             tc qdisc del dev "$qos_interface" ingress 2>/dev/null
             return 1
         else
+            ipv4_success=true
             qos_log "INFO" "IPv4入口重定向规则添加成功（使用 connmark）"
         fi
     else
@@ -599,78 +661,113 @@ setup_ingress_redirect() {
         if ! tc filter add dev "$qos_interface" parent ffff: protocol ip \
             u32 match u32 0 0 \
             action mirred egress redirect dev "$IFB_DEVICE" 2>&1; then
-            qos_log "ERROR" "IPv4入口重定向规则添加失败（无 connmark）"
+            qos_log "ERROR" "IPv4入口重定向规则添加失败（无标记）"
             tc qdisc del dev "$qos_interface" ingress 2>/dev/null
             return 1
         else
-            qos_log "WARN" "IPv4入口重定向规则添加成功（未使用 connmark，标记将丢失）"
+            ipv4_success=true
+            qos_log "WARN" "IPv4入口重定向规则添加成功（未使用标记，标记将丢失）"
         fi
     fi
 
+    if [[ "$ipv4_success" != "true" ]]; then
+        qos_log "ERROR" "IPv4入口重定向配置失败"
+        return 1
+    fi
+
+    # 检查 IPv6 全局地址
     local has_ipv6_global=0
     if ip -6 addr show dev "$qos_interface" scope global 2>/dev/null | grep -q "inet6"; then
         has_ipv6_global=1
-        qos_log "INFO" "接口 $qos_interface 拥有全局 IPv6 地址，将强制 IPv6 重定向必须成功"
+        qos_log "INFO" "接口 $qos_interface 拥有全局 IPv6 地址，将尝试配置 IPv6 重定向"
     else
         qos_log "INFO" "接口 $qos_interface 无全局 IPv6 地址，IPv6 重定向失败仅警告"
     fi
 
-    # 清理现有 IPv6 过滤器
-    tc filter del dev "$qos_interface" parent ffff: protocol ipv6 2>/dev/null || true
-
+    # IPv6 重定向
     local ipv6_success=false
-    # 使用 flower 匹配 IPv6 全球单播地址（dst_ip 已在验证中可用）
-    if (( connmark_ok )); then
+    if (( sfo_enabled && ctinfo_ok )); then
+        # 尝试使用 ctinfo
+        if tc filter add dev "$qos_interface" parent ffff: protocol ipv6 \
+            flower dst_ip 2000::/3 \
+            action ctinfo mark 0xffffffff 0xffffffff \
+            action mirred egress redirect dev "$IFB_DEVICE" 2>&1; then
+            ipv6_success=true
+            qos_log "INFO" "IPv6入口重定向规则（flower 全球单播，ctinfo）添加成功"
+        else
+            qos_log "WARN" "flower ctinfo 规则失败，尝试 u32"
+            if tc filter add dev "$qos_interface" parent ffff: protocol ipv6 \
+                u32 match u32 0x20000000 0xe0000000 at 24 \
+                action ctinfo mark 0xffffffff 0xffffffff \
+                action mirred egress redirect dev "$IFB_DEVICE" 2>&1; then
+                ipv6_success=true
+                qos_log "INFO" "IPv6入口重定向规则（u32 全球单播，ctinfo）添加成功"
+            else
+                qos_log "WARN" "u32 ctinfo 规则失败，尝试无过滤"
+                if tc filter add dev "$qos_interface" parent ffff: protocol ipv6 \
+                    u32 match u32 0 0 \
+                    action ctinfo mark 0xffffffff 0xffffffff \
+                    action mirred egress redirect dev "$IFB_DEVICE" 2>&1; then
+                    ipv6_success=true
+                    qos_log "INFO" "IPv6入口重定向规则（无过滤，ctinfo）添加成功"
+                else
+                    ipv6_success=false
+                    qos_log "WARN" "IPv6入口重定向规则添加失败（ctinfo）"
+                fi
+            fi
+        fi
+    elif (( connmark_ok )); then
+        # 使用 connmark
         if tc filter add dev "$qos_interface" parent ffff: protocol ipv6 \
             flower dst_ip 2000::/3 \
             action connmark \
             action mirred egress redirect dev "$IFB_DEVICE" 2>&1; then
             ipv6_success=true
-            qos_log "INFO" "IPv6入口重定向规则（flower 匹配全球单播，带 connmark）添加成功"
+            qos_log "INFO" "IPv6入口重定向规则（flower 全球单播，connmark）添加成功"
         else
-            qos_log "WARN" "flower 规则添加失败，尝试 u32 全球单播匹配"
+            qos_log "WARN" "flower connmark 规则失败，尝试 u32"
             if tc filter add dev "$qos_interface" parent ffff: protocol ipv6 \
                 u32 match u32 0x20000000 0xe0000000 at 24 \
                 action connmark \
                 action mirred egress redirect dev "$IFB_DEVICE" 2>&1; then
                 ipv6_success=true
-                qos_log "INFO" "IPv6入口重定向规则（u32 全球单播，带 connmark）添加成功"
+                qos_log "INFO" "IPv6入口重定向规则（u32 全球单播，connmark）添加成功"
             else
-                qos_log "WARN" "u32 全球单播规则添加失败，尝试无过滤规则"
+                qos_log "WARN" "u32 connmark 规则失败，尝试无过滤"
                 if tc filter add dev "$qos_interface" parent ffff: protocol ipv6 \
                     u32 match u32 0 0 \
                     action connmark \
                     action mirred egress redirect dev "$IFB_DEVICE" 2>&1; then
                     ipv6_success=true
-                    qos_log "INFO" "IPv6入口重定向规则（无过滤，带 connmark）添加成功"
+                    qos_log "INFO" "IPv6入口重定向规则（无过滤，connmark）添加成功"
                 else
                     ipv6_success=false
-                    qos_log "WARN" "IPv6入口重定向规则添加失败，IPv6流量将不会通过IFB"
+                    qos_log "WARN" "IPv6入口重定向规则添加失败（connmark）"
                 fi
             fi
         fi
     else
-        # 不使用 connmark
+        # 不使用标记，仅重定向
         if tc filter add dev "$qos_interface" parent ffff: protocol ipv6 \
             flower dst_ip 2000::/3 \
             action mirred egress redirect dev "$IFB_DEVICE" 2>&1; then
             ipv6_success=true
-            qos_log "INFO" "IPv6入口重定向规则（flower 匹配全球单播，无 connmark）添加成功"
+            qos_log "INFO" "IPv6入口重定向规则（flower 全球单播，无标记）添加成功"
         else
             if tc filter add dev "$qos_interface" parent ffff: protocol ipv6 \
                 u32 match u32 0x20000000 0xe0000000 at 24 \
                 action mirred egress redirect dev "$IFB_DEVICE" 2>&1; then
                 ipv6_success=true
-                qos_log "INFO" "IPv6入口重定向规则（u32 全球单播，无 connmark）添加成功"
+                qos_log "INFO" "IPv6入口重定向规则（u32 全球单播，无标记）添加成功"
             else
                 if tc filter add dev "$qos_interface" parent ffff: protocol ipv6 \
                     u32 match u32 0 0 \
                     action mirred egress redirect dev "$IFB_DEVICE" 2>&1; then
                     ipv6_success=true
-                    qos_log "INFO" "IPv6入口重定向规则（无过滤，无 connmark）添加成功"
+                    qos_log "INFO" "IPv6入口重定向规则（无过滤，无标记）添加成功"
                 else
                     ipv6_success=false
-                    qos_log "WARN" "IPv6入口重定向规则添加失败，IPv6流量将不会通过IFB"
+                    qos_log "WARN" "IPv6入口重定向规则添加失败（无标记）"
                 fi
             fi
         fi
@@ -678,11 +775,9 @@ setup_ingress_redirect() {
 
     if (( has_ipv6_global == 1 )); then
         if [[ "$ipv6_success" != "true" ]]; then
-            qos_log "ERROR" "接口存在全局 IPv6 地址，但 IPv6 入口重定向配置失败，QoS 无法正常工作"
-            tc qdisc del dev "$qos_interface" ingress 2>/dev/null
-            return 1
+            qos_log "WARN" "接口存在全局 IPv6 地址，但 IPv6 入口重定向配置失败，IPv6 流量可能不受 QoS 控制，但 IPv4 QoS 将继续工作"
         else
-            qos_log "INFO" "IPv6 入口重定向成功（强制）"
+            qos_log "INFO" "IPv6 入口重定向成功"
         fi
     else
         if [[ "$ipv6_success" == "true" ]]; then
@@ -735,16 +830,16 @@ check_ingress_redirect() {
     return 0
 }
 
+
 # ========== 上传方向初始化 ==========
 init_htb_cake_upload() {
     qos_log "INFO" "初始化上传方向HTB"
-    # 使用已加载的 upload_class_list（已在 init_htb_cake_qos 中加载）
+    load_upload_class_configurations
     if [[ -z "$upload_class_list" ]]; then
         qos_log "ERROR" "未找到上传类别配置，请至少配置一个上传类"
         return 1
     fi
 
-    # 检查所有类的数量（包括禁用），防止标记冲突
     local total_classes=0
     for class in $upload_class_list; do
         ((total_classes++))
@@ -754,17 +849,13 @@ init_htb_cake_upload() {
         return 1
     fi
 
-    # 构建启用类列表并计算索引
     local enabled_classes=""
     local class_index=2
     local default_class_index=""
     local default_class_name=""
     local first_enabled_class=""
 
-    # 使用关联数组存储类索引
     declare -A class_index_map
-
-    # 获取配置的默认类
     default_class_name=$(uci -q get ${CONFIG_FILE}.upload.default_class 2>/dev/null)
 
     for class in $upload_class_list; do
@@ -772,23 +863,20 @@ init_htb_cake_upload() {
         if [[ "$enabled" == "1" ]] || [[ -z "$enabled" ]]; then
             enabled_classes="$enabled_classes $class"
             [[ -z "$first_enabled_class" ]] && first_enabled_class="$class"
-            # 记录该类的索引
             class_index_map["$class"]=$class_index
-            # 判断是否为默认类
             if [[ -n "$default_class_name" ]] && [[ "$class" == "$default_class_name" ]]; then
                 default_class_index=$class_index
             fi
             ((class_index++))
         fi
     done
-    enabled_classes=$(echo "$enabled_classes" | xargs)  # 去除多余空格
+    enabled_classes=$(echo "$enabled_classes" | xargs)
 
     if [[ -z "$enabled_classes" ]]; then
         qos_log "ERROR" "没有启用的上传类，请至少启用一个上传类"
         return 1
     fi
 
-    # 确定默认类索引
     if [[ -z "$default_class_index" ]]; then
         if [[ -n "$default_class_name" ]]; then
             qos_log "WARN" "未找到上传默认类别 '$default_class_name' 或该类未启用，将使用第一个启用的类别"
@@ -804,8 +892,8 @@ init_htb_cake_upload() {
         qos_log "INFO" "上传默认类别: $default_class_name (ID: 1:$default_class_index)"
     fi
 
-    # 创建根队列，直接指定默认类
-    if ! create_htb_root_qdisc "$qos_interface" "upload" "1:0" "1:1" "$default_class_index"; then
+    # 先创建根队列（不带 default）
+    if ! create_htb_root_qdisc "$qos_interface" "upload" "1:0" "1:1"; then
         qos_log "ERROR" "创建上传根队列失败"
         return 1
     fi
@@ -824,6 +912,13 @@ init_htb_cake_upload() {
         fi
     done
 
+    # 最后设置默认类
+    if ! set_htb_default_class "$qos_interface" "$default_class_index"; then
+        qos_log "ERROR" "设置上传默认类失败"
+        tc qdisc del dev "$qos_interface" root 2>/dev/null
+        return 1
+    fi
+
     qos_log "INFO" "上传方向HTB初始化完成"
     return 0
 }
@@ -831,12 +926,12 @@ init_htb_cake_upload() {
 # ========== 下载方向初始化 ==========
 init_htb_cake_download() {
     qos_log "INFO" "初始化下载方向HTB"
+    load_download_class_configurations
     if [[ -z "$download_class_list" ]]; then
         qos_log "ERROR" "未找到下载类别配置，请至少配置一个下载类"
         return 1
     fi
 
-    # 检查所有类的数量（包括禁用），防止标记冲突
     local total_classes=0
     for class in $download_class_list; do
         ((total_classes++))
@@ -846,7 +941,6 @@ init_htb_cake_download() {
         return 1
     fi
 
-    # 构建启用类列表并计算索引
     local enabled_classes=""
     local class_index=2
     local default_class_index=""
@@ -854,7 +948,6 @@ init_htb_cake_download() {
     local first_enabled_class=""
 
     declare -A class_index_map
-
     default_class_name=$(uci -q get ${CONFIG_FILE}.download.default_class 2>/dev/null)
 
     for class in $download_class_list; do
@@ -899,7 +992,8 @@ init_htb_cake_download() {
         qos_log "ERROR" "无法启动IFB设备 $IFB_DEVICE"
         return 1
     fi
-    if ! create_htb_root_qdisc "$IFB_DEVICE" "download" "1:0" "1:1" "$default_class_index"; then
+    # 先创建根队列（不带 default）
+    if ! create_htb_root_qdisc "$IFB_DEVICE" "download" "1:0" "1:1"; then
         qos_log "ERROR" "创建下载根队列失败"
         return 1
     fi
@@ -919,12 +1013,53 @@ init_htb_cake_download() {
         filter_prio=$((filter_prio + 2))
     done
 
+    # 最后设置默认类
+    if ! set_htb_default_class "$IFB_DEVICE" "$default_class_index"; then
+        qos_log "ERROR" "设置下载默认类失败"
+        tc qdisc del dev "$IFB_DEVICE" root 2>/dev/null
+        return 1
+    fi
+
     if ! setup_ingress_redirect; then
         qos_log "ERROR" "设置入口重定向失败"
         return 1
     fi
     qos_log "INFO" "下载方向HTB初始化完成"
     return 0
+}
+
+# ========== HTB 增强规则链 ==========
+setup_htb_enhance_chains() {
+    qos_log "INFO" "设置HTB增强规则链"
+    nft add chain inet gargoyle-qos-priority filter_qos_egress_enhance 2>/dev/null || true
+    nft add chain inet gargoyle-qos-priority filter_qos_ingress_enhance 2>/dev/null || true
+    nft insert rule inet gargoyle-qos-priority filter_qos_egress \
+        jump filter_qos_egress_enhance 2>/dev/null || true
+    nft insert rule inet gargoyle-qos-priority filter_qos_ingress \
+        jump filter_qos_ingress_enhance 2>/dev/null || true
+}
+
+apply_htb_specific_rules() {
+    qos_log "INFO" "应用HTB特定增强规则（专用链）"
+    nft flush chain inet gargoyle-qos-priority filter_qos_egress_enhance 2>/dev/null || true
+    nft flush chain inet gargoyle-qos-priority filter_qos_ingress_enhance 2>/dev/null || true
+    nft add rule inet gargoyle-qos-priority filter_qos_egress_enhance \
+        meta mark and 0x007f != 0 counter meta priority set "bulk" 2>/dev/null || true
+    nft add rule inet gargoyle-qos-priority filter_qos_ingress_enhance \
+        meta mark and 0x7f00 != 0 counter meta priority set "bulk" 2>/dev/null || true
+    nft add rule inet gargoyle-qos-priority filter_qos_egress_enhance \
+        meta mark and 0x0010 != 0 counter meta priority set "critical" 2>/dev/null || true
+    nft add rule inet gargoyle-qos-priority filter_qos_ingress_enhance \
+        meta mark and 0x1000 != 0 counter meta priority set "critical" 2>/dev/null || true
+    nft add rule inet gargoyle-qos-priority filter_qos_egress_enhance \
+        ct bytes lt 200 counter meta priority set "normal" 2>/dev/null || true
+    nft add rule inet gargoyle-qos-priority filter_qos_ingress_enhance \
+        ct bytes lt 200 counter meta priority set "normal" 2>/dev/null || true
+    nft add rule inet gargoyle-qos-priority filter_qos_egress_enhance \
+        ct state established,related counter meta mark set ct mark 2>/dev/null || true
+    nft add rule inet gargoyle-qos-priority filter_qos_egress_enhance \
+        tcp flags syn tcp option maxseg size set rt mtu counter meta mark set 0x3F 2>/dev/null || true
+    qos_log "INFO" "HTB特定增强规则应用完成"
 }
 
 # ========== 主初始化函数 ==========
@@ -973,6 +1108,26 @@ init_htb_cake_qos() {
         fi
     fi
     qos_log "INFO" "使用WAN接口: $qos_interface"
+	
+	# ========== 自动测速与带宽加载 ==========
+    # 自动测速开关处理（需要在加载带宽配置之前执行）
+    if [[ "$AUTO_SPEEDTEST" == "1" ]]; then
+        qos_log "INFO" "自动测速开关已开启，正在执行速度测试..."
+        # 非交互模式，强制覆盖现有配置
+        if ! auto_speedtest -n -f; then
+            qos_log "WARN" "自动测速失败，将使用原有带宽配置（若有）"
+        fi
+    fi
+
+    # 加载带宽配置（会设置 total_upload_bandwidth 和 total_download_bandwidth）
+    if ! load_bandwidth_from_config; then
+        qos_log "ERROR" "加载带宽配置失败"
+        release_lock
+        rm -f "$QOS_RUNNING_FILE"
+        return 1
+    fi
+    # ====================================
+	
     if ! load_htb_cake_config; then
         qos_log "ERROR" "加载HTB+CAKE配置失败"
         release_lock
@@ -986,7 +1141,6 @@ init_htb_cake_qos() {
         return 1
     fi
 
-    # 验证掩码有效性
     if [[ "$UPLOAD_MASK" == "0" ]] || [[ "$DOWNLOAD_MASK" == "0" ]]; then
         qos_log "ERROR" "UPLOAD_MASK 或 DOWNLOAD_MASK 为 0，无法正确匹配标记"
         release_lock
@@ -994,11 +1148,9 @@ init_htb_cake_qos() {
         return 1
     fi
 
-    # 加载类别列表
     load_upload_class_configurations
     load_download_class_configurations
 
-    # 检查上传/下载带宽是否有效，决定是否进行标记分配和规则应用
     local upload_enabled=0
     local download_enabled=0
 
@@ -1016,7 +1168,6 @@ init_htb_cake_qos() {
         qos_log "INFO" "下载带宽未配置或为0，禁用下载QoS"
     fi
 
-    # 若两者均为0，则提前退出
     if (( upload_enabled == 0 )) && (( download_enabled == 0 )); then
         qos_log "WARN" "上传和下载带宽均为0，QoS未启动任何方向"
         check_and_handle_zero_bandwidth "$total_upload_bandwidth" "$total_download_bandwidth"
@@ -1025,7 +1176,6 @@ init_htb_cake_qos() {
         return 0
     fi
 
-    # 仅在对应方向启用时才分配标记和生成规则
     if (( upload_enabled == 1 )) && [[ -n "$upload_class_list" ]]; then
         if ! allocate_class_marks "upload" "$upload_class_list"; then
             qos_log "ERROR" "上传方向标记分配失败"
@@ -1044,7 +1194,6 @@ init_htb_cake_qos() {
         fi
     fi
 
-    # 应用规则（仅当方向启用时）
     if (( upload_enabled == 1 )); then
         echo "调用上传分类规则应用..." 
         if ! apply_all_rules "upload_rule" "$UPLOAD_MASK" "filter_qos_egress"; then
@@ -1078,7 +1227,6 @@ init_htb_cake_qos() {
     local upload_skipped=0
     local download_skipped=0
 
-    # 检查上传带宽
     if (( upload_enabled == 1 )); then
         if ! init_htb_cake_upload; then
             qos_log "ERROR" "上传方向初始化失败"
@@ -1088,7 +1236,6 @@ init_htb_cake_qos() {
         upload_skipped=1
     fi
 
-    # 检查下载带宽
     if (( download_enabled == 1 )); then
         if ! init_htb_cake_download; then
             qos_log "ERROR" "下载方向初始化失败"
@@ -1098,7 +1245,6 @@ init_htb_cake_qos() {
         download_skipped=1
     fi
 
-    # 如果有任何方向尝试初始化但失败，则整体失败
     if (( upload_failed == 1 )) || (( download_failed == 1 )); then
         qos_log "ERROR" "HTB+CAKE QoS 初始化部分失败"
         stop_htb_cake_qos
@@ -1138,9 +1284,7 @@ stop_htb_cake_qos() {
             tc qdisc del dev "$IFB_DEVICE" ingress 2>/dev/null || true
             tc qdisc del dev "$IFB_DEVICE" root 2>/dev/null || true
             ip link set dev "$IFB_DEVICE" down
-            # 仅在明确配置删除且无其他引用时删除
             if [[ "${DELETE_IFB_ON_STOP:-0}" == "1" ]]; then
-                # 简单检查是否有其他 qdisc 使用该 IFB（通常没有）
                 if ! tc qdisc show dev "$IFB_DEVICE" 2>/dev/null | grep -q .; then
                     ip link del dev "$IFB_DEVICE" 2>/dev/null
                     qos_log "INFO" "IFB设备 $IFB_DEVICE 已删除"
@@ -1157,52 +1301,12 @@ stop_htb_cake_qos() {
     nft delete table inet gargoyle-qos-priority 2>/dev/null || true
     clear_class_marks
     qos_log "INFO" "HTB+CAKE QoS停止完成"
-    # 恢复主配置文件（删除追加的规则集）
     restore_main_config
-    # 重置 nftables 表刷新标志
     _QOS_TABLE_FLUSHED=0
     _IPSET_LOADED=0
-    # 清理临时状态文件
     cleanup_qos_state
-    # 清理临时文件
     cleanup_temp_files
     release_lock
-}
-
-# ========== HTB 增强规则链 ==========
-setup_htb_enhance_chains() {
-    qos_log "INFO" "设置HTB增强规则链"
-    nft add chain inet gargoyle-qos-priority filter_qos_egress_enhance 2>/dev/null || true
-    nft add chain inet gargoyle-qos-priority filter_qos_ingress_enhance 2>/dev/null || true
-    nft insert rule inet gargoyle-qos-priority filter_qos_egress \
-        jump filter_qos_egress_enhance 2>/dev/null || true
-    nft insert rule inet gargoyle-qos-priority filter_qos_ingress \
-        jump filter_qos_ingress_enhance 2>/dev/null || true
-}
-
-apply_htb_specific_rules() {
-    qos_log "INFO" "应用HTB特定增强规则（专用链）"
-    nft flush chain inet gargoyle-qos-priority filter_qos_egress_enhance 2>/dev/null || true
-    nft flush chain inet gargoyle-qos-priority filter_qos_ingress_enhance 2>/dev/null || true
-    # 注意：以下 meta priority 规则在 HTB 根队列下无效，仅用于可能的默认 pfifo_fast 调度器
-    nft add rule inet gargoyle-qos-priority filter_qos_egress_enhance \
-        meta mark and 0x007f != 0 counter meta priority set "bulk" 2>/dev/null || true
-    nft add rule inet gargoyle-qos-priority filter_qos_ingress_enhance \
-        meta mark and 0x7f00 != 0 counter meta priority set "bulk" 2>/dev/null || true
-    nft add rule inet gargoyle-qos-priority filter_qos_egress_enhance \
-        meta mark and 0x0010 != 0 counter meta priority set "critical" 2>/dev/null || true
-    nft add rule inet gargoyle-qos-priority filter_qos_ingress_enhance \
-        meta mark and 0x1000 != 0 counter meta priority set "critical" 2>/dev/null || true
-    nft add rule inet gargoyle-qos-priority filter_qos_egress_enhance \
-        ct bytes lt 200 counter meta priority set "normal" 2>/dev/null || true
-    nft add rule inet gargoyle-qos-priority filter_qos_ingress_enhance \
-        ct bytes lt 200 counter meta priority set "normal" 2>/dev/null || true
-    # 将连接跟踪标记复制到包标记（用于保持标记连续性）
-    nft add rule inet gargoyle-qos-priority filter_qos_egress_enhance \
-        ct state established,related counter meta mark set ct mark 2>/dev/null || true
-    nft add rule inet gargoyle-qos-priority filter_qos_egress_enhance \
-        tcp flags syn tcp option maxseg size set rt mtu counter meta mark set 0x3F 2>/dev/null || true
-    qos_log "INFO" "HTB特定增强规则应用完成"
 }
 
 # ========== 状态显示函数 ==========
@@ -1210,7 +1314,6 @@ show_htb_cake_status() {
     # 从 UCI 获取真实 WAN 接口
     local real_wan_if=$(uci -q get ${CONFIG_FILE}.global.wan_interface 2>/dev/null)
     if [[ -z "$real_wan_if" ]] || [[ "$real_wan_if" == "auto" ]]; then
-        # 如果未配置或为 auto，尝试自动检测
         if command -v network_find_wan >/dev/null 2>&1; then
             network_find_wan real_wan_if 2>/dev/null
         fi
@@ -1230,7 +1333,6 @@ show_htb_cake_status() {
     echo "时间: $(date)"
     echo "WAN接口: ${real_wan_if}"
 
-    # 如果 WAN 接口无效，则跳过依赖接口的检查
     if [[ "$real_wan_if" == "未知" ]] || ! ip link show "$real_wan_if" >/dev/null 2>&1; then
         echo "警告: 无法确定有效的 WAN 接口，部分信息可能无法显示。"
     else
@@ -1249,7 +1351,6 @@ show_htb_cake_status() {
         echo "IFB设备: 未创建"
     fi
 
-    # 以下部分仅在 WAN 接口有效时显示
     if [[ "$real_wan_if" != "未知" ]] && ip link show "$real_wan_if" >/dev/null 2>&1; then
         echo -e "\n======== 出口QoS ($real_wan_if) ========"
         echo -e "\nTC队列:"
@@ -1368,7 +1469,6 @@ show_htb_cake_status() {
     fi
 
     echo -e "\n===== 增强特性状态 ====="
-    # 直接从 UCI 读取，避免依赖可能未同步的全局变量
     local rate_val=$(uci -q get ${CONFIG_FILE}.global.enable_ratelimit 2>/dev/null)
     local ack_val=$(uci -q get ${CONFIG_FILE}.global.enable_ack_limit 2>/dev/null)
     local tcp_val=$(uci -q get ${CONFIG_FILE}.global.enable_tcp_upgrade 2>/dev/null)
@@ -1493,6 +1593,12 @@ main_htb_cake_qos() {
         "health_check")
             health_check
             ;;
+		"auto_speedtest")
+			if ! auto_speedtest; then
+				qos_log "ERROR" "自动速率测试失败"
+				exit 1
+			fi
+            ;;
         *)
             echo "用法: $0 {start|stop|restart|status|health_check}"
             echo ""
@@ -1502,6 +1608,7 @@ main_htb_cake_qos() {
             echo "  restart      重启HTB+CAKE QoS"
             echo "  status       显示状态"
             echo "  health_check 执行健康检查"
+			echo "  auto_speedtest   自动配置（测速或手动输入带宽）"
             exit 1
             ;;
     esac
