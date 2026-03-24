@@ -1,6 +1,6 @@
 #!/bin/bash
 # HTB_FQCODEL算法实现模块
-# 版本: 3.2.4 - 修复默认类创建顺序、dummy设备残留、带宽单位解析、类存在性验证等
+# 版本: 3.2.5 - 修复启用类数量检查、无效速率保护、fq_codel参数构建函数缺失
 # 基于HTB与FQ_CODEL组合算法实现QoS流量控制。
 
 # ========== 全局配置常量 ==========
@@ -229,7 +229,6 @@ load_htb_class_config() {
     return 0
 }
 
-# 以下函数已在 rule.sh 中定义，但为保持兼容性保留
 load_upload_class_configurations() {
     qos_log "INFO" "正在加载上传类别配置..."
     upload_class_list=$(load_all_config_sections "$CONFIG_FILE" "upload_class")
@@ -276,8 +275,19 @@ calculate_htb_burst() {
     echo "${burst_kb}kb ${cburst_kb}kb"
 }
 
-# ========== fq_codel 参数构建（由 rule.sh 提供，直接调用） ==========
-# build_fq_codel_params 已在 rule.sh 中定义，此处不再重复
+# ========== FQ_CODEL 参数构建函数 ==========
+build_fq_codel_params() {
+    local params=""
+    [[ -n "$FQCODEL_LIMIT" ]] && params="$params limit $FQCODEL_LIMIT"
+    [[ -n "$FQCODEL_INTERVAL" ]] && params="$params interval ${FQCODEL_INTERVAL}us"
+    [[ -n "$FQCODEL_TARGET" ]] && params="$params target ${FQCODEL_TARGET}us"
+    [[ -n "$FQCODEL_FLOWS" ]] && params="$params flows $FQCODEL_FLOWS"
+    [[ -n "$FQCODEL_QUANTUM" ]] && params="$params quantum $FQCODEL_QUANTUM"
+    [[ -n "$FQCODEL_MEMORY_LIMIT" ]] && params="$params memory_limit $FQCODEL_MEMORY_LIMIT"
+    [[ -n "$FQCODEL_CE_THRESHOLD" ]] && params="$params ce_threshold $FQCODEL_CE_THRESHOLD"
+    [[ -n "$FQCODEL_ECN" ]] && params="$params $FQCODEL_ECN"
+    echo "$params"
+}
 
 # ========== HTB 核心队列函数（修正默认类顺序） ==========
 # 先创建根队列（不带 default），创建子类后最后设置 default
@@ -400,6 +410,8 @@ create_htb_upload_class() {
         qos_log "INFO" "类别 $class_name 使用类别总带宽作为上限带宽: $ceil"
     fi
     local ceil_value=$(echo "$ceil" | sed 's/kbit//')
+    # 确保 ceil 至少为 1kbit（如果总带宽为0已提前返回，但防御）
+    (( ceil_value < 1 )) && { ceil="1kbit"; ceil_value=1; qos_log "WARN" "上限带宽为0，调整为1kbit"; }
     if (( rate_value > ceil_value )); then
         qos_log "WARN" "类别 $class_name 保证带宽($rate)超过上限带宽($ceil)，调整为上限带宽"
         rate="$ceil"
@@ -518,6 +530,7 @@ create_htb_download_class() {
         qos_log "INFO" "类别 $class_name 使用类别总带宽作为上限带宽: $ceil"
     fi
     local ceil_value=$(echo "$ceil" | sed 's/kbit//')
+    (( ceil_value < 1 )) && { ceil="1kbit"; ceil_value=1; qos_log "WARN" "上限带宽为0，调整为1kbit"; }
     if (( rate_value > ceil_value )); then
         qos_log "WARN" "类别 $class_name 保证带宽($rate)超过上限带宽($ceil)，调整为上限带宽"
         rate="$ceil"
@@ -819,12 +832,17 @@ init_htb_fqcodel_upload() {
         return 1
     fi
 
-    local total_classes=0
-    for class in $upload_class_list; do
-        ((total_classes++))
+    # 统计启用的类数量，而不是所有类
+    local enabled_class_count=0
+    local class_list="$upload_class_list"
+    for class in $class_list; do
+        local enabled=$(uci -q get ${CONFIG_FILE}.${class}.enabled 2>/dev/null)
+        if [[ "$enabled" == "1" ]] || [[ -z "$enabled" ]]; then
+            ((enabled_class_count++))
+        fi
     done
-    if (( total_classes > 16 )); then
-        qos_log "ERROR" "上传方向总类别数量为 $total_classes，超过16个，将导致标记冲突，启动中止！"
+    if (( enabled_class_count > 16 )); then
+        qos_log "ERROR" "上传方向启用的类别数量为 $enabled_class_count，超过16个，将导致标记冲突，启动中止！"
         return 1
     fi
 
@@ -911,12 +929,17 @@ init_htb_fqcodel_download() {
         return 1
     fi
 
-    local total_classes=0
-    for class in $download_class_list; do
-        ((total_classes++))
+    # 统计启用的类数量，而不是所有类
+    local enabled_class_count=0
+    local class_list="$download_class_list"
+    for class in $class_list; do
+        local enabled=$(uci -q get ${CONFIG_FILE}.${class}.enabled 2>/dev/null)
+        if [[ "$enabled" == "1" ]] || [[ -z "$enabled" ]]; then
+            ((enabled_class_count++))
+        fi
     done
-    if (( total_classes > 16 )); then
-        qos_log "ERROR" "下载方向总类别数量为 $total_classes，超过16个，将导致标记冲突，启动中止！"
+    if (( enabled_class_count > 16 )); then
+        qos_log "ERROR" "下载方向启用的类别数量为 $enabled_class_count，超过16个，将导致标记冲突，启动中止！"
         return 1
     fi
 
