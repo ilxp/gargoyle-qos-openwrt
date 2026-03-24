@@ -1,7 +1,7 @@
 #!/bin/bash
 # 规则辅助模块 (rule.sh)
-# 版本: 3.2.8
-# 基于 HTB 与 CAKE 组合算法实现 QoS 流量控制
+# 版本: 3.2.9
+# 提供 nftables 规则生成与系统钩子挂载
 
 # 加载核心库
 if [[ -f "/usr/lib/qos_gargoyle/lib.sh" ]]; then
@@ -11,9 +11,41 @@ else
     exit 1
 fi
 
-# ========== 外部函数定义（依赖 lib.sh 中的基础功能） ==========
+# ========== 辅助函数：调整协议以适应地址族 ==========
+adjust_proto_for_family() {
+    local proto="$1"
+    local family="$2"
+    local adjusted="$proto"
+    
+    # 空协议或 all 保持原样
+    [[ -z "$proto" || "$proto" == "all" ]] && { echo "$proto"; return 0; }
+    
+    case "$family" in
+        ipv4|ip|inet4)
+            case "$proto" in
+                icmpv6) adjusted="icmp" ;;
+                *) adjusted="$proto" ;;
+            esac
+            ;;
+        ipv6|ip6|inet6)
+            case "$proto" in
+                icmp) adjusted="icmpv6" ;;
+                *) adjusted="$proto" ;;
+            esac
+            ;;
+        inet)
+            # inet 族保持原样，但需确保协议在 inet 下有效
+            if [[ "$proto" == "icmp" ]]; then
+                adjusted="icmp"
+            elif [[ "$proto" == "icmpv6" ]]; then
+                adjusted="icmpv6"
+            fi
+            ;;
+    esac
+    echo "$adjusted"
+}
 
-# 拆分多集合字段（如 @set1,@set2）为数组
+# ========== 拆分多集合字段（如 @set1,@set2）为数组 ==========
 split_multiset() {
     local field="$1"
     local result=()
@@ -28,7 +60,7 @@ split_multiset() {
     printf '%s\n' "${result[@]}"
 }
 
-# 通用规则构建函数
+# ========== 通用规则构建函数 ==========
 # 参数：规则名称、链名、类标记、掩码、family、proto、srcport、dstport、connbytes_kb、state、src_ip、dest_ip、packet_len、tcp_flags、iif、oif、udp_length、dscp、ttl、icmp_type
 # 返回：输出一条或多条 nft 规则（通过 echo）
 build_nft_rule_generic() {
@@ -37,7 +69,15 @@ build_nft_rule_generic() {
     local packet_len="${13}" tcp_flags="${14}" iif="${15}" oif="${16}" udp_length="${17}"
     local dscp="${18}" ttl="${19}" icmp_type="${20}"
     
-    # 以下变量用于收集生成的规则行
+    # 调整协议以适应地址族
+    proto=$(adjust_proto_for_family "$proto" "$family")
+    
+    # 如果协议调整为空（不匹配），跳过该规则
+    if [[ -z "$proto" ]]; then
+        log_warn "规则 $rule_name: 协议与地址族不匹配，跳过"
+        return
+    fi
+    
     local ipv4_rules=()
     local ipv6_rules=()
     
@@ -75,6 +115,7 @@ build_nft_rule_generic() {
         tcp) common_cond="meta l4proto tcp" ;;
         udp) common_cond="meta l4proto udp" ;;
         tcp_udp) common_cond="meta l4proto { tcp, udp }" ;;
+        icmp|icmpv6|gre|esp|ah|sctp|dccp|udplite) common_cond="meta l4proto $proto" ;;
         all|"") ;;
         *) common_cond="meta l4proto $proto" ;;
     esac
@@ -410,7 +451,7 @@ build_nft_rule_generic() {
     done
 }
 
-# 增强规则应用
+# ========== 增强规则应用 ==========
 apply_enhanced_direction_rules() {
     local rule_type="$1" chain="$2" mask="$3"
     log_info "应用增强$rule_type规则到链: $chain, 掩码: $mask"
@@ -622,6 +663,7 @@ apply_all_rules() {
         nft add chain inet gargoyle-qos-priority filter_qos_ingress 2>/dev/null || true
         generate_ipset_sets
 
+        # 创建动态集合，并检测是否成功
         local sets_ok=1
         for set in _qos_xfst_ack _qos_fast_ack _qos_med_ack _qos_slow_ack _qos_slow_tcp; do
             if ! nft list set inet gargoyle-qos-priority "$set" &>/dev/null; then
@@ -631,6 +673,7 @@ apply_all_rules() {
 
         if [[ $sets_ok -eq 0 ]]; then
             log_error "动态集合创建失败，ACK 限速和 TCP 升级功能将被禁用"
+            # 全局禁用相关功能，避免后续错误
             ENABLE_ACK_LIMIT=0
             ENABLE_TCP_UPGRADE=0
         fi
@@ -662,7 +705,7 @@ apply_all_rules() {
         fi
 
         nft add chain inet gargoyle-qos-priority filter_output '{ type filter hook output priority 0; policy accept; }' 2>/dev/null || true
-        nft add chain inet gargoyle-qos-priority filter_input  '{ type filter hook input  priority 0; policy accept; }' 2>/dev/null || true
+        nft add chain inet gargoyle-qos-priority filter_input  '{ type filter hook input priority 0; policy accept; }' 2>/dev/null || true
         nft add chain inet gargoyle-qos-priority filter_forward '{ type filter hook forward priority 0; policy accept; }' 2>/dev/null || true
 
         nft flush chain inet gargoyle-qos-priority filter_output 2>/dev/null || true
@@ -698,14 +741,17 @@ apply_all_rules() {
         fi
     fi
 
-    local ret=0
+    # 应用增强规则，如果失败则返回错误，不继续加载其他规则
     if ! apply_enhanced_direction_rules "$rule_type" "$chain" "$mask"; then
         log_error "应用 $rule_type 规则失败"
-        ret=1
+        # 清理已挂载的钩子链？但停止函数会清理整个表，这里先返回错误
+        return 1
     fi
 
+    # 加载自定义完整表规则（不影响返回码，即使失败也不终止）
     load_custom_full_table
 
+    # 应用 ACK 限速规则
     if [[ $ENABLE_ACK_LIMIT -eq 1 ]]; then
         local ack_rules=$(generate_ack_limit_rules)
         if [[ -n "$ack_rules" ]]; then
@@ -719,6 +765,7 @@ apply_all_rules() {
         fi
     fi
 
+    # 应用 TCP 升级规则
     if [[ $ENABLE_TCP_UPGRADE -eq 1 ]]; then
         local tcp_upgrade_rules=$(generate_tcp_upgrade_rules)
         if [[ -n "$tcp_upgrade_rules" ]]; then
@@ -732,7 +779,7 @@ apply_all_rules() {
         fi
     fi
 
-    return $ret
+    return 0
 }
 
 # ========== 健康检查 ==========
