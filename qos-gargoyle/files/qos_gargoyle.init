@@ -857,9 +857,15 @@ init_qos() {
     if [ $? -ne 0 ]; then
         echo "Warning: QoS acc failed to start, but QoS core is running."
     fi
-    
+	
     release_lock
     
+	# 锁外，因为加载自定义表不依赖锁保护，且可减少锁持有时间。
+    load_custom_full_table
+    if [ $? -ne 0 ]; then
+        log_warn "完整表规则加载失败，但 QoS 核心已启动"
+    fi
+	
     echo "✅ QoS init successfully (Algorithm: $algorithm)"
     return 0
 }

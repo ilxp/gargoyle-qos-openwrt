@@ -12,25 +12,36 @@
 #       请注意钩子优先级，以免顺序错误。
 # ====================================================================
 
-table inet gargoyle-qos-priority-custom {
+# 先删除可能存在的旧表
+#delete table inet gargoyle-qos-priority-custom 2>/dev/null
+#delete table inet gargoyle_custom 2>/dev/null
+
+#table inet gargoyle-qos-priority-custom {
     # 示例链: 在 prerouting 钩子中标记特定 IP 的流量为高优先级
-    chain prerouting_custom {
-        type filter hook prerouting priority 0; policy accept;
+    #chain prerouting_custom {
+        #type filter hook prerouting priority 0; policy accept;
         
         # 标记来自指定 IP 的流量为高优先级 (realtime 类)
-        ip saddr 192.168.1.100 meta mark set 0x7F counter comment "Gaming PC"
-        ip6 saddr 2001:db8::1 meta mark set 0x7F counter
+        #ip saddr 192.168.1.100 meta mark set 0x7F counter comment "Gaming PC"
+        #ip6 saddr 2001:db8::1 meta mark set 0x7F counter
         
         # 标记来自特定网段的流量为低优先级 (bulk 类)
-        ip saddr 192.168.2.0/24 meta mark set 0x3F counter
-    }
+        #ip saddr 192.168.2.0/24 meta mark set 0x3F counter
+    #}
     
     # 示例链: 在 forward 钩子中做二次分类
-    chain forward_custom {
-        type filter hook forward priority 5; policy accept;
+    #chain forward_custom {
+        #type filter hook forward priority 5; policy accept;
         
         # 对已标记的流量进行计数
-        meta mark 0x7F counter comment "High priority traffic"
-        meta mark 0x3F counter comment "Low priority traffic"
-    }
-}
+        #meta mark 0x7F counter comment "High priority traffic"
+        #meta mark 0x3F counter comment "Low priority traffic"
+    #}
+#}
+
+#table inet gargoyle_custom {
+    #chain custom_forward {
+        #type filter hook forward priority 10; policy accept;
+        #ip saddr 192.168.1.100 drop
+    #}
+#}
