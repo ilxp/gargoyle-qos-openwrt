@@ -1,6 +1,6 @@
 #!/bin/bash
 # 核心库模块 (lib.sh)
-# 版本: 3.2.9
+# 版本: 3.3.0 - 统一公共函数，增强命令检测，优化临时文件管理
 # 提供 QoS 系统基础功能
 
 # ========== 全局配置常量 ==========
@@ -40,6 +40,19 @@ declare -A _SET_FAMILY_CACHE=()
 
 # 临时文件数组
 TEMP_FILES=()
+
+# ========== 公共辅助函数 ==========
+# 去除前导零（空字符串返回空）
+strip_leading_zeros() {
+    local val="$1"
+    if [[ -z "$val" ]]; then
+        echo ""
+        return
+    fi
+    val=$(echo "$val" | sed 's/^0*//')
+    [[ -z "$val" ]] && val=0
+    echo "$val"
+}
 
 # ========== 日志函数 ==========
 log_debug() { [[ "$DEBUG" == "1" ]] && log "DEBUG" "$@"; }
@@ -170,8 +183,7 @@ validate_number() {
         log_error "参数 $param_name 必须是整数: $value"
         return 1
     fi
-    value=$(echo "$value" | sed 's/^0*//')
-    [[ -z "$value" ]] && value=0
+    value=$(strip_leading_zeros "$value")
     local clean_value=$((value))
     if (( clean_value < min || clean_value > max )); then
         log_error "参数 $param_name 范围应为 $min-$max: $value"
@@ -1337,7 +1349,7 @@ load_bandwidth_from_config() {
 # ========== 检查必需的命令 ==========
 check_required_commands() {
     local missing=0
-    for cmd in tc nft ip; do
+    for cmd in tc nft ip awk bc logger; do
         if ! command -v "$cmd" >/dev/null 2>&1; then
             log_error "命令 '$cmd' 未找到，请安装相应软件包"
             missing=1
@@ -1388,12 +1400,12 @@ ensure_ifb_device() {
     return 1
 }
 
-# ========== 检查 tc connmark 支持 ==========
+# ========== 检查 tc connmark 支持（使用唯一 dummy 设备） ==========
 check_tc_connmark_support() {
     modprobe sch_ingress 2>/dev/null
     modprobe act_connmark 2>/dev/null
 
-    local dummy_dev="dummy0"
+    local dummy_dev="qos_test_dummy_$$"
     local created=0
     if ! ip link show "$dummy_dev" >/dev/null 2>&1; then
         ip link add "$dummy_dev" type dummy 2>/dev/null || {
@@ -1430,9 +1442,9 @@ check_sfo_enabled() {
     fi
 }
 
-# ========== 检查 tc ctinfo 支持 ==========
+# ========== 检查 tc ctinfo 支持（使用唯一 dummy 设备） ==========
 check_tc_ctinfo_support() {
-    local dummy_dev="dummy0"
+    local dummy_dev="qos_test_dummy_$$"
     local created=0
     if ! ip link show "$dummy_dev" >/dev/null 2>&1; then
         ip link add "$dummy_dev" type dummy 2>/dev/null || {
