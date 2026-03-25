@@ -1,9 +1,9 @@
 #!/bin/bash
 # 规则辅助模块 (rule.sh)
-# 版本: 3.3.8 - 增加 IPv6 重定向前缀可配置，优化错误处理
+# 版本: 3.3.9 - 增强 IPv6 重定向回退，优化错误处理，依赖修复后的 common.sh
 # 提供 nftables 规则生成与系统钩子挂载
 
-# 加载核心库
+# 加载核心库（已修复）
 if [[ -f "/usr/lib/qos_gargoyle/common.sh" ]]; then
     . /usr/lib/qos_gargoyle/common.sh
 else
@@ -787,7 +787,7 @@ apply_all_rules() {
     return 0
 }
 
-# ========== 入口重定向（增加 IPv6 前缀可配置） ==========
+# ========== 入口重定向（增强 IPv6 回退） ==========
 setup_ingress_redirect() {
     if [[ -z "$qos_interface" ]]; then
         log_error "无法确定 WAN 接口"
@@ -862,7 +862,7 @@ setup_ingress_redirect() {
         log_error "IPv4入口重定向配置失败"
         return 1
     fi
-    # 获取 IPv6 重定向前缀（可配置）
+    # IPv6 重定向
     local ipv6_prefix=$(uci -q get ${CONFIG_FILE}.global.ipv6_redirect_prefix 2>/dev/null)
     [[ -z "$ipv6_prefix" ]] && ipv6_prefix="2000::/3"
     local has_ipv6_global=0
@@ -872,78 +872,92 @@ setup_ingress_redirect() {
     else
         log_info "接口 $qos_interface 无全局 IPv6 地址，IPv6 重定向失败仅警告"
     fi
-    local ipv6_success=false
+
+    # 确定 IPv6 使用的 action 前缀
+    local ipv6_action=""
     if (( sfo_enabled && ctinfo_ok )); then
-        if tc filter add dev "$qos_interface" parent ffff: protocol ipv6 \
-            flower dst_ip "$ipv6_prefix" \
-            action ctinfo mark 0xffffffff 0xffffffff \
-            action mirred egress redirect dev "$IFB_DEVICE" 2>&1; then
-            ipv6_success=true
-            log_info "IPv6入口重定向规则（flower 前缀 $ipv6_prefix，ctinfo）添加成功"
-        else
-            log_warn "flower ctinfo 规则失败，尝试 u32（仅支持全球单播）"
-            if [[ "$ipv6_prefix" == "2000::/3" ]] || [[ "$ipv6_prefix" == "2000::/3" ]]; then
-                if tc filter add dev "$qos_interface" parent ffff: protocol ipv6 \
-                    u32 match u32 0x20000000 0xe0000000 at 24 \
-                    action ctinfo mark 0xffffffff 0xffffffff \
-                    action mirred egress redirect dev "$IFB_DEVICE" 2>&1; then
-                    ipv6_success=true
-                    log_info "IPv6入口重定向规则（u32 全球单播，ctinfo）添加成功"
-                else
-                    log_warn "IPv6 全球单播匹配失败，无法添加 IPv6 重定向规则"
-                fi
-            else
-                log_warn "自定义前缀 $ipv6_prefix 无法使用 u32 回退，IPv6 重定向可能失败"
-            fi
-        fi
+        ipv6_action="action ctinfo mark 0xffffffff 0xffffffff"
     elif (( connmark_ok )); then
+        ipv6_action="action connmark"
+    fi
+
+    local ipv6_success=false
+    # 尝试 flower 规则
+    if [[ -n "$ipv6_action" ]]; then
         if tc filter add dev "$qos_interface" parent ffff: protocol ipv6 \
             flower dst_ip "$ipv6_prefix" \
-            action connmark \
+            $ipv6_action \
             action mirred egress redirect dev "$IFB_DEVICE" 2>&1; then
             ipv6_success=true
-            log_info "IPv6入口重定向规则（flower 前缀 $ipv6_prefix，connmark）添加成功"
+            log_info "IPv6入口重定向规则（flower 前缀 $ipv6_prefix，带标记）添加成功"
         else
-            log_warn "flower connmark 规则失败，尝试 u32（仅支持全球单播）"
-            if [[ "$ipv6_prefix" == "2000::/3" ]]; then
-                if tc filter add dev "$qos_interface" parent ffff: protocol ipv6 \
-                    u32 match u32 0x20000000 0xe0000000 at 24 \
-                    action connmark \
-                    action mirred egress redirect dev "$IFB_DEVICE" 2>&1; then
-                    ipv6_success=true
-                    log_info "IPv6入口重定向规则（u32 全球单播，connmark）添加成功"
-                else
-                    log_warn "IPv6 全球单播匹配失败，无法添加 IPv6 重定向规则"
-                fi
-            else
-                log_warn "自定义前缀 $ipv6_prefix 无法使用 u32 回退，IPv6 重定向可能失败"
-            fi
+            log_warn "flower 带标记规则失败，尝试无标记 flower"
         fi
-    else
+    fi
+    if [[ "$ipv6_success" != "true" ]]; then
         if tc filter add dev "$qos_interface" parent ffff: protocol ipv6 \
             flower dst_ip "$ipv6_prefix" \
             action mirred egress redirect dev "$IFB_DEVICE" 2>&1; then
             ipv6_success=true
             log_info "IPv6入口重定向规则（flower 前缀 $ipv6_prefix，无标记）添加成功"
         else
-            log_warn "flower 无标记规则失败，尝试 u32（仅支持全球单播）"
-            if [[ "$ipv6_prefix" == "2000::/3" ]]; then
-                if tc filter add dev "$qos_interface" parent ffff: protocol ipv6 \
-                    u32 match u32 0x20000000 0xe0000000 at 24 \
-                    action mirred egress redirect dev "$IFB_DEVICE" 2>&1; then
-                    ipv6_success=true
-                    log_info "IPv6入口重定向规则（u32 全球单播，无标记）添加成功"
-                else
-                    log_warn "IPv6 全球单播匹配失败，无法添加 IPv6 重定向规则"
-                fi
+            log_warn "flower 无标记规则失败"
+        fi
+    fi
+
+    # 尝试 u32 全球单播回退（仅当前缀为全球单播时）
+    if [[ "$ipv6_success" != "true" ]] && [[ "$ipv6_prefix" == "2000::/3" ]]; then
+        if [[ -n "$ipv6_action" ]]; then
+            if tc filter add dev "$qos_interface" parent ffff: protocol ipv6 \
+                u32 match u32 0x20000000 0xe0000000 at 24 \
+                $ipv6_action \
+                action mirred egress redirect dev "$IFB_DEVICE" 2>&1; then
+                ipv6_success=true
+                log_info "IPv6入口重定向规则（u32 全球单播，带标记）添加成功"
             else
-                log_warn "自定义前缀 $ipv6_prefix 无法使用 u32 回退，IPv6 重定向可能失败"
+                log_warn "u32 全球单播带标记规则失败"
+            fi
+        fi
+        if [[ "$ipv6_success" != "true" ]]; then
+            if tc filter add dev "$qos_interface" parent ffff: protocol ipv6 \
+                u32 match u32 0x20000000 0xe0000000 at 24 \
+                action mirred egress redirect dev "$IFB_DEVICE" 2>&1; then
+                ipv6_success=true
+                log_info "IPv6入口重定向规则（u32 全球单播，无标记）添加成功"
+            else
+                log_warn "u32 全球单播无标记规则失败"
             fi
         fi
     fi
+
+    # 最终回退：u32 全匹配所有 IPv6 流量
+    if [[ "$ipv6_success" != "true" ]]; then
+        if [[ -n "$ipv6_action" ]]; then
+            if tc filter add dev "$qos_interface" parent ffff: protocol ipv6 \
+                u32 match u32 0 0 \
+                $ipv6_action \
+                action mirred egress redirect dev "$IFB_DEVICE" 2>&1; then
+                ipv6_success=true
+                log_info "IPv6入口重定向规则（u32 全匹配，带标记）添加成功"
+            else
+                log_warn "u32 全匹配带标记规则失败"
+            fi
+        fi
+        if [[ "$ipv6_success" != "true" ]]; then
+            if tc filter add dev "$qos_interface" parent ffff: protocol ipv6 \
+                u32 match u32 0 0 \
+                action mirred egress redirect dev "$IFB_DEVICE" 2>&1; then
+                ipv6_success=true
+                log_info "IPv6入口重定向规则（u32 全匹配，无标记）添加成功"
+            else
+                log_warn "IPv6全匹配回退规则添加失败"
+            fi
+        fi
+    fi
+
     if (( has_ipv6_global == 1 )); then
         if [[ "$ipv6_success" != "true" ]]; then
-            log_warn "接口存在全局 IPv6 地址，但 IPv6 入口重定向配置失败，IPv6 流量可能不受 QoS 控制，但 IPv4 QoS 将继续工作"
+            log_warn "接口存在全局 IPv6 地址，但所有 IPv6 入口重定向配置失败，IPv6 流量可能不受 QoS 控制，但 IPv4 QoS 将继续工作"
         else
             log_info "IPv6 入口重定向成功"
         fi
@@ -954,6 +968,7 @@ setup_ingress_redirect() {
             log_warn "IPv6 入口重定向失败，但因接口无全局 IPv6 地址，继续启动"
         fi
     fi
+
     local ipv4_rule_count=$(tc filter show dev "$qos_interface" parent ffff: protocol ip 2>/dev/null | grep -c "mirred.*Redirect to device $IFB_DEVICE")
     local ipv6_rule_count=$(tc filter show dev "$qos_interface" parent ffff: protocol ipv6 2>/dev/null | grep -c "mirred.*Redirect to device $IFB_DEVICE")
     if (( ipv4_rule_count >= 1 )) && (( ipv6_rule_count >= 1 )); then
