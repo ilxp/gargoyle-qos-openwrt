@@ -1,6 +1,6 @@
 #!/bin/bash
 # HTB_FQCODEL算法实现模块
-# 版本: 3.3.8 - 与修复后的 common.sh 和 rule.sh 兼容
+# 版本: 3.3.9 - 依赖修复后的 common.sh，优化变量作用域，添加 trap 清理
 # 基于HTB与FQ_CODEL组合算法实现QoS流量控制。
 
 # ========== 全局配置常量 ==========
@@ -29,9 +29,6 @@ else
     echo "错误: 规则辅助模块 /usr/lib/qos_gargoyle/rule.sh 未找到" >&2
     exit 1
 fi
-
-# 锁持有标志（由 rule.sh 管理）
-HAVE_LOCK=0
 
 # 清理函数：合并 rule.sh 的临时文件清理和锁释放
 main_cleanup() {
