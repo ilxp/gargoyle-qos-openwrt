@@ -1,6 +1,6 @@
 #!/bin/bash
 # HFSC_CAKE算法实现模块
-# 版本: 3.3.8 - 与修复后的 common.sh 和 rule.sh 兼容
+# 版本: 3.3.9 - 依赖修复后的 common.sh，优化变量作用域，修复 HFSC 参数，添加 trap 清理
 # 基于HFSC与CAKE组合算法实现QoS流量控制。
 
 # ========== 全局配置常量 ==========
@@ -29,9 +29,6 @@ else
     echo "错误: 规则辅助模块 /usr/lib/qos_gargoyle/rule.sh 未找到" >&2
     exit 1
 fi
-
-# 锁持有标志（由 rule.sh 管理）
-HAVE_LOCK=0
 
 # 清理函数：合并 rule.sh 的临时文件清理和锁释放
 main_cleanup() {
@@ -119,7 +116,7 @@ load_hfsc_cake_config() {
     return 0
 }
 
-# 重构：使用全局变量传递配置，避免 eval
+# 加载HFSC类别配置（使用全局变量传递）
 load_hfsc_class_config() {
     local class_name="$1"
     local percent_bandwidth per_min_bandwidth per_max_bandwidth minRTT priority name
@@ -128,11 +125,9 @@ load_hfsc_class_config() {
     per_min_bandwidth=$(uci -q get ${CONFIG_FILE}.$class_name.per_min_bandwidth 2>/dev/null)
     per_max_bandwidth=$(uci -q get ${CONFIG_FILE}.$class_name.per_max_bandwidth 2>/dev/null)
     minRTT=$(uci -q get ${CONFIG_FILE}.$class_name.minRTT 2>/dev/null)
-    # priority 在 HFSC 中无效，但保留读取以兼容配置，但不使用
-    priority=$(uci -q get ${CONFIG_FILE}.$class_name.priority 2>/dev/null)
+    priority=$(uci -q get ${CONFIG_FILE}.$class_name.priority 2>/dev/null)  # HFSC 中 priority 无效，保留读取以兼容
     name=$(uci -q get ${CONFIG_FILE}.$class_name.name 2>/dev/null)
 
-    # 验证并去除前导零
     if [[ -n "$percent_bandwidth" ]]; then
         if validate_number "$percent_bandwidth" "$class_name.percent_bandwidth" 0 100; then
             percent_bandwidth=$(strip_leading_zeros "$percent_bandwidth")
@@ -287,7 +282,6 @@ create_hfsc_upload_class() {
         qos_log "ERROR" "加载HFSC配置失败: $class_name"
         return 1
     fi
-    # 使用全局变量
     local percent_bandwidth="$HFSC_CLASS_PERCENT"
     local per_min_bandwidth="$HFSC_CLASS_MIN"
     local per_max_bandwidth="$HFSC_CLASS_MAX"
@@ -369,7 +363,7 @@ create_hfsc_upload_class() {
     if ! tc class add dev "$qos_interface" parent 1:1 \
         classid 1:$class_index hfsc \
         ls m1 $m1 d $d m2 $m2 \
-        ul rate $ul_m2; then
+        ul m2 $ul_m2; then
         qos_log "ERROR" "创建上传类别 1:$class_index 失败"
         return 1
     fi
@@ -466,7 +460,6 @@ create_hfsc_download_class() {
         ul_m2="${class_total_bw}kbit"
         qos_log "INFO" "类别 $class_name 使用类别总带宽作为上限带宽: $ul_m2"
     fi
-    # 确保 ul_m2 至少为 1kbit（防止为0）
     local ul_m2_value=$(echo "$ul_m2" | sed 's/kbit//')
     if (( ul_m2_value < 1 )); then
         ul_m2="1kbit"
@@ -496,7 +489,7 @@ create_hfsc_download_class() {
     if ! tc class add dev "$ifb_dev" parent 1:1 \
         classid 1:$class_index hfsc \
         ls m1 $m1 d $d m2 $m2 \
-        ul rate $ul_m2; then
+        ul m2 $ul_m2; then
         qos_log "ERROR" "创建下载类别 1:$class_index 失败"
         return 1
     fi
@@ -554,17 +547,13 @@ init_hfsc_cake_upload() {
         return 1
     fi
 
-    # 构建启用类列表并计算索引
     local enabled_classes=""
     local class_index=2
     local default_class_index=""
     local default_class_name=""
     local first_enabled_class=""
 
-    # 使用关联数组存储类索引
     declare -A class_index_map
-
-    # 获取配置的默认类
     default_class_name=$(uci -q get ${CONFIG_FILE}.upload.default_class 2>/dev/null)
 
     for class in $upload_class_list; do
@@ -572,23 +561,20 @@ init_hfsc_cake_upload() {
         if [[ "$enabled" == "1" ]] || [[ -z "$enabled" ]]; then
             enabled_classes="$enabled_classes $class"
             [[ -z "$first_enabled_class" ]] && first_enabled_class="$class"
-            # 记录该类的索引
             class_index_map["$class"]=$class_index
-            # 判断是否为默认类
             if [[ -n "$default_class_name" ]] && [[ "$class" == "$default_class_name" ]]; then
                 default_class_index=$class_index
             fi
             ((class_index++))
         fi
     done
-    enabled_classes=$(echo "$enabled_classes" | xargs)  # 去除多余空格
+    enabled_classes=$(echo "$enabled_classes" | xargs)
 
     if [[ -z "$enabled_classes" ]]; then
         qos_log "ERROR" "没有启用的上传类，请至少启用一个上传类"
         return 1
     fi
 
-    # 确定默认类索引
     if [[ -z "$default_class_index" ]]; then
         if [[ -n "$default_class_name" ]]; then
             qos_log "WARN" "未找到上传默认类别 '$default_class_name' 或该类未启用，将使用第一个启用的类别"
@@ -656,7 +642,6 @@ init_hfsc_cake_download() {
         return 1
     fi
 
-    # 构建启用类列表并计算索引
     local enabled_classes=""
     local class_index=2
     local default_class_index=""
@@ -664,7 +649,6 @@ init_hfsc_cake_download() {
     local first_enabled_class=""
 
     declare -A class_index_map
-
     default_class_name=$(uci -q get ${CONFIG_FILE}.download.default_class 2>/dev/null)
 
     for class in $download_class_list; do
