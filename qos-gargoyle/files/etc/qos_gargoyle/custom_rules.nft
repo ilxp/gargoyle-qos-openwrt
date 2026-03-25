@@ -10,13 +10,11 @@
 # ====================================================================
 # 注意: 本表与主表是独立的，不会相互影响。若需要与主表交互（如修改标记），
 #       请注意钩子优先级，以免顺序错误。
+# 表名：以 gargoyle_custom_* 开头的表 *可以是数字字母以及组合
 # ====================================================================
 
-# 先删除可能存在的旧表
-#delete table inet gargoyle-qos-priority-custom 2>/dev/null
-#delete table inet gargoyle_custom 2>/dev/null
 
-#table inet gargoyle-qos-priority-custom {
+#table inet gargoyle_custom_1 {
     # 示例链: 在 prerouting 钩子中标记特定 IP 的流量为高优先级
     #chain prerouting_custom {
         #type filter hook prerouting priority 0; policy accept;
@@ -36,12 +34,5 @@
         # 对已标记的流量进行计数
         #meta mark 0x7F counter comment "High priority traffic"
         #meta mark 0x3F counter comment "Low priority traffic"
-    #}
-#}
-
-#table inet gargoyle_custom {
-    #chain custom_forward {
-        #type filter hook forward priority 10; policy accept;
-        #ip saddr 192.168.1.100 drop
     #}
 #}

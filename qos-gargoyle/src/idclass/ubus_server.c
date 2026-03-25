@@ -1,15 +1,23 @@
 // SPDX-License-Identifier: GPL-2.0+
 /*
- * Copyright (C) 2021 Felix Fietkau <nbd@nbd.name>
- * Modified to support multi-feature classification (idclass)
+ * ubus_server.c - ubus server module
+ *
+ * Provides ubus methods for configuration, status, statistics, and DNS host
+ * management. Integrates with other modules (config, map_manager, interface,
+ * dns_parser) to expose runtime control and monitoring.
  */
+#include "common.h"
 #include <libubus.h>
-#include "idclass.h"
 
 static struct blob_buf b;
+static struct ubus_auto_conn conn;
+static struct ubus_object idclass_object;
 
-static int idclass_ubus_add_array(struct blob_attr *attr, uint8_t val, enum idclass_map_id id)
-{
+/* 外部函数声明（来自 main.c） */
+extern int idclass_run_cmd(char *cmd, bool ignore_error);
+
+/* 内部辅助函数：解析数组并添加到 map */
+static int ubus_add_array(struct blob_attr *attr, uint8_t val, enum idclass_map_id id) {
     struct blob_attr *cur;
     int rem;
 
@@ -17,29 +25,37 @@ static int idclass_ubus_add_array(struct blob_attr *attr, uint8_t val, enum idcl
         return UBUS_STATUS_INVALID_ARGUMENT;
 
     blobmsg_for_each_attr(cur, attr, rem)
-        idclass_map_set_entry(id, false, blobmsg_get_string(cur), val);
+        map_manager_set_entry(id, false, blobmsg_get_string(cur), val);
 
     return 0;
 }
 
-static int idclass_ubus_set_files(struct blob_attr *attr)
-{
+/* 内部辅助函数：设置文件列表 */
+static int ubus_set_files(struct blob_attr *attr) {
     struct blob_attr *cur;
     int rem;
 
     if (blobmsg_check_array(attr, BLOBMSG_TYPE_STRING) < 0)
         return UBUS_STATUS_INVALID_ARGUMENT;
 
-    idclass_map_clear_files();
+    map_manager_clear_files();
 
     blobmsg_for_each_attr(cur, attr, rem)
-        idclass_map_load_file(blobmsg_get_string(cur));
+        map_manager_load_file(blobmsg_get_string(cur));
 
-    idclass_map_gc();
-
+    map_manager_gc();
     return 0;
 }
 
+/* ubus 方法: reload */
+static int ubus_reload(struct ubus_context *ctx, struct ubus_object *obj,
+                       struct ubus_request_data *req, const char *method,
+                       struct blob_attr *msg) {
+    config_reload();
+    return 0;
+}
+
+/* ubus 方法: add / remove */
 enum {
     ADD_DSCP,
     ADD_TIMEOUT,
@@ -51,7 +67,7 @@ enum {
     __ADD_MAX
 };
 
-static const struct blobmsg_policy idclass_add_policy[__ADD_MAX] = {
+static const struct blobmsg_policy add_policy[__ADD_MAX] = {
     [ADD_DSCP] = { "dscp", BLOBMSG_TYPE_STRING },
     [ADD_TIMEOUT] = { "timeout", BLOBMSG_TYPE_INT32 },
     [ADD_IPV4] = { "ipv4", BLOBMSG_TYPE_ARRAY },
@@ -61,25 +77,16 @@ static const struct blobmsg_policy idclass_add_policy[__ADD_MAX] = {
     [ADD_DNS] = { "dns", BLOBMSG_TYPE_ARRAY },
 };
 
-static int idclass_ubus_reload(struct ubus_context *ctx, struct ubus_object *obj,
-                              struct ubus_request_data *req, const char *method,
-                              struct blob_attr *msg)
-{
-    idclass_map_reload();
-    return 0;
-}
-
-static int idclass_ubus_add(struct ubus_context *ctx, struct ubus_object *obj,
-                           struct ubus_request_data *req, const char *method,
-                           struct blob_attr *msg)
-{
-    int prev_timemout = idclass_map_timeout;
+static int ubus_add(struct ubus_context *ctx, struct ubus_object *obj,
+                    struct ubus_request_data *req, const char *method,
+                    struct blob_attr *msg) {
+    int prev_timeout = idclass_map_timeout;
     struct blob_attr *tb[__ADD_MAX];
     struct blob_attr *cur;
     uint8_t dscp = 0xff;
     int ret;
 
-    blobmsg_parse(idclass_add_policy, __ADD_MAX, tb,
+    blobmsg_parse(add_policy, __ADD_MAX, tb,
                   blobmsg_data(msg), blobmsg_len(msg));
 
     if (!strcmp(method, "add")) {
@@ -92,30 +99,30 @@ static int idclass_ubus_add(struct ubus_context *ctx, struct ubus_object *obj,
     }
 
     if ((cur = tb[ADD_IPV4]) != NULL &&
-        (ret = idclass_ubus_add_array(cur, dscp, CL_MAP_IPV4_ADDR) != 0))
+        (ret = ubus_add_array(cur, dscp, CL_MAP_IPV4_ADDR) != 0))
         return ret;
 
     if ((cur = tb[ADD_IPV6]) != NULL &&
-        (ret = idclass_ubus_add_array(cur, dscp, CL_MAP_IPV6_ADDR) != 0))
+        (ret = ubus_add_array(cur, dscp, CL_MAP_IPV6_ADDR) != 0))
         return ret;
 
     if ((cur = tb[ADD_TCP_PORT]) != NULL &&
-        (ret = idclass_ubus_add_array(cur, dscp, CL_MAP_TCP_PORTS) != 0))
+        (ret = ubus_add_array(cur, dscp, CL_MAP_TCP_PORTS) != 0))
         return ret;
 
     if ((cur = tb[ADD_UDP_PORT]) != NULL &&
-        (ret = idclass_ubus_add_array(cur, dscp, CL_MAP_UDP_PORTS) != 0))
+        (ret = ubus_add_array(cur, dscp, CL_MAP_UDP_PORTS) != 0))
         return ret;
 
     if ((cur = tb[ADD_DNS]) != NULL &&
-        (ret = idclass_ubus_add_array(cur, dscp, CL_MAP_DNS) != 0))
+        (ret = ubus_add_array(cur, dscp, CL_MAP_DNS) != 0))
         return ret;
 
-    idclass_map_timeout = prev_timemout;
-
+    idclass_map_timeout = prev_timeout;
     return 0;
 }
 
+/* ubus 方法: config */
 enum {
     CL_CONFIG_RESET,
     CL_CONFIG_FILES,
@@ -187,10 +194,32 @@ enum {
     CL_CONFIG_PRIO_VIDEO,
     CL_CONFIG_PRIO_NORMAL,
     CL_CONFIG_PRIO_BULK,
+    // 新增 TCP 特征相关选项
+    CL_CONFIG_TCP_WINDOW_LOW,
+    CL_CONFIG_TCP_WINDOW_HIGH,
+    CL_CONFIG_TCP_MSS_LOW,
+    CL_CONFIG_TCP_MSS_HIGH,
+    CL_CONFIG_TCP_RTT_LOW_US,
+    CL_CONFIG_TCP_RTT_HIGH_US,
+    CL_CONFIG_WEIGHT_WINDOW_REALTIME,
+    CL_CONFIG_WEIGHT_WINDOW_VIDEO,
+    CL_CONFIG_WEIGHT_WINDOW_NORMAL,
+    CL_CONFIG_WEIGHT_WINDOW_BULK,
+    CL_CONFIG_WEIGHT_MSS_REALTIME,
+    CL_CONFIG_WEIGHT_MSS_VIDEO,
+    CL_CONFIG_WEIGHT_MSS_NORMAL,
+    CL_CONFIG_WEIGHT_MSS_BULK,
+    CL_CONFIG_WEIGHT_RTT_REALTIME,
+    CL_CONFIG_WEIGHT_RTT_VIDEO,
+    CL_CONFIG_WEIGHT_RTT_NORMAL,
+    CL_CONFIG_WEIGHT_RTT_BULK,
+    CL_CONFIG_ENABLE_TCP_WINDOW,
+    CL_CONFIG_ENABLE_TCP_MSS,
+    CL_CONFIG_ENABLE_TCP_RTT,
     __CL_CONFIG_MAX
 };
 
-static const struct blobmsg_policy idclass_config_policy[__CL_CONFIG_MAX] = {
+static const struct blobmsg_policy config_policy[__CL_CONFIG_MAX] = {
     [CL_CONFIG_RESET] = { "reset", BLOBMSG_TYPE_BOOL },
     [CL_CONFIG_FILES] = { "files", BLOBMSG_TYPE_ARRAY },
     [CL_CONFIG_TIMEOUT] = { "timeout", BLOBMSG_TYPE_INT32 },
@@ -261,126 +290,128 @@ static const struct blobmsg_policy idclass_config_policy[__CL_CONFIG_MAX] = {
     [CL_CONFIG_PRIO_VIDEO]             = { "prio_video",             BLOBMSG_TYPE_INT32 },
     [CL_CONFIG_PRIO_NORMAL]            = { "prio_normal",            BLOBMSG_TYPE_INT32 },
     [CL_CONFIG_PRIO_BULK]              = { "prio_bulk",              BLOBMSG_TYPE_INT32 },
+    // 新增 TCP 特征
+    [CL_CONFIG_TCP_WINDOW_LOW] = { "tcp_window_low", BLOBMSG_TYPE_INT32 },
+    [CL_CONFIG_TCP_WINDOW_HIGH] = { "tcp_window_high", BLOBMSG_TYPE_INT32 },
+    [CL_CONFIG_TCP_MSS_LOW] = { "tcp_mss_low", BLOBMSG_TYPE_INT32 },
+    [CL_CONFIG_TCP_MSS_HIGH] = { "tcp_mss_high", BLOBMSG_TYPE_INT32 },
+    [CL_CONFIG_TCP_RTT_LOW_US] = { "tcp_rtt_low_us", BLOBMSG_TYPE_INT32 },
+    [CL_CONFIG_TCP_RTT_HIGH_US] = { "tcp_rtt_high_us", BLOBMSG_TYPE_INT32 },
+    [CL_CONFIG_WEIGHT_WINDOW_REALTIME] = { "weight_window_realtime", BLOBMSG_TYPE_INT32 },
+    [CL_CONFIG_WEIGHT_WINDOW_VIDEO]    = { "weight_window_video",    BLOBMSG_TYPE_INT32 },
+    [CL_CONFIG_WEIGHT_WINDOW_NORMAL]   = { "weight_window_normal",   BLOBMSG_TYPE_INT32 },
+    [CL_CONFIG_WEIGHT_WINDOW_BULK]     = { "weight_window_bulk",     BLOBMSG_TYPE_INT32 },
+    [CL_CONFIG_WEIGHT_MSS_REALTIME]    = { "weight_mss_realtime",    BLOBMSG_TYPE_INT32 },
+    [CL_CONFIG_WEIGHT_MSS_VIDEO]       = { "weight_mss_video",       BLOBMSG_TYPE_INT32 },
+    [CL_CONFIG_WEIGHT_MSS_NORMAL]      = { "weight_mss_normal",      BLOBMSG_TYPE_INT32 },
+    [CL_CONFIG_WEIGHT_MSS_BULK]        = { "weight_mss_bulk",        BLOBMSG_TYPE_INT32 },
+    [CL_CONFIG_WEIGHT_RTT_REALTIME]    = { "weight_rtt_realtime",    BLOBMSG_TYPE_INT32 },
+    [CL_CONFIG_WEIGHT_RTT_VIDEO]       = { "weight_rtt_video",       BLOBMSG_TYPE_INT32 },
+    [CL_CONFIG_WEIGHT_RTT_NORMAL]      = { "weight_rtt_normal",      BLOBMSG_TYPE_INT32 },
+    [CL_CONFIG_WEIGHT_RTT_BULK]        = { "weight_rtt_bulk",        BLOBMSG_TYPE_INT32 },
+    [CL_CONFIG_ENABLE_TCP_WINDOW] = { "enable_tcp_window", BLOBMSG_TYPE_BOOL },
+    [CL_CONFIG_ENABLE_TCP_MSS]    = { "enable_tcp_mss",    BLOBMSG_TYPE_BOOL },
+    [CL_CONFIG_ENABLE_TCP_RTT]    = { "enable_tcp_rtt",    BLOBMSG_TYPE_BOOL },
 };
 
-static int read_float_mult100(const char *val)
-{
-    double d = atof(val);
-    return (int)(d * 100 + 0.5);
-}
-
-static int
-idclass_ubus_config(struct ubus_context *ctx, struct ubus_object *obj,
-                   struct ubus_request_data *req, const char *method,
-                   struct blob_attr *msg)
-{
+static int ubus_config(struct ubus_context *ctx, struct ubus_object *obj,
+                       struct ubus_request_data *req, const char *method,
+                       struct blob_attr *msg) {
     struct blob_attr *tb[__CL_CONFIG_MAX];
     struct blob_attr *cur;
     uint8_t dscp;
     bool reset = false;
     int ret;
 
-    blobmsg_parse(idclass_config_policy, __CL_CONFIG_MAX, tb,
+    blobmsg_parse(config_policy, __CL_CONFIG_MAX, tb,
                   blobmsg_data(msg), blobmsg_len(msg));
 
     if ((cur = tb[CL_CONFIG_RESET]) != NULL)
         reset = blobmsg_get_bool(cur);
 
     if (reset)
-        idclass_map_reset_config();
+        map_manager_reset_config();
 
     if ((cur = tb[CL_CONFIG_CLASSES]) != NULL || reset)
-        idclass_map_set_classes(cur);
+        config_set_classes(cur);
 
     if ((cur = tb[CL_CONFIG_TIMEOUT]) != NULL)
         idclass_map_timeout = blobmsg_get_u32(cur);
 
     if ((cur = tb[CL_CONFIG_FILES]) != NULL &&
-        (ret = idclass_ubus_set_files(cur) != 0))
+        (ret = ubus_set_files(cur) != 0))
         return ret;
 
-    if (map_fill_dscp_value(&global_config.dscp_icmp, tb[CL_CONFIG_DSCP_ICMP], reset))
+    if (config_parse_dscp_value(&global_config.dscp_icmp, tb[CL_CONFIG_DSCP_ICMP], reset))
         return UBUS_STATUS_INVALID_ARGUMENT;
 
-    map_fill_dscp_value(&dscp, tb[CL_CONFIG_DSCP_UDP], true);
+    config_parse_dscp_value(&dscp, tb[CL_CONFIG_DSCP_UDP], true);
     if (dscp != 0xff)
-        idclass_map_set_dscp_default(CL_MAP_UDP_PORTS, dscp);
+        map_manager_set_dscp_default(CL_MAP_UDP_PORTS, dscp);
 
-    map_fill_dscp_value(&dscp, tb[CL_CONFIG_DSCP_TCP], true);
+    config_parse_dscp_value(&dscp, tb[CL_CONFIG_DSCP_TCP], true);
     if (dscp != 0xff)
-        idclass_map_set_dscp_default(CL_MAP_TCP_PORTS, dscp);
+        map_manager_set_dscp_default(CL_MAP_TCP_PORTS, dscp);
 
-    int fd = idclass_map_get_fd(CL_MAP_GLOBAL_CONFIG);
-    if (fd >= 0) {
-        uint32_t key = 0;
-        bpf_map_update_elem(fd, &key, &global_config, 0);
-    }
+    map_manager_update_config();
 
-    idclass_map_update_config();
+    interface_config_update(tb[CL_CONFIG_INTERFACES], tb[CL_CONFIG_DEVICES]);
+    interface_check();
 
-    idclass_iface_config_update(tb[CL_CONFIG_INTERFACES], tb[CL_CONFIG_DEVICES]);
-
-    idclass_iface_check();
-	
-	sync_class_config();   // 全局配置变化后同步所有 class 的 config
+    map_manager_sync_class_config();
 
     return 0;
 }
 
-static int
-idclass_ubus_dump(struct ubus_context *ctx, struct ubus_object *obj,
-                 struct ubus_request_data *req, const char *method,
-                 struct blob_attr *msg)
-{
+/* ubus 方法: dump */
+static int ubus_dump(struct ubus_context *ctx, struct ubus_object *obj,
+                     struct ubus_request_data *req, const char *method,
+                     struct blob_attr *msg) {
     blob_buf_init(&b, 0);
-    idclass_map_dump(&b);
+    map_manager_dump(&b);
     ubus_send_reply(ctx, req, b.head);
     blob_buf_free(&b);
     return 0;
 }
 
-static int
-idclass_ubus_status(struct ubus_context *ctx, struct ubus_object *obj,
-                   struct ubus_request_data *req, const char *method,
-                   struct blob_attr *msg)
-{
+/* ubus 方法: status */
+static int ubus_status(struct ubus_context *ctx, struct ubus_object *obj,
+                       struct ubus_request_data *req, const char *method,
+                       struct blob_attr *msg) {
     blob_buf_init(&b, 0);
-    idclass_iface_status(&b);
+    interface_status(&b);
     ubus_send_reply(ctx, req, b.head);
     blob_buf_free(&b);
     return 0;
 }
 
-static int
-idclass_ubus_get_stats(struct ubus_context *ctx, struct ubus_object *obj,
-                      struct ubus_request_data *req, const char *method,
-                      struct blob_attr *msg)
-{
+/* ubus 方法: get_stats */
+static int ubus_get_stats(struct ubus_context *ctx, struct ubus_object *obj,
+                          struct ubus_request_data *req, const char *method,
+                          struct blob_attr *msg) {
     static const struct blobmsg_policy policy = { "reset", BLOBMSG_TYPE_BOOL };
     struct blob_attr *tb;
     bool reset = false;
 
     blobmsg_parse(&policy, 1, &tb, blobmsg_data(msg), blobmsg_len(msg));
-
     reset = tb && blobmsg_get_u8(tb);
 
     blob_buf_init(&b, 0);
-    idclass_map_stats(&b, reset);
+    map_manager_stats(&b, reset);
     ubus_send_reply(ctx, req, b.head);
     blob_buf_free(&b);
-
     return 0;
 }
 
-static int
-idclass_ubus_check_devices(struct ubus_context *ctx, struct ubus_object *obj,
-                          struct ubus_request_data *req, const char *method,
-                          struct blob_attr *msg)
-{
-    idclass_iface_check();
+/* ubus 方法: check_devices */
+static int ubus_check_devices(struct ubus_context *ctx, struct ubus_object *obj,
+                              struct ubus_request_data *req, const char *method,
+                              struct blob_attr *msg) {
+    interface_check();
     return 0;
 }
 
+/* ubus 方法: add_dns_host */
 enum {
     DNS_HOST_NAME,
     DNS_HOST_TYPE,
@@ -389,21 +420,21 @@ enum {
     __DNS_HOST_MAX
 };
 
-static const struct blobmsg_policy idclass_dns_policy[__DNS_HOST_MAX] = {
+static const struct blobmsg_policy dns_policy[__DNS_HOST_MAX] = {
     [DNS_HOST_NAME] = { "name", BLOBMSG_TYPE_STRING },
     [DNS_HOST_TYPE] = { "type", BLOBMSG_TYPE_STRING },
     [DNS_HOST_ADDR] = { "address", BLOBMSG_TYPE_STRING },
     [DNS_HOST_TTL] = { "ttl", BLOBMSG_TYPE_INT32 },
 };
 
-static int
-__idclass_ubus_add_dns_host(struct blob_attr *msg)
-{
+static int ubus_add_dns_host(struct ubus_context *ctx, struct ubus_object *obj,
+                             struct ubus_request_data *req, const char *method,
+                             struct blob_attr *msg) {
     struct blob_attr *tb[__DNS_HOST_MAX];
     struct blob_attr *cur;
     uint32_t ttl = 0;
 
-    blobmsg_parse(idclass_dns_policy, __DNS_HOST_MAX, tb,
+    blobmsg_parse(dns_policy, __DNS_HOST_MAX, tb,
                   blobmsg_data(msg), blobmsg_len(msg));
 
     if (!tb[DNS_HOST_NAME] || !tb[DNS_HOST_TYPE] || !tb[DNS_HOST_ADDR])
@@ -412,34 +443,27 @@ __idclass_ubus_add_dns_host(struct blob_attr *msg)
     if ((cur = tb[DNS_HOST_TTL]) != NULL)
         ttl = blobmsg_get_u32(cur);
 
-    if (idclass_map_add_dns_host(blobmsg_get_string(tb[DNS_HOST_NAME]),
-                                blobmsg_get_string(tb[DNS_HOST_ADDR]),
-                                blobmsg_get_string(tb[DNS_HOST_TYPE]),
-                                ttl))
+    if (map_manager_add_dns_host(blobmsg_get_string(tb[DNS_HOST_NAME]),
+                                 blobmsg_get_string(tb[DNS_HOST_ADDR]),
+                                 blobmsg_get_string(tb[DNS_HOST_TYPE]),
+                                 ttl))
         return UBUS_STATUS_INVALID_ARGUMENT;
 
     return 0;
 }
 
-static int
-idclass_ubus_add_dns_host(struct ubus_context *ctx, struct ubus_object *obj,
-                         struct ubus_request_data *req, const char *method,
-                         struct blob_attr *msg)
-{
-    return __idclass_ubus_add_dns_host(msg);
-}
-
+/* ubus 对象方法列表 */
 static const struct ubus_method idclass_methods[] = {
-    UBUS_METHOD_NOARG("reload", idclass_ubus_reload),
-    UBUS_METHOD("add", idclass_ubus_add, idclass_add_policy),
-    UBUS_METHOD_MASK("remove", idclass_ubus_add, idclass_add_policy,
+    UBUS_METHOD_NOARG("reload", ubus_reload),
+    UBUS_METHOD("add", ubus_add, add_policy),
+    UBUS_METHOD_MASK("remove", ubus_add, add_policy,
                      ((1 << __ADD_MAX) - 1) & ~(1 << ADD_DSCP)),
-    UBUS_METHOD("config", idclass_ubus_config, idclass_config_policy),
-    UBUS_METHOD_NOARG("dump", idclass_ubus_dump),
-    UBUS_METHOD_NOARG("status", idclass_ubus_status),
-    UBUS_METHOD_NOARG("get_stats", idclass_ubus_get_stats),
-    UBUS_METHOD("add_dns_host", idclass_ubus_add_dns_host, idclass_dns_policy),
-    UBUS_METHOD_NOARG("check_devices", idclass_ubus_check_devices),
+    UBUS_METHOD("config", ubus_config, config_policy),
+    UBUS_METHOD_NOARG("dump", ubus_dump),
+    UBUS_METHOD_NOARG("status", ubus_status),
+    UBUS_METHOD_NOARG("get_stats", ubus_get_stats),
+    UBUS_METHOD("add_dns_host", ubus_add_dns_host, dns_policy),
+    UBUS_METHOD_NOARG("check_devices", ubus_check_devices),
 };
 
 static struct ubus_object_type idclass_object_type =
@@ -452,16 +476,14 @@ static struct ubus_object idclass_object = {
     .n_methods = ARRAY_SIZE(idclass_methods),
 };
 
-static void
-idclass_subscribe_dnsmasq(struct ubus_context *ctx)
-{
+/* 订阅 dnsmasq 事件 */
+static void ubus_subscribe_dnsmasq(struct ubus_context *ctx) {
     static struct ubus_subscriber sub = {
-        .cb = idclass_ubus_add_dns_host,
+        .cb = ubus_add_dns_host,
     };
     uint32_t id;
 
-    if (!sub.obj.id &&
-        ubus_register_subscriber(ctx, &sub))
+    if (!sub.obj.id && ubus_register_subscriber(ctx, &sub))
         return;
 
     if (ubus_lookup_id(ctx, "dnsmasq.dns", &id))
@@ -470,42 +492,35 @@ idclass_subscribe_dnsmasq(struct ubus_context *ctx)
     ubus_subscribe(ctx, &sub, id);
 }
 
-static void
-idclass_ubus_event_cb(struct ubus_context *ctx, struct ubus_event_handler *ev,
-                     const char *type, struct blob_attr *msg)
-{
+/* ubus 事件处理 */
+static void ubus_event_cb(struct ubus_context *ctx, struct ubus_event_handler *ev,
+                          const char *type, struct blob_attr *msg) {
     static const struct blobmsg_policy policy = { "path", BLOBMSG_TYPE_STRING };
     struct blob_attr *attr;
     const char *path;
 
     blobmsg_parse(&policy, 1, &attr, blobmsg_data(msg), blobmsg_len(msg));
-
     if (!attr)
         return;
 
     path = blobmsg_get_string(attr);
     if (!strcmp(path, "dnsmasq.dns"))
-        idclass_subscribe_dnsmasq(ctx);
+        ubus_subscribe_dnsmasq(ctx);
     else if (!strcmp(path, "bridger"))
-        idclass_ubus_update_bridger(false);
+        ubus_server_update_bridger(false);
 }
 
-static void
-ubus_connect_handler(struct ubus_context *ctx)
-{
-    static struct ubus_event_handler ev = {
-        .cb = idclass_ubus_event_cb
-    };
+/* ubus 连接回调 */
+static void ubus_connect_handler(struct ubus_context *ctx) {
+    static struct ubus_event_handler ev = { .cb = ubus_event_cb };
 
     ubus_add_object(ctx, &idclass_object);
     ubus_register_event_handler(ctx, &ev, "ubus.object.add");
-    idclass_subscribe_dnsmasq(ctx);
+    ubus_subscribe_dnsmasq(ctx);
 }
 
-static struct ubus_auto_conn conn;
-
-void idclass_ubus_update_bridger(bool shutdown)
-{
+/* 外部接口：更新 bridger 黑名单 */
+void ubus_server_update_bridger(bool shutdown) {
     struct ubus_request req;
     uint32_t id;
     void *c;
@@ -517,33 +532,19 @@ void idclass_ubus_update_bridger(bool shutdown)
     blobmsg_add_string(&b, "name", "idclass");
     c = blobmsg_open_array(&b, "devices");
     if (!shutdown)
-        idclass_iface_get_devices(&b);
+        interface_get_devices(&b);
     blobmsg_close_array(&b, c);
 
     ubus_invoke_async(&conn.ctx, id, "set_blacklist", b.head, &req);
 }
 
-int idclass_ubus_init(void)
-{
-    conn.cb = ubus_connect_handler;
-    ubus_auto_connect(&conn);
-    return 0;
-}
-
-void idclass_ubus_stop(void)
-{
-    idclass_ubus_update_bridger(true);
-    ubus_auto_shutdown(&conn);
-}
-
+/* 外部接口：检查逻辑接口对应的物理设备 */
 struct iface_req {
     char *name;
     int len;
 };
 
-static void
-netifd_if_cb(struct ubus_request *req, int type, struct blob_attr *msg)
-{
+static void netifd_if_cb(struct ubus_request *req, int type, struct blob_attr *msg) {
     struct iface_req *ifr = req->priv;
     enum {
         IFS_ATTR_UP,
@@ -567,15 +568,12 @@ netifd_if_cb(struct ubus_request *req, int type, struct blob_attr *msg)
     snprintf(ifr->name, ifr->len, "%s", blobmsg_get_string(tb[IFS_ATTR_DEV]));
 }
 
-int idclass_ubus_check_interface(const char *name, char *ifname, int ifname_len)
-{
+int ubus_server_check_interface(const char *name, char *ifname, int ifname_len) {
     struct iface_req req = { ifname, ifname_len };
-    char *obj_name = "network.interface.";
+    char *obj_name = alloca(sizeof("network.interface.") + strlen(name) + 1);
     uint32_t id;
 
-    obj_name = alloca(sizeof("network.interface.") + strlen(name) + 1);
     sprintf(obj_name, "network.interface.%s", name);
-
     ifname[0] = 0;
 
     if (ubus_lookup_id(&conn.ctx, obj_name, &id))
@@ -583,9 +581,19 @@ int idclass_ubus_check_interface(const char *name, char *ifname, int ifname_len)
 
     blob_buf_init(&b, 0);
     ubus_invoke(&conn.ctx, id, "status", b.head, netifd_if_cb, &req, 1000);
+    blob_buf_free(&b);  // 释放临时缓冲区
+    return ifname[0] ? 0 : -1;
+}
 
-    if (!ifname[0])
-        return -1;
-
+/* 外部接口：初始化 ubus 服务器 */
+int ubus_server_init(void) {
+    conn.cb = ubus_connect_handler;
+    ubus_auto_connect(&conn);
     return 0;
+}
+
+/* 外部接口：停止 ubus 服务器 */
+void ubus_server_stop(void) {
+    ubus_server_update_bridger(true);
+    ubus_auto_shutdown(&conn);
 }

@@ -1,13 +1,13 @@
 #!/bin/bash
 # 规则辅助模块 (rule.sh)
-# 版本: 3.3.0 - 优化协议族匹配，统一临时文件管理，完善规则生成
+# 版本: 3.3.8 - 增加 IPv6 重定向前缀可配置，优化错误处理
 # 提供 nftables 规则生成与系统钩子挂载
 
 # 加载核心库
-if [[ -f "/usr/lib/qos_gargoyle/lib.sh" ]]; then
-    . /usr/lib/qos_gargoyle/lib.sh
+if [[ -f "/usr/lib/qos_gargoyle/common.sh" ]]; then
+    . /usr/lib/qos_gargoyle/common.sh
 else
-    echo "错误: 核心库 /usr/lib/qos_gargoyle/lib.sh 未找到" >&2
+    echo "错误: 核心库 /usr/lib/qos_gargoyle/common.sh 未找到" >&2
     exit 1
 fi
 
@@ -16,10 +16,7 @@ adjust_proto_for_family() {
     local proto="$1"
     local family="$2"
     local adjusted="$proto"
-    
-    # 空协议或 all 保持原样
     [[ -z "$proto" || "$proto" == "all" ]] && { echo "$proto"; return 0; }
-    
     case "$family" in
         ipv4|ip|inet4)
             case "$proto" in
@@ -34,7 +31,6 @@ adjust_proto_for_family() {
             esac
             ;;
         inet)
-            # inet 族保持原样，但需确保协议在 inet 下有效
             if [[ "$proto" == "icmp" ]]; then
                 adjusted="icmp"
             elif [[ "$proto" == "icmpv6" ]]; then
@@ -45,7 +41,7 @@ adjust_proto_for_family() {
     echo "$adjusted"
 }
 
-# ========== 拆分多集合字段（如 @set1,@set2）为数组 ==========
+# ========== 拆分多集合字段 ==========
 split_multiset() {
     local field="$1"
     local result=()
@@ -60,28 +56,44 @@ split_multiset() {
     printf '%s\n' "${result[@]}"
 }
 
+# ========== TCP 标志位映射 ==========
+declare -A TCP_FLAG_MAP=(
+    [syn]=0x02
+    [ack]=0x10
+    [rst]=0x04
+    [fin]=0x01
+    [urg]=0x20
+    [psh]=0x08
+    [ecn]=0x40
+    [cwr]=0x80
+)
+
+flags_to_mask() {
+    local flags_list="$1"
+    local mask=0
+    local flag
+    IFS=',' read -ra flags <<< "$flags_list"
+    for flag in "${flags[@]}"; do
+        flag="${flag// /}"
+        [[ -z "$flag" ]] && continue
+        mask=$((mask | ${TCP_FLAG_MAP[$flag]:-0}))
+    done
+    printf "0x%x" "$mask"
+}
+
 # ========== 通用规则构建函数 ==========
-# 参数：规则名称、链名、类标记、掩码、family、proto、srcport、dstport、connbytes_kb、state、src_ip、dest_ip、packet_len、tcp_flags、iif、oif、udp_length、dscp、ttl、icmp_type
-# 返回：输出一条或多条 nft 规则（通过 echo）
 build_nft_rule_generic() {
     local rule_name="$1" chain="$2" class_mark="$3" mask="$4" family="$5" proto="$6"
     local srcport="$7" dstport="$8" connbytes_kb="$9" state="${10}" src_ip="${11}" dest_ip="${12}"
     local packet_len="${13}" tcp_flags="${14}" iif="${15}" oif="${16}" udp_length="${17}"
     local dscp="${18}" ttl="${19}" icmp_type="${20}"
     
-    # 调整协议以适应地址族
-    proto=$(adjust_proto_for_family "$proto" "$family")
-    
-    # 如果协议调整为空（不匹配），跳过该规则
-    if [[ -z "$proto" ]]; then
-        log_warn "规则 $rule_name: 协议与地址族不匹配，跳过"
-        return
-    fi
+    local proto_v4=$(adjust_proto_for_family "$proto" "ipv4")
+    local proto_v6=$(adjust_proto_for_family "$proto" "ipv6")
     
     local ipv4_rules=()
     local ipv6_rules=()
     
-    # 辅助函数：添加一条 IPv4 规则
     add_ipv4_rule() {
         local cmd="add rule inet gargoyle-qos-priority $chain meta mark == 0 meta nfproto ipv4"
         [ -n "$1" ] && cmd="$cmd $1"
@@ -95,7 +107,6 @@ build_nft_rule_generic() {
         ipv4_rules+=("$cmd")
     }
     
-    # 辅助函数：添加一条 IPv6 规则
     add_ipv6_rule() {
         local cmd="add rule inet gargoyle-qos-priority $chain meta mark == 0 meta nfproto ipv6"
         [ -n "$1" ] && cmd="$cmd $1"
@@ -109,18 +120,7 @@ build_nft_rule_generic() {
         ipv6_rules+=("$cmd")
     }
     
-    # 构建通用条件
     local common_cond=""
-    case "$proto" in
-        tcp) common_cond="meta l4proto tcp" ;;
-        udp) common_cond="meta l4proto udp" ;;
-        tcp_udp) common_cond="meta l4proto { tcp, udp }" ;;
-        icmp|icmpv6|gre|esp|ah|sctp|dccp|udplite) common_cond="meta l4proto $proto" ;;
-        all|"") ;;
-        *) common_cond="meta l4proto $proto" ;;
-    esac
-    
-    # 包长度条件
     if [[ -n "$packet_len" ]]; then
         if [[ "$packet_len" == *-* ]]; then
             local min="${packet_len%-*}" max="${packet_len#*-}"
@@ -144,7 +144,6 @@ build_nft_rule_generic() {
         fi
     fi
     
-    # TCP 标志处理（支持部分否定）
     local tcp_flag_expr=""
     if [[ -n "$tcp_flags" ]] && [[ "$proto" == "tcp" ]]; then
         local set_flags=""
@@ -158,38 +157,27 @@ build_nft_rule_generic() {
                 set_flags="${set_flags}${set_flags:+,}$f"
             fi
         done
-        if [[ -n "$set_flags" ]] || [[ -n "$unset_flags" ]]; then
-            local mask_all=""
-            local mask_set=""
-            if [[ -n "$set_flags" ]]; then
-                mask_set="$set_flags"
-                mask_all="$set_flags"
-            fi
-            if [[ -n "$unset_flags" ]]; then
-                if [[ -n "$mask_all" ]]; then
-                    mask_all="$mask_all,$unset_flags"
-                else
-                    mask_all="$unset_flags"
-                fi
-            fi
-            if [[ -n "$set_flags" ]] && [[ -n "$unset_flags" ]]; then
-                tcp_flag_expr="tcp flags & ( $mask_all ) == $mask_set"
-            elif [[ -n "$set_flags" ]]; then
-                tcp_flag_expr="tcp flags { $set_flags }"
-            elif [[ -n "$unset_flags" ]]; then
-                tcp_flag_expr="tcp flags & ( $unset_flags ) == 0"
+        local mask_set=0
+        local mask_unset=0
+        if [[ -n "$set_flags" ]]; then
+            mask_set=$(flags_to_mask "$set_flags")
+        fi
+        if [[ -n "$unset_flags" ]]; then
+            mask_unset=$(flags_to_mask "$unset_flags")
+        fi
+        local total_mask=$((mask_set | mask_unset))
+        if [[ $total_mask -ne 0 ]]; then
+            if [[ $mask_unset -eq 0 ]]; then
+                tcp_flag_expr="tcp flags { ${set_flags//,/ } }"
+            else
+                tcp_flag_expr="tcp flags & 0x$(printf '%x' "$total_mask") == 0x$(printf '%x' "$mask_set")"
             fi
         fi
     fi
-    if [[ -n "$tcp_flag_expr" ]]; then
-        common_cond="$common_cond $tcp_flag_expr"
-    fi
     
-    # 接口条件
     [[ -n "$iif" ]] && common_cond="$common_cond iifname \"$iif\""
     [[ -n "$oif" ]] && common_cond="$common_cond oifname \"$oif\""
     
-    # UDP 长度条件
     if [[ -n "$udp_length" ]] && [[ "$proto" == "udp" ]]; then
         if [[ "$udp_length" == *-* ]]; then
             local min="${udp_length%-*}" max="${udp_length#*-}"
@@ -213,7 +201,6 @@ build_nft_rule_generic() {
         fi
     fi
     
-    # 端口条件（注意方向）
     local port_cond=""
     if [[ "$proto" =~ ^(tcp|udp|tcp_udp)$ ]]; then
         if [[ "$chain" == *"ingress"* ]]; then
@@ -238,7 +225,6 @@ build_nft_rule_generic() {
         fi
     fi
     
-    # 连接状态
     if [[ -n "$state" ]]; then
         local state_value="${state//[{}]/}"
         if [[ "$state_value" == *,* ]]; then
@@ -248,7 +234,6 @@ build_nft_rule_generic() {
         fi
     fi
     
-    # 连接字节数
     if [[ -n "$connbytes_kb" ]]; then
         if [[ "$connbytes_kb" == *-* ]]; then
             local min_val="${connbytes_kb%-*}" max_val="${connbytes_kb#*-}"
@@ -275,22 +260,8 @@ build_nft_rule_generic() {
         fi
     fi
     
-    # 辅助函数：将 ::mask 格式转换为十六进制数值
-    ipv6_mask_to_hex() {
-        local mask="$1"
-        local hex=""
-        mask="${mask#::}"
-        if [[ -z "$mask" ]]; then
-            hex="0"
-        else
-            hex="0x$mask"
-        fi
-        echo "$hex"
-    }
-    
-    # 辅助函数：处理源/目的 IP 并生成对应的 IP 条件
     process_ip_field() {
-        local ip_val="$1" direction="$2" # direction: "saddr" or "daddr"
+        local ip_val="$1" direction="$2"
         local ipv4_cond=""
         local ipv6_cond=""
         if [[ -n "$ip_val" ]]; then
@@ -305,11 +276,6 @@ build_nft_rule_generic() {
                 else
                     ipv4_cond="ip $direction $neg $val"
                 fi
-            elif [[ "$val" =~ ^::[0-9a-fA-F]+/::[0-9a-fA-F]+$ ]]; then
-                local suffix="${val%%/::*}"
-                local mask="${val#*/::}"
-                local hex_mask=$(ipv6_mask_to_hex "$mask")
-                ipv6_cond="ip6 $direction & $hex_mask == $suffix"
             elif [[ "$val" =~ : ]]; then
                 ipv6_cond="ip6 $direction $neg $val"
             else
@@ -320,7 +286,6 @@ build_nft_rule_generic() {
         eval "$4=\"\$ipv6_cond\""
     }
     
-    # 处理源 IP 和目的 IP
     local src_ipv4_cond=""
     local src_ipv6_cond=""
     local dst_ipv4_cond=""
@@ -328,7 +293,6 @@ build_nft_rule_generic() {
     process_ip_field "$src_ip" "saddr" src_ipv4_cond src_ipv6_cond
     process_ip_field "$dest_ip" "daddr" dst_ipv4_cond dst_ipv6_cond
     
-    # 根据 family 决定生成哪些规则
     local has_ipv4=0 has_ipv6=0
     case "$family" in
         ip|ipv4|inet4)
@@ -352,9 +316,18 @@ build_nft_rule_generic() {
         *) log_error "规则 $rule_name 无效的 family '$family'"; return ;;
     esac
     
-    # 生成 IPv4 规则
     if (( has_ipv4 )); then
         local ipv4_full_cond="$common_cond"
+        if [[ -n "$proto_v4" && "$proto_v4" != "all" ]]; then
+            case "$proto_v4" in
+                tcp) ipv4_full_cond="$ipv4_full_cond meta l4proto tcp" ;;
+                udp) ipv4_full_cond="$ipv4_full_cond meta l4proto udp" ;;
+                tcp_udp) ipv4_full_cond="$ipv4_full_cond meta l4proto { tcp, udp }" ;;
+                icmp|icmpv6|gre|esp|ah|sctp|dccp|udplite) ipv4_full_cond="$ipv4_full_cond meta l4proto $proto_v4" ;;
+                all|"") ;;
+                *) ipv4_full_cond="$ipv4_full_cond meta l4proto $proto_v4" ;;
+            esac
+        fi
         [[ -n "$src_ipv4_cond" ]] && ipv4_full_cond="$ipv4_full_cond $src_ipv4_cond"
         [[ -n "$dst_ipv4_cond" ]] && ipv4_full_cond="$ipv4_full_cond $dst_ipv4_cond"
         if [[ -n "$dscp" ]]; then
@@ -383,7 +356,7 @@ build_nft_rule_generic() {
                 ipv4_full_cond="$ipv4_full_cond ip ttl eq $ttl_val"
             fi
         fi
-        if [[ -n "$icmp_type" ]] && [[ "$proto" == "icmp" ]]; then
+        if [[ -n "$icmp_type" ]] && [[ "$proto_v4" == "icmp" ]]; then
             local icmp_val="$icmp_type"
             local neg=""
             [[ "$icmp_val" == "!="* ]] && { neg="!="; icmp_val="${icmp_val#!=}"; }
@@ -394,12 +367,22 @@ build_nft_rule_generic() {
                 ipv4_full_cond="$ipv4_full_cond icmp type $neg $icmp_val"
             fi
         fi
+        [[ -n "$tcp_flag_expr" ]] && ipv4_full_cond="$ipv4_full_cond $tcp_flag_expr"
         add_ipv4_rule "$ipv4_full_cond"
     fi
     
-    # 生成 IPv6 规则
     if (( has_ipv6 )); then
         local ipv6_full_cond="$common_cond"
+        if [[ -n "$proto_v6" && "$proto_v6" != "all" ]]; then
+            case "$proto_v6" in
+                tcp) ipv6_full_cond="$ipv6_full_cond meta l4proto tcp" ;;
+                udp) ipv6_full_cond="$ipv6_full_cond meta l4proto udp" ;;
+                tcp_udp) ipv6_full_cond="$ipv6_full_cond meta l4proto { tcp, udp }" ;;
+                icmp|icmpv6|gre|esp|ah|sctp|dccp|udplite) ipv6_full_cond="$ipv6_full_cond meta l4proto $proto_v6" ;;
+                all|"") ;;
+                *) ipv6_full_cond="$ipv6_full_cond meta l4proto $proto_v6" ;;
+            esac
+        fi
         [[ -n "$src_ipv6_cond" ]] && ipv6_full_cond="$ipv6_full_cond $src_ipv6_cond"
         [[ -n "$dst_ipv6_cond" ]] && ipv6_full_cond="$ipv6_full_cond $dst_ipv6_cond"
         if [[ -n "$dscp" ]]; then
@@ -428,7 +411,7 @@ build_nft_rule_generic() {
                 ipv6_full_cond="$ipv6_full_cond ip6 hoplimit eq $hop_val"
             fi
         fi
-        if [[ -n "$icmp_type" ]] && [[ "$proto" == "icmpv6" ]]; then
+        if [[ -n "$icmp_type" ]] && [[ "$proto_v6" == "icmpv6" ]]; then
             local icmp_val="$icmp_type"
             local neg=""
             [[ "$icmp_val" == "!="* ]] && { neg="!="; icmp_val="${icmp_val#!=}"; }
@@ -439,10 +422,10 @@ build_nft_rule_generic() {
                 ipv6_full_cond="$ipv6_full_cond icmpv6 type $neg $icmp_val"
             fi
         fi
+        [[ -n "$tcp_flag_expr" ]] && ipv6_full_cond="$ipv6_full_cond $tcp_flag_expr"
         add_ipv6_rule "$ipv6_full_cond"
     fi
     
-    # 输出所有规则
     for rule in "${ipv4_rules[@]}"; do
         echo "$rule"
     done
@@ -455,19 +438,14 @@ build_nft_rule_generic() {
 apply_enhanced_direction_rules() {
     local rule_type="$1" chain="$2" mask="$3"
     log_info "应用增强$rule_type规则到链: $chain, 掩码: $mask"
-
     nft add chain inet gargoyle-qos-priority "$chain" 2>/dev/null || true
     nft flush chain inet gargoyle-qos-priority "$chain" 2>/dev/null || true
-
     local direction=""
     [[ "$chain" == "filter_qos_egress" ]] && direction="upload"
     [[ "$chain" == "filter_qos_ingress" ]] && direction="download"
-
     local rule_list=$(load_all_config_sections "$CONFIG_FILE" "$rule_type")
     [[ -z "$rule_list" ]] && { log_info "未找到$rule_type规则配置"; return 0; }
     log_info "找到$rule_type规则: $rule_list"
-
-    local class_priority_map
     declare -A class_priority_map
     local class_list=""
     [[ "$direction" == "upload" ]] && class_list="$upload_class_list"
@@ -476,10 +454,8 @@ apply_enhanced_direction_rules() {
         local prio=$(uci -q get ${CONFIG_FILE}.${class}.priority 2>/dev/null)
         class_priority_map["$class"]=${prio:-999}
     done
-
     local rule_prio_file=$(mktemp)
     TEMP_FILES+=("$rule_prio_file")
-
     local rule
     for rule in $rule_list; do
         [[ -n "$rule" ]] || continue
@@ -490,16 +466,12 @@ apply_enhanced_direction_rules() {
             echo "$class_priority $rule_order $rule" >> "$rule_prio_file"
         fi
     done
-
     local sorted_rule_list=$(sort -n -k1,1 -k2,2 "$rule_prio_file" | awk '{print $3}' | tr '\n' ' ')
     rm -f "$rule_prio_file"
-
     if [[ -z "$sorted_rule_list" ]]; then
         log_info "没有可用的启用规则"
         return 0
     fi
-
-    # 集合存在性验证
     local all_sets=()
     for rule_name in $sorted_rule_list; do
         if ! load_all_config_options "$CONFIG_FILE" "$rule_name" "tmp_"; then
@@ -507,7 +479,9 @@ apply_enhanced_direction_rules() {
         fi
         [[ "$tmp_enabled" != "1" ]] && continue
         for field in src_ip dest_ip; do
-            local val="${tmp_$field}"
+            local var_name="tmp_${field}"
+            local val
+            eval "val=\${${var_name}}"
             [[ -z "$val" ]] && continue
             [[ "$val" == "!="* ]] && val="${val#!=}"
             if [[ "$val" == @* ]]; then
@@ -531,10 +505,8 @@ apply_enhanced_direction_rules() {
         fi
         log_info "所有引用的集合验证通过"
     fi
-
     local nft_batch_file=$(mktemp /tmp/qos_nft_batch_XXXXXX)
     TEMP_FILES+=("$nft_batch_file")
-
     log_info "按优先级顺序生成nft规则..."
     local rule_count=0
     for rule_name in $sorted_rule_list; do
@@ -542,17 +514,17 @@ apply_enhanced_direction_rules() {
             continue
         fi
         [[ "$tmp_enabled" == "1" ]] || continue
-
+        if [[ -z "$tmp_class" ]]; then
+            log_warn "规则 $rule_name 缺少 class 参数，跳过"
+            continue
+        fi
         local class_mark=$(get_class_mark "$direction" "$tmp_class")
         [[ -z "$class_mark" ]] && { log_error "规则 $rule_name 的类 $tmp_class 无法获取标记，跳过"; continue; }
         [[ -z "$tmp_family" ]] && tmp_family="inet"
-
-        # 处理多集合引用的端口字段
         local srcport_list=()
         local dstport_list=()
         local src_ip_list=()
         local dest_ip_list=()
-
         if [[ -n "$tmp_srcport" ]]; then
             mapfile -t srcport_list < <(split_multiset "$tmp_srcport")
         else
@@ -573,7 +545,6 @@ apply_enhanced_direction_rules() {
         else
             dest_ip_list=("")
         fi
-
         for srcp in "${srcport_list[@]}"; do
             for dstp in "${dstport_list[@]}"; do
                 for srcip in "${src_ip_list[@]}"; do
@@ -588,40 +559,66 @@ apply_enhanced_direction_rules() {
             done
         done
     done
-
-    local custom_inline_file="$CUSTOM_INLINE_FILE"
-    if [[ -s "$custom_inline_file" ]]; then
-        log_info "验证自定义内联规则: $custom_inline_file"
-        if validate_inline_rules "$custom_inline_file"; then
-            log_info "自定义内联规则语法正确: $custom_inline_file"
-            echo "include \"$custom_inline_file\";" >> "$nft_batch_file"
-            ((rule_count++))
-        else
-            log_warn "自定义内联规则文件 $custom_inline_file 语法错误，已忽略"
-        fi
+    local custom_file=""
+    if [[ "$chain" == "filter_qos_egress" ]]; then
+        custom_file="/etc/qos_gargoyle/egress_custom.nft"
+    else
+        custom_file="/etc/qos_gargoyle/ingress_custom.nft"
     fi
-
+    if [[ -s "$custom_file" ]]; then
+        log_info "验证自定义规则: $custom_file"
+        local check_file=$(mktemp)
+        TEMP_FILES+=("$check_file")
+        {
+            printf '%s\n\t%s\n' "table inet __qos_custom_check {" "chain __temp_chain {"
+            cat "$custom_file"
+            printf '\n\t%s\n%s\n' "}" "}"
+        } > "$check_file"
+        if nft --check --file "$check_file" 2>/dev/null; then
+            log_info "自定义规则语法正确: $custom_file"
+            while IFS= read -r line || [[ -n "$line" ]]; do
+                line="${line#"${line%%[![:space:]]*}"}"
+                line="${line%"${line##*[![:space:]]}"}"
+                [[ -z "$line" || "$line" == \#* ]] && continue
+                echo "add rule inet gargoyle-qos-priority $chain $line" >> "$nft_batch_file"
+                ((rule_count++))
+            done < "$custom_file"
+        else
+            log_warn "自定义规则文件 $custom_file 语法错误，已忽略"
+            nft --check --file "$check_file" 2>&1 | while IFS= read -r err; do
+                log_error "nft语法错误: $err"
+            done
+        fi
+        rm -f "$check_file"
+    fi
     local batch_success=0
     if [[ -s "$nft_batch_file" ]]; then
-        log_info "执行批量nft规则 (共 $rule_count 条)..."
-        local nft_output
-        nft_output=$(nft -f "$nft_batch_file" 2>&1)
-        local nft_ret=$?
-        if [[ $nft_ret -eq 0 ]]; then
-            log_info "✅ 批量规则应用成功"
-            if [[ $SAVE_NFT_RULES -eq 1 ]]; then
-                mkdir -p /etc/nftables.d
-                local nft_save_file="/etc/nftables.d/qos_gargoyle_${chain}.nft"
-                cp "$nft_batch_file" "$nft_save_file"
-                log_info "规则已保存到 $nft_save_file"
+        log_info "执行批量nft规则语法检查 (共 $rule_count 条)..."
+        local check_output
+        if check_output=$(nft --check --file "$nft_batch_file" 2>&1); then
+            log_info "语法检查通过，开始应用规则..."
+            local nft_output
+            nft_output=$(nft -f "$nft_batch_file" 2>&1)
+            local nft_ret=$?
+            if [[ $nft_ret -eq 0 ]]; then
+                log_info "✅ 批量规则应用成功"
+                if [[ $SAVE_NFT_RULES -eq 1 ]]; then
+                    mkdir -p /etc/nftables.d
+                    local nft_save_file="/etc/nftables.d/qos_gargoyle_${chain}.nft"
+                    cp "$nft_batch_file" "$nft_save_file"
+                    log_info "规则已保存到 $nft_save_file"
+                fi
+            else
+                log_error "❌ 批量规则应用失败 (退出码: $nft_ret)"
+                log_error "nft 错误输出: $nft_output"
+                batch_success=1
             fi
         else
-            log_error "❌ 批量规则应用失败 (退出码: $nft_ret)"
-            log_error "nft 错误输出: $nft_output"
+            log_error "❌ 批量规则语法检查失败，无法应用规则"
+            log_error "检查错误: $check_output"
             batch_success=1
         fi
     fi
-
     rm -f "$nft_batch_file"
     return $batch_success
 }
@@ -637,11 +634,27 @@ get_wan_interface() {
     echo "$wan_if"
 }
 
-# ========== 应用所有规则（包括钩子挂载和辅助功能） ==========
+# ========== 应用所有规则 ==========
 apply_all_rules() {
     local rule_type="$1" mask="$2" chain="$3"
     log_info "开始应用 $rule_type 规则到链 $chain (掩码: $mask)"
-
+    load_global_config
+    log_info "ENABLE_ACK_LIMIT=$ENABLE_ACK_LIMIT, ENABLE_TCP_UPGRADE=$ENABLE_TCP_UPGRADE"
+    if [[ ${#UCI_CACHE[@]} -eq 0 ]]; then
+        unset UCI_CACHE 2>/dev/null
+        declare -A UCI_CACHE
+        log_info "构建 UCI 配置缓存..."
+        while IFS= read -r line; do
+            [[ -z "$line" ]] && continue
+            local key="${line%%=*}"
+            local val="${line#*=}"
+            val="${val#\'}"; val="${val%\'}"
+            if [[ "$key" == "${CONFIG_FILE}."* ]]; then
+                UCI_CACHE["$key"]="$val"
+            fi
+        done < <(uci show "${CONFIG_FILE}" 2>/dev/null)
+        log_debug "已加载 UCI 配置缓存 (${#UCI_CACHE[@]} 个选项)"
+    fi
     if ! nft list table inet gargoyle-qos-priority &>/dev/null; then
         log_info "nft 表不存在，将重新初始化"
         _QOS_TABLE_FLUSHED=0
@@ -649,7 +662,6 @@ apply_all_rules() {
         _HOOKS_SETUP=0
         _SET_FAMILY_CACHE=()
     fi
-
     if [[ $_QOS_TABLE_FLUSHED -eq 0 ]]; then
         log_info "初始化 nftables 表"
         nft add table inet gargoyle-qos-priority 2>/dev/null || true
@@ -662,22 +674,19 @@ apply_all_rules() {
         nft add chain inet gargoyle-qos-priority filter_qos_egress 2>/dev/null || true
         nft add chain inet gargoyle-qos-priority filter_qos_ingress 2>/dev/null || true
         generate_ipset_sets
-
-        # 创建动态集合，并检测是否成功
         local sets_ok=1
-        for set in _qos_xfst_ack _qos_fast_ack _qos_med_ack _qos_slow_ack _qos_slow_tcp; do
+        for set in qos_xfst_ack qos_fast_ack qos_med_ack qos_slow_ack qos_slow_tcp; do
             if ! nft list set inet gargoyle-qos-priority "$set" &>/dev/null; then
-                nft add set inet gargoyle-qos-priority "$set" '{ typeof ct id . ct direction; flags dynamic; timeout 5m; }' 2>/dev/null || sets_ok=0
+                if ! nft add set inet gargoyle-qos-priority "$set" '{ typeof ct id . ct direction; flags dynamic; timeout 5m; }' 2>/dev/null; then
+                    sets_ok=0
+                fi
             fi
         done
-
         if [[ $sets_ok -eq 0 ]]; then
             log_error "动态集合创建失败，ACK 限速和 TCP 升级功能将被禁用"
-            # 全局禁用相关功能，避免后续错误
             ENABLE_ACK_LIMIT=0
             ENABLE_TCP_UPGRADE=0
         fi
-
         nft add chain inet gargoyle-qos-priority drop995 2>/dev/null || true
         nft add chain inet gargoyle-qos-priority drop95 2>/dev/null || true
         nft add chain inet gargoyle-qos-priority drop50 2>/dev/null || true
@@ -690,69 +699,47 @@ apply_all_rules() {
         nft add rule inet gargoyle-qos-priority drop95 drop
         nft add rule inet gargoyle-qos-priority drop50 numgen random mod 1000 ge 500 return
         nft add rule inet gargoyle-qos-priority drop50 drop
-
         _QOS_TABLE_FLUSHED=1
     fi
-
     if [[ $_HOOKS_SETUP -eq 0 ]]; then
         log_info "挂载 nftables 钩子链"
-
         local wan_if=$(get_wan_interface)
         if [[ -z "$wan_if" ]]; then
             log_error "无法获取 WAN 接口，钩子链可能不完整，QoS 可能无法正确区分方向"
-        else
-            log_info "使用 WAN 接口: $wan_if"
-        fi
-
-        nft add chain inet gargoyle-qos-priority filter_output '{ type filter hook output priority 0; policy accept; }' 2>/dev/null || true
-        nft add chain inet gargoyle-qos-priority filter_input  '{ type filter hook input priority 0; policy accept; }' 2>/dev/null || true
-        nft add chain inet gargoyle-qos-priority filter_forward '{ type filter hook forward priority 0; policy accept; }' 2>/dev/null || true
-
-        nft flush chain inet gargoyle-qos-priority filter_output 2>/dev/null || true
-        nft flush chain inet gargoyle-qos-priority filter_input  2>/dev/null || true
-        nft flush chain inet gargoyle-qos-priority filter_forward 2>/dev/null || true
-
-        nft add rule inet gargoyle-qos-priority filter_output jump filter_qos_egress 2>/dev/null || true
-        if [[ -n "$wan_if" ]]; then
-            nft add rule inet gargoyle-qos-priority filter_forward oifname "$wan_if" jump filter_qos_egress 2>/dev/null || true
-            nft add rule inet gargoyle-qos-priority filter_forward iifname "$wan_if" jump filter_qos_ingress 2>/dev/null || true
-        else
             log_warn "未配置 WAN 接口，将不使用方向区分，所有转发流量同时进入上传和下载链（可能导致双重标记）"
+            nft add chain inet gargoyle-qos-priority filter_forward '{ type filter hook forward priority 0; policy accept; }' 2>/dev/null || true
+            nft flush chain inet gargoyle-qos-priority filter_forward 2>/dev/null || true
             nft add rule inet gargoyle-qos-priority filter_forward jump filter_qos_egress 2>/dev/null || true
             nft add rule inet gargoyle-qos-priority filter_forward jump filter_qos_ingress 2>/dev/null || true
+        else
+            log_info "使用 WAN 接口: $wan_if"
+            nft add chain inet gargoyle-qos-priority filter_output '{ type filter hook output priority 0; policy accept; }' 2>/dev/null || true
+            nft add chain inet gargoyle-qos-priority filter_input  '{ type filter hook input priority 0; policy accept; }' 2>/dev/null || true
+            nft add chain inet gargoyle-qos-priority filter_forward '{ type filter hook forward priority 0; policy accept; }' 2>/dev/null || true
+            nft flush chain inet gargoyle-qos-priority filter_output 2>/dev/null || true
+            nft flush chain inet gargoyle-qos-priority filter_input  2>/dev/null || true
+            nft flush chain inet gargoyle-qos-priority filter_forward 2>/dev/null || true
+            nft add rule inet gargoyle-qos-priority filter_output jump filter_qos_egress 2>/dev/null || true
+            nft add rule inet gargoyle-qos-priority filter_forward oifname "$wan_if" jump filter_qos_egress 2>/dev/null || true
+            nft add rule inet gargoyle-qos-priority filter_forward iifname "$wan_if" jump filter_qos_ingress 2>/dev/null || true
+            nft add rule inet gargoyle-qos-priority filter_input jump filter_qos_ingress 2>/dev/null || true
         fi
-        nft add rule inet gargoyle-qos-priority filter_input jump filter_qos_ingress 2>/dev/null || true
-
         _HOOKS_SETUP=1
         log_info "nftables 钩子链挂载完成"
     fi
-
-    if [[ $_UCI_CONFIG_CACHED -eq 0 ]]; then
-        _UCI_CACHE_FILE=$(mktemp)
-        TEMP_FILES+=("$_UCI_CACHE_FILE")
-        uci -X export ${CONFIG_FILE} > "$_UCI_CACHE_FILE" 2>/dev/null
-        if [[ -s "$_UCI_CACHE_FILE" ]]; then
-            source "$_UCI_CACHE_FILE"
-            _UCI_CONFIG_CACHED=1
-            log_debug "已加载 UCI 配置缓存"
-        else
-            log_warn "无法导出 UCI 配置，将回退到单次查询模式"
-            _UCI_CONFIG_CACHED=2
+    if [[ $ENABLE_EBPF -eq 1 ]]; then
+        log_info "eBPF 已启用，尝试加载 eBPF 程序..."
+        if ! load_ebpf_programs; then
+            log_warn "eBPF 程序加载部分失败，将继续使用 nftables 规则"
         fi
     fi
-
-    # 应用增强规则，如果失败则返回错误，不继续加载其他规则
     if ! apply_enhanced_direction_rules "$rule_type" "$chain" "$mask"; then
         log_error "应用 $rule_type 规则失败"
-        # 清理已挂载的钩子链？但停止函数会清理整个表，这里先返回错误
         return 1
     fi
-
-    # 加载自定义完整表规则（不影响返回码，即使失败也不终止）
     load_custom_full_table
-
-    # 应用 ACK 限速规则
     if [[ $ENABLE_ACK_LIMIT -eq 1 ]]; then
+        log_info "ACK 限速已启用，生成规则..."
         local ack_rules=$(generate_ack_limit_rules)
         if [[ -n "$ack_rules" ]]; then
             local ack_file=$(mktemp)
@@ -761,12 +748,21 @@ apply_all_rules() {
                 [[ -z "$rule" ]] && continue
                 echo "${rule/add rule/insert rule}" >> "$ack_file"
             done
-            nft -f "$ack_file" 2>/dev/null || log_warn "应用 ACK 限速规则失败"
+            log_info "ACK 规则文件内容:"
+            cat "$ack_file" | logger -t qos_gargoyle
+            if nft -f "$ack_file" 2>&1 | logger -t qos_gargoyle; then
+                log_info "ACK 限速规则添加成功"
+            else
+                log_warn "ACK 限速规则添加失败"
+            fi
+        else
+            log_warn "ACK 限速规则生成失败（返回空）"
         fi
+    else
+        log_info "ACK 限速未启用"
     fi
-
-    # 应用 TCP 升级规则
     if [[ $ENABLE_TCP_UPGRADE -eq 1 ]]; then
+        log_info "TCP 升级已启用，生成规则..."
         local tcp_upgrade_rules=$(generate_tcp_upgrade_rules)
         if [[ -n "$tcp_upgrade_rules" ]]; then
             local tcp_file=$(mktemp)
@@ -775,11 +771,255 @@ apply_all_rules() {
                 [[ -z "$rule" ]] && continue
                 echo "${rule/add rule/insert rule}" >> "$tcp_file"
             done
-            nft -f "$tcp_file" 2>/dev/null || log_warn "应用 TCP 升级规则失败"
+            log_info "TCP 升级规则文件内容:"
+            cat "$tcp_file" | logger -t qos_gargoyle
+            if nft -f "$tcp_file" 2>&1 | logger -t qos_gargoyle; then
+                log_info "TCP 升级规则添加成功"
+            else
+                log_warn "TCP 升级规则添加失败"
+            fi
+        else
+            log_warn "TCP 升级规则生成失败（返回空）"
+        fi
+    else
+        log_info "TCP 升级未启用"
+    fi
+    return 0
+}
+
+# ========== 入口重定向（增加 IPv6 前缀可配置） ==========
+setup_ingress_redirect() {
+    if [[ -z "$qos_interface" ]]; then
+        log_error "无法确定 WAN 接口"
+        return 1
+    fi
+    local sfo_enabled=0
+    if check_sfo_enabled; then
+        sfo_enabled=1
+        log_info "SFO 已启用，将使用 ctinfo 恢复标记"
+    fi
+    local connmark_ok=0
+    if check_tc_connmark_support; then
+        connmark_ok=1
+        log_info "tc connmark 动作受支持"
+    else
+        log_warn "tc connmark 动作不受支持"
+    fi
+    local ctinfo_ok=0
+    if (( sfo_enabled )); then
+        if check_tc_ctinfo_support; then
+            ctinfo_ok=1
+            log_info "tc ctinfo 动作受支持"
+        else
+            log_warn "tc ctinfo 动作不受支持，将回退到 connmark"
         fi
     fi
-
+    log_info "设置入口重定向: $qos_interface -> $IFB_DEVICE"
+    tc qdisc del dev "$qos_interface" ingress 2>/dev/null || true
+    if ! tc qdisc add dev "$qos_interface" handle ffff: ingress; then
+        log_error "无法在 $qos_interface 上创建入口队列"
+        return 1
+    fi
+    tc filter del dev "$qos_interface" parent ffff: 2>/dev/null || true
+    local ipv4_success=false
+    if (( sfo_enabled && ctinfo_ok )); then
+        if ! tc filter add dev "$qos_interface" parent ffff: protocol ip \
+            u32 match u32 0 0 \
+            action ctinfo mark 0xffffffff 0xffffffff \
+            action mirred egress redirect dev "$IFB_DEVICE" 2>&1; then
+            log_error "IPv4入口重定向规则添加失败（使用 ctinfo）"
+            tc qdisc del dev "$qos_interface" ingress 2>/dev/null
+            return 1
+        else
+            ipv4_success=true
+            log_info "IPv4入口重定向规则添加成功（使用 ctinfo，SFO 兼容）"
+        fi
+    elif (( connmark_ok )); then
+        if ! tc filter add dev "$qos_interface" parent ffff: protocol ip \
+            u32 match u32 0 0 \
+            action connmark \
+            action mirred egress redirect dev "$IFB_DEVICE" 2>&1; then
+            log_error "IPv4入口重定向规则添加失败（使用 connmark）"
+            tc qdisc del dev "$qos_interface" ingress 2>/dev/null
+            return 1
+        else
+            ipv4_success=true
+            log_info "IPv4入口重定向规则添加成功（使用 connmark）"
+        fi
+    else
+        if ! tc filter add dev "$qos_interface" parent ffff: protocol ip \
+            u32 match u32 0 0 \
+            action mirred egress redirect dev "$IFB_DEVICE" 2>&1; then
+            log_error "IPv4入口重定向规则添加失败（无标记）"
+            tc qdisc del dev "$qos_interface" ingress 2>/dev/null
+            return 1
+        else
+            ipv4_success=true
+            log_warn "IPv4入口重定向规则添加成功（未使用标记，标记将丢失）"
+        fi
+    fi
+    if [[ "$ipv4_success" != "true" ]]; then
+        log_error "IPv4入口重定向配置失败"
+        return 1
+    fi
+    # 获取 IPv6 重定向前缀（可配置）
+    local ipv6_prefix=$(uci -q get ${CONFIG_FILE}.global.ipv6_redirect_prefix 2>/dev/null)
+    [[ -z "$ipv6_prefix" ]] && ipv6_prefix="2000::/3"
+    local has_ipv6_global=0
+    if ip -6 addr show dev "$qos_interface" scope global 2>/dev/null | grep -q "inet6"; then
+        has_ipv6_global=1
+        log_info "接口 $qos_interface 拥有全局 IPv6 地址，将尝试配置 IPv6 重定向，前缀: $ipv6_prefix"
+    else
+        log_info "接口 $qos_interface 无全局 IPv6 地址，IPv6 重定向失败仅警告"
+    fi
+    local ipv6_success=false
+    if (( sfo_enabled && ctinfo_ok )); then
+        if tc filter add dev "$qos_interface" parent ffff: protocol ipv6 \
+            flower dst_ip "$ipv6_prefix" \
+            action ctinfo mark 0xffffffff 0xffffffff \
+            action mirred egress redirect dev "$IFB_DEVICE" 2>&1; then
+            ipv6_success=true
+            log_info "IPv6入口重定向规则（flower 前缀 $ipv6_prefix，ctinfo）添加成功"
+        else
+            log_warn "flower ctinfo 规则失败，尝试 u32（仅支持全球单播）"
+            if [[ "$ipv6_prefix" == "2000::/3" ]] || [[ "$ipv6_prefix" == "2000::/3" ]]; then
+                if tc filter add dev "$qos_interface" parent ffff: protocol ipv6 \
+                    u32 match u32 0x20000000 0xe0000000 at 24 \
+                    action ctinfo mark 0xffffffff 0xffffffff \
+                    action mirred egress redirect dev "$IFB_DEVICE" 2>&1; then
+                    ipv6_success=true
+                    log_info "IPv6入口重定向规则（u32 全球单播，ctinfo）添加成功"
+                else
+                    log_warn "IPv6 全球单播匹配失败，无法添加 IPv6 重定向规则"
+                fi
+            else
+                log_warn "自定义前缀 $ipv6_prefix 无法使用 u32 回退，IPv6 重定向可能失败"
+            fi
+        fi
+    elif (( connmark_ok )); then
+        if tc filter add dev "$qos_interface" parent ffff: protocol ipv6 \
+            flower dst_ip "$ipv6_prefix" \
+            action connmark \
+            action mirred egress redirect dev "$IFB_DEVICE" 2>&1; then
+            ipv6_success=true
+            log_info "IPv6入口重定向规则（flower 前缀 $ipv6_prefix，connmark）添加成功"
+        else
+            log_warn "flower connmark 规则失败，尝试 u32（仅支持全球单播）"
+            if [[ "$ipv6_prefix" == "2000::/3" ]]; then
+                if tc filter add dev "$qos_interface" parent ffff: protocol ipv6 \
+                    u32 match u32 0x20000000 0xe0000000 at 24 \
+                    action connmark \
+                    action mirred egress redirect dev "$IFB_DEVICE" 2>&1; then
+                    ipv6_success=true
+                    log_info "IPv6入口重定向规则（u32 全球单播，connmark）添加成功"
+                else
+                    log_warn "IPv6 全球单播匹配失败，无法添加 IPv6 重定向规则"
+                fi
+            else
+                log_warn "自定义前缀 $ipv6_prefix 无法使用 u32 回退，IPv6 重定向可能失败"
+            fi
+        fi
+    else
+        if tc filter add dev "$qos_interface" parent ffff: protocol ipv6 \
+            flower dst_ip "$ipv6_prefix" \
+            action mirred egress redirect dev "$IFB_DEVICE" 2>&1; then
+            ipv6_success=true
+            log_info "IPv6入口重定向规则（flower 前缀 $ipv6_prefix，无标记）添加成功"
+        else
+            log_warn "flower 无标记规则失败，尝试 u32（仅支持全球单播）"
+            if [[ "$ipv6_prefix" == "2000::/3" ]]; then
+                if tc filter add dev "$qos_interface" parent ffff: protocol ipv6 \
+                    u32 match u32 0x20000000 0xe0000000 at 24 \
+                    action mirred egress redirect dev "$IFB_DEVICE" 2>&1; then
+                    ipv6_success=true
+                    log_info "IPv6入口重定向规则（u32 全球单播，无标记）添加成功"
+                else
+                    log_warn "IPv6 全球单播匹配失败，无法添加 IPv6 重定向规则"
+                fi
+            else
+                log_warn "自定义前缀 $ipv6_prefix 无法使用 u32 回退，IPv6 重定向可能失败"
+            fi
+        fi
+    fi
+    if (( has_ipv6_global == 1 )); then
+        if [[ "$ipv6_success" != "true" ]]; then
+            log_warn "接口存在全局 IPv6 地址，但 IPv6 入口重定向配置失败，IPv6 流量可能不受 QoS 控制，但 IPv4 QoS 将继续工作"
+        else
+            log_info "IPv6 入口重定向成功"
+        fi
+    else
+        if [[ "$ipv6_success" == "true" ]]; then
+            log_info "IPv6 入口重定向成功（尽管无全局 IPv6 地址，仍添加了规则）"
+        else
+            log_warn "IPv6 入口重定向失败，但因接口无全局 IPv6 地址，继续启动"
+        fi
+    fi
+    local ipv4_rule_count=$(tc filter show dev "$qos_interface" parent ffff: protocol ip 2>/dev/null | grep -c "mirred.*Redirect to device $IFB_DEVICE")
+    local ipv6_rule_count=$(tc filter show dev "$qos_interface" parent ffff: protocol ipv6 2>/dev/null | grep -c "mirred.*Redirect to device $IFB_DEVICE")
+    if (( ipv4_rule_count >= 1 )) && (( ipv6_rule_count >= 1 )); then
+        log_info "入口重定向已成功设置: IPv4和IPv6规则均生效"
+    elif (( ipv4_rule_count >= 1 )); then
+        log_info "入口重定向已成功设置: 仅IPv4生效"
+    fi
     return 0
+}
+
+check_ingress_redirect() {
+    local iface="$1"
+    local ifb_dev="$2"
+    [[ -z "$ifb_dev" ]] && ifb_dev="$IFB_DEVICE"
+    echo "检查入口重定向 (接口: $iface, IFB设备: $ifb_dev)"
+    echo "  IPv4入口规则:"
+    local ipv4_rules=$(tc filter show dev "$iface" parent ffff: protocol ip 2>/dev/null)
+    if [[ -n "$ipv4_rules" ]]; then
+        echo "$ipv4_rules" | sed 's/^/    /'
+        if echo "$ipv4_rules" | grep -q "mirred.*Redirect to device $ifb_dev"; then
+            echo "    ✓ IPv4 重定向到 $ifb_dev: 已生效"
+        else
+            echo "    ✗ IPv4 重定向: mirred动作未找到"
+        fi
+    else
+        echo "    无IPv4入口规则"
+    fi
+    echo ""
+    echo "  IPv6入口规则:"
+    local ipv6_rules=$(tc filter show dev "$iface" parent ffff: protocol ipv6 2>/dev/null)
+    if [[ -n "$ipv6_rules" ]]; then
+        echo "$ipv6_rules" | sed 's/^/    /'
+        if echo "$ipv6_rules" | grep -q "mirred.*Redirect to device $ifb_dev"; then
+            echo "    ✓ IPv6 重定向到 $ifb_dev: 已生效"
+        else
+            echo "    ✗ IPv6 重定向: mirred动作未找到"
+        fi
+    else
+        echo "    无IPv6入口规则"
+    fi
+    return 0
+}
+
+# ========== IPv6增强支持 ==========
+setup_ipv6_specific_rules() {
+    log_info "设置IPv6特定规则（优化版）"
+    nft add chain inet gargoyle-qos-priority filter_prerouting '{ type filter hook prerouting priority 0; policy accept; }' 2>/dev/null || true
+    nft flush chain inet gargoyle-qos-priority filter_prerouting 2>/dev/null || true
+    local ICMPV6_CRITICAL_TYPES="133,134,135,136,137"
+    nft add rule inet gargoyle-qos-priority filter_prerouting \
+        meta nfproto ipv6 ip6 daddr { ff02::1:2, ff02::1:3 } meta mark set 0x80000000 counter 2>/dev/null || true
+    nft add rule inet gargoyle-qos-priority filter_prerouting \
+        meta nfproto ipv6 ip6 daddr ::1 meta mark set 0x80000000 counter 2>/dev/null || true
+    nft add rule inet gargoyle-qos-priority filter_prerouting \
+        meta nfproto ipv6 icmpv6 type { $ICMPV6_CRITICAL_TYPES } meta mark set 0x40000000 counter 2>/dev/null || true
+    nft add rule inet gargoyle-qos-priority filter_prerouting \
+        meta nfproto ipv6 udp dport { 546, 547 } meta mark set 0x40000000 counter 2>/dev/null || true
+    nft add rule inet gargoyle-qos-priority filter_prerouting \
+        meta nfproto ipv6 udp dport 53 meta mark set 0x40000000 counter 2>/dev/null || true
+    nft add rule inet gargoyle-qos-priority filter_prerouting \
+        meta nfproto ipv6 tcp dport 53 meta mark set 0x40000000 counter 2>/dev/null || true
+    nft add rule inet gargoyle-qos-priority filter_prerouting \
+        meta nfproto ipv6 tcp dport { 80, 443 } meta mark set 0x40000000 counter 2>/dev/null || true
+    nft add rule inet gargoyle-qos-priority filter_prerouting \
+        meta nfproto ipv6 udp dport 123 meta mark set 0x40000000 counter 2>/dev/null || true
+    log_info "IPv6关键流量规则设置完成"
 }
 
 # ========== 健康检查 ==========
@@ -793,7 +1033,7 @@ health_check() {
     else
         status="${status}tc:missing;"; ((errors++))
     fi
-    for mod in ifb sch_htb sch_hfsc sch_cake sch_fq_codel; do
+    for mod in ifb sch_htb sch_hfsc sch_cake sch_fq; do
         if ! lsmod 2>/dev/null | grep -q "^$mod"; then
             modprobe "$mod" 2>/dev/null || true
             if ! lsmod 2>/dev/null | grep -q "^$mod"; then

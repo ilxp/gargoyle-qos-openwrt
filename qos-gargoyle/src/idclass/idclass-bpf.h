@@ -2,6 +2,7 @@
 /*
  * Copyright (C) 2021 Felix Fietkau <nbd@nbd.name>
  * Modified to support four-class classification (realtime, video, normal, bulk)
+ * Extended with TCP window, MSS, RTT features (12 features total).
  */
 #ifndef __BPF_IDCLASS_H
 #define __BPF_IDCLASS_H
@@ -19,23 +20,27 @@
 
 #define IDCLASS_INGRESS			(1 << 0)
 #define IDCLASS_IP_ONLY			(1 << 1)
+#define IDCLASS_SET_DSCP			(1 << 2)
 
 #define IDCLASS_DSCP_VALUE_MASK		((1 << 6) - 1)
 #define IDCLASS_DSCP_FALLBACK_FLAG	(1 << 6)
 #define IDCLASS_DSCP_CLASS_FLAG		(1 << 7)
-#define IDCLASS_SET_DSCP          (1 << 2)
+
 #define IDCLASS_CLASS_FLAG_PRESENT	(1 << 0)
 
-// 特征掩码宏
-#define FEATURE_PKTLEN    (1 << 0)
-#define FEATURE_CONN      (1 << 1)
-#define FEATURE_PPS       (1 << 2)
-#define FEATURE_IAT       (1 << 3)
-#define FEATURE_RETRANS   (1 << 4)
-#define FEATURE_TCPFLAGS  (1 << 5)
-#define FEATURE_DURATION  (1 << 6)
-#define FEATURE_RATIO     (1 << 7)
-#define FEATURE_BURST     (1 << 8)
+// 特征掩码宏（共12个）
+#define FEATURE_PKTLEN      (1 << 0)
+#define FEATURE_CONN        (1 << 1)
+#define FEATURE_PPS         (1 << 2)
+#define FEATURE_IAT         (1 << 3)
+#define FEATURE_RETRANS     (1 << 4)
+#define FEATURE_TCPFLAGS    (1 << 5)
+#define FEATURE_DURATION    (1 << 6)
+#define FEATURE_RATIO       (1 << 7)
+#define FEATURE_BURST       (1 << 8)
+#define FEATURE_TCP_WINDOW  (1 << 9)
+#define FEATURE_TCP_MSS     (1 << 10)
+#define FEATURE_TCP_RTT     (1 << 11)
 
 /* 定义结构体，放在 map 定义之前 */
 struct idclass_ip_map_val {
@@ -54,12 +59,14 @@ struct idclass_flow_config {
     __u16 prio_max_avg_pkt_len;
 
     __u16 game_max_avg_pkt_len;
+    __u16 game_min_conn;
     __u16 game_max_conn;
     __u16 game_max_pps;
     __u16 game_sample_packets;
 
     __u16 video_min_avg_pkt_len;
     __u16 video_max_avg_pkt_len;
+    __u16 video_min_conn;
     __u16 video_max_conn;
     __u16 video_min_pps;
     __u16 video_max_pps;
@@ -109,13 +116,35 @@ struct idclass_flow_config {
     __u16 weight_ratio_bulk;
     __u16 weight_iat_realtime;
 
+    // 新增 TCP 特征权重
+    __u16 weight_window_realtime;
+    __u16 weight_window_video;
+    __u16 weight_window_normal;
+    __u16 weight_window_bulk;
+    __u16 weight_mss_realtime;
+    __u16 weight_mss_video;
+    __u16 weight_mss_normal;
+    __u16 weight_mss_bulk;
+    __u16 weight_rtt_realtime;
+    __u16 weight_rtt_video;
+    __u16 weight_rtt_normal;
+    __u16 weight_rtt_bulk;
+
+    // 新增 TCP 特征阈值
+    __u16 tcp_window_low;      // 窗口低于此值视为实时（小窗口）
+    __u16 tcp_window_high;     // 窗口高于此值视为批量（大窗口）
+    __u16 tcp_mss_low;         // MSS 低于此值视为实时（小包）
+    __u16 tcp_mss_high;        // MSS 高于此值视为批量（大包）
+    __u16 tcp_rtt_low_us;      // RTT 低于此值视为实时（微秒）
+    __u16 tcp_rtt_high_us;     // RTT 高于此值视为批量（微秒）
+
     __u32 score_threshold;
 
     __u32 prio_realtime;
     __u32 prio_video;
     __u32 prio_normal;
     __u32 prio_bulk;
-};
+} __attribute__((packed));
 
 struct flow_stats {
     __u64 packets;
@@ -144,19 +173,25 @@ struct flow_stats {
     __u8 client_ip[16];        // 客户端 IP（IPv4 用 IPv4-mapped 格式）
     __u8 client_family;        // 地址族：4 或 6
     __u64 max_seq;              // 最大 TCP 序列号
-};
+
+    // 新增 TCP 特征字段
+    __u16 tcp_window;          // 当前 TCP 接收窗口大小（EWMA）
+    __u16 tcp_mss;             // TCP 最大段大小（从 SYN 包提取）
+    __u32 tcp_rtt_us;          // RTT 估计值（微秒，EWMA）
+    __u32 tcp_rtt_var_us;      // RTT 方差（可选，暂未使用）
+} __attribute__((packed));
 
 struct global_config {
     __u8 dscp_icmp;
     __u32 wan_ifindex;
     __u32 ifb_ifindex;
-};
+} __attribute__((packed));
 
 struct idclass_class {
     struct idclass_flow_config config;
     struct idclass_dscp_val val;
     __u8 flags;
     __u64 packets;
-};
+} __attribute__((packed));
 
-#endif
+#endif /* __BPF_IDCLASS_H */

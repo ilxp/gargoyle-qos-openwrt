@@ -1,22 +1,21 @@
 #!/bin/sh
 # CAKE算法实现模块 - 多队列增强版
-# 版本: 2.6.0 - 统一锁机制(flock)，集成rule.sh辅助模块，优化入口重定向，修复规则集成
+# 版本: 3.3.8 - 与修复后的 common.sh 和 rule.sh 兼容，优化 IPv6 重定向
 # 支持与 idclass 集成，通过 DSCP 进行分类（diffserv4 模式）
 # 必要工具：tc, nft, conntrack, ethtool, sysctl
 # 内核模块：sch_cake
 
 # ========== 变量初始化 ==========
-: ${total_upload_bandwidth:=50000}
-: ${total_download_bandwidth:=100000}
 : ${IFB_DEVICE:=ifb0}
-QOS_RUNNING_FILE="/var/run/cake_qos.running"
-RUNTIME_PARAMS_FILE="/tmp/cake_runtime_params"
-PERSISTENT_CLASS_MARKS="/etc/qos_gargoyle/class_marks"   # 持久化标记文件
+: ${qos_interface:=$(uci -q get qos_gargoyle.global.wan_interface 2>/dev/null)}
+: ${qos_interface:=pppoe-wan}
 
-# 如果 qos_interface 未设置，尝试获取
-if [ -z "$qos_interface" ]; then
-    qos_interface=$(uci -q get qos_gargoyle.global.wan_interface 2>/dev/null)
-    qos_interface="${qos_interface:-pppoe-wan}"
+# 加载核心库（必须在最前面）
+if [ -f "/usr/lib/qos_gargoyle/common.sh" ]; then
+    . /usr/lib/qos_gargoyle/common.sh
+else
+    echo "错误: 核心库 /usr/lib/qos_gargoyle/common.sh 未找到" >&2
+    exit 1
 fi
 
 # 加载规则辅助模块（必须）
@@ -28,15 +27,19 @@ else
     exit 1
 fi
 
+# 确保全局变量定义（避免未定义）
+CLASS_MARKS_FILE="${CLASS_MARKS_FILE:-/etc/qos_gargoyle/class_marks}"
+RUNTIME_PARAMS_FILE="${RUNTIME_PARAMS_FILE:-/tmp/cake_runtime_params}"
+
 # 掩码变量（DSCP 模式下未使用，但 rule.sh 需要）
 UPLOAD_MASK=0
 DOWNLOAD_MASK=0
 
-echo "CAKE 模块初始化完成 (v2.6.0)"
+echo "CAKE 模块初始化完成 (v3.3.8)"
 echo "  网络接口: $qos_interface"
 echo "  IFB 设备: $IFB_DEVICE"
-echo "  上传带宽: ${total_upload_bandwidth}kbit/s"
-echo "  下载带宽: ${total_download_bandwidth}kbit/s"
+echo "  上传带宽: ${total_upload_bandwidth:-未配置}kbit/s"
+echo "  下载带宽: ${total_download_bandwidth:-未配置}kbit/s"
 
 # ========= CAKE专属常量 ==========
 CAKE_DIFFSERV_MODE="diffserv4"
@@ -117,67 +120,6 @@ check_dependencies() {
         qos_log "WARN" "ethtool 命令未找到，队列数检测将回退到 sysfs"
     fi
     return 0
-}
-
-# ========== 带宽单位转换（严格区分字节与比特）==========
-convert_bandwidth_to_kbit() {
-    local bw="$1"
-    local num unit result
-
-    [ -z "$bw" ] && { qos_log "ERROR" "带宽值为空"; return 1; }
-
-    # 纯数字视为 kbit
-    if echo "$bw" | grep -qE '^[0-9]+$'; then
-        echo "$bw"
-        return 0
-    fi
-
-    # 提取数字和单位
-    if echo "$bw" | grep -qiE '^[0-9]+(\.[0-9]+)?[a-zA-Z]+$'; then
-        num=$(echo "$bw" | grep -oE '^[0-9]+(\.[0-9]+)?')
-        unit=$(echo "$bw" | sed 's/[0-9.]//g' | tr '[:lower:]' '[:upper:]')
-
-        case "$unit" in
-            # 比特单位
-            K|KBIT|KILOBIT)
-                result=$(echo "$num * 1" | awk '{printf "%.0f", $1}')
-                ;;
-            M|MBIT|MEGABIT)
-                result=$(echo "$num * 1000" | awk '{printf "%.0f", $1}')
-                ;;
-            G|GBIT|GIGABIT)
-                result=$(echo "$num * 1000000" | awk '{printf "%.0f", $1}')
-                ;;
-            # 字节单位 → 乘以 8 转换为比特
-            KB|KIB)
-                qos_log "WARN" "检测到字节单位 '$unit'，将自动乘以 8 转换为 kbit"
-                result=$(echo "$num * 8" | awk '{printf "%.0f", $1}')
-                ;;
-            MB|MIB)
-                qos_log "WARN" "检测到字节单位 '$unit'，将自动乘以 8 转换为 kbit"
-                result=$(echo "$num * 8000" | awk '{printf "%.0f", $1}')
-                ;;
-            GB|GIB)
-                qos_log "WARN" "检测到字节单位 '$unit'，将自动乘以 8 转换为 kbit"
-                result=$(echo "$num * 8000000" | awk '{printf "%.0f", $1}')
-                ;;
-            *)
-                qos_log "ERROR" "未知带宽单位: $unit"
-                return 1
-                ;;
-        esac
-
-        if [ -z "$result" ] || ! echo "$result" | grep -qE '^[0-9]+$' || [ "$result" -lt 0 ] 2>/dev/null; then
-            qos_log "ERROR" "带宽转换结果无效: $result"
-            return 1
-        fi
-
-        echo "$result"
-        return 0
-    else
-        qos_log "ERROR" "无效带宽格式: $bw (应为数字或数字+单位，例如 100mbit、10MB)"
-        return 1
-    fi
 }
 
 # ========== 参数验证 ==========
@@ -304,8 +246,7 @@ get_tx_queues() {
 # ========== 检测内核是否支持特定 CAKE 参数 ==========
 check_cake_param_support() {
     local param="$1"
-    # 使用临时 dummy 接口避免影响 lo
-    local dummy_dev="dummy0"
+    local dummy_dev="dummy_test_$$"
     ip link add "$dummy_dev" type dummy 2>/dev/null || {
         dummy_dev="lo"
     }
@@ -325,52 +266,61 @@ load_cake_config() {
     qos_log "INFO" "加载CAKE配置"
     local uci_upload uci_download uci_ifb val
 
-    uci_upload=$(uci -q get qos_gargoyle.global.upload_bandwidth 2>/dev/null)
-    uci_download=$(uci -q get qos_gargoyle.global.download_bandwidth 2>/dev/null)
-    [ -n "$uci_upload" ] && total_upload_bandwidth=$(sanitize_param "$uci_upload")
-    [ -n "$uci_download" ] && total_download_bandwidth=$(sanitize_param "$uci_download")
+    # 如果带宽变量未设置，从 UCI 读取（避免覆盖已由 load_bandwidth_from_config 设置的值）
+    if [ -z "$total_upload_bandwidth" ] || [ "$total_upload_bandwidth" -eq 0 ]; then
+        uci_upload=$(uci -q get ${CONFIG_FILE}.upload.total_bandwidth 2>/dev/null)
+        if [ -n "$uci_upload" ]; then
+            total_upload_bandwidth=$(convert_bandwidth_to_kbit "$(sanitize_param "$uci_upload")")
+        fi
+    fi
+    if [ -z "$total_download_bandwidth" ] || [ "$total_download_bandwidth" -eq 0 ]; then
+        uci_download=$(uci -q get ${CONFIG_FILE}.download.total_bandwidth 2>/dev/null)
+        if [ -n "$uci_download" ]; then
+            total_download_bandwidth=$(convert_bandwidth_to_kbit "$(sanitize_param "$uci_download")")
+        fi
+    fi
 
-    uci_ifb=$(uci -q get qos_gargoyle.download.ifb_device 2>/dev/null)
+    uci_ifb=$(uci -q get ${CONFIG_FILE}.download.ifb_device 2>/dev/null)
     [ -n "$uci_ifb" ] && IFB_DEVICE=$(sanitize_param "$uci_ifb")
 
-    val=$(uci -q get qos_gargoyle.cake.diffserv_mode 2>/dev/null)
+    val=$(uci -q get ${CONFIG_FILE}.cake.diffserv_mode 2>/dev/null)
     CAKE_DIFFSERV_MODE=$(sanitize_param "${val:-diffserv4}")
 
-    val=$(uci -q get qos_gargoyle.cake.flowmode 2>/dev/null)
+    val=$(uci -q get ${CONFIG_FILE}.cake.flowmode 2>/dev/null)
     [ -n "$val" ] && CAKE_FLOWMODE=$(sanitize_param "$val")
 
-    val=$(uci -q get qos_gargoyle.cake.overhead 2>/dev/null)
+    val=$(uci -q get ${CONFIG_FILE}.cake.overhead 2>/dev/null)
     CAKE_OVERHEAD=$(sanitize_param "${val:-0}")
 
-    val=$(uci -q get qos_gargoyle.cake.mpu 2>/dev/null)
+    val=$(uci -q get ${CONFIG_FILE}.cake.mpu 2>/dev/null)
     CAKE_MPU=$(sanitize_param "${val:-0}")
 
-    val=$(uci -q get qos_gargoyle.cake.rtt 2>/dev/null)
+    val=$(uci -q get ${CONFIG_FILE}.cake.rtt 2>/dev/null)
     CAKE_RTT=$(sanitize_param "${val:-100ms}")
 
-    val=$(uci -q get qos_gargoyle.cake.ack_filter 2>/dev/null)
+    val=$(uci -q get ${CONFIG_FILE}.cake.ack_filter 2>/dev/null)
     CAKE_ACK_FILTER=$(sanitize_param "${val:-0}")
 
-    val=$(uci -q get qos_gargoyle.cake.nat 2>/dev/null)
+    val=$(uci -q get ${CONFIG_FILE}.cake.nat 2>/dev/null)
     CAKE_NAT=$(sanitize_param "${val:-0}")
 
-    val=$(uci -q get qos_gargoyle.cake.wash 2>/dev/null)
+    val=$(uci -q get ${CONFIG_FILE}.cake.wash 2>/dev/null)
     CAKE_WASH=$(sanitize_param "${val:-0}")
 
-    val=$(uci -q get qos_gargoyle.cake.split_gso 2>/dev/null)
+    val=$(uci -q get ${CONFIG_FILE}.cake.split_gso 2>/dev/null)
     CAKE_SPLIT_GSO=$(sanitize_param "${val:-0}")
 
-    val=$(uci -q get qos_gargoyle.cake.ingress 2>/dev/null)
+    val=$(uci -q get ${CONFIG_FILE}.cake.ingress 2>/dev/null)
     CAKE_INGRESS=$(sanitize_param "${val:-0}")
 
-    val=$(uci -q get qos_gargoyle.cake.autorate_ingress 2>/dev/null)
+    val=$(uci -q get ${CONFIG_FILE}.cake.autorate_ingress 2>/dev/null)
     CAKE_AUTORATE_INGRESS=$(sanitize_param "${val:-0}")
 
-    val=$(uci -q get qos_gargoyle.cake.memlimit 2>/dev/null)
+    val=$(uci -q get ${CONFIG_FILE}.cake.memlimit 2>/dev/null)
     CAKE_MEMORY_LIMIT=$(sanitize_param "${val:-32mb}")
     CAKE_MEMORY_LIMIT=$(echo "$CAKE_MEMORY_LIMIT" | tr 'A-Z' 'a-z')
 
-    val=$(uci -q get qos_gargoyle.cake.ecn 2>/dev/null)
+    val=$(uci -q get ${CONFIG_FILE}.cake.ecn 2>/dev/null)
     if [ -n "$val" ]; then
         case "$val" in
             yes|1|enable|on|true|ecn)
@@ -388,13 +338,13 @@ load_cake_config() {
         esac
     fi
 
-    val=$(uci -q get qos_gargoyle.cake.enable_auto_tune 2>/dev/null)
+    val=$(uci -q get ${CONFIG_FILE}.cake.enable_auto_tune 2>/dev/null)
     [ -n "$val" ] && ENABLE_AUTO_TUNE=$(sanitize_param "$val")
 
-    val=$(uci -q get qos_gargoyle.cake.enable_mq 2>/dev/null)
+    val=$(uci -q get ${CONFIG_FILE}.cake.enable_mq 2>/dev/null)
     [ -n "$val" ] && CAKE_MQ_ENABLED=$(sanitize_param "$val")
 
-    val=$(uci -q get qos_gargoyle.cake.delete_ifb_on_stop 2>/dev/null)
+    val=$(uci -q get ${CONFIG_FILE}.cake.delete_ifb_on_stop 2>/dev/null)
     [ -n "$val" ] && CAKE_DELETE_IFB_ON_STOP=$(sanitize_param "$val")
 
     qos_log "INFO" "CAKE配置加载完成"
@@ -414,8 +364,8 @@ auto_tune_cake() {
         total_bw=$total_download_bandwidth
     fi
 
-    user_set_rtt=$(uci -q get qos_gargoyle.cake.rtt 2>/dev/null)
-    user_set_mem=$(uci -q get qos_gargoyle.cake.memlimit 2>/dev/null)
+    user_set_rtt=$(uci -q get ${CONFIG_FILE}.cake.rtt 2>/dev/null)
+    user_set_mem=$(uci -q get ${CONFIG_FILE}.cake.memlimit 2>/dev/null)
 
     if [ "$total_bw" -gt 200000 ]; then
         [ -z "$user_set_mem" ] && CAKE_MEMORY_LIMIT="128mb"
@@ -473,7 +423,7 @@ validate_cake_config() {
     return 0
 }
 
-# ========== 入口重定向（IPv4必须成功，IPv6按优先级尝试，并增加全局地址检测）==========
+# ========== 入口重定向（支持 IPv6 前缀可配置）==========
 setup_ingress_redirect() {
     qos_log "INFO" "设置入口重定向: $qos_interface -> $IFB_DEVICE"
     local ipv4_success=false
@@ -498,18 +448,22 @@ setup_ingress_redirect() {
         return 1
     fi
 
+    # 获取 IPv6 重定向前缀（可配置）
+    local ipv6_prefix=$(uci -q get ${CONFIG_FILE}.global.ipv6_redirect_prefix 2>/dev/null)
+    [ -z "$ipv6_prefix" ] && ipv6_prefix="2000::/3"
+
     # 检测接口是否有全局 IPv6 地址，以决定是否强制 IPv6 必须成功
     local has_ipv6_global=0
     if ip -6 addr show dev "$qos_interface" scope global 2>/dev/null | grep -q "inet6"; then
         has_ipv6_global=1
-        qos_log "INFO" "接口 $qos_interface 拥有全局 IPv6 地址，将强制 IPv6 重定向必须成功"
+        qos_log "INFO" "接口 $qos_interface 拥有全局 IPv6 地址，将强制 IPv6 重定向必须成功，前缀: $ipv6_prefix"
     else
         qos_log "INFO" "接口 $qos_interface 无全局 IPv6 地址，IPv6 重定向失败仅警告"
     fi
 
-    # IPv6 重定向：按优先级尝试三种匹配方式
+    # IPv6 重定向：按优先级尝试匹配方式
     for match_cmd in \
-        "flower dst_ip 2000::/3" \
+        "flower dst_ip $ipv6_prefix" \
         "u32 match u32 0x20000000 0xe0000000 at 24" \
         "u32 match u32 0 0"; do
         if tc filter add dev "$qos_interface" parent ffff: protocol ipv6 \
@@ -836,7 +790,7 @@ health_check_cake() {
 
 # ========== 状态显示 ==========
 show_cake_status() {
-    echo "===== CAKE QoS状态报告 (v2.6.0) ====="
+    echo "===== CAKE QoS状态报告 (v3.3.8) ====="
     echo "时间: $(date)"
     echo "网络接口: ${qos_interface:-未知}"
 
@@ -971,7 +925,6 @@ show_cake_status() {
 # ========== 停止清理 ==========
 stop_cake_qos() {
     qos_log "INFO" "停止CAKE QoS"
-    # 使用 rule.sh 的统一锁机制（支持嵌套）
     acquire_lock
 
     if tc qdisc show dev "$qos_interface" root 2>/dev/null | grep -q "cake"; then
@@ -1000,6 +953,8 @@ stop_cake_qos() {
     rm -f "$RUNTIME_PARAMS_FILE"
     rm -f "$QOS_RUNNING_FILE"
 
+    # 重置全局状态（调用 common.sh 中的函数）
+    cleanup_qos_state
     release_lock
     qos_log "INFO" "CAKE QoS停止完成"
 }
@@ -1012,7 +967,6 @@ init_cake_qos() {
         start)
             qos_log "INFO" "启动CAKE QoS"
             check_dependencies || exit 1
-            # 使用 rule.sh 的统一锁机制
             acquire_lock || exit 1
             check_already_running || { release_lock; exit 1; }
 
@@ -1022,6 +976,7 @@ init_cake_qos() {
 
             load_cake_config
 
+            # 确保带宽变量已转换为 kbit
             total_upload_bandwidth=$(convert_bandwidth_to_kbit "$total_upload_bandwidth") || {
                 release_lock
                 rm -f "$QOS_RUNNING_FILE"
@@ -1045,8 +1000,11 @@ init_cake_qos() {
             load_upload_class_configurations
             load_download_class_configurations
 
+            # 确保标记文件目录存在
+            mkdir -p "$(dirname "$CLASS_MARKS_FILE")" 2>/dev/null
+
             # 为 DSCP 模式生成标记文件（使用固定 DSCP 映射）
-            : > "$PERSISTENT_CLASS_MARKS"
+            : > "$CLASS_MARKS_FILE"
             for class in $upload_class_list; do
                 class_id=$(get_class_id "upload" "$class") || continue
                 case "$class_id" in
@@ -1056,7 +1014,7 @@ init_cake_qos() {
                     4) dscp=8 ;;   # bulk -> CS1
                     *) dscp=0 ;;
                 esac
-                echo "upload:$class:$dscp" >> "$PERSISTENT_CLASS_MARKS"
+                echo "upload:$class:$dscp" >> "$CLASS_MARKS_FILE"
             done
             for class in $download_class_list; do
                 class_id=$(get_class_id "download" "$class") || continue
@@ -1067,7 +1025,7 @@ init_cake_qos() {
                     4) dscp=8 ;;
                     *) dscp=0 ;;
                 esac
-                echo "download:$class:$dscp" >> "$PERSISTENT_CLASS_MARKS"
+                echo "download:$class:$dscp" >> "$CLASS_MARKS_FILE"
             done
 
             # 创建 nftables 表（如果不存在）
@@ -1080,8 +1038,8 @@ init_cake_qos() {
             nft add map inet gargoyle-qos-priority download_udp_sport_map { type mark : verdict; flags interval; } 2>/dev/null || true
 
             # 创建基于类别的集合（用于 DNS 学习）
-            if [ -f "$PERSISTENT_CLASS_MARKS" ]; then
-                for class_name in $(cut -d: -f2 "$PERSISTENT_CLASS_MARKS" | sort -u); do
+            if [ -f "$CLASS_MARKS_FILE" ]; then
+                for class_name in $(cut -d: -f2 "$CLASS_MARKS_FILE" | sort -u); do
                     realname=$(uci -q get ${CONFIG_FILE}.${class_name}.name 2>/dev/null | tr '[:upper:]' '[:lower:]')
                     [ -z "$realname" ] && continue
                     nft add set inet gargoyle-qos-priority upload_${realname} { type ipv4_addr; flags dynamic, timeout; } 2>/dev/null || true
@@ -1110,12 +1068,12 @@ init_cake_qos() {
             # 创建 class_mark 映射并添加 conntrack 恢复规则（设置 DSCP）
             nft add map inet gargoyle-qos-priority class_mark { type mark : mark; } 2>/dev/null || true
             nft flush map inet gargoyle-qos-priority class_mark 2>/dev/null || true
-            if [ -f "$PERSISTENT_CLASS_MARKS" ]; then
+            if [ -f "$CLASS_MARKS_FILE" ]; then
                 while IFS=: read -r dir cls mark; do
                     [ -z "$dir" ] || [ -z "$cls" ] || [ -z "$mark" ] && continue
                     class_id=$(get_class_id "$dir" "$cls") || continue
                     nft add element inet gargoyle-qos-priority class_mark { $class_id : $mark } 2>/dev/null
-                done < "$PERSISTENT_CLASS_MARKS"
+                done < "$CLASS_MARKS_FILE"
             fi
             # 插入恢复规则到链首（设置 DSCP）
             nft insert rule inet gargoyle-qos-priority filter_qos_egress ct state established,related ip dscp set class_mark[ct mark & 0xff]

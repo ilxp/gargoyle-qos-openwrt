@@ -2,6 +2,9 @@
 /*
  * Copyright (C) 2021 Felix Fietkau <nbd@nbd.name>
  * Modified to support multi-feature classification and DSCP setting
+ * Extended with TCP window, MSS, RTT features (total 12 features)
+ * Fixed: direction of up/down bytes, always update stats, IPv6 DSCP,
+ * IAT smoothing, default fallback classification.
  */
 #define KBUILD_MODNAME "foo"
 #include <linux/bpf.h>
@@ -17,15 +20,6 @@
 #include <bpf/bpf_endian.h>
 #include "bpf_skb_utils.h"
 #include "idclass-bpf.h"
-
-/* 定义 bpf_skb_set_mark 辅助函数，确保编译通过 */
-#ifndef BPF_FUNC_skb_set_mark
-#define BPF_FUNC_skb_set_mark 63
-#endif
-
-static __always_inline int bpf_skb_set_mark(struct __sk_buff *skb, __u32 mark) {
-    return ((int (*)(struct __sk_buff *, __u32))BPF_FUNC_skb_set_mark)(skb, mark);
-}
 
 #define INET_ECN_MASK 3
 #define EWMA_SHIFT 12
@@ -153,34 +147,28 @@ static void
 parse_l4proto(struct global_config *config, struct skb_parser_info *info,
           __u8 ingress, __u8 *out_val)
 {
-    struct udphdr *udp;
-    __u32 src, dest, key;
-    __u8 *value;
     __u8 proto = info->proto;
-
-    udp = skb_info_ptr(info, sizeof(*udp));
-    if (!udp) return;
 
     if (config && (proto == IPPROTO_ICMP || proto == IPPROTO_ICMPV6)) {
         *out_val = config->dscp_icmp;
         return;
     }
 
-    src = READ_ONCE(udp->source);
-    dest = READ_ONCE(udp->dest);
-    if (ingress)
-        key = src;
-    else
-        key = dest;
-
-    if (proto == IPPROTO_TCP)
-        value = bpf_map_lookup_elem(&tcp_ports, &key);
-    else {
-        if (proto != IPPROTO_UDP) key = 0;
-        value = bpf_map_lookup_elem(&udp_ports, &key);
+    if (proto == IPPROTO_TCP) {
+        struct tcphdr *tcp = skb_info_ptr(info, sizeof(*tcp));
+        if (!tcp) return;
+        __u32 key = ingress ? bpf_ntohs(tcp->source) : bpf_ntohs(tcp->dest);
+        __u8 *value = bpf_map_lookup_elem(&tcp_ports, &key);
+        if (value)
+            *out_val = *value;
+    } else if (proto == IPPROTO_UDP) {
+        struct udphdr *udp = skb_info_ptr(info, sizeof(*udp));
+        if (!udp) return;
+        __u32 key = ingress ? bpf_ntohs(udp->source) : bpf_ntohs(udp->dest);
+        __u8 *value = bpf_map_lookup_elem(&udp_ports, &key);
+        if (value)
+            *out_val = *value;
     }
-    if (value)
-        *out_val = *value;
 }
 
 static __always_inline struct idclass_ip_map_val *
@@ -234,9 +222,9 @@ static __always_inline void update_flow_stats(struct flow_stats *stats,
                           __u64 ts_ns,
                           __u8 direction,
                           struct idclass_flow_config *cfg,
-                          struct tcphdr *tcph)
+                          struct tcphdr *tcph,
+                          struct __sk_buff *skb)
 {
-    __u32 packets = stats->packets;
     __u64 prev_ts = stats->last_seen;
 
     __sync_fetch_and_add(&stats->packets, 1);
@@ -245,15 +233,21 @@ static __always_inline void update_flow_stats(struct flow_stats *stats,
 
     if (prev_ts != 0) {
         __u64 iat_ns = ts_ns - prev_ts;
-        stats->iat_us = iat_ns / 1000ULL;
+        __u32 iat_us = iat_ns / 1000ULL;
+        // 使用 EWMA 平滑 IAT
+        if (stats->iat_us == 0)
+            stats->iat_us = iat_us;
+        else
+            stats->iat_us = (stats->iat_us * 7 + iat_us) / 8;
     }
 
     ewma(&stats->avg_pkt_len, pkt_len);
 
+    /* 修复：方向：1 = ingress（下行），0 = egress（上行） */
     if (direction == 1)
-        __sync_fetch_and_add(&stats->up_bytes, pkt_len);
-    else if (direction == 2)
         __sync_fetch_and_add(&stats->down_bytes, pkt_len);
+    else
+        __sync_fetch_and_add(&stats->up_bytes, pkt_len);
 
     if (cfg && cfg->bulk_trigger_pps) {
         __u64 now_ns = ts_ns;
@@ -317,6 +311,47 @@ static __always_inline void update_flow_stats(struct flow_stats *stats,
 
         __sync_lock_test_and_set(&stats->tcp_seq, (__u64)seq);
         stats->last_pkt_ts = now_ns;
+
+        /* TCP 窗口（接收窗口） */
+        __u16 window = bpf_ntohs(tcph->window);
+        if (window > 0) {
+            if (stats->tcp_window == 0)
+                stats->tcp_window = window;
+            else
+                stats->tcp_window = (stats->tcp_window * 7 + window) / 8;
+        }
+
+        /* MSS 提取（仅在 SYN 包中解析 TCP 选项） */
+        if (tcp_flags & 0x02) { // SYN
+            __u32 offset = sizeof(struct tcphdr);
+            __u8 *opts = (__u8 *)tcph + offset;
+            __u8 *end = (__u8 *)(long)skb->data_end;
+            while (offset < tcph->doff * 4 && opts + 1 <= end) {
+                __u8 kind = opts[0];
+                if (kind == 0) break;
+                if (kind == 1) { offset++; opts++; continue; }
+                if (offset + 1 > end) break;
+                __u8 len = opts[1];
+                if (kind == 2 && len == 4) { // MSS
+                    __u16 mss = (opts[2] << 8) | opts[3];
+                    if (mss > 0) stats->tcp_mss = mss;
+                }
+                offset += len;
+                opts += len;
+            }
+        }
+
+        /* RTT 估算：使用 ACK 与上一数据包的时间差，简化但不精确 */
+        if (tcp_flags & 0x10) { // ACK
+            if (stats->last_pkt_ts != 0) {
+                __u64 rtt_ns = now_ns - stats->last_pkt_ts;
+                __u32 rtt_us = rtt_ns / 1000;
+                if (stats->tcp_rtt_us == 0)
+                    stats->tcp_rtt_us = rtt_us;
+                else
+                    stats->tcp_rtt_us = (stats->tcp_rtt_us * 7 + rtt_us) / 8;
+            }
+        }
     }
 }
 
@@ -373,6 +408,7 @@ static __always_inline __u32 classify_score(struct flow_stats *stats,
 
     if ((mask & FEATURE_TCPFLAGS) && packets >= cfg->tcp_flags_window) {
         if (stats->ack_count > 0) {
+            // 高 SYN 比例视为 bulk（可能为扫描或异常），实际可根据经验调整
             if (stats->syn_count * 100 > stats->ack_count * cfg->tcp_flags_syn_ack_ratio)
                 score_bulk += cfg->weight_tcpflags_bulk;
         }
@@ -408,9 +444,36 @@ static __always_inline __u32 classify_score(struct flow_stats *stats,
     if ((mask & FEATURE_IAT) && stats->iat_us > 0 && stats->iat_us < cfg->iat_threshold_us)
         score_realtime += cfg->weight_iat_realtime;
 
+    if ((mask & FEATURE_TCP_WINDOW) && stats->tcp_window > 0) {
+        if (stats->tcp_window <= cfg->tcp_window_low)
+            score_realtime += cfg->weight_window_realtime;
+        else if (stats->tcp_window >= cfg->tcp_window_high)
+            score_bulk += cfg->weight_window_bulk;
+        else
+            score_normal += cfg->weight_window_normal;
+    }
+
+    if ((mask & FEATURE_TCP_MSS) && stats->tcp_mss > 0) {
+        if (stats->tcp_mss <= cfg->tcp_mss_low)
+            score_realtime += cfg->weight_mss_realtime;
+        else if (stats->tcp_mss >= cfg->tcp_mss_high)
+            score_bulk += cfg->weight_mss_bulk;
+        else
+            score_video += cfg->weight_mss_video;
+    }
+
+    if ((mask & FEATURE_TCP_RTT) && stats->tcp_rtt_us > 0) {
+        if (stats->tcp_rtt_us <= cfg->tcp_rtt_low_us)
+            score_realtime += cfg->weight_rtt_realtime;
+        else if (stats->tcp_rtt_us >= cfg->tcp_rtt_high_us)
+            score_bulk += cfg->weight_rtt_bulk;
+        else
+            score_video += cfg->weight_rtt_video;
+    }
+
     __u32 threshold = cfg->score_threshold;
     __u32 max_score = 0;
-    __u32 selected = 0;
+    __u32 selected = 2; /* 默认 normal（2） */
 
     if (score_realtime >= threshold && score_realtime > max_score) {
         max_score = score_realtime;
@@ -451,20 +514,19 @@ static __always_inline void ipv4_set_dscp(struct __sk_buff *skb, __u32 offset, _
     iph->tos = (iph->tos & 0xFC) | dscp;
 }
 
+/* 修正 IPv6 DSCP 设置，避免破坏流标签和版本位 */
 static __always_inline void ipv6_set_dscp(struct __sk_buff *skb, __u32 offset, __u8 dscp)
 {
     struct ipv6hdr *ip6h;
-    __u16 *p;
-    __u16 val;
+    __u8 old;
 
     ip6h = skb_ptr(skb, offset, sizeof(*ip6h));
     if (!ip6h) return;
 
-    p = (__u16 *)ip6h;
-    // 前 4 位是版本，接着 12 位流标签，再 8 位流量类型（包括 DSCP 和 ECN）
-    val = (*p & bpf_htons(0x0F00)) | bpf_htons(((__u16)dscp << 4) & 0x0FF0);
-    if (val == *p) return;
-    *p = val;
+    old = ip6h->priority;  // 在 Linux 中 priority 实际是 traffic class 字段
+    if ((old & 0xFC) == dscp) return;
+
+    ip6h->priority = (old & 0x03) | (dscp << 2);
 }
 
 SEC("classifier")
@@ -535,8 +597,10 @@ int classify(struct __sk_buff *skb)
         stats = bpf_map_lookup_elem(&flow_stats_map, &hash);
     }
 
-    if (stats && class) {
-        update_flow_stats(stats, skb->len, bpf_ktime_get_ns(), ingress, &class->config, tcph);
+    /* 无论是否有 class，都更新统计 */
+    if (stats) {
+        update_flow_stats(stats, skb->len, bpf_ktime_get_ns(), ingress,
+                          class ? &class->config : NULL, tcph, skb);
 
         if (type == bpf_htons(ETH_P_IP)) {
             struct iphdr *iph = skb_ptr(skb, iph_offset, sizeof(*iph));
@@ -559,7 +623,8 @@ int classify(struct __sk_buff *skb)
             }
         }
 
-        prio_level = classify_score(stats, &class->config);
+        if (class)
+            prio_level = classify_score(stats, &class->config);
     }
 
     __u32 *class_id_ptr;
@@ -578,7 +643,7 @@ int classify(struct __sk_buff *skb)
                 else if (type == bpf_htons(ETH_P_IPV6))
                     ipv6_set_dscp(skb, iph_offset, dscp_val);
             } else {
-                bpf_skb_set_mark(skb, *val);
+                skb->mark = *val;   /* 直接赋值，无需辅助函数 */
             }
         }
     }

@@ -1,6 +1,6 @@
 #!/bin/bash
-# 核心库模块 (lib.sh)
-# 版本: 3.3.0 - 统一公共函数，增强命令检测，优化临时文件管理
+# 核心库模块 (common.sh)
+# 版本: 3.3.7 - 修复多项缺陷：缓存验证、集合重复创建、规则集合并顺序、IP列表换行、全局状态重置等
 # 提供 QoS 系统基础功能
 
 # ========== 全局配置常量 ==========
@@ -16,30 +16,46 @@
 : ${CUSTOM_FULL_TABLE_FILE:=/etc/qos_gargoyle/custom_rules.nft}
 : ${RATELIMIT_CHAIN:=ratelimit}
 : ${CUSTOM_VALIDATION_FILE:=/tmp/qos_gargoyle_custom_validation.txt}
+: ${EBPF_PROG_DIR:=/etc/qos_gargoyle/bpf}
+: ${EBPF_PROG_EGRESS:=egress.o}
+: ${EBPF_PROG_INGRESS:=ingress.o}
+: ${ENABLE_EBPF:=0}               # 全局 eBPF 开关，从 UCI 读取
 
 # ========== 全局变量 ==========
-upload_class_list=""
-download_class_list=""
-ENABLE_RATELIMIT=0
-ENABLE_ACK_LIMIT=0
-ENABLE_TCP_UPGRADE=0
-SAVE_NFT_RULES=0
-ACK_SLOW=50
-ACK_MED=100
-ACK_FAST=500
-ACK_XFAST=5000
-AUTO_SPEEDTEST=0
-_QOS_TABLE_FLUSHED=0
-_IPSET_LOADED=0
-_HOOKS_SETUP=0
-_UCI_CONFIG_CACHED=0
-_UCI_CACHE_FILE=""
+# 这些变量在首次加载时初始化，避免重复定义覆盖状态
+if [[ -z "$_QOS_LIB_SH_LOADED" ]]; then
+    _QOS_LIB_SH_LOADED=1
 
-# 集合族缓存
-declare -A _SET_FAMILY_CACHE=()
+    upload_class_list=""
+    download_class_list=""
+    ENABLE_RATELIMIT=0
+    ENABLE_ACK_LIMIT=0
+    ENABLE_TCP_UPGRADE=0
+    SAVE_NFT_RULES=0
+    ACK_SLOW=50
+    ACK_MED=100
+    ACK_FAST=500
+    ACK_XFAST=5000
+    AUTO_SPEEDTEST=0
+    _QOS_TABLE_FLUSHED=0
+    _IPSET_LOADED=0
+    _HOOKS_SETUP=0
+    _UCI_CONFIG_CACHED=0
+    _UCI_CACHE_FILE=""
+    _EBPF_LOADED=0                 # eBPF 程序加载标志
 
-# 临时文件数组
-TEMP_FILES=()
+    # UCI 配置缓存（由 rule.sh 填充）
+    declare -A UCI_CACHE
+
+    # 集合族缓存
+    declare -A _SET_FAMILY_CACHE=()
+
+    # 临时文件数组
+    TEMP_FILES=()
+
+    # 锁计数（递归锁）
+    _LOCK_COUNT=0
+fi
 
 # ========== 公共辅助函数 ==========
 # 去除前导零（空字符串返回空）
@@ -94,47 +110,61 @@ cleanup_temp_files() {
     done
     TEMP_FILES=()
 }
-trap cleanup_temp_files EXIT INT TERM HUP QUIT
+# 注意：trap 不再在库中设置，由主脚本负责调用 cleanup_temp_files
 
-# ========== 锁机制 ==========
+# ========== 锁机制（递归锁，支持嵌套） ==========
 LOCK_FILE="/var/run/qos_gargoyle.lock"
-LOCK_FD=200
-_LOCK_FD_OPEN=0
+LOCK_FD=""          # 动态分配的文件描述符，初始为空
 
 acquire_lock() {
-    if [[ $_LOCK_FD_OPEN -eq 0 ]]; then
+    if [[ $_LOCK_COUNT -eq 0 ]]; then
+        # 第一次获取锁，打开文件并获取锁
         if [[ ! -f "$LOCK_FILE" ]]; then
             touch "$LOCK_FILE" 2>/dev/null || {
                 log_error "无法创建锁文件 $LOCK_FILE"
                 return 1
             }
         fi
-        eval "exec $LOCK_FD>>$LOCK_FILE" 2>/dev/null || {
+        eval "exec {LOCK_FD}>>$LOCK_FILE" 2>/dev/null || {
             log_error "无法打开锁文件 $LOCK_FILE"
             return 1
         }
-        _LOCK_FD_OPEN=1
-    fi
-
-    if ! flock -n "$LOCK_FD"; then
-        log_warn "等待锁释放..."
-        if ! flock -w 5 "$LOCK_FD"; then
-            log_error "获取锁超时（5秒）"
-            eval "exec $LOCK_FD>&-"
-            _LOCK_FD_OPEN=0
+        # 确保 LOCK_FD 已设置
+        if [[ -z "$LOCK_FD" ]]; then
+            log_error "锁文件描述符未设置"
             return 1
         fi
+        if ! flock -n "$LOCK_FD"; then
+            log_warn "等待锁释放..."
+            if ! flock -w 5 "$LOCK_FD"; then
+                log_error "获取锁超时（5秒）"
+                eval "exec $LOCK_FD>&-"
+                LOCK_FD=""
+                return 1
+            fi
+        fi
+        _LOCK_COUNT=1
+        log_debug "成功获取锁 (计数=1)"
+    else
+        ((_LOCK_COUNT++))
+        log_debug "递归获取锁，计数=$_LOCK_COUNT"
     fi
-    log_debug "成功获取锁"
     return 0
 }
 
 release_lock() {
-    if [[ $_LOCK_FD_OPEN -eq 1 ]]; then
-        flock -u "$LOCK_FD" 2>/dev/null
-        eval "exec $LOCK_FD>&-"
-        _LOCK_FD_OPEN=0
-        log_debug "锁已释放"
+    if [[ $_LOCK_COUNT -gt 0 ]]; then
+        ((_LOCK_COUNT--))
+        if [[ $_LOCK_COUNT -eq 0 ]]; then
+            # 真正释放锁：关闭文件描述符即可释放锁
+            if [[ -n "$LOCK_FD" ]]; then
+                eval "exec $LOCK_FD>&-"
+                LOCK_FD=""
+            fi
+            log_debug "锁已释放 (计数归零)"
+        else
+            log_debug "递归释放锁，计数=$_LOCK_COUNT"
+        fi
     fi
 }
 
@@ -144,6 +174,18 @@ cleanup_qos_state() {
     rm -f "$QOS_RUNNING_FILE" 2>/dev/null
     rm -f "$SET_FAMILIES_FILE" 2>/dev/null
     rm -f "$CUSTOM_VALIDATION_FILE" 2>/dev/null
+    # 清理 eBPF pin 文件
+    if [[ -d "/sys/fs/bpf/qos_gargoyle" ]]; then
+        rm -rf "/sys/fs/bpf/qos_gargoyle" 2>/dev/null
+        log_debug "已清理 eBPF pin 目录"
+    fi
+    # 重置全局状态标志（修复问题 4、8）
+    _EBPF_LOADED=0
+    _QOS_TABLE_FLUSHED=0
+    _IPSET_LOADED=0
+    _HOOKS_SETUP=0
+    _SET_FAMILY_CACHE=()
+    log_debug "已重置全局状态标志"
 }
 
 check_and_handle_zero_bandwidth() {
@@ -174,6 +216,122 @@ load_global_config() {
 
     val=$(uci -q get ${CONFIG_FILE}.global.auto_speedtest 2>/dev/null)
     case "$val" in 1|yes|true|on) AUTO_SPEEDTEST=1 ;; *) AUTO_SPEEDTEST=0 ;; esac
+
+    # eBPF 开关
+    val=$(uci -q get ${CONFIG_FILE}.global.enable_ebpf 2>/dev/null)
+    case "$val" in 1|yes|true|on) ENABLE_EBPF=1 ;; *) ENABLE_EBPF=0 ;; esac
+}
+
+# ========== eBPF 支持函数 ==========
+# 检测内核是否支持 eBPF 程序挂载到 nftables
+check_ebpf_support() {
+    # 检查 nftables 是否支持 bpf 关键字（需要 nft >= 0.9.0）
+    if nft --help 2>&1 | grep -q "bpf"; then
+        return 0
+    else
+        log_warn "当前 nftables 版本不支持 bpf 关键字，eBPF 功能将禁用"
+        return 1
+    fi
+}
+
+# 加载 eBPF 程序并挂载到指定链
+# 参数: $1=程序类型 (egress|ingress), $2=目标链名
+# 程序路径: ${EBPF_PROG_DIR}/${EBPF_PROG_EGRESS} 或 ${EBPF_PROG_DIR}/${EBPF_PROG_INGRESS}
+load_ebpf_program() {
+    local prog_type="$1"
+    local target_chain="$2"
+    local prog_file=""
+
+    [[ "$ENABLE_EBPF" != "1" ]] && return 0
+    [[ $_EBPF_LOADED -eq 1 ]] && return 0
+
+    case "$prog_type" in
+        egress)   prog_file="$EBPF_PROG_DIR/$EBPF_PROG_EGRESS" ;;
+        ingress)  prog_file="$EBPF_PROG_DIR/$EBPF_PROG_INGRESS" ;;
+        *) log_error "未知 eBPF 程序类型: $prog_type"; return 1 ;;
+    esac
+
+    if [[ ! -f "$prog_file" ]]; then
+        log_info "eBPF 程序文件 $prog_file 不存在，跳过加载"
+        return 0
+    fi
+
+    # 检查 nftables 支持
+    if ! check_ebpf_support; then
+        log_warn "内核不支持 nftables bpf 扩展，eBPF 程序无法加载"
+        return 1
+    fi
+
+    # 程序 pin 路径
+    local pin_path="/sys/fs/bpf/qos_gargoyle/${prog_type}"
+    # 确保目录存在
+    if [[ ! -d "/sys/fs/bpf/qos_gargoyle" ]]; then
+        mkdir -p "/sys/fs/bpf/qos_gargoyle" 2>/dev/null
+    fi
+
+    # 如果程序未 pin，尝试使用 bpftool 加载（如果可用）
+    local need_load=1
+    if [[ -f "$pin_path" ]]; then
+        need_load=0
+        log_info "eBPF 程序已 pin 在 $pin_path"
+    fi
+
+    if [[ $need_load -eq 1 ]]; then
+        if ! command -v bpftool >/dev/null 2>&1; then
+            log_warn "bpftool 未安装，无法自动加载 eBPF 程序，请确保程序已预先加载"
+            return 1
+        fi
+        # 尝试加载程序并 pin
+        if bpftool prog load "$prog_file" "$pin_path" 2>/dev/null; then
+            log_info "eBPF 程序 $prog_type 已加载并 pin 到 $pin_path"
+        else
+            log_warn "加载 eBPF 程序 $prog_file 失败，请检查程序兼容性"
+            return 1
+        fi
+    fi
+
+    # 再次检查 pin 文件是否存在，确保规则可以引用
+    if [[ ! -f "$pin_path" ]]; then
+        log_error "eBPF 程序 pin 文件不存在: $pin_path"
+        return 1
+    fi
+
+    # 在 nftables 链中添加 bpf 跳转规则（插入到链首）
+    # 移除 meta nfproto ipv4 条件，让 eBPF 同时处理 IPv4 和 IPv6
+    local bpf_rule="insert rule inet gargoyle-qos-priority $target_chain meta mark == 0 bpf obj $pin_path counter"
+    log_info "添加 eBPF 跳转规则: $bpf_rule"
+    if nft "$bpf_rule" 2>/dev/null; then
+        log_info "eBPF 程序 $prog_type 已挂载到链 $target_chain"
+    else
+        log_warn "挂载 eBPF 程序失败，可能语法不支持或程序未正确加载"
+        return 1
+    fi
+
+    return 0
+}
+
+# 统一加载所有 eBPF 程序（在主初始化时调用）
+load_ebpf_programs() {
+    [[ "$ENABLE_EBPF" != "1" ]] && return 0
+    [[ $_EBPF_LOADED -eq 1 ]] && return 0
+
+    log_info "开始加载 eBPF 程序..."
+
+    # 确保目标链存在（由 rule.sh 创建）
+    nft add chain inet gargoyle-qos-priority filter_qos_egress 2>/dev/null || true
+    nft add chain inet gargoyle-qos-priority filter_qos_ingress 2>/dev/null || true
+
+    local ret=0
+    load_ebpf_program "egress" "filter_qos_egress" || ret=1
+    load_ebpf_program "ingress" "filter_qos_ingress" || ret=1
+
+    if [[ $ret -eq 0 ]]; then
+        _EBPF_LOADED=1
+        log_info "eBPF 程序加载完成"
+    else
+        log_warn "部分 eBPF 程序加载失败，eBPF 功能可能不完整"
+    fi
+    return $ret
 }
 
 # ========== 数字验证 ==========
@@ -491,6 +649,13 @@ load_custom_full_table() {
         return 1
     fi
 
+    # 删除所有以 gargoyle_custom_ 开头的表
+    local custom_tables=$(nft list tables inet 2>/dev/null | sed -n 's/^table inet \([a-zA-Z0-9_]*\)$/\1/p' | grep '^gargoyle_custom_')
+    for tbl in $custom_tables; do
+        log_debug "删除旧的自定义表: $tbl"
+        nft destroy table inet "$tbl" 2>/dev/null || true
+    done
+
     if nft -f "$custom_table_file" 2>&1; then
         log_info "完整表规则加载成功"
         return 0
@@ -629,7 +794,7 @@ load_download_class_configurations() {
     return 0
 }
 
-# 加载配置选项
+# 加载配置选项（修复问题1：缓存时增加验证）
 load_all_config_options() {
     local config_name="$1" section_id="$2" prefix="$3"
     local var_name val
@@ -639,13 +804,12 @@ load_all_config_options() {
         eval "${prefix}${var}=''"
     done
 
-    if [[ $_UCI_CONFIG_CACHED -eq 1 ]]; then
-        var_name="config_${section_id}_class"
-        eval "val=\${${var_name}:-}"
+    # 尝试从缓存读取
+    if [[ ${#UCI_CACHE[@]} -gt 0 ]]; then
+        local key="${config_name}.${section_id}.class"
+        val="${UCI_CACHE[$key]}"
         if [[ -n "$val" ]]; then
-            val="${val#\'}"; val="${val%\'}"; val="${val#\"}"; val="${val%\"}"
-            val=$(echo "$val" | tr -d '\n\r')
-            eval "${prefix}class=$(printf "%q" "$val")"
+            eval "${prefix}class='$val'"
         else
             log_warn "配置节 $section_id 缺少 class 参数，忽略此规则"
             return 1
@@ -653,80 +817,36 @@ load_all_config_options() {
 
         for opt in order enabled proto srcport dstport connbytes_kb family state src_ip dest_ip \
             tcp_flags packet_len dscp iif oif icmp_type udp_length ttl; do
-            var_name="config_${section_id}_${opt}"
-            eval "val=\${${var_name}:-}"
+            local key="${config_name}.${section_id}.${opt}"
+            val="${UCI_CACHE[$key]}"
             [[ -z "$val" ]] && continue
-            val="${val#\'}"; val="${val%\'}"; val="${val#\"}"; val="${val%\"}"
-            val=$(echo "$val" | tr -d '\n\r')
-
+            # 缓存值需经过验证（修复问题1）
             case "$opt" in
-                order)   val=$(echo "$val" | sed 's/[^0-9]//g'); [[ -n "$val" ]] && eval "${prefix}order=$(printf "%q" "$val")" ;;
-                enabled) val=$(echo "$val" | grep -o '^[01]'); [[ -n "$val" ]] && eval "${prefix}enabled=$(printf "%q" "$val")" ;;
-                proto)   if validate_protocol "$val" "${section_id}.proto"; then
-                             val=$(echo "$val" | sed 's/[^a-zA-Z0-9_]//g')
-                             eval "${prefix}proto=$(printf "%q" "$val")"
-                         else log_warn "规则 $section_id 协议 '$val' 无效，忽略此字段"; fi ;;
-                srcport) if validate_port "$val" "${section_id}.srcport"; then
-                             val=$(echo "$val" | tr -d '[:space:]')
-                             eval "${prefix}srcport=$(printf "%q" "$val")"
-                         else log_warn "规则 $section_id 源端口 '$val' 无效，忽略此字段"; fi ;;
-                dstport) if validate_port "$val" "${section_id}.dstport"; then
-                             val=$(echo "$val" | tr -d '[:space:]')
-                             eval "${prefix}dstport=$(printf "%q" "$val")"
-                         else log_warn "规则 $section_id 目的端口 '$val' 无效，忽略此字段"; fi ;;
-                connbytes_kb) if validate_connbytes "$val" "${section_id}.connbytes_kb"; then
-                                  val=$(echo "$val" | sed 's/[^0-9<>!= -]//g' | tr -d ' ')
-                                  eval "${prefix}connbytes_kb=$(printf "%q" "$val")"
-                              else log_warn "规则 $section_id 连接字节数 '$val' 无效，忽略此字段"; fi ;;
-                family)  if validate_family "$val" "${section_id}.family"; then
-                             val=$(echo "$val" | sed 's/[^a-zA-Z0-9]//g')
-                             eval "${prefix}family=$(printf "%q" "$val")"
-                         else log_warn "规则 $section_id 地址族 '$val' 无效，忽略此字段"; fi ;;
-                state)   val=$(echo "$val" | tr -d '{}' | sed 's/[^a-zA-Z,]//g')
-                         if validate_state "$val" "${section_id}.state"; then
-                             eval "${prefix}state=$(printf "%q" "$val")"
-                         else log_warn "规则 $section_id 连接状态 '$val' 无效，忽略此字段"; fi ;;
-                src_ip)  if validate_ip "$val"; then
-                             eval "${prefix}src_ip=$(printf "%q" "$val")"
-                         else log_warn "规则 $section_id 源 IP '$val' 格式无效，忽略此字段"; fi ;;
-                dest_ip) if validate_ip "$val"; then
-                             eval "${prefix}dest_ip=$(printf "%q" "$val")"
-                         else log_warn "规则 $section_id 目的 IP '$val' 格式无效，忽略此字段"; fi ;;
-                tcp_flags)
-                    val=$(echo "$val" | tr -d '[:space:]')
-                    if [[ -n "$val" ]] && validate_tcp_flags "$val" "${section_id}.tcp_flags"; then
-                        eval "${prefix}tcp_flags=$(printf "%q" "$val")"
-                    else
-                        log_warn "规则 $section_id TCP标志 '$val' 无效，忽略此字段"
-                    fi
-                    ;;
-                packet_len) if validate_length "$val" "${section_id}.packet_len"; then
-                                eval "${prefix}packet_len=$(printf "%q" "$val")"
-                            else log_warn "规则 $section_id 包长度 '$val' 无效，忽略此字段"; fi ;;
-                dscp)       if validate_dscp "$val" "${section_id}.dscp"; then
-                                eval "${prefix}dscp=$(printf "%q" "$val")"
-                            else log_warn "规则 $section_id DSCP值 '$val' 无效，忽略此字段"; fi ;;
-                iif)        if validate_ifname "$val" "${section_id}.iif"; then
-                                eval "${prefix}iif=$(printf "%q" "$val")"
-                            else log_warn "规则 $section_id 入接口 '$val' 无效，忽略此字段"; fi ;;
-                oif)        if validate_ifname "$val" "${section_id}.oif"; then
-                                eval "${prefix}oif=$(printf "%q" "$val")"
-                            else log_warn "规则 $section_id 出接口 '$val' 无效，忽略此字段"; fi ;;
-                icmp_type)  if validate_icmp_type "$val" "${section_id}.icmp_type"; then
-                                eval "${prefix}icmp_type=$(printf "%q" "$val")"
-                            else log_warn "规则 $section_id ICMP类型 '$val' 无效，忽略此字段"; fi ;;
-                udp_length) if validate_length "$val" "${section_id}.udp_length"; then
-                                eval "${prefix}udp_length=$(printf "%q" "$val")"
-                            else log_warn "规则 $section_id UDP长度 '$val' 无效，忽略此字段"; fi ;;
-                ttl)        if validate_ttl "$val" "${section_id}.ttl"; then
-                                eval "${prefix}ttl=$(printf "%q" "$val")"
-                            else log_warn "规则 $section_id TTL值 '$val' 无效，忽略此字段"; fi ;;
+                order)   val=$(echo "$val" | sed 's/[^0-9]//g') ;;
+                enabled) val=$(echo "$val" | grep -o '^[01]') ;;
+                proto)   if ! validate_protocol "$val" "${section_id}.proto"; then continue; fi ;;
+                srcport) if ! validate_port "$val" "${section_id}.srcport"; then continue; fi ;;
+                dstport) if ! validate_port "$val" "${section_id}.dstport"; then continue; fi ;;
+                connbytes_kb) if ! validate_connbytes "$val" "${section_id}.connbytes_kb"; then continue; fi ;;
+                family)  if ! validate_family "$val" "${section_id}.family"; then continue; fi ;;
+                state)   val=$(echo "$val" | tr -d '{}' | sed 's/[^a-zA-Z,]//g'); if ! validate_state "$val" "${section_id}.state"; then continue; fi ;;
+                src_ip)  if ! validate_ip "$val"; then continue; fi ;;
+                dest_ip) if ! validate_ip "$val"; then continue; fi ;;
+                tcp_flags) if ! validate_tcp_flags "$val" "${section_id}.tcp_flags"; then continue; fi ;;
+                packet_len) if ! validate_length "$val" "${section_id}.packet_len"; then continue; fi ;;
+                dscp)       if ! validate_dscp "$val" "${section_id}.dscp"; then continue; fi ;;
+                iif)        if ! validate_ifname "$val" "${section_id}.iif"; then continue; fi ;;
+                oif)        if ! validate_ifname "$val" "${section_id}.oif"; then continue; fi ;;
+                icmp_type)  if ! validate_icmp_type "$val" "${section_id}.icmp_type"; then continue; fi ;;
+                udp_length) if ! validate_length "$val" "${section_id}.udp_length"; then continue; fi ;;
+                ttl)        if ! validate_ttl "$val" "${section_id}.ttl"; then continue; fi ;;
             esac
+            eval "${prefix}${opt}='$val'"
         done
         return 0
     fi
 
-    # 缓存不可用，回退到直接读取 UCI
+    # 缓存不可用，回退到直接 UCI 读取
     log_debug "配置缓存不可用，从 UCI 直接读取规则 $section_id"
     local tmp_class
     tmp_class=$(uci -q get "${config_name}.${section_id}.class" 2>/dev/null)
@@ -816,9 +936,10 @@ generate_ipset_sets() {
             echo "add set inet gargoyle-qos-priority $name { type ${family}_addr; flags dynamic, timeout; timeout $timeout; }" >> "$sets_file"
         else
             if [[ "$family" == "ipv6" ]]; then
-                [[ -n "$ip6_list" ]] && elements=$(echo "$ip6_list" | tr -s ' ' ',' | sed 's/^,//;s/,$//')
+                # 修复问题6：先替换换行为空格，再处理逗号
+                [[ -n "$ip6_list" ]] && elements=$(echo "$ip6_list" | tr '\n' ' ' | tr -s ' ' ',' | sed 's/^,//;s/,$//')
             else
-                [[ -n "$ip4_list" ]] && elements=$(echo "$ip4_list" | tr -s ' ' ',' | sed 's/^,//;s/,$//')
+                [[ -n "$ip4_list" ]] && elements=$(echo "$ip4_list" | tr '\n' ' ' | tr -s ' ' ',' | sed 's/^,//;s/,$//')
             fi
             if [[ -n "$elements" ]]; then
                 echo "add set inet gargoyle-qos-priority $name { type ${family}_addr; flags interval; elements = { $elements }; }" >> "$sets_file"
@@ -908,14 +1029,34 @@ generate_ratelimit_rules() {
         download_kbytes=$((download_limit / 8))
         upload_kbytes=$((upload_limit / 8))
 
+        # 使用 qosmate 风格的 burst 计算（整数运算），优先使用 bc，回退到 awk
         if [[ -n "$burst_factor" && "$burst_factor" != "0" && "$burst_factor" != "0.0" ]]; then
-            if command -v bc >/dev/null 2>&1; then
-                download_burst=$(echo "$download_kbytes * $burst_factor" | bc | awk '{printf "%.0f", $1}')
-                upload_burst=$(echo "$upload_kbytes * $burst_factor" | bc | awk '{printf "%.0f", $1}')
-            else
-                download_burst=$(awk "BEGIN {printf \"%.0f\", $download_kbytes * $burst_factor}")
-                upload_burst=$(awk "BEGIN {printf \"%.0f\", $upload_kbytes * $burst_factor}")
-            fi
+            case "$burst_factor" in
+                *.*)
+                    local burst_int="${burst_factor%.*}"
+                    local burst_dec="${burst_factor#*.}"
+                    [ -z "$burst_int" ] && burst_int='0'
+                    [ -z "$burst_dec" ] && burst_dec='0'
+                    case "${#burst_dec}" in
+                        1) burst_dec="${burst_dec}0" ;;
+                        2) ;;
+                        *) burst_dec="${burst_dec:0:2}" ;;
+                    esac
+                    # 优先使用 bc，若不可用则使用 awk
+                    if command -v bc >/dev/null 2>&1; then
+                        download_burst=$(echo "$download_kbytes * $burst_int + $download_kbytes * $burst_dec / 100" | bc | awk '{printf "%.0f", $1}')
+                        upload_burst=$(echo "$upload_kbytes * $burst_int + $upload_kbytes * $burst_dec / 100" | bc | awk '{printf "%.0f", $1}')
+                    else
+                        download_burst=$(awk "BEGIN {printf \"%.0f\", $download_kbytes * $burst_int + $download_kbytes * $burst_dec / 100}")
+                        upload_burst=$(awk "BEGIN {printf \"%.0f\", $upload_kbytes * $burst_int + $upload_kbytes * $burst_dec / 100}")
+                    fi
+                    ;;
+                *)
+                    # 纯整数
+                    download_burst=$((download_kbytes * burst_factor))
+                    upload_burst=$((upload_kbytes * burst_factor))
+                    ;;
+            esac
             (( download_burst < 1 )) && download_burst=1
             (( upload_burst < 1 )) && upload_burst=1
             download_burst_param=" burst ${download_burst} kbytes"
@@ -964,13 +1105,13 @@ generate_ratelimit_rules() {
 
         if [[ $download_limit -gt 0 ]]; then
             rules="${rules}
-add set inet gargoyle-qos-priority ${set_name_dl4} { type ipv4_addr; flags dynamic, timeout; timeout ${timeout}; }
-add set inet gargoyle-qos-priority ${set_name_dl6} { type ipv6_addr; flags dynamic, timeout; timeout ${timeout}; }"
+create set inet gargoyle-qos-priority ${set_name_dl4} { type ipv4_addr; flags dynamic, timeout; timeout ${timeout}; }
+create set inet gargoyle-qos-priority ${set_name_dl6} { type ipv6_addr; flags dynamic, timeout; timeout ${timeout}; }"
         fi
         if [[ $upload_limit -gt 0 ]]; then
             rules="${rules}
-add set inet gargoyle-qos-priority ${set_name_ul4} { type ipv4_addr; flags dynamic, timeout; timeout ${timeout}; }
-add set inet gargoyle-qos-priority ${set_name_ul6} { type ipv6_addr; flags dynamic, timeout; timeout ${timeout}; }"
+create set inet gargoyle-qos-priority ${set_name_ul4} { type ipv4_addr; flags dynamic, timeout; timeout ${timeout}; }
+create set inet gargoyle-qos-priority ${set_name_ul6} { type ipv6_addr; flags dynamic, timeout; timeout ${timeout}; }"
         fi
 
         if [[ $download_limit -gt 0 ]]; then
@@ -1113,13 +1254,16 @@ generate_ack_limit_rules() {
     [[ -n "$med_rate" ]] && ACK_MED="$med_rate"
     [[ -n "$fast_rate" ]] && ACK_FAST="$fast_rate"
     [[ -n "$xfast_rate" ]] && ACK_XFAST="$xfast_rate"
-
+    : ${ACK_SLOW:=50}
+    : ${ACK_MED:=100}
+    : ${ACK_FAST:=500}
+    : ${ACK_XFAST:=5000}
     cat <<EOF
 # ACK rate limiting using dynamic sets (ct id . ct direction key)
-add rule inet gargoyle-qos-priority filter_qos_egress meta length < 100 tcp flags ack limit rate over ${ACK_XFAST}/second add @_qos_xfst_ack { ct id . ct direction } counter jump drop995
-add rule inet gargoyle-qos-priority filter_qos_egress meta length < 100 tcp flags ack limit rate over ${ACK_FAST}/second add @_qos_fast_ack { ct id . ct direction } counter jump drop95
-add rule inet gargoyle-qos-priority filter_qos_egress meta length < 100 tcp flags ack limit rate over ${ACK_MED}/second add @_qos_med_ack { ct id . ct direction } counter jump drop50
-add rule inet gargoyle-qos-priority filter_qos_egress meta length < 100 tcp flags ack limit rate over ${ACK_SLOW}/second add @_qos_slow_ack { ct id . ct direction } counter jump drop50
+add rule inet gargoyle-qos-priority filter_qos_egress meta length < 100 tcp flags ack limit rate over ${ACK_XFAST}/second add @qos_xfst_ack { ct id . ct direction } counter jump drop995
+add rule inet gargoyle-qos-priority filter_qos_egress meta length < 100 tcp flags ack limit rate over ${ACK_FAST}/second add @qos_fast_ack { ct id . ct direction } counter jump drop95
+add rule inet gargoyle-qos-priority filter_qos_egress meta length < 100 tcp flags ack limit rate over ${ACK_MED}/second add @qos_med_ack { ct id . ct direction } counter jump drop50
+add rule inet gargoyle-qos-priority filter_qos_egress meta length < 100 tcp flags ack limit rate over ${ACK_SLOW}/second add @qos_slow_ack { ct id . ct direction } counter jump drop50
 EOF
 }
 
@@ -1164,8 +1308,8 @@ generate_tcp_upgrade_rules() {
 
     cat <<EOF
 # TCP upgrade for slow connections (using dynamic set, ct id . ct direction key)
-add rule inet gargoyle-qos-priority filter_qos_egress meta l4proto tcp ct state established meta nfproto ipv4 add @_qos_slow_tcp { ct id . ct direction limit rate 150/second burst 150 packets } meta mark set $realtime_mark counter
-add rule inet gargoyle-qos-priority filter_qos_egress meta l4proto tcp ct state established meta nfproto ipv6 add @_qos_slow_tcp { ct id . ct direction limit rate 150/second burst 150 packets } meta mark set $realtime_mark counter
+add rule inet gargoyle-qos-priority filter_qos_egress meta l4proto tcp ct state established meta nfproto ipv4 limit rate 150/second burst 150 packets add @qos_slow_tcp { ct id . ct direction } meta mark set $realtime_mark counter
+add rule inet gargoyle-qos-priority filter_qos_egress meta l4proto tcp ct state established meta nfproto ipv6 limit rate 150/second burst 150 packets add @qos_slow_tcp { ct id . ct direction } meta mark set $realtime_mark counter
 EOF
 }
 
@@ -1210,7 +1354,8 @@ get_existing_sets() {
     fi
 
     if [[ ${#sets[@]} -eq 0 ]]; then
-        local set_list=$(nft list sets "$table" 2>/dev/null | grep -oP 'set \K[a-zA-Z0-9_]+' || true)
+        # 使用标准 sed 解析，避免 grep -oP 不兼容 busybox
+        local set_list=$(nft list sets "$table" 2>/dev/null | sed -n 's/^[[:space:]]*set \([a-zA-Z0-9_]\+\).*/\1/p')
         while IFS= read -r set; do
             [[ -n "$set" ]] && sets+=("$set")
         done <<< "$set_list"
@@ -1349,12 +1494,16 @@ load_bandwidth_from_config() {
 # ========== 检查必需的命令 ==========
 check_required_commands() {
     local missing=0
-    for cmd in tc nft ip awk bc logger; do
+    for cmd in tc nft ip awk logger; do
         if ! command -v "$cmd" >/dev/null 2>&1; then
             log_error "命令 '$cmd' 未找到，请安装相应软件包"
             missing=1
         fi
     done
+    # bc 是可选的，若缺失则使用 awk 替代
+    if ! command -v bc >/dev/null 2>&1; then
+        log_info "bc 未安装，将使用 awk 进行浮点数运算"
+    fi
     if ! command -v ethtool >/dev/null 2>&1; then
         log_info "ethtool 未安装，将尝试从 sysfs 获取接口速度"
     fi
@@ -1364,19 +1513,19 @@ check_required_commands() {
 # ========== 加载必需的内核模块 ==========
 load_required_modules() {
     local missing=0
-    for mod in ifb sch_htb sch_hfsc sch_cake sch_fq_codel sch_ingress; do
-        if ! lsmod 2>/dev/null | grep -q "^$mod"; then
-            log_info "尝试加载内核模块: $mod"
-            modprobe "$mod" 2>/dev/null || { log_error "无法加载内核模块 $mod"; missing=1; }
-            if ! lsmod 2>/dev/null | grep -q "^$mod"; then
-                log_error "内核模块 $mod 加载失败"
+    # 不再依赖 lsmod，直接尝试 modprobe 并检查 /sys/module 是否存在
+    for mod in ifb sch_ingress; do
+        # 如果模块已加载或内置，modprobe 会成功，且不会重复加载
+        if ! modprobe "$mod" 2>/dev/null; then
+            # 如果 modprobe 失败，再检查 /sys/module 是否存在（可能已内置但 modprobe 仍返回 0）
+            if [[ ! -d "/sys/module/$mod" ]]; then
+                log_error "无法加载内核模块 $mod"
                 missing=1
             fi
         fi
     done
-    if ! lsmod 2>/dev/null | grep -q "^act_connmark"; then
-        modprobe act_connmark 2>/dev/null || log_info "act_connmark 模块未加载，入口 connmark 功能可能受限"
-    fi
+    # 尝试加载 act_connmark，不强制要求
+    modprobe act_connmark 2>/dev/null || log_info "act_connmark 模块未加载，入口 connmark 功能可能受限"
     return $missing
 }
 
@@ -1470,7 +1619,7 @@ check_tc_ctinfo_support() {
     return $ret
 }
 
-# ========== 规则集合并 ==========
+# ========== 规则集合并（修复问题5：先检查文件存在） ==========
 init_ruleset() {
     local nofix="$1"
     if [[ "$nofix" == "1" ]]; then
@@ -1484,14 +1633,27 @@ init_ruleset() {
     [[ -z "$ruleset" ]] && ruleset="default.conf"
     case "$ruleset" in *.conf) ;; *) ruleset="${ruleset}.conf" ;; esac
     ruleset_file="$RULESET_DIR/$ruleset"
+    
+    # 修复：先检查规则集文件是否存在，再进行备份和合并
     if [[ ! -f "$ruleset_file" ]]; then
         log_error "规则集文件 $ruleset_file 不存在，无法加载任何规则！"
         return 1
     fi
 
-    local backup_file="/etc/config/${CONFIG_FILE}.bak.$(date +%s)"
+    # 备份主配置文件，并清理旧备份（保留最近3个）
+    local backup_base="/etc/config/${CONFIG_FILE}.bak"
+    local backup_file="${backup_base}.$(date +%s)"
     cp "/etc/config/${CONFIG_FILE}" "$backup_file"
     log_info "已备份主配置文件到 $backup_file"
+
+    # 清理旧备份，保留最近3个
+    local backups=($(ls -t ${backup_base}.* 2>/dev/null))
+    if [[ ${#backups[@]} -gt 3 ]]; then
+        for ((i=3; i<${#backups[@]}; i++)); do
+            rm -f "${backups[$i]}" 2>/dev/null
+            log_debug "删除旧备份: ${backups[$i]}"
+        done
+    fi
 
     if grep -q "^# === RULESET_" "/etc/config/${CONFIG_FILE}"; then
         local tmp_conf=$(mktemp /tmp/qos_config_$$.tmp)
@@ -1531,6 +1693,53 @@ restore_main_config() {
     log_info "已清理规则集标记"
 }
 
+# ========== 内存限制计算 ==========
+calculate_memory_limit() {
+    local config_value="$1" result
+    [[ -z "$config_value" ]] && { echo ""; return; }
+    if [[ "$config_value" == "auto" ]]; then
+        local total_mem_mb=0
+        if [[ -f /sys/fs/cgroup/memory.max ]]; then
+            local total_mem_bytes=$(cat /sys/fs/cgroup/memory.max 2>/dev/null)
+            if [[ "$total_mem_bytes" =~ ^[0-9]+$ ]] && (( total_mem_bytes > 0 )); then
+                total_mem_mb=$(( total_mem_bytes / 1024 / 1024 ))
+                log_info "从 cgroup v2 memory.max 获取内存限制: ${total_mem_mb}MB"
+            fi
+        fi
+        if (( total_mem_mb == 0 )) && [[ -f /sys/fs/cgroup/memory/memory.limit_in_bytes ]]; then
+            local total_mem_bytes=$(cat /sys/fs/cgroup/memory/memory.limit_in_bytes 2>/dev/null)
+            if [[ -n "$total_mem_bytes" ]] && (( total_mem_bytes > 0 )); then
+                total_mem_mb=$(( total_mem_bytes / 1024 / 1024 ))
+                log_info "从 cgroup v1 memory.limit_in_bytes 获取内存限制: ${total_mem_mb}MB"
+            fi
+        fi
+        if (( total_mem_mb == 0 )); then
+            local total_mem_kb=$(grep MemTotal /proc/meminfo 2>/dev/null | awk '{print $2}')
+            if [[ -n "$total_mem_kb" ]] && (( total_mem_kb > 0 )); then
+                total_mem_mb=$(( total_mem_kb / 1024 ))
+                log_info "从 /proc/meminfo 获取内存: ${total_mem_mb}MB"
+            fi
+        fi
+        if (( total_mem_mb > 0 )); then
+            result="$(((total_mem_mb + 63) / 64))Mb"
+            local min_limit=8 max_limit=32
+            local result_value=${result%Mb}
+            if (( result_value < min_limit )); then result="${min_limit}Mb"
+            elif (( result_value > max_limit )); then result="${max_limit}Mb"; fi
+            log_info "系统内存 ${total_mem_mb}MB，自动计算 memlimit=${result}"
+        else
+            log_warn "无法读取内存信息，使用默认值 16Mb"; result="16Mb"
+        fi
+    else
+        if [[ "$config_value" =~ ^[0-9]+Mb$ ]]; then
+            result="$config_value"; log_info "使用用户配置的 memlimit: ${result}"
+        else
+            log_warn "无效的 memlimit 格式 '$config_value'，使用默认值 16Mb"; result="16Mb"
+        fi
+    fi
+    echo "$result"
+}
+
 # ========== 获取最高优先级的类名称 ==========
 get_highest_priority_class() {
     local direction="$1"  # upload 或 download
@@ -1564,7 +1773,7 @@ get_highest_priority_class() {
     echo "$best_class"
 }
 
-# ========== 自动速率测试 ==========
+# ========== 自动速率测试（修复问题7：游戏规则order改为10） ==========
 auto_speedtest() {   
     local noninteractive=0 force=0 gaming_ip=""
     local WAN_IF="" DOWNLOAD_SPEED="" UPLOAD_SPEED="" SPEEDTEST_CMD=""
@@ -1579,6 +1788,10 @@ auto_speedtest() {
     done
     shift $((OPTIND-1))
     gaming_ip="$1"
+
+    # 加载类列表，以便后续获取最高优先级类
+    load_upload_class_configurations
+    load_download_class_configurations
 
     WAN_IF=$(uci -q get ${CONFIG_FILE}.global.wan_interface 2>/dev/null)
     if [[ -z "$WAN_IF" ]]; then
@@ -1675,6 +1888,7 @@ auto_speedtest() {
         if [[ "$gaming_ip" =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$ ]] || [[ "$gaming_ip" =~ : ]]; then
             log_info "添加游戏设备 IP $gaming_ip 的规则"
             
+            # 重新加载类列表（前面已加载，但确保最新）
             load_upload_class_configurations
             load_download_class_configurations
             
@@ -1688,10 +1902,25 @@ auto_speedtest() {
                 log_warn "未找到下载方向的最高优先级类，跳过下载规则添加"
             fi
             
-            local old_upload_rule=$(uci -q show ${CONFIG_FILE} | grep -E "\.upload_rule.*\.src_ip='${gaming_ip}'" | cut -d. -f2 | head -1)
-            local old_download_rule=$(uci -q show ${CONFIG_FILE} | grep -E "\.download_rule.*\.dest_ip='${gaming_ip}'" | cut -d. -f2 | head -1)
-            [[ -n "$old_upload_rule" ]] && uci -q delete ${CONFIG_FILE}.${old_upload_rule}
-            [[ -n "$old_download_rule" ]] && uci -q delete ${CONFIG_FILE}.${old_download_rule}
+            # 循环删除所有匹配的旧规则（使用固定字符串匹配）
+            while true; do
+                local old_upload_rule=$(uci -q show ${CONFIG_FILE} | grep -F ".upload_rule." | grep -F ".src_ip='${gaming_ip}'" | cut -d. -f2 | head -1)
+                if [[ -n "$old_upload_rule" ]]; then
+                    uci -q delete ${CONFIG_FILE}.${old_upload_rule}
+                    log_debug "删除旧上传规则: $old_upload_rule"
+                else
+                    break
+                fi
+            done
+            while true; do
+                local old_download_rule=$(uci -q show ${CONFIG_FILE} | grep -F ".download_rule." | grep -F ".dest_ip='${gaming_ip}'" | cut -d. -f2 | head -1)
+                if [[ -n "$old_download_rule" ]]; then
+                    uci -q delete ${CONFIG_FILE}.${old_download_rule}
+                    log_debug "删除旧下载规则: $old_download_rule"
+                else
+                    break
+                fi
+            done
             
             if [[ -n "$upload_best_class" ]]; then
                 uci add ${CONFIG_FILE} upload_rule
@@ -1700,8 +1929,10 @@ auto_speedtest() {
                 uci set ${CONFIG_FILE}.@upload_rule[-1].class="$upload_best_class"
                 uci set ${CONFIG_FILE}.@upload_rule[-1].src_ip="$gaming_ip"
                 uci set ${CONFIG_FILE}.@upload_rule[-1].proto="udp"
+                # 修复问题7：将 order 改为更小的值（10）以确保优先匹配
+                uci set ${CONFIG_FILE}.@upload_rule[-1].order=10
                 uci set ${CONFIG_FILE}.@upload_rule[-1].counter=1
-                log_info "已添加上传规则: 源IP=${gaming_ip}, 协议=UDP, 类=${upload_best_class}"
+                log_info "已添加上传规则: 源IP=${gaming_ip}, 协议=UDP, 类=${upload_best_class}, order=10"
             fi
             
             if [[ -n "$download_best_class" ]]; then
@@ -1711,8 +1942,9 @@ auto_speedtest() {
                 uci set ${CONFIG_FILE}.@download_rule[-1].class="$download_best_class"
                 uci set ${CONFIG_FILE}.@download_rule[-1].dest_ip="$gaming_ip"
                 uci set ${CONFIG_FILE}.@download_rule[-1].proto="udp"
+                uci set ${CONFIG_FILE}.@download_rule[-1].order=10
                 uci set ${CONFIG_FILE}.@download_rule[-1].counter=1
-                log_info "已添加下载规则: 目的IP=${gaming_ip}, 协议=UDP, 类=${download_best_class}"
+                log_info "已添加下载规则: 目的IP=${gaming_ip}, 协议=UDP, 类=${download_best_class}, order=10"
             fi
             
             uci commit ${CONFIG_FILE}
@@ -1721,12 +1953,12 @@ auto_speedtest() {
         fi
     fi
 
-    log_info "自动设置完成。请重启 QoS 服务生效（/etc/init.d/qos_gargoyle restart）。"
+    log_info "自动测速完成。请重启 QoS 服务生效（/etc/init.d/qos_gargoyle restart）。"
     return 0
 }
 
 # ========== 自动加载全局配置 ==========
-if [[ -z "$_QOS_LIB_SH_LOADED" ]] && [[ "$(basename "$0")" != "lib.sh" ]]; then
+if [[ -z "$_QOS_LIB_SH_LOADED" ]] && [[ "$(basename "$0")" != "common.sh" ]]; then
     load_global_config
     _QOS_LIB_SH_LOADED=1
 fi
