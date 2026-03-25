@@ -61,18 +61,38 @@ _LOCK_HELD=0
 
 acquire_lock() {
     if [[ $_LOCK_HELD -eq 1 ]]; then
-        # 已持有锁，直接返回成功
         return 0
     fi
-    # 将文件描述符 3 关联到锁文件（可读写）
+    # 打开文件描述符（用于持锁）
     exec 3> "$LOCK_FILE"
-    if ! flock -w 5 3 2>/dev/null; then
-        log_error "获取锁超时（5秒）"
-        return 1
+    # 非阻塞尝试加锁
+    if flock -n 3; then
+        # 成功加锁
+        echo $$ > "$LOCK_FILE"
+        _LOCK_HELD=1
+        return 0
     fi
-    echo $$ > "$LOCK_FILE"
-    _LOCK_HELD=1
-    return 0
+    # 加锁失败，检查是否有进程持有
+    local pid=$(fuser "$LOCK_FILE" 2>/dev/null | awk '{print $1}')
+    if [ -n "$pid" ]; then
+        log_error "锁已被进程 $pid 持有"
+        exec 3>&-
+        return 1
+    else
+        # 无进程，删除残留文件并重试
+        log_warn "发现残留锁文件，删除后重试"
+        rm -f "$LOCK_FILE"
+        exec 3> "$LOCK_FILE"
+        if flock -n 3; then
+            echo $$ > "$LOCK_FILE"
+            _LOCK_HELD=1
+            return 0
+        else
+            log_error "仍无法获取锁"
+            exec 3>&-
+            return 1
+        fi
+    fi
 }
 
 release_lock() {
@@ -82,6 +102,20 @@ release_lock() {
     flock -u 3 2>/dev/null || true
     exec 3>&-
     _LOCK_HELD=0
+}
+
+# ========== 检查是否已经在运行 ==========
+check_already_running() {
+    if [ -f "$QOS_RUNNING_FILE" ]; then
+        local old_pid=$(cat "$QOS_RUNNING_FILE" 2>/dev/null)
+        if kill -0 "$old_pid" 2>/dev/null; then
+            return 1
+        else
+            rm -f "$QOS_RUNNING_FILE"
+        fi
+    fi
+    echo $$ > "$QOS_RUNNING_FILE"
+    return 0
 }
 
 # ========== 公共辅助函数 ==========
@@ -160,6 +194,16 @@ load_global_config() {
     case "$val" in 1|yes|true|on) SAVE_NFT_RULES=1 ;; *) SAVE_NFT_RULES=0 ;; esac
     val=$(uci -q get ${CONFIG_FILE}.global.enable_ebpf 2>/dev/null)
     case "$val" in 1|yes|true|on) ENABLE_EBPF=1 ;; *) ENABLE_EBPF=0 ;; esac
+
+    # 从各自的配置节读取启用状态（覆盖全局变量）
+    local ack_enabled=$(uci -q get ${CONFIG_FILE}.ack_limit.enabled 2>/dev/null)
+    case "$ack_enabled" in 1|yes|true|on) ENABLE_ACK_LIMIT=1 ;; *) ENABLE_ACK_LIMIT=0 ;; esac
+    local tcp_enabled=$(uci -q get ${CONFIG_FILE}.tcp_upgrade.enabled 2>/dev/null)
+    case "$tcp_enabled" in 1|yes|true|on) ENABLE_TCP_UPGRADE=1 ;; *) ENABLE_TCP_UPGRADE=0 ;; esac
+	local udp_enabled=$(uci -q get ${CONFIG_FILE}.udp_limit.enabled 2>/dev/null)
+    case "$udp_enabled" in 1|yes|true|on) ENABLE_UDP_LIMIT=1 ;; *) ENABLE_UDP_LIMIT=0 ;; esac
+    local speedtest_enabled=$(uci -q get ${CONFIG_FILE}.speedtest.enabled 2>/dev/null)
+    case "$speedtest_enabled" in 1|yes|true|on) AUTO_SPEEDTEST=1 ;; *) AUTO_SPEEDTEST=0 ;; esac
 }
 
 # ========== eBPF 支持函数 ==========
@@ -382,7 +426,8 @@ validate_ip() {
 # ========== TCP 标志验证 ==========
 validate_tcp_flags() {
     local val="$1" param_name="$2"
-    val=$(echo "$val" | tr -d '[:space:]' | tr -d '\r\n')
+    # 清理字符串：去除所有空白和回车
+    val=$(echo "$val" | tr -d '[:space:]' | tr -d '\r')
     [[ -z "$val" ]] && return 0
     IFS=',' read -ra flags <<< "$val"
     for f in "${flags[@]}"; do
@@ -1028,6 +1073,72 @@ process_ratelimit_section() {
     fi
 }
 
+generate_udp_limit_rules() {
+    local udp_enable=$(uci -q get ${CONFIG_FILE}.udp_limit.enabled 2>/dev/null)
+    local udp_rate=$(uci -q get ${CONFIG_FILE}.udp_limit.rate 2>/dev/null)
+    local udp_action=$(uci -q get ${CONFIG_FILE}.udp_limit.action 2>/dev/null)
+    local udp_mark_class=$(uci -q get ${CONFIG_FILE}.udp_limit.mark_class 2>/dev/null)
+
+    case "$udp_enable" in 1|yes|true|on) udp_enable=1 ;; *) udp_enable=0 ;; esac
+    [[ -z "$udp_rate" ]] && udp_rate=450
+    [[ -z "$udp_action" ]] && udp_action="mark"
+    [[ -z "$udp_mark_class" ]] && udp_mark_class="bulk"
+
+    if [[ "$udp_enable" != "1" ]] || [[ "$udp_rate" -le 0 ]]; then
+        return
+    fi
+
+    local upload_mark="" download_mark=""
+    if [[ "$udp_action" == "mark" ]]; then
+        if [[ -z "$upload_class_list" ]]; then
+            load_upload_class_configurations
+        fi
+        if [[ -z "$download_class_list" ]]; then
+            load_download_class_configurations
+        fi
+        for class in $upload_class_list; do
+            local name=$(uci -q get ${CONFIG_FILE}.${class}.name 2>/dev/null)
+            if [[ "$name" == "$udp_mark_class" ]]; then
+                upload_mark=$(get_class_mark "upload" "$class")
+                break
+            fi
+        done
+        for class in $download_class_list; do
+            local name=$(uci -q get ${CONFIG_FILE}.${class}.name 2>/dev/null)
+            if [[ "$name" == "$udp_mark_class" ]]; then
+                download_mark=$(get_class_mark "download" "$class")
+                break
+            fi
+        done
+        if [[ -z "$upload_mark" ]] || [[ -z "$download_mark" ]]; then
+            log_warn "UDP 速率限制目标类 '$udp_mark_class' 未同时存在于上传/下载类中，将回退到丢弃动作"
+            udp_action="drop"
+        fi
+    fi
+
+    local wan_if="${qos_interface:-$(uci -q get ${CONFIG_FILE}.global.wan_interface 2>/dev/null)}"
+    if [[ -z "$wan_if" ]]; then
+        log_warn "无法确定 WAN 接口，UDP 速率限制规则将被跳过"
+        return
+    fi
+
+    local rules=""
+    if [[ "$udp_action" == "mark" ]] && [[ -n "$upload_mark" ]] && [[ -n "$download_mark" ]]; then
+        rules="${rules}
+# Global UDP rate limit - upload direction (mark)
+add rule inet gargoyle-qos-priority filter_qos_egress oifname \"$wan_if\" meta l4proto udp limit rate over ${udp_rate}/second counter meta mark set $upload_mark
+# Global UDP rate limit - download direction (mark)
+add rule inet gargoyle-qos-priority filter_qos_ingress iifname \"$wan_if\" meta l4proto udp limit rate over ${udp_rate}/second counter meta mark set $download_mark"
+    elif [[ "$udp_action" == "drop" ]]; then
+        rules="${rules}
+# Global UDP rate limit - drop
+add rule inet gargoyle-qos-priority filter_qos_egress meta l4proto udp limit rate over ${udp_rate}/second counter drop
+add rule inet gargoyle-qos-priority filter_qos_ingress meta l4proto udp limit rate over ${udp_rate}/second counter drop"
+    fi
+
+    echo "$rules"
+}
+
 generate_ratelimit_rules() {
     [[ $ENABLE_RATELIMIT != 1 ]] && return
     # 确保 config_load 可用
@@ -1041,64 +1152,6 @@ generate_ratelimit_rules() {
     for section in $sections; do
         process_ratelimit_section "$section"
     done
-
-    # ========== 全局 UDP 速率限制 ==========
-    local udp_enable=$(uci -q get ${CONFIG_FILE}.udp_limit.enabled 2>/dev/null)
-    local udp_rate=$(uci -q get ${CONFIG_FILE}.udp_limit.rate 2>/dev/null)
-    local udp_action=$(uci -q get ${CONFIG_FILE}.udp_limit.action 2>/dev/null)
-    local udp_mark_class=$(uci -q get ${CONFIG_FILE}.udp_limit.mark_class 2>/dev/null)
-
-    case "$udp_enable" in 1|yes|true|on) udp_enable=1 ;; *) udp_enable=0 ;; esac
-    [[ -z "$udp_rate" ]] && udp_rate=450
-    [[ -z "$udp_action" ]] && udp_action="mark"
-    [[ -z "$udp_mark_class" ]] && udp_mark_class="bulk"
-
-    if [[ "$udp_enable" == "1" ]] && [[ "$udp_rate" -gt 0 ]]; then
-        local upload_mark="" download_mark=""
-        if [[ "$udp_action" == "mark" ]]; then
-            if [[ -z "$upload_class_list" ]]; then
-                load_upload_class_configurations
-            fi
-            if [[ -z "$download_class_list" ]]; then
-                load_download_class_configurations
-            fi
-            for class in $upload_class_list; do
-                local name=$(uci -q get ${CONFIG_FILE}.${class}.name 2>/dev/null)
-                if [[ "$name" == "$udp_mark_class" ]]; then
-                    upload_mark=$(get_class_mark "upload" "$class")
-                    break
-                fi
-            done
-            for class in $download_class_list; do
-                local name=$(uci -q get ${CONFIG_FILE}.${class}.name 2>/dev/null)
-                if [[ "$name" == "$udp_mark_class" ]]; then
-                    download_mark=$(get_class_mark "download" "$class")
-                    break
-                fi
-            done
-            if [[ -z "$upload_mark" ]] || [[ -z "$download_mark" ]]; then
-                log_warn "UDP 速率限制目标类 '$udp_mark_class' 未同时存在于上传/下载类中，将回退到丢弃动作"
-                udp_action="drop"
-            fi
-        fi
-
-        local wan_if="${qos_interface:-$(uci -q get ${CONFIG_FILE}.global.wan_interface 2>/dev/null)}"
-        if [[ -z "$wan_if" ]]; then
-            log_warn "无法确定 WAN 接口，UDP 速率限制规则将被跳过"
-        else
-            if [[ "$udp_action" == "mark" ]] && [[ -n "$upload_mark" ]] && [[ -n "$download_mark" ]]; then
-                echo "# Global UDP rate limit - upload direction (mark)" >> "$RATELIMIT_TEMP_FILE"
-                echo "oifname \"$wan_if\" meta l4proto udp limit rate over ${udp_rate}/second counter meta mark set $upload_mark" >> "$RATELIMIT_TEMP_FILE"
-                echo "# Global UDP rate limit - download direction (mark)" >> "$RATELIMIT_TEMP_FILE"
-                echo "iifname \"$wan_if\" meta l4proto udp limit rate over ${udp_rate}/second counter meta mark set $download_mark" >> "$RATELIMIT_TEMP_FILE"
-            elif [[ "$udp_action" == "drop" ]]; then
-                echo "# Global UDP rate limit - drop" >> "$RATELIMIT_TEMP_FILE"
-                echo "meta l4proto udp limit rate over ${udp_rate}/second counter drop" >> "$RATELIMIT_TEMP_FILE"
-            else
-                log_warn "未知的 UDP 速率限制动作 '$udp_action'，跳过"
-            fi
-        fi
-    fi
 
     cat "$RATELIMIT_TEMP_FILE"
     rm -f "$RATELIMIT_TEMP_FILE"

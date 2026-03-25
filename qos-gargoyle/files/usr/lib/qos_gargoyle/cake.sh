@@ -881,6 +881,7 @@ stop_cake_qos() {
 
     # 重置全局状态（调用 common.sh 中的函数）
     cleanup_qos_state
+	restore_main_config
     release_lock
     qos_log "INFO" "CAKE QoS停止完成"
 }
@@ -893,6 +894,7 @@ init_cake_qos() {
         start)
             qos_log "INFO" "启动CAKE QoS"
             check_dependencies || exit 1
+			init_ruleset || exit 1
             acquire_lock || exit 1
             check_already_running || { release_lock; exit 1; }
 
@@ -926,71 +928,34 @@ init_cake_qos() {
             load_upload_class_configurations
             load_download_class_configurations
 
-            # 确保标记文件目录存在
-            mkdir -p "$(dirname "$CLASS_MARKS_FILE")" 2>/dev/null
-
-            # 生成标记文件（格式：direction:class:mark:dscp）
-            : > "$CLASS_MARKS_FILE"
-            for class in $upload_class_list; do
-                class_mark=$(get_class_mark "upload" "$class") || continue
-                dscp=$(uci -q get ${CONFIG_FILE}.${class}.dscp 2>/dev/null)
-                if [ -n "$dscp" ]; then
-                    if ! validate_number "$dscp" "dscp" 0 63 2>/dev/null; then
-                        qos_log "WARN" "类别 $class 的 dscp 值 $dscp 无效，使用默认值 0"
-                        dscp=0
-                    fi
-                else
-                    # 未配置 dscp，尝试从 priority 获取
-                    priority=$(uci -q get ${CONFIG_FILE}.${class}.priority 2>/dev/null)
-                    if [ -n "$priority" ] && validate_number "$priority" "priority" 0 7 2>/dev/null; then
-                        dscp=$priority
-                        qos_log "INFO" "类别 $class 未配置 dscp，使用 priority=$priority 作为 DSCP 值"
-                    else
-                        dscp=0
-                        qos_log "WARN" "类别 $class 未配置 dscp 且 priority 无效，使用默认 DSCP 0"
-                    fi
-                fi
-                echo "upload:$class:$class_mark:$dscp" >> "$CLASS_MARKS_FILE"
-            done
-            for class in $download_class_list; do
-                class_mark=$(get_class_mark "download" "$class") || continue
-                dscp=$(uci -q get ${CONFIG_FILE}.${class}.dscp 2>/dev/null)
-                if [ -n "$dscp" ]; then
-                    if ! validate_number "$dscp" "dscp" 0 63 2>/dev/null; then
-                        qos_log "WARN" "类别 $class 的 dscp 值 $dscp 无效，使用默认值 0"
-                        dscp=0
-                    fi
-                else
-                    priority=$(uci -q get ${CONFIG_FILE}.${class}.priority 2>/dev/null)
-                    if [ -n "$priority" ] && validate_number "$priority" "priority" 0 7 2>/dev/null; then
-                        dscp=$priority
-                        qos_log "INFO" "类别 $class 未配置 dscp，使用 priority=$priority 作为 DSCP 值"
-                    else
-                        dscp=0
-                        qos_log "WARN" "类别 $class 未配置 dscp 且 priority 无效，使用默认 DSCP 0"
-                    fi
-                fi
-                echo "download:$class:$class_mark:$dscp" >> "$CLASS_MARKS_FILE"
-            done
+            # 检查硬编码的标记文件是否存在且非空
+            if [ ! -s "$CLASS_MARKS_FILE" ]; then
+                qos_log "ERROR" "Class marks file $CLASS_MARKS_FILE is missing or empty"
+                stop_cake_qos
+                release_lock
+                rm -f "$QOS_RUNNING_FILE"
+                exit 1
+            fi
+            qos_log "INFO" "Using existing class marks file: $CLASS_MARKS_FILE"
 
             # 创建 nftables 表（如果不存在）
             nft add table inet gargoyle-qos-priority 2>/dev/null || true
 
             # 创建 vmap（用于纯端口规则）
-            nft add map inet gargoyle-qos-priority upload_tcp_dport_map { type mark : verdict; flags interval; } 2>/dev/null || true
-            nft add map inet gargoyle-qos-priority upload_udp_dport_map { type mark : verdict; flags interval; } 2>/dev/null || true
-            nft add map inet gargoyle-qos-priority download_tcp_sport_map { type mark : verdict; flags interval; } 2>/dev/null || true
-            nft add map inet gargoyle-qos-priority download_udp_sport_map { type mark : verdict; flags interval; } 2>/dev/null || true
+            nft add map inet gargoyle-qos-priority upload_tcp_dport_map '{ type mark : verdict; flags interval; }' 2>/dev/null || true
+            nft add map inet gargoyle-qos-priority upload_udp_dport_map '{ type mark : verdict; flags interval; }' 2>/dev/null || true
+            nft add map inet gargoyle-qos-priority download_tcp_sport_map '{ type mark : verdict; flags interval; }' 2>/dev/null || true
+            nft add map inet gargoyle-qos-priority download_udp_sport_map '{ type mark : verdict; flags interval; }' 2>/dev/null || true
 
             # 创建基于类别的集合（用于 DNS 学习）
             if [ -f "$CLASS_MARKS_FILE" ]; then
                 for class_name in $(cut -d: -f2 "$CLASS_MARKS_FILE" | sort -u); do
                     realname=$(uci -q get ${CONFIG_FILE}.${class_name}.name 2>/dev/null | tr '[:upper:]' '[:lower:]')
                     [ -z "$realname" ] && continue
-                    nft add set inet gargoyle-qos-priority upload_${realname} { type ipv4_addr; flags dynamic, timeout; } 2>/dev/null || true
-                    nft add set inet gargoyle-qos-priority upload_${realname}6 { type ipv6_addr; flags dynamic, timeout; } 2>/dev/null || true
-                    nft add set inet gargoyle-qos-priority download_${realname} { type ipv4_addr; flags dynamic, timeout; } 2>/dev/null || true
-                    nft add set inet gargoyle-qos-priority download_${realname}6 { type ipv6_addr; flags dynamic, timeout; } 2>/dev/null || true
+                    nft add set inet gargoyle-qos-priority upload_${realname} '{ type ipv4_addr; flags dynamic, timeout; }' 2>/dev/null || true
+                    nft add set inet gargoyle-qos-priority upload_${realname}6 '{ type ipv6_addr; flags dynamic, timeout; }' 2>/dev/null || true
+                    nft add set inet gargoyle-qos-priority download_${realname} '{ type ipv4_addr; flags dynamic, timeout; }' 2>/dev/null || true
+                    nft add set inet gargoyle-qos-priority download_${realname}6 '{ type ipv6_addr; flags dynamic, timeout; }' 2>/dev/null || true
                 done
             fi
 
@@ -1010,33 +975,80 @@ init_cake_qos() {
                 exit 1
             fi
 
-            # 创建 class_mark 映射（key 为标记值，value 为 DSCP 值）
-            nft add map inet gargoyle-qos-priority class_mark { type mark : mark; } 2>/dev/null || true
-            nft flush map inet gargoyle-qos-priority class_mark 2>/dev/null || true
-            if [ -f "$CLASS_MARKS_FILE" ]; then
-                while IFS=: read -r dir cls mark dscp; do
-                    [ -z "$dir" ] || [ -z "$cls" ] || [ -z "$mark" ] || [ -z "$dscp" ] && continue
-                    # 验证 mark 是否为数字，dscp 是否为数字
-                    if validate_number "$mark" "mark" 1 65535 2>/dev/null && \
-                       validate_number "$dscp" "dscp" 0 63 2>/dev/null; then
-                        nft add element inet gargoyle-qos-priority class_mark { $mark : $dscp } 2>/dev/null
-                    fi
-                done < "$CLASS_MARKS_FILE"
-            fi
+            # 创建临时文件用于批量 nft 命令
+tmp_nft_file=$(mktemp)
+trap 'rm -f "$tmp_nft_file"' EXIT
 
-            # 插入恢复规则到链首（设置 DSCP），并确保首包也能正确设置 DSCP
-            # 首先处理已有标记的连接（ct mark != 0）
-			# 使用完整的 ct mark 作为映射 key，避免截断冲突
-			nft insert rule inet gargoyle-qos-priority filter_qos_egress ct mark != 0 ip dscp set class_mark[ct mark]
-			nft insert rule inet gargoyle-qos-priority filter_qos_egress ct mark != 0 ip6 dscp set class_mark[ct mark]
-			nft insert rule inet gargoyle-qos-priority filter_qos_ingress ct mark != 0 ip dscp set class_mark[ct mark]
-			nft insert rule inet gargoyle-qos-priority filter_qos_ingress ct mark != 0 ip6 dscp set class_mark[ct mark]
-			# 再处理 established/related 连接（通过规则设置标记后）
-			nft insert rule inet gargoyle-qos-priority filter_qos_egress ct state established,related ip dscp set class_mark[ct mark]
-			nft insert rule inet gargoyle-qos-priority filter_qos_egress ct state established,related ip6 dscp set class_mark[ct mark]
-			nft insert rule inet gargoyle-qos-priority filter_qos_ingress ct state established,related ip dscp set class_mark[ct mark]
-			nft insert rule inet gargoyle-qos-priority filter_qos_ingress ct state established,related ip6 dscp set class_mark[ct mark]
-            qos_log "INFO" "已添加 conntrack 恢复规则（DSCP 模式），映射 key 为标记值，value 为 DSCP"
+# 写入 map 定义
+cat << EOF >> "$tmp_nft_file"
+delete map inet gargoyle-qos-priority class_mark 2>/dev/null
+add map inet gargoyle-qos-priority class_mark { type mark : dscp; }
+EOF
+
+# 读取硬编码的三列标记文件（格式 direction:class:mark）
+# 先加载 UCI 配置
+config_load "$CONFIG_FILE"
+
+while IFS=: read -r dir cls mark_raw; do
+    [ -z "$dir" ] || [ -z "$cls" ] && continue
+    # 清理 cls
+    cls_clean=$(echo "$cls" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' | tr -d '\r')
+    mark="${mark_raw%%#*}"
+    mark=$(echo "$mark" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+    [ -z "$mark" ] && continue
+
+    # 优先读取 dscp
+    dscp_raw=$(uci -q get "${CONFIG_FILE}.${cls_clean}.dscp" 2>/dev/null)
+    echo "DEBUG: dscp_raw='$dscp_raw'" >&2
+    dscp=$(echo "$dscp_raw" | tr -d '\r' | tr -d '[:space:]')
+    if [ -z "$dscp" ]; then
+        # 无 dscp，尝试读取 priority
+        priority_raw=$(uci -q get "${CONFIG_FILE}.${cls_clean}.priority" 2>/dev/null)
+        echo "DEBUG: priority_raw='$priority_raw'" >&2
+        priority=$(echo "$priority_raw" | tr -d '\r' | tr -d '[:space:]')
+        if [ -n "$priority" ] && [ "$priority" -ge 0 ] 2>/dev/null && [ "$priority" -le 7 ] 2>/dev/null; then
+            dscp=$priority
+        else
+            dscp=0
+        fi
+    else
+        # 确保 dscp 值在 0-63 范围内
+        if ! [ "$dscp" -ge 0 ] 2>/dev/null || ! [ "$dscp" -le 63 ] 2>/dev/null; then
+            echo "DEBUG: dscp value '$dscp' out of range, setting to 0" >&2
+            dscp=0
+        fi
+    fi
+    echo "DEBUG: final dscp='$dscp'" >&2
+    nft delete element inet gargoyle-qos-priority class_mark { $mark } 2>/dev/null
+    nft add element inet gargoyle-qos-priority class_mark { $mark : $dscp } 2>/dev/null
+    qos_log "DEBUG" "Added map element $mark : $dscp for $cls_clean"
+done < "$CLASS_MARKS_FILE"
+
+# 写入恢复规则
+cat << EOF >> "$tmp_nft_file"
+insert rule inet gargoyle-qos-priority filter_qos_egress ct mark != 0 ip dscp set @class_mark[ct mark]
+insert rule inet gargoyle-qos-priority filter_qos_egress ct mark != 0 ip6 dscp set @class_mark[ct mark]
+insert rule inet gargoyle-qos-priority filter_qos_ingress ct mark != 0 ip dscp set @class_mark[ct mark]
+insert rule inet gargoyle-qos-priority filter_qos_ingress ct mark != 0 ip6 dscp set @class_mark[ct mark]
+insert rule inet gargoyle-qos-priority filter_qos_egress ct state established,related ip dscp set @class_mark[ct mark]
+insert rule inet gargoyle-qos-priority filter_qos_egress ct state established,related ip6 dscp set @class_mark[ct mark]
+insert rule inet gargoyle-qos-priority filter_qos_ingress ct state established,related ip dscp set @class_mark[ct mark]
+insert rule inet gargoyle-qos-priority filter_qos_ingress ct state established,related ip6 dscp set @class_mark[ct mark]
+EOF
+
+# 执行批量命令
+if nft -f "$tmp_nft_file" 2>&1 | logger -t qos_gargoyle; then
+    qos_log "INFO" "class_mark map and recovery rules loaded successfully"
+else
+    qos_log "ERROR" "Failed to load class_mark map and recovery rules"
+    cat "$tmp_nft_file" | logger -t qos_gargoyle
+    stop_cake_qos
+    release_lock
+    rm -f "$QOS_RUNNING_FILE"
+    exit 1
+fi
+
+rm -f "$tmp_nft_file"
 
             # 继续原有的 CAKE 队列配置
             local upload_success=0 download_success=0

@@ -623,6 +623,81 @@ apply_enhanced_direction_rules() {
     return $batch_success
 }
 
+# 应用增强功能（ACK限速、TCP升级、UDP限速）
+apply_enhanced_features() {
+    # ACK 限速
+    if [[ $ENABLE_ACK_LIMIT -eq 1 ]]; then
+        log_info "ACK 限速已启用，生成规则..."
+        local ack_rules=$(generate_ack_limit_rules)
+        if [[ -n "$ack_rules" ]]; then
+            local ack_file=$(mktemp)
+            TEMP_FILES+=("$ack_file")
+            echo "$ack_rules" | while IFS= read -r rule; do
+                [[ -z "$rule" ]] && continue
+                echo "${rule/add rule/insert rule}" >> "$ack_file"
+            done
+            log_info "ACK 规则文件内容:"
+            cat "$ack_file" | logger -t qos_gargoyle
+            if nft -f "$ack_file" 2>&1 | logger -t qos_gargoyle; then
+                log_info "ACK 限速规则添加成功"
+            else
+                log_warn "ACK 限速规则添加失败"
+            fi
+        else
+            log_warn "ACK 限速规则生成失败（返回空）"
+        fi
+    else
+        log_info "ACK 限速未启用"
+    fi
+
+    # TCP 升级
+    if [[ $ENABLE_TCP_UPGRADE -eq 1 ]]; then
+        log_info "TCP 升级已启用，生成规则..."
+        local tcp_upgrade_rules=$(generate_tcp_upgrade_rules)
+        if [[ -n "$tcp_upgrade_rules" ]]; then
+            local tcp_file=$(mktemp)
+            TEMP_FILES+=("$tcp_file")
+            echo "$tcp_upgrade_rules" | while IFS= read -r rule; do
+                [[ -z "$rule" ]] && continue
+                echo "${rule/add rule/insert rule}" >> "$tcp_file"
+            done
+            log_info "TCP 升级规则文件内容:"
+            cat "$tcp_file" | logger -t qos_gargoyle
+            if nft -f "$tcp_file" 2>&1 | logger -t qos_gargoyle; then
+                log_info "TCP 升级规则添加成功"
+            else
+                log_warn "TCP 升级规则添加失败"
+            fi
+        else
+            log_warn "TCP 升级规则生成失败（返回空）"
+        fi
+    else
+        log_info "TCP 升级未启用"
+    fi
+
+    # UDP 限速
+    if [[ $ENABLE_UDP_LIMIT -eq 1 ]]; then
+        log_info "生成 UDP 限速规则..."
+        local udp_limit_rules=$(generate_udp_limit_rules)
+        if [[ -n "$udp_limit_rules" ]]; then
+            local udp_file=$(mktemp)
+            TEMP_FILES+=("$udp_file")
+            echo "$udp_limit_rules" > "$udp_file"
+            log_info "UDP 限速规则文件内容:"
+            cat "$udp_file" | logger -t qos_gargoyle
+            if nft -f "$udp_file" 2>&1 | logger -t qos_gargoyle; then
+                log_info "UDP 限速规则添加成功"
+            else
+                log_warn "UDP 限速规则添加失败"
+            fi
+        else
+            log_warn "UDP 限速规则生成失败（返回空）"
+        fi
+    else
+        log_info "UDP 限速未启用"
+    fi
+}
+
 # ========== 获取 WAN 接口 ==========
 get_wan_interface() {
     local wan_if
@@ -738,52 +813,7 @@ apply_all_rules() {
         return 1
     fi
     load_custom_full_table
-    if [[ $ENABLE_ACK_LIMIT -eq 1 ]]; then
-        log_info "ACK 限速已启用，生成规则..."
-        local ack_rules=$(generate_ack_limit_rules)
-        if [[ -n "$ack_rules" ]]; then
-            local ack_file=$(mktemp)
-            TEMP_FILES+=("$ack_file")
-            echo "$ack_rules" | while IFS= read -r rule; do
-                [[ -z "$rule" ]] && continue
-                echo "${rule/add rule/insert rule}" >> "$ack_file"
-            done
-            log_info "ACK 规则文件内容:"
-            cat "$ack_file" | logger -t qos_gargoyle
-            if nft -f "$ack_file" 2>&1 | logger -t qos_gargoyle; then
-                log_info "ACK 限速规则添加成功"
-            else
-                log_warn "ACK 限速规则添加失败"
-            fi
-        else
-            log_warn "ACK 限速规则生成失败（返回空）"
-        fi
-    else
-        log_info "ACK 限速未启用"
-    fi
-    if [[ $ENABLE_TCP_UPGRADE -eq 1 ]]; then
-        log_info "TCP 升级已启用，生成规则..."
-        local tcp_upgrade_rules=$(generate_tcp_upgrade_rules)
-        if [[ -n "$tcp_upgrade_rules" ]]; then
-            local tcp_file=$(mktemp)
-            TEMP_FILES+=("$tcp_file")
-            echo "$tcp_upgrade_rules" | while IFS= read -r rule; do
-                [[ -z "$rule" ]] && continue
-                echo "${rule/add rule/insert rule}" >> "$tcp_file"
-            done
-            log_info "TCP 升级规则文件内容:"
-            cat "$tcp_file" | logger -t qos_gargoyle
-            if nft -f "$tcp_file" 2>&1 | logger -t qos_gargoyle; then
-                log_info "TCP 升级规则添加成功"
-            else
-                log_warn "TCP 升级规则添加失败"
-            fi
-        else
-            log_warn "TCP 升级规则生成失败（返回空）"
-        fi
-    else
-        log_info "TCP 升级未启用"
-    fi
+    
     return 0
 }
 

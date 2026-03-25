@@ -188,6 +188,14 @@ start() {
             [ -f "$f" ] && sed 's/\r$//' "$f" > "$f.tmp" && mv "$f.tmp" "$f" 2>/dev/null || echo "Warning: Failed to process $f"
         done
     fi
+
+    # 清理 UCI 配置文件中的 Windows 换行符
+    if [ -f "/etc/config/$CONFIG_FILE" ]; then
+        echo "Cleaning Windows line endings from UCI config..."
+        sed 's/\r$//' "/etc/config/$CONFIG_FILE" > "/etc/config/$CONFIG_FILE.tmp" && \
+            mv "/etc/config/$CONFIG_FILE.tmp" "/etc/config/$CONFIG_FILE" 2>/dev/null
+        uci commit "$CONFIG_FILE" 2>/dev/null
+    fi
     
     load_common_libraries
     
@@ -211,7 +219,6 @@ start() {
         exit 1
     fi
 }
-
 stop() {
     # 确保规则辅助模块已加载（提供 acquire_lock 等函数）
     load_common_libraries

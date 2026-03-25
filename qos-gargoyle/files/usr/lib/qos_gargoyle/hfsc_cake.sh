@@ -41,20 +41,6 @@ trap main_cleanup EXIT INT TERM HUP QUIT
 . /lib/functions/network.sh
 include /lib/network
 
-# ========== 检查是否已经在运行 ==========
-check_already_running() {
-    if [[ -f "$QOS_RUNNING_FILE" ]]; then
-        local old_pid=$(cat "$QOS_RUNNING_FILE" 2>/dev/null)
-        if kill -0 "$old_pid" 2>/dev/null; then
-            return 1
-        else
-            rm -f "$QOS_RUNNING_FILE"
-        fi
-    fi
-    echo $$ > "$QOS_RUNNING_FILE"
-    return 0
-}
-
 # ========== HFSC 与 CAKE 专属配置加载 ==========
 load_hfsc_cake_config() {
     qos_log "INFO" "加载HFSC与CAKE配置"
@@ -902,12 +888,16 @@ init_hfsc_cake_qos() {
             return 1
         fi
     fi
-
     qos_log "INFO" "应用自定义规则成功"
+	
     if (( ENABLE_RATELIMIT == 1 )); then
         echo "应用速率限制链..." 
         setup_ratelimit_chain
     fi
+	
+	# 增强功能函数（ACK/TCP/UDP）
+	apply_enhanced_features
+	
     echo "应用ipv6特别规则..." 
     setup_ipv6_specific_rules
     
@@ -1159,14 +1149,14 @@ show_hfsc_cake_status() {
 
     echo -e "\n===== 增强特性状态 ====="
     local rate_val=$(uci -q get ${CONFIG_FILE}.global.enable_ratelimit 2>/dev/null)
-    local ack_val=$(uci -q get ${CONFIG_FILE}.global.enable_ack_limit 2>/dev/null)
-    local tcp_val=$(uci -q get ${CONFIG_FILE}.global.enable_tcp_upgrade 2>/dev/null)
-    local save_val=$(uci -q get ${CONFIG_FILE}.global.save_nft_rules 2>/dev/null)
+    local ack_val=$(uci -q get ${CONFIG_FILE}.ack_limit.enabled 2>/dev/null)
+    local tcp_val=$(uci -q get ${CONFIG_FILE}.tcp_upgrade.enabled 2>/dev/null)
+    local udp_val=$(uci -q get ${CONFIG_FILE}.udp_limit.enabled 2>/dev/null)
 
     case "$rate_val" in 1|yes|true|on) echo "速率限制: 已启用" ;; *) echo "速率限制: 未启用" ;; esac
     case "$ack_val"  in 1|yes|true|on) echo "ACK 限速: 已启用" ;; *) echo "ACK 限速: 未启用" ;; esac
     case "$tcp_val"  in 1|yes|true|on) echo "TCP 升级: 已启用" ;; *) echo "TCP 升级: 未启用" ;; esac
-    case "$save_val" in 1|yes|true|on) echo "规则持久化: 已启用" ;; *) echo "规则持久化: 未启用" ;; esac
+    case "$udp_val"  in 1|yes|true|on) echo "UDP 限速: 已启用" ;; *) echo "UDP 限速: 未启用" ;; esac
 
     echo -e "\n===== 健康检查 ====="
     health_check
