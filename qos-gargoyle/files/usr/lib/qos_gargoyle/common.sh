@@ -1,7 +1,10 @@
 #!/bin/bash
 # 核心库模块 (common.sh)
-# 版本: 3.3.8 - 使用 flock 命令锁，修复多项缺陷
+# 版本: 3.3.9 - 修复锁机制、UCI函数作用域、未定义函数、变量作用域等问题
 # 提供 QoS 系统基础功能
+
+# ========== 加载 OpenWrt 标准函数库 ==========
+. /lib/functions.sh 2>/dev/null || true
 
 # ========== 全局配置常量 ==========
 : ${DEBUG:=0}
@@ -35,10 +38,10 @@ if [[ -z "$_QOS_LIB_SH_LOADED" ]]; then
     ACK_MED=100
     ACK_FAST=500
     ACK_XFAST=5000
-	UDP_RATE_LIMIT_ENABLE=0           # UDP 全局限速开关
-	UDP_RATE_LIMIT_RATE=450           # 限速阈值（包/秒）
-	UDP_RATE_LIMIT_ACTION="mark"      # 动作：mark 或 drop
-	UDP_RATE_LIMIT_MARK_CLASS="bulk"  # 当 action=mark 时，标记到的目标类名称
+    UDP_RATE_LIMIT_ENABLE=0
+    UDP_RATE_LIMIT_RATE=450
+    UDP_RATE_LIMIT_ACTION="mark"
+    UDP_RATE_LIMIT_MARK_CLASS="bulk"
     AUTO_SPEEDTEST=0
     _QOS_TABLE_FLUSHED=0
     _IPSET_LOADED=0
@@ -52,10 +55,39 @@ if [[ -z "$_QOS_LIB_SH_LOADED" ]]; then
     TEMP_FILES=()
 fi
 
+# ========== 锁机制（基于文件描述符，支持嵌套） ==========
+LOCK_FILE="/var/run/qos_gargoyle.lock"
+_LOCK_HELD=0
+
+acquire_lock() {
+    if [[ $_LOCK_HELD -eq 1 ]]; then
+        # 已持有锁，直接返回成功
+        return 0
+    fi
+    # 将文件描述符 3 关联到锁文件（可读写）
+    exec 3> "$LOCK_FILE"
+    if ! flock -w 5 3 2>/dev/null; then
+        log_error "获取锁超时（5秒）"
+        return 1
+    fi
+    echo $$ > "$LOCK_FILE"
+    _LOCK_HELD=1
+    return 0
+}
+
+release_lock() {
+    if [[ $_LOCK_HELD -eq 0 ]]; then
+        return 0
+    fi
+    flock -u 3 2>/dev/null || true
+    exec 3>&-
+    _LOCK_HELD=0
+}
+
 # ========== 公共辅助函数 ==========
 strip_leading_zeros() {
     local val="$1"
-    [[ -z "$val" ]] && { echo ""; return; }
+    [[ -z "$val" ]] && { echo "0"; return; }
     val=$(echo "$val" | sed 's/^0*//')
     [[ -z "$val" ]] && val=0
     echo "$val"
@@ -93,22 +125,8 @@ cleanup_temp_files() {
     TEMP_FILES=()
 }
 
-# ========== 锁机制（基于 flock 命令，可靠无僵尸） ==========
-LOCK_FILE="/var/run/qos_gargoyle.lock"
-
-acquire_lock() {
-    # 使用 flock 命令对文件加锁，等待最多5秒
-    if ! flock -w 5 "$LOCK_FILE" 2>/dev/null; then
-        log_error "获取锁超时（5秒）"
-        return 1
-    fi
-    return 0
-}
-
-release_lock() {
-    # 释放锁（flock -u 显式解锁，但进程退出时会自动释放）
-    flock -u "$LOCK_FILE" 2>/dev/null || true
-}
+# 设置退出时清理临时文件
+trap cleanup_temp_files EXIT
 
 # ========== 外部辅助函数 ==========
 cleanup_qos_state() {
@@ -610,7 +628,8 @@ load_all_config_sections() {
         local anonymous=$(echo "$output" | grep -E "^${config_name}\\.@${section_type}\\[[0-9]+\\]=" | cut -d= -f1 | sed "s/^${config_name}\\.//")
         local named=$(echo "$output" | grep -E "^${config_name}\\.[a-zA-Z0-9_]+=${section_type}"'$' | cut -d= -f1 | cut -d. -f2)
         local old=$(echo "$output" | grep -E "^${config_name}\\.${section_type}_[0-9]+=" | cut -d= -f1 | cut -d. -f2)
-        echo "$anonymous $named $old" | tr ' ' '\n' | grep -v "^$" | sort -u | tr '\n' ' ' | sed 's/^[[:space:]]*//; s/[[:space:]]*$//'
+        # 合并并过滤空值
+        echo "$anonymous $named $old" | tr ' ' '\n' | grep -v '^$' | sort -u | tr '\n' ' ' | sed 's/^[[:space:]]*//; s/[[:space:]]*$//'
     else
         echo "$output" | grep -E "^${config_name}\\.[a-zA-Z_]+[0-9]*=" | cut -d= -f1 | cut -d. -f2
     fi
@@ -725,63 +744,67 @@ load_all_config_options() {
 }
 
 # ========== UCI ipset 生成 nftables 集合 ==========
+# 定义全局处理函数供 config_load 调用
+process_ipset_section() {
+    local section="$1" name enabled mode family timeout ip4 ip6 ip4_list ip6_list
+    local elements=""
+    config_get_bool enabled "$section" enabled 1
+    [[ $enabled -eq 0 ]] && return 0
+    config_get name "$section" name
+    [[ -z "$name" ]] && { log_warn "ipset 节 $section 缺少 name，跳过"; return 0; }
+    if [[ ! "$name" =~ ^[a-zA-Z0-9_]+$ ]]; then
+        log_error "ipset 节 $section 的 name '$name' 包含非法字符，跳过"
+        return 0
+    fi
+    config_get mode "$section" mode "static"
+    config_get family "$section" family "ipv4"
+    config_get timeout "$section" timeout "1h"
+    case "$family" in ipv4|ipv6) ;; *) log_warn "ipset $name 族 '$family' 无效，使用 ipv4"; family="ipv4"; ;; esac
+    if [[ "$family" == "ipv6" ]]; then
+        config_get ip6 "$section" ip6
+        ip6_list="$ip6"
+    else
+        config_get ip4 "$section" ip4
+        ip4_list="$ip4"
+    fi
+    echo "$name $family" >> "$SET_FAMILIES_FILE"
+    if [[ "$mode" == "dynamic" ]]; then
+        echo "add set inet gargoyle-qos-priority $name { type ${family}_addr; flags dynamic, timeout; timeout $timeout; }" >> "$IPSET_TEMP_FILE"
+    else
+        if [[ "$family" == "ipv6" ]]; then
+            [[ -n "$ip6_list" ]] && elements=$(echo "$ip6_list" | tr '\n' ' ' | tr -s ' ' ',' | sed 's/^,//;s/,$//')
+        else
+            [[ -n "$ip4_list" ]] && elements=$(echo "$ip4_list" | tr '\n' ' ' | tr -s ' ' ',' | sed 's/^,//;s/,$//')
+        fi
+        if [[ -n "$elements" ]]; then
+            echo "add set inet gargoyle-qos-priority $name { type ${family}_addr; flags interval; elements = { $elements }; }" >> "$IPSET_TEMP_FILE"
+        else
+            echo "add set inet gargoyle-qos-priority $name { type ${family}_addr; flags interval; }" >> "$IPSET_TEMP_FILE"
+        fi
+    fi
+    log_info "已生成 ipset: $name ($family, mode=$mode)"
+}
+
 generate_ipset_sets() {
     [[ $_IPSET_LOADED -eq 1 ]] && return 0
     nft add table inet gargoyle-qos-priority 2>/dev/null || true
-    if ! type config_get_bool >/dev/null 2>&1; then
+    # 确保 config_load 可用
+    if ! type config_load >/dev/null 2>&1; then
         . /lib/functions.sh
     fi
     config_load "$CONFIG_FILE" 2>/dev/null
-    local sets_file=$(mktemp /tmp/qos_ipset_sets_XXXXXX)
-    local families_file="$SET_FAMILIES_FILE"
-    TEMP_FILES+=("$sets_file")
-    > "$families_file"
-    process_ipset_section() {
-        local section="$1" name enabled mode family timeout ip4 ip6 ip4_list ip6_list
-        local elements=""
-        config_get_bool enabled "$section" enabled 1
-        [[ $enabled -eq 0 ]] && return 0
-        config_get name "$section" name
-        [[ -z "$name" ]] && { log_warn "ipset 节 $section 缺少 name，跳过"; return 0; }
-        if [[ ! "$name" =~ ^[a-zA-Z0-9_]+$ ]]; then
-            log_error "ipset 节 $section 的 name '$name' 包含非法字符，跳过"
-            return 0
-        fi
-        config_get mode "$section" mode "static"
-        config_get family "$section" family "ipv4"
-        config_get timeout "$section" timeout "1h"
-        case "$family" in ipv4|ipv6) ;; *) log_warn "ipset $name 族 '$family' 无效，使用 ipv4"; family="ipv4"; ;; esac
-        if [[ "$family" == "ipv6" ]]; then
-            config_get ip6 "$section" ip6
-            ip6_list="$ip6"
-        else
-            config_get ip4 "$section" ip4
-            ip4_list="$ip4"
-        fi
-        echo "$name $family" >> "$families_file"
-        if [[ "$mode" == "dynamic" ]]; then
-            echo "add set inet gargoyle-qos-priority $name { type ${family}_addr; flags dynamic, timeout; timeout $timeout; }" >> "$sets_file"
-        else
-            if [[ "$family" == "ipv6" ]]; then
-                [[ -n "$ip6_list" ]] && elements=$(echo "$ip6_list" | tr '\n' ' ' | tr -s ' ' ',' | sed 's/^,//;s/,$//')
-            else
-                [[ -n "$ip4_list" ]] && elements=$(echo "$ip4_list" | tr '\n' ' ' | tr -s ' ' ',' | sed 's/^,//;s/,$//')
-            fi
-            if [[ -n "$elements" ]]; then
-                echo "add set inet gargoyle-qos-priority $name { type ${family}_addr; flags interval; elements = { $elements }; }" >> "$sets_file"
-            else
-                echo "add set inet gargoyle-qos-priority $name { type ${family}_addr; flags interval; }" >> "$sets_file"
-            fi
-        fi
-        log_info "已生成 ipset: $name ($family, mode=$mode)"
-    }
+    local IPSET_TEMP_FILE=$(mktemp /tmp/qos_ipset_sets_XXXXXX)
+    TEMP_FILES+=("$IPSET_TEMP_FILE")
+    > "$SET_FAMILIES_FILE"
     local sections=$(load_all_config_sections "$CONFIG_FILE" "ipset")
-    for section in $sections; do process_ipset_section "$section"; done
-    if [[ -s "$sets_file" ]]; then
-        nft -f "$sets_file" 2>/dev/null || log_warn "部分 ipset 集合加载失败，请检查 UCI 配置"
+    for section in $sections; do
+        process_ipset_section "$section"
+    done
+    if [[ -s "$IPSET_TEMP_FILE" ]]; then
+        nft -f "$IPSET_TEMP_FILE" 2>/dev/null || log_warn "部分 ipset 集合加载失败，请检查 UCI 配置"
         log_info "已加载 UCI 定义的 ipset 集合"
     fi
-    rm -f "$sets_file"
+    rm -f "$IPSET_TEMP_FILE"
     _IPSET_LOADED=1
 }
 
@@ -814,244 +837,231 @@ build_ip_conditions_for_direction() {
     eval "${result_var}=\"\${result}\""
 }
 
+# 定义全局处理函数供 config_load 调用
+process_ratelimit_section() {
+    local section="$1" name enabled download_limit upload_limit burst_factor target_values
+    local set_name_dl4 set_name_ul4 set_name_dl6 set_name_ul6
+    local download_kbytes upload_kbytes download_burst upload_burst
+    local download_burst_param='' upload_burst_param=''
+    local sets_neg_v4="" sets_pos_v4="" ips_neg_v4="" ips_pos_v4=""
+    local sets_neg_v6="" sets_pos_v6="" ips_neg_v6="" ips_pos_v6=""
+    local value prefix setname set_family
+    config_get_bool enabled "$section" enabled 1
+    [[ $enabled -eq 0 ]] && return 0
+    config_get name "$section" name
+    [[ -z "$name" ]] && return 0
+    name=$(echo "$name" | sed 's/[^a-zA-Z0-9_]/_/g')
+    config_get download_limit "$section" download_limit "0"
+    config_get upload_limit "$section" upload_limit "0"
+    config_get burst_factor "$section" burst_factor "1.0"
+    if ! validate_float "$burst_factor" "${section}.burst_factor" 2>/dev/null; then
+        log_warn "规则 $section 的 burst_factor '$burst_factor' 无效，使用默认值 1.0"
+        burst_factor="1.0"
+    fi
+    config_get target_values "$section" target
+    [[ -z "$target_values" ]] && return 0
+    [[ $download_limit -eq 0 && $upload_limit -eq 0 ]] && return 0
+    download_kbytes=$((download_limit / 8))
+    upload_kbytes=$((upload_limit / 8))
+    if [[ -n "$burst_factor" && "$burst_factor" != "0" && "$burst_factor" != "0.0" ]]; then
+        case "$burst_factor" in
+            *.*)
+                local burst_int="${burst_factor%.*}"
+                local burst_dec="${burst_factor#*.}"
+                [ -z "$burst_int" ] && burst_int='0'
+                [ -z "$burst_dec" ] && burst_dec='0'
+                case "${#burst_dec}" in
+                    1) burst_dec="${burst_dec}0" ;;
+                    2) ;;
+                    *) burst_dec="${burst_dec:0:2}" ;;
+                esac
+                if command -v bc >/dev/null 2>&1; then
+                    download_burst=$(echo "$download_kbytes * $burst_int + $download_kbytes * $burst_dec / 100" | bc | awk '{printf "%.0f", $1}')
+                    upload_burst=$(echo "$upload_kbytes * $burst_int + $upload_kbytes * $burst_dec / 100" | bc | awk '{printf "%.0f", $1}')
+                else
+                    download_burst=$(awk "BEGIN {printf \"%.0f\", $download_kbytes * $burst_int + $download_kbytes * $burst_dec / 100}")
+                    upload_burst=$(awk "BEGIN {printf \"%.0f\", $upload_kbytes * $burst_int + $upload_kbytes * $burst_dec / 100}")
+                fi
+                ;;
+            *)
+                download_burst=$((download_kbytes * burst_factor))
+                upload_burst=$((upload_kbytes * burst_factor))
+                ;;
+        esac
+        (( download_burst < 1 )) && download_burst=1
+        (( upload_burst < 1 )) && upload_burst=1
+        download_burst_param=" burst ${download_burst} kbytes"
+        upload_burst_param=" burst ${upload_burst} kbytes"
+    fi
+    for value in $target_values; do
+        prefix=''
+        [[ "$value" == "!="* ]] && { prefix='!='; value="${value#!=}"; }
+        if [[ "$value" == '@'* ]]; then
+            setname="${value#@}"
+            if [[ -f "$SET_FAMILIES_FILE" ]]; then
+                set_family=$(awk -v set="$setname" '$1 == set {print $2}' "$SET_FAMILIES_FILE" 2>/dev/null)
+            fi
+            if [[ -z "$set_family" ]]; then
+                set_family=$(nft list set inet gargoyle-qos-priority "$setname" 2>/dev/null | grep -o 'type [a-z0-9_]*' | head -1 | awk '{print $2}')
+                set_family=${set_family%_addr}
+            fi
+            [[ -z "$set_family" ]] && set_family="ipv4"
+            if [[ "$set_family" == "ipv6" ]]; then
+                [[ -n "$prefix" ]] && sets_neg_v6="${sets_neg_v6}${sets_neg_v6:+, }${setname}" || sets_pos_v6="${sets_pos_v6}${sets_pos_v6:+, }${setname}"
+            else
+                [[ -n "$prefix" ]] && sets_neg_v4="${sets_neg_v4}${sets_neg_v4:+, }${setname}" || sets_pos_v4="${sets_pos_v4}${sets_pos_v4:+, }${setname}"
+            fi
+        else
+            if [[ "$value" =~ : ]] && ! [[ "$value" =~ ^([0-9a-fA-F]{2}[:-]){5}[0-9a-fA-F]{2}$ ]]; then
+                [[ -n "$prefix" ]] && ips_neg_v6="${ips_neg_v6}${ips_neg_v6:+, }${value}" || ips_pos_v6="${ips_pos_v6}${ips_pos_v6:+, }${value}"
+            else
+                [[ -n "$prefix" ]] && ips_neg_v4="${ips_neg_v4}${ips_neg_v4:+, }${value}" || ips_pos_v4="${ips_pos_v4}${ips_pos_v4:+, }${value}"
+            fi
+        fi
+    done
+    local prefix_set="rl_"
+    local timeout=60
+    local set_timeout=$(uci -q get ${CONFIG_FILE}.${section}.timeout 2>/dev/null)
+    [[ -n "$set_timeout" ]] && timeout="$set_timeout"
+    if [[ "$timeout" =~ ^[0-9]+$ ]]; then
+        timeout="${timeout}s"
+    fi
+    set_name_dl4="${prefix_set}${name}_dl4"
+    set_name_ul4="${prefix_set}${name}_ul4"
+    set_name_dl6="${prefix_set}${name}_dl6"
+    set_name_ul6="${prefix_set}${name}_ul6"
+    if [[ $download_limit -gt 0 ]]; then
+        echo "create set inet gargoyle-qos-priority ${set_name_dl4} { type ipv4_addr; flags dynamic, timeout; timeout ${timeout}; }" >> "$RATELIMIT_TEMP_FILE"
+        echo "create set inet gargoyle-qos-priority ${set_name_dl6} { type ipv6_addr; flags dynamic, timeout; timeout ${timeout}; }" >> "$RATELIMIT_TEMP_FILE"
+    fi
+    if [[ $upload_limit -gt 0 ]]; then
+        echo "create set inet gargoyle-qos-priority ${set_name_ul4} { type ipv4_addr; flags dynamic, timeout; timeout ${timeout}; }" >> "$RATELIMIT_TEMP_FILE"
+        echo "create set inet gargoyle-qos-priority ${set_name_ul6} { type ipv6_addr; flags dynamic, timeout; timeout ${timeout}; }" >> "$RATELIMIT_TEMP_FILE"
+    fi
+    if [[ $download_limit -gt 0 ]]; then
+        for grp in "pos:$ips_pos_v4" "neg:$ips_neg_v4"; do
+            local type="${grp%:*}" iplist="${grp#*:}"
+            [[ -z "$iplist" ]] && continue
+            local cond=""
+            build_ip_conditions_for_direction "$iplist" "daddr" cond
+            if [[ -n "$cond" ]]; then
+                echo "# ${name} - Download limit (IPv4 IP ${type})" >> "$RATELIMIT_TEMP_FILE"
+                echo "${cond} ip daddr @${set_name_dl4} counter drop comment \"${name} download (in set)\"" >> "$RATELIMIT_TEMP_FILE"
+                echo "${cond} ip daddr limit rate over ${download_kbytes} kbytes/second${download_burst_param} add @${set_name_dl4} { ip daddr } counter drop comment \"${name} download (rate limit)\"" >> "$RATELIMIT_TEMP_FILE"
+            fi
+        done
+        for set in $sets_pos_v4; do
+            echo "# ${name} - Download limit (IPv4 set @${set})" >> "$RATELIMIT_TEMP_FILE"
+            echo "ip daddr @${set} ip daddr @${set_name_dl4} counter drop comment \"${name} download (in set)\"" >> "$RATELIMIT_TEMP_FILE"
+            echo "ip daddr @${set} ip daddr limit rate over ${download_kbytes} kbytes/second${download_burst_param} add @${set_name_dl4} { ip daddr } counter drop comment \"${name} download (rate limit)\"" >> "$RATELIMIT_TEMP_FILE"
+        done
+        for set in $sets_neg_v4; do
+            echo "# ${name} - Download limit (IPv4 set != @${set})" >> "$RATELIMIT_TEMP_FILE"
+            echo "ip daddr != @${set} ip daddr @${set_name_dl4} counter drop comment \"${name} download (in set)\"" >> "$RATELIMIT_TEMP_FILE"
+            echo "ip daddr != @${set} ip daddr limit rate over ${download_kbytes} kbytes/second${download_burst_param} add @${set_name_dl4} { ip daddr } counter drop comment \"${name} download (rate limit)\"" >> "$RATELIMIT_TEMP_FILE"
+        done
+        for grp in "pos:$ips_pos_v6" "neg:$ips_neg_v6"; do
+            local type="${grp%:*}" iplist="${grp#*:}"
+            [[ -z "$iplist" ]] && continue
+            local cond=""
+            build_ip_conditions_for_direction "$iplist" "daddr" cond
+            if [[ -n "$cond" ]]; then
+                echo "# ${name} - Download limit (IPv6 IP ${type})" >> "$RATELIMIT_TEMP_FILE"
+                echo "${cond} ip6 daddr @${set_name_dl6} counter drop comment \"${name} download (in set)\"" >> "$RATELIMIT_TEMP_FILE"
+                echo "${cond} ip6 daddr limit rate over ${download_kbytes} kbytes/second${download_burst_param} add @${set_name_dl6} { ip6 daddr } counter drop comment \"${name} download (rate limit)\"" >> "$RATELIMIT_TEMP_FILE"
+            fi
+        done
+        for set in $sets_pos_v6; do
+            echo "# ${name} - Download limit (IPv6 set @${set})" >> "$RATELIMIT_TEMP_FILE"
+            echo "ip6 daddr @${set} ip6 daddr @${set_name_dl6} counter drop comment \"${name} download (in set)\"" >> "$RATELIMIT_TEMP_FILE"
+            echo "ip6 daddr @${set} ip6 daddr limit rate over ${download_kbytes} kbytes/second${download_burst_param} add @${set_name_dl6} { ip6 daddr } counter drop comment \"${name} download (rate limit)\"" >> "$RATELIMIT_TEMP_FILE"
+        done
+        for set in $sets_neg_v6; do
+            echo "# ${name} - Download limit (IPv6 set != @${set})" >> "$RATELIMIT_TEMP_FILE"
+            echo "ip6 daddr != @${set} ip6 daddr @${set_name_dl6} counter drop comment \"${name} download (in set)\"" >> "$RATELIMIT_TEMP_FILE"
+            echo "ip6 daddr != @${set} ip6 daddr limit rate over ${download_kbytes} kbytes/second${download_burst_param} add @${set_name_dl6} { ip6 daddr } counter drop comment \"${name} download (rate limit)\"" >> "$RATELIMIT_TEMP_FILE"
+        done
+    fi
+    if [[ $upload_limit -gt 0 ]]; then
+        for grp in "pos:$ips_pos_v4" "neg:$ips_neg_v4"; do
+            local type="${grp%:*}" iplist="${grp#*:}"
+            [[ -z "$iplist" ]] && continue
+            local cond=""
+            build_ip_conditions_for_direction "$iplist" "saddr" cond
+            if [[ -n "$cond" ]]; then
+                echo "# ${name} - Upload limit (IPv4 IP ${type})" >> "$RATELIMIT_TEMP_FILE"
+                echo "${cond} ip saddr @${set_name_ul4} counter drop comment \"${name} upload (in set)\"" >> "$RATELIMIT_TEMP_FILE"
+                echo "${cond} ip saddr limit rate over ${upload_kbytes} kbytes/second${upload_burst_param} add @${set_name_ul4} { ip saddr } counter drop comment \"${name} upload (rate limit)\"" >> "$RATELIMIT_TEMP_FILE"
+            fi
+        done
+        for set in $sets_pos_v4; do
+            echo "# ${name} - Upload limit (IPv4 set @${set})" >> "$RATELIMIT_TEMP_FILE"
+            echo "ip saddr @${set} ip saddr @${set_name_ul4} counter drop comment \"${name} upload (in set)\"" >> "$RATELIMIT_TEMP_FILE"
+            echo "ip saddr @${set} ip saddr limit rate over ${upload_kbytes} kbytes/second${upload_burst_param} add @${set_name_ul4} { ip saddr } counter drop comment \"${name} upload (rate limit)\"" >> "$RATELIMIT_TEMP_FILE"
+        done
+        for set in $sets_neg_v4; do
+            echo "# ${name} - Upload limit (IPv4 set != @${set})" >> "$RATELIMIT_TEMP_FILE"
+            echo "ip saddr != @${set} ip saddr @${set_name_ul4} counter drop comment \"${name} upload (in set)\"" >> "$RATELIMIT_TEMP_FILE"
+            echo "ip saddr != @${set} ip saddr limit rate over ${upload_kbytes} kbytes/second${upload_burst_param} add @${set_name_ul4} { ip saddr } counter drop comment \"${name} upload (rate limit)\"" >> "$RATELIMIT_TEMP_FILE"
+        done
+        for grp in "pos:$ips_pos_v6" "neg:$ips_neg_v6"; do
+            local type="${grp%:*}" iplist="${grp#*:}"
+            [[ -z "$iplist" ]] && continue
+            local cond=""
+            build_ip_conditions_for_direction "$iplist" "saddr" cond
+            if [[ -n "$cond" ]]; then
+                echo "# ${name} - Upload limit (IPv6 IP ${type})" >> "$RATELIMIT_TEMP_FILE"
+                echo "${cond} ip6 saddr @${set_name_ul6} counter drop comment \"${name} upload (in set)\"" >> "$RATELIMIT_TEMP_FILE"
+                echo "${cond} ip6 saddr limit rate over ${upload_kbytes} kbytes/second${upload_burst_param} add @${set_name_ul6} { ip6 saddr } counter drop comment \"${name} upload (rate limit)\"" >> "$RATELIMIT_TEMP_FILE"
+            fi
+        done
+        for set in $sets_pos_v6; do
+            echo "# ${name} - Upload limit (IPv6 set @${set})" >> "$RATELIMIT_TEMP_FILE"
+            echo "ip6 saddr @${set} ip6 saddr @${set_name_ul6} counter drop comment \"${name} upload (in set)\"" >> "$RATELIMIT_TEMP_FILE"
+            echo "ip6 saddr @${set} ip6 saddr limit rate over ${upload_kbytes} kbytes/second${upload_burst_param} add @${set_name_ul6} { ip6 saddr } counter drop comment \"${name} upload (rate limit)\"" >> "$RATELIMIT_TEMP_FILE"
+        done
+        for set in $sets_neg_v6; do
+            echo "# ${name} - Upload limit (IPv6 set != @${set})" >> "$RATELIMIT_TEMP_FILE"
+            echo "ip6 saddr != @${set} ip6 saddr @${set_name_ul6} counter drop comment \"${name} upload (in set)\"" >> "$RATELIMIT_TEMP_FILE"
+            echo "ip6 saddr != @${set} ip6 saddr limit rate over ${upload_kbytes} kbytes/second${upload_burst_param} add @${set_name_ul6} { ip6 saddr } counter drop comment \"${name} upload (rate limit)\"" >> "$RATELIMIT_TEMP_FILE"
+        done
+    fi
+}
+
 generate_ratelimit_rules() {
     [[ $ENABLE_RATELIMIT != 1 ]] && return
+    # 确保 config_load 可用
     if ! type config_load >/dev/null 2>&1; then
         . /lib/functions.sh
     fi
     config_load "$CONFIG_FILE" 2>/dev/null
-    local rules=""
-    process_ratelimit_section() {
-        local section="$1" name enabled download_limit upload_limit burst_factor target_values
-        local set_name_dl4 set_name_ul4 set_name_dl6 set_name_ul6
-        local download_kbytes upload_kbytes download_burst upload_burst
-        local download_burst_param='' upload_burst_param=''
-        local sets_neg_v4="" sets_pos_v4="" ips_neg_v4="" ips_pos_v4=""
-        local sets_neg_v6="" sets_pos_v6="" ips_neg_v6="" ips_pos_v6=""
-        local value prefix setname set_family
-        config_get_bool enabled "$section" enabled 1
-        [[ $enabled -eq 0 ]] && return 0
-        config_get name "$section" name
-        [[ -z "$name" ]] && return 0
-        name=$(echo "$name" | sed 's/[^a-zA-Z0-9_]/_/g')
-        config_get download_limit "$section" download_limit "0"
-        config_get upload_limit "$section" upload_limit "0"
-        config_get burst_factor "$section" burst_factor "1.0"
-        if ! validate_float "$burst_factor" "${section}.burst_factor" 2>/dev/null; then
-            log_warn "规则 $section 的 burst_factor '$burst_factor' 无效，使用默认值 1.0"
-            burst_factor="1.0"
-        fi
-        config_get target_values "$section" target
-        [[ -z "$target_values" ]] && return 0
-        [[ $download_limit -eq 0 && $upload_limit -eq 0 ]] && return 0
-        download_kbytes=$((download_limit / 8))
-        upload_kbytes=$((upload_limit / 8))
-        if [[ -n "$burst_factor" && "$burst_factor" != "0" && "$burst_factor" != "0.0" ]]; then
-            case "$burst_factor" in
-                *.*)
-                    local burst_int="${burst_factor%.*}"
-                    local burst_dec="${burst_factor#*.}"
-                    [ -z "$burst_int" ] && burst_int='0'
-                    [ -z "$burst_dec" ] && burst_dec='0'
-                    case "${#burst_dec}" in
-                        1) burst_dec="${burst_dec}0" ;;
-                        2) ;;
-                        *) burst_dec="${burst_dec:0:2}" ;;
-                    esac
-                    if command -v bc >/dev/null 2>&1; then
-                        download_burst=$(echo "$download_kbytes * $burst_int + $download_kbytes * $burst_dec / 100" | bc | awk '{printf "%.0f", $1}')
-                        upload_burst=$(echo "$upload_kbytes * $burst_int + $upload_kbytes * $burst_dec / 100" | bc | awk '{printf "%.0f", $1}')
-                    else
-                        download_burst=$(awk "BEGIN {printf \"%.0f\", $download_kbytes * $burst_int + $download_kbytes * $burst_dec / 100}")
-                        upload_burst=$(awk "BEGIN {printf \"%.0f\", $upload_kbytes * $burst_int + $upload_kbytes * $burst_dec / 100}")
-                    fi
-                    ;;
-                *)
-                    download_burst=$((download_kbytes * burst_factor))
-                    upload_burst=$((upload_kbytes * burst_factor))
-                    ;;
-            esac
-            (( download_burst < 1 )) && download_burst=1
-            (( upload_burst < 1 )) && upload_burst=1
-            download_burst_param=" burst ${download_burst} kbytes"
-            upload_burst_param=" burst ${upload_burst} kbytes"
-        fi
-        for value in $target_values; do
-            prefix=''
-            [[ "$value" == "!="* ]] && { prefix='!='; value="${value#!=}"; }
-            if [[ "$value" == '@'* ]]; then
-                setname="${value#@}"
-                if [[ -f "$SET_FAMILIES_FILE" ]]; then
-                    set_family=$(awk -v set="$setname" '$1 == set {print $2}' "$SET_FAMILIES_FILE" 2>/dev/null)
-                fi
-                if [[ -z "$set_family" ]]; then
-                    set_family=$(nft list set inet gargoyle-qos-priority "$setname" 2>/dev/null | grep -o 'type [a-z0-9_]*' | head -1 | awk '{print $2}')
-                    set_family=${set_family%_addr}
-                fi
-                [[ -z "$set_family" ]] && set_family="ipv4"
-                if [[ "$set_family" == "ipv6" ]]; then
-                    [[ -n "$prefix" ]] && sets_neg_v6="${sets_neg_v6}${sets_neg_v6:+, }${setname}" || sets_pos_v6="${sets_pos_v6}${sets_pos_v6:+, }${setname}"
-                else
-                    [[ -n "$prefix" ]] && sets_neg_v4="${sets_neg_v4}${sets_neg_v4:+, }${setname}" || sets_pos_v4="${sets_pos_v4}${sets_pos_v4:+, }${setname}"
-                fi
-            else
-                if [[ "$value" =~ : ]] && ! [[ "$value" =~ ^([0-9a-fA-F]{2}[:-]){5}[0-9a-fA-F]{2}$ ]]; then
-                    [[ -n "$prefix" ]] && ips_neg_v6="${ips_neg_v6}${ips_neg_v6:+, }${value}" || ips_pos_v6="${ips_pos_v6}${ips_pos_v6:+, }${value}"
-                else
-                    [[ -n "$prefix" ]] && ips_neg_v4="${ips_neg_v4}${ips_neg_v4:+, }${value}" || ips_pos_v4="${ips_pos_v4}${ips_pos_v4:+, }${value}"
-                fi
-            fi
-        done
-        local prefix_set="rl_"
-        local timeout=60
-        local set_timeout=$(uci -q get ${CONFIG_FILE}.${section}.timeout 2>/dev/null)
-        [[ -n "$set_timeout" ]] && timeout="$set_timeout"
-        if [[ "$timeout" =~ ^[0-9]+$ ]]; then
-            timeout="${timeout}s"
-        fi
-        set_name_dl4="${prefix_set}${name}_dl4"
-        set_name_ul4="${prefix_set}${name}_ul4"
-        set_name_dl6="${prefix_set}${name}_dl6"
-        set_name_ul6="${prefix_set}${name}_ul6"
-        if [[ $download_limit -gt 0 ]]; then
-            rules="${rules}
-create set inet gargoyle-qos-priority ${set_name_dl4} { type ipv4_addr; flags dynamic, timeout; timeout ${timeout}; }
-create set inet gargoyle-qos-priority ${set_name_dl6} { type ipv6_addr; flags dynamic, timeout; timeout ${timeout}; }"
-        fi
-        if [[ $upload_limit -gt 0 ]]; then
-            rules="${rules}
-create set inet gargoyle-qos-priority ${set_name_ul4} { type ipv4_addr; flags dynamic, timeout; timeout ${timeout}; }
-create set inet gargoyle-qos-priority ${set_name_ul6} { type ipv6_addr; flags dynamic, timeout; timeout ${timeout}; }"
-        fi
-        if [[ $download_limit -gt 0 ]]; then
-            for grp in "pos:$ips_pos_v4" "neg:$ips_neg_v4"; do
-                local type="${grp%:*}" iplist="${grp#*:}"
-                [[ -z "$iplist" ]] && continue
-                local cond=""
-                build_ip_conditions_for_direction "$iplist" "daddr" cond
-                if [[ -n "$cond" ]]; then
-                    rules="${rules}
-        # ${name} - Download limit (IPv4 IP ${type})
-        ${cond} ip daddr @${set_name_dl4} counter drop comment \"${name} download (in set)\"
-        ${cond} ip daddr limit rate over ${download_kbytes} kbytes/second${download_burst_param} add @${set_name_dl4} { ip daddr } counter drop comment \"${name} download (rate limit)\""
-                fi
-            done
-            for set in $sets_pos_v4; do
-                rules="${rules}
-        # ${name} - Download limit (IPv4 set @${set})
-        ip daddr @${set} ip daddr @${set_name_dl4} counter drop comment \"${name} download (in set)\"
-        ip daddr @${set} ip daddr limit rate over ${download_kbytes} kbytes/second${download_burst_param} add @${set_name_dl4} { ip daddr } counter drop comment \"${name} download (rate limit)\""
-            done
-            for set in $sets_neg_v4; do
-                rules="${rules}
-        # ${name} - Download limit (IPv4 set != @${set})
-        ip daddr != @${set} ip daddr @${set_name_dl4} counter drop comment \"${name} download (in set)\"
-        ip daddr != @${set} ip daddr limit rate over ${download_kbytes} kbytes/second${download_burst_param} add @${set_name_dl4} { ip daddr } counter drop comment \"${name} download (rate limit)\""
-            done
-            for grp in "pos:$ips_pos_v6" "neg:$ips_neg_v6"; do
-                local type="${grp%:*}" iplist="${grp#*:}"
-                [[ -z "$iplist" ]] && continue
-                local cond=""
-                build_ip_conditions_for_direction "$iplist" "daddr" cond
-                if [[ -n "$cond" ]]; then
-                    rules="${rules}
-        # ${name} - Download limit (IPv6 IP ${type})
-        ${cond} ip6 daddr @${set_name_dl6} counter drop comment \"${name} download (in set)\"
-        ${cond} ip6 daddr limit rate over ${download_kbytes} kbytes/second${download_burst_param} add @${set_name_dl6} { ip6 daddr } counter drop comment \"${name} download (rate limit)\""
-                fi
-            done
-            for set in $sets_pos_v6; do
-                rules="${rules}
-        # ${name} - Download limit (IPv6 set @${set})
-        ip6 daddr @${set} ip6 daddr @${set_name_dl6} counter drop comment \"${name} download (in set)\"
-        ip6 daddr @${set} ip6 daddr limit rate over ${download_kbytes} kbytes/second${download_burst_param} add @${set_name_dl6} { ip6 daddr } counter drop comment \"${name} download (rate limit)\""
-            done
-            for set in $sets_neg_v6; do
-                rules="${rules}
-        # ${name} - Download limit (IPv6 set != @${set})
-        ip6 daddr != @${set} ip6 daddr @${set_name_dl6} counter drop comment \"${name} download (in set)\"
-        ip6 daddr != @${set} ip6 daddr limit rate over ${download_kbytes} kbytes/second${download_burst_param} add @${set_name_dl6} { ip6 daddr } counter drop comment \"${name} download (rate limit)\""
-            done
-        fi
-        if [[ $upload_limit -gt 0 ]]; then
-            for grp in "pos:$ips_pos_v4" "neg:$ips_neg_v4"; do
-                local type="${grp%:*}" iplist="${grp#*:}"
-                [[ -z "$iplist" ]] && continue
-                local cond=""
-                build_ip_conditions_for_direction "$iplist" "saddr" cond
-                if [[ -n "$cond" ]]; then
-                    rules="${rules}
-        # ${name} - Upload limit (IPv4 IP ${type})
-        ${cond} ip saddr @${set_name_ul4} counter drop comment \"${name} upload (in set)\"
-        ${cond} ip saddr limit rate over ${upload_kbytes} kbytes/second${upload_burst_param} add @${set_name_ul4} { ip saddr } counter drop comment \"${name} upload (rate limit)\""
-                fi
-            done
-            for set in $sets_pos_v4; do
-                rules="${rules}
-        # ${name} - Upload limit (IPv4 set @${set})
-        ip saddr @${set} ip saddr @${set_name_ul4} counter drop comment \"${name} upload (in set)\"
-        ip saddr @${set} ip saddr limit rate over ${upload_kbytes} kbytes/second${upload_burst_param} add @${set_name_ul4} { ip saddr } counter drop comment \"${name} upload (rate limit)\""
-            done
-            for set in $sets_neg_v4; do
-                rules="${rules}
-        # ${name} - Upload limit (IPv4 set != @${set})
-        ip saddr != @${set} ip saddr @${set_name_ul4} counter drop comment \"${name} upload (in set)\"
-        ip saddr != @${set} ip saddr limit rate over ${upload_kbytes} kbytes/second${upload_burst_param} add @${set_name_ul4} { ip saddr } counter drop comment \"${name} upload (rate limit)\""
-            done
-            for grp in "pos:$ips_pos_v6" "neg:$ips_neg_v6"; do
-                local type="${grp%:*}" iplist="${grp#*:}"
-                [[ -z "$iplist" ]] && continue
-                local cond=""
-                build_ip_conditions_for_direction "$iplist" "saddr" cond
-                if [[ -n "$cond" ]]; then
-                    rules="${rules}
-        # ${name} - Upload limit (IPv6 IP ${type})
-        ${cond} ip6 saddr @${set_name_ul6} counter drop comment \"${name} upload (in set)\"
-        ${cond} ip6 saddr limit rate over ${upload_kbytes} kbytes/second${upload_burst_param} add @${set_name_ul6} { ip6 saddr } counter drop comment \"${name} upload (rate limit)\""
-                fi
-            done
-            for set in $sets_pos_v6; do
-                rules="${rules}
-        # ${name} - Upload limit (IPv6 set @${set})
-        ip6 saddr @${set} ip6 saddr @${set_name_ul6} counter drop comment \"${name} upload (in set)\"
-        ip6 saddr @${set} ip6 saddr limit rate over ${upload_kbytes} kbytes/second${upload_burst_param} add @${set_name_ul6} { ip6 saddr } counter drop comment \"${name} upload (rate limit)\""
-            done
-            for set in $sets_neg_v6; do
-                rules="${rules}
-        # ${name} - Upload limit (IPv6 set != @${set})
-        ip6 saddr != @${set} ip6 saddr @${set_name_ul6} counter drop comment \"${name} upload (in set)\"
-        ip6 saddr != @${set} ip6 saddr limit rate over ${upload_kbytes} kbytes/second${upload_burst_param} add @${set_name_ul6} { ip6 saddr } counter drop comment \"${name} upload (rate limit)\""
-            done
-        fi
-    }
+    local RATELIMIT_TEMP_FILE=$(mktemp /tmp/qos_ratelimit_rules_XXXXXX)
+    TEMP_FILES+=("$RATELIMIT_TEMP_FILE")
     local sections=$(load_all_config_sections "$CONFIG_FILE" "ratelimit")
-    for section in $sections; do process_ratelimit_section "$section"; done
-	
-	    # ========== 全局 UDP 速率限制 ==========
-    # 从 udp_limit 节读取配置
+    for section in $sections; do
+        process_ratelimit_section "$section"
+    done
+
+    # ========== 全局 UDP 速率限制 ==========
     local udp_enable=$(uci -q get ${CONFIG_FILE}.udp_limit.enabled 2>/dev/null)
     local udp_rate=$(uci -q get ${CONFIG_FILE}.udp_limit.rate 2>/dev/null)
     local udp_action=$(uci -q get ${CONFIG_FILE}.udp_limit.action 2>/dev/null)
     local udp_mark_class=$(uci -q get ${CONFIG_FILE}.udp_limit.mark_class 2>/dev/null)
-    
-    # 默认值
+
     case "$udp_enable" in 1|yes|true|on) udp_enable=1 ;; *) udp_enable=0 ;; esac
     [[ -z "$udp_rate" ]] && udp_rate=450
     [[ -z "$udp_action" ]] && udp_action="mark"
     [[ -z "$udp_mark_class" ]] && udp_mark_class="bulk"
-    
+
     if [[ "$udp_enable" == "1" ]] && [[ "$udp_rate" -gt 0 ]]; then
         local upload_mark="" download_mark=""
-        # 如果动作为 mark，则获取目标类的标记值
         if [[ "$udp_action" == "mark" ]]; then
-            # 确保类列表已加载
             if [[ -z "$upload_class_list" ]]; then
                 load_upload_class_configurations
             fi
             if [[ -z "$download_class_list" ]]; then
                 load_download_class_configurations
             fi
-            # 查找上传方向的目标类
             for class in $upload_class_list; do
                 local name=$(uci -q get ${CONFIG_FILE}.${class}.name 2>/dev/null)
                 if [[ "$name" == "$udp_mark_class" ]]; then
@@ -1059,7 +1069,6 @@ create set inet gargoyle-qos-priority ${set_name_ul6} { type ipv6_addr; flags dy
                     break
                 fi
             done
-            # 查找下载方向的目标类
             for class in $download_class_list; do
                 local name=$(uci -q get ${CONFIG_FILE}.${class}.name 2>/dev/null)
                 if [[ "$name" == "$udp_mark_class" ]]; then
@@ -1072,30 +1081,27 @@ create set inet gargoyle-qos-priority ${set_name_ul6} { type ipv6_addr; flags dy
                 udp_action="drop"
             fi
         fi
-        
+
         local wan_if="${qos_interface:-$(uci -q get ${CONFIG_FILE}.global.wan_interface 2>/dev/null)}"
         if [[ -z "$wan_if" ]]; then
             log_warn "无法确定 WAN 接口，UDP 速率限制规则将被跳过"
         else
             if [[ "$udp_action" == "mark" ]] && [[ -n "$upload_mark" ]] && [[ -n "$download_mark" ]]; then
-                # 生成标记规则（区分上传和下载）
-                rules="${rules}
-        # Global UDP rate limit - upload direction (mark)
-        oifname \"$wan_if\" meta l4proto udp limit rate over ${udp_rate}/second counter meta mark set $upload_mark
-        # Global UDP rate limit - download direction (mark)
-        iifname \"$wan_if\" meta l4proto udp limit rate over ${udp_rate}/second counter meta mark set $download_mark"
+                echo "# Global UDP rate limit - upload direction (mark)" >> "$RATELIMIT_TEMP_FILE"
+                echo "oifname \"$wan_if\" meta l4proto udp limit rate over ${udp_rate}/second counter meta mark set $upload_mark" >> "$RATELIMIT_TEMP_FILE"
+                echo "# Global UDP rate limit - download direction (mark)" >> "$RATELIMIT_TEMP_FILE"
+                echo "iifname \"$wan_if\" meta l4proto udp limit rate over ${udp_rate}/second counter meta mark set $download_mark" >> "$RATELIMIT_TEMP_FILE"
             elif [[ "$udp_action" == "drop" ]]; then
-                # 直接丢弃超限 UDP 包
-                rules="${rules}
-        # Global UDP rate limit - drop
-        meta l4proto udp limit rate over ${udp_rate}/second counter drop"
+                echo "# Global UDP rate limit - drop" >> "$RATELIMIT_TEMP_FILE"
+                echo "meta l4proto udp limit rate over ${udp_rate}/second counter drop" >> "$RATELIMIT_TEMP_FILE"
             else
                 log_warn "未知的 UDP 速率限制动作 '$udp_action'，跳过"
             fi
         fi
     fi
-	
-    echo "$rules"
+
+    cat "$RATELIMIT_TEMP_FILE"
+    rm -f "$RATELIMIT_TEMP_FILE"
 }
 
 setup_ratelimit_chain() {
@@ -1107,7 +1113,7 @@ setup_ratelimit_chain() {
         for set in $old_sets; do
             nft delete set inet gargoyle-qos-priority "$set" 2>/dev/null || true
         done
-        
+
         local temp_ratelimit_file=$(mktemp /tmp/qos_ratelimit_XXXXXX)
         TEMP_FILES+=("$temp_ratelimit_file")
         echo "create chain inet gargoyle-qos-priority $RATELIMIT_CHAIN '{ type filter hook forward priority -10; policy accept; }'" > "$temp_ratelimit_file"
@@ -1273,12 +1279,11 @@ get_physical_interface_max_bandwidth() {
 convert_bandwidth_to_kbit() {
     local bw="$1" num unit multiplier result
     [[ -z "$bw" ]] && { log_error "带宽值为空"; return 1; }
-    bw=$(echo "$bw" | tr -d '[:space:]')
+    bw=$(echo "$bw" | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]')
     if [[ "$bw" =~ ^[0-9]+$ ]]; then echo "$bw"; return 0; fi
-    if [[ "$bw" =~ ^([0-9]+(\.[0-9]+)?)([a-zA-Z]+)$ ]]; then
+    if [[ "$bw" =~ ^([0-9]+(\.[0-9]+)?)([a-z]+)$ ]]; then
         num="${BASH_REMATCH[1]}"
         unit="${BASH_REMATCH[3]}"
-        unit=$(echo "$unit" | tr '[:upper:]' '[:lower:]')
         case "$unit" in
             kbit|kbits|kbit/s|kbps|kb|kib) multiplier=1 ;;
             mbit|mbits|mbit/s|mbps|mb|mib) multiplier=1000 ;;
@@ -1499,7 +1504,7 @@ init_ruleset() {
     local backup_file="${backup_base}.$(date +%s)"
     cp "/etc/config/${CONFIG_FILE}" "$backup_file"
     log_info "已备份主配置文件到 $backup_file"
-	# 清理旧备份，保留最近3个
+    # 清理旧备份，保留最近3个
     local backups=($(ls -t ${backup_base}.* 2>/dev/null))
     if [[ ${#backups[@]} -gt 3 ]]; then
         for ((i=3; i<${#backups[@]}; i++)); do
@@ -1591,11 +1596,39 @@ calculate_memory_limit() {
 }
 
 # ========== 获取最高优先级的类名称 ==========
-auto_speedtest() {   
+get_highest_priority_class() {
+    local direction="$1"
+    local class_list=""
+    if [[ "$direction" == "upload" ]]; then
+        class_list="$upload_class_list"
+    else
+        class_list="$download_class_list"
+    fi
+    local highest_prio=999
+    local best_class=""
+    for class in $class_list; do
+        local enabled=$(uci -q get ${CONFIG_FILE}.${class}.enabled 2>/dev/null)
+        if [[ "$enabled" != "1" ]] && [[ -n "$enabled" ]]; then
+            continue
+        fi
+        local prio=$(uci -q get ${CONFIG_FILE}.${class}.priority 2>/dev/null)
+        if [[ -z "$prio" ]]; then
+            prio=999
+        fi
+        if (( prio < highest_prio )); then
+            highest_prio=$prio
+            best_class="$class"
+        fi
+    done
+    echo "$best_class"
+}
+
+auto_speedtest() {
     local noninteractive=0 force=0 gaming_ip=""
     local WAN_IF="" DOWNLOAD_SPEED="" UPLOAD_SPEED="" SPEEDTEST_CMD=""
     local response cur_upload cur_download
     local coeff server spec_interface
+    local SPEED_RESULT=""  # 声明局部变量
 
     while getopts ":nf" opt; do
         case $opt in
@@ -1605,9 +1638,8 @@ auto_speedtest() {
         esac
     done
     shift $((OPTIND-1))
-    gaming_ip="$1"   # 命令行参数优先
+    gaming_ip="$1"
 
-    # 读取 speedtest 节配置
     local speedtest_enabled=$(uci -q get ${CONFIG_FILE}.speedtest.enabled 2>/dev/null)
     case "$speedtest_enabled" in 1|yes|true|on) ;; *) return 0 ;; esac
 
@@ -1615,13 +1647,11 @@ auto_speedtest() {
     [[ -z "$coeff" ]] && coeff=0.9
     server=$(uci -q get ${CONFIG_FILE}.speedtest.server 2>/dev/null)
     spec_interface=$(uci -q get ${CONFIG_FILE}.speedtest.interface 2>/dev/null)
-    
-    # 如果命令行未指定游戏IP，尝试从UCI读取
+
     if [[ -z "$gaming_ip" ]]; then
         gaming_ip=$(uci -q get ${CONFIG_FILE}.speedtest.gaming_ip 2>/dev/null)
     fi
 
-    # 加载类列表，以便后续获取最高优先级类
     load_upload_class_configurations
     load_download_class_configurations
 
@@ -1661,10 +1691,8 @@ auto_speedtest() {
         fi
     fi
 
-    # 选择测速命令
     if command -v speedtest-go >/dev/null 2>&1; then
         SPEEDTEST_CMD="speedtest-go"
-        # 添加可选参数
         [[ -n "$server" ]] && SPEEDTEST_CMD="$SPEEDTEST_CMD -s $server"
         [[ -n "$spec_interface" ]] && SPEEDTEST_CMD="$SPEEDTEST_CMD -i $spec_interface"
     elif command -v speedtest >/dev/null 2>&1 && speedtest --version 2>&1 | grep -q speedtest-cli; then
@@ -1724,14 +1752,12 @@ auto_speedtest() {
     uci set ${CONFIG_FILE}.download.total_bandwidth="${DOWNRATE}kbit"
     uci commit ${CONFIG_FILE}
 
-    # 测速成功后，如果处于非交互模式且存在 gaming_ip，则添加规则
     if [[ $noninteractive -eq 1 ]] && [[ -n "$gaming_ip" ]] && [[ "$gaming_ip" =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$ || "$gaming_ip" =~ : ]]; then
         log_info "添加游戏设备 IP $gaming_ip 的规则"
         load_upload_class_configurations
         load_download_class_configurations
         local upload_best_class=$(get_highest_priority_class "upload")
         local download_best_class=$(get_highest_priority_class "download")
-        # 删除旧规则（如果有）
         while true; do
             local old_upload_rule=$(uci -q show ${CONFIG_FILE} | grep -F ".upload_rule." | grep -F ".src_ip='${gaming_ip}'" | cut -d. -f2 | head -1)
             [[ -n "$old_upload_rule" ]] && uci -q delete ${CONFIG_FILE}.${old_upload_rule} || break
@@ -1740,7 +1766,6 @@ auto_speedtest() {
             local old_download_rule=$(uci -q show ${CONFIG_FILE} | grep -F ".download_rule." | grep -F ".dest_ip='${gaming_ip}'" | cut -d. -f2 | head -1)
             [[ -n "$old_download_rule" ]] && uci -q delete ${CONFIG_FILE}.${old_download_rule} || break
         done
-        # 添加上传规则
         if [[ -n "$upload_best_class" ]]; then
             uci add ${CONFIG_FILE} upload_rule
             uci set ${CONFIG_FILE}.@upload_rule[-1].name="Game_Console_Upload_${gaming_ip//[.:]/_}"
@@ -1752,7 +1777,6 @@ auto_speedtest() {
             uci set ${CONFIG_FILE}.@upload_rule[-1].counter=1
             log_info "已添加上传规则: 源IP=${gaming_ip}, 协议=UDP, 类=${upload_best_class}, order=10"
         fi
-        # 添加下载规则
         if [[ -n "$download_best_class" ]]; then
             uci add ${CONFIG_FILE} download_rule
             uci set ${CONFIG_FILE}.@download_rule[-1].name="Game_Console_Download_${gaming_ip//[.:]/_}"
