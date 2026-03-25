@@ -1026,15 +1026,16 @@ init_cake_qos() {
 
             # 插入恢复规则到链首（设置 DSCP），并确保首包也能正确设置 DSCP
             # 首先处理已有标记的连接（ct mark != 0）
-            nft insert rule inet gargoyle-qos-priority filter_qos_egress ct mark != 0 ip dscp set class_mark[ct mark & 0xff]
-            nft insert rule inet gargoyle-qos-priority filter_qos_egress ct mark != 0 ip6 dscp set class_mark[ct mark & 0xff]
-            nft insert rule inet gargoyle-qos-priority filter_qos_ingress ct mark != 0 ip dscp set class_mark[ct mark & 0xff]
-            nft insert rule inet gargoyle-qos-priority filter_qos_ingress ct mark != 0 ip6 dscp set class_mark[ct mark & 0xff]
-            # 再处理 established/related 连接（通过规则设置标记后）
-            nft insert rule inet gargoyle-qos-priority filter_qos_egress ct state established,related ip dscp set class_mark[ct mark & 0xff]
-            nft insert rule inet gargoyle-qos-priority filter_qos_egress ct state established,related ip6 dscp set class_mark[ct mark & 0xff]
-            nft insert rule inet gargoyle-qos-priority filter_qos_ingress ct state established,related ip dscp set class_mark[ct mark & 0xff]
-            nft insert rule inet gargoyle-qos-priority filter_qos_ingress ct state established,related ip6 dscp set class_mark[ct mark & 0xff]
+			# 使用完整的 ct mark 作为映射 key，避免截断冲突
+			nft insert rule inet gargoyle-qos-priority filter_qos_egress ct mark != 0 ip dscp set class_mark[ct mark]
+			nft insert rule inet gargoyle-qos-priority filter_qos_egress ct mark != 0 ip6 dscp set class_mark[ct mark]
+			nft insert rule inet gargoyle-qos-priority filter_qos_ingress ct mark != 0 ip dscp set class_mark[ct mark]
+			nft insert rule inet gargoyle-qos-priority filter_qos_ingress ct mark != 0 ip6 dscp set class_mark[ct mark]
+			# 再处理 established/related 连接（通过规则设置标记后）
+			nft insert rule inet gargoyle-qos-priority filter_qos_egress ct state established,related ip dscp set class_mark[ct mark]
+			nft insert rule inet gargoyle-qos-priority filter_qos_egress ct state established,related ip6 dscp set class_mark[ct mark]
+			nft insert rule inet gargoyle-qos-priority filter_qos_ingress ct state established,related ip dscp set class_mark[ct mark]
+			nft insert rule inet gargoyle-qos-priority filter_qos_ingress ct state established,related ip6 dscp set class_mark[ct mark]
             qos_log "INFO" "已添加 conntrack 恢复规则（DSCP 模式），映射 key 为标记值，value 为 DSCP"
 
             # 继续原有的 CAKE 队列配置
