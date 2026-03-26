@@ -1,6 +1,6 @@
 #!/bin/bash
 # HTB_CAKE算法实现模块
-# 版本: 3.3.9 - 依赖修复后的 common.sh，优化变量作用域，添加 trap 清理
+# 版本: 3.4.0 - 强制忽略 CAKE_BANDWIDTH 防止二次整形，移除停止时的配置恢复，优化默认类设置
 # 基于 HTB 与 CAKE 组合算法实现 QoS 流量控制
 
 # ========== 全局配置常量 ==========
@@ -63,10 +63,16 @@ load_htb_cake_config() {
     HTB_DRR_QUANTUM=$(uci -q get ${CONFIG_FILE}.htb.drr_quantum 2>/dev/null)
     [[ -z "$HTB_DRR_QUANTUM" ]] && HTB_DRR_QUANTUM="auto"
 
-    CAKE_BANDWIDTH=$(uci -q get ${CONFIG_FILE}.cake.bandwidth 2>/dev/null)
-    if [[ -n "$CAKE_BANDWIDTH" ]]; then
-        qos_log "ERROR" "检测到 CAKE_BANDWIDTH 已配置 (值: $CAKE_BANDWIDTH)，这将导致CAKE二次整形，可能严重影响HTB调度性能。建议删除此配置项以使用HTB主导的整形。"
+    # 强制忽略 CAKE_BANDWIDTH，防止二次整形
+    local cake_bw=$(uci -q get ${CONFIG_FILE}.cake.bandwidth 2>/dev/null)
+    if [[ -n "$cake_bw" ]]; then
+        qos_log "ERROR" "检测到 CAKE_BANDWIDTH 已配置 (值: $cake_bw)，这将导致CAKE二次整形，严重影响HTB调度性能。已强制忽略该配置，使用HTB主导整形。"
+        # 运行时忽略，不修改UCI
+        CAKE_BANDWIDTH=""
+    else
+        CAKE_BANDWIDTH=""
     fi
+
     CAKE_RTT=$(uci -q get ${CONFIG_FILE}.cake.rtt 2>/dev/null)
     CAKE_FLOWMODE=$(uci -q get ${CONFIG_FILE}.cake.flowmode 2>/dev/null)
     [[ -z "$CAKE_FLOWMODE" ]] && CAKE_FLOWMODE="srchost"
@@ -178,7 +184,7 @@ calculate_htb_burst() {
     echo "${burst_kb}kb ${cburst_kb}kb"
 }
 
-# ========== CAKE 参数支持检查（使用唯一 dummy 设备） ==========
+# ========== CAKE 参数支持检查（使用唯一 dummy 设备，确保清理） ==========
 check_cake_param_support() {
     local param="$1"
     local dummy_dev="qos_test_dummy_$$"
@@ -190,18 +196,15 @@ check_cake_param_support() {
         created=1
     fi
     tc qdisc del dev "$dummy_dev" root 2>/dev/null
+    local ret=1
     if tc qdisc add dev "$dummy_dev" root cake bandwidth 1mbit "$param" 2>/dev/null; then
+        ret=0
         tc qdisc del dev "$dummy_dev" root 2>/dev/null
-        if [[ $created -eq 1 && "$dummy_dev" != "lo" ]]; then
-            ip link del "$dummy_dev" 2>/dev/null
-        fi
-        return 0
-    else
-        if [[ $created -eq 1 && "$dummy_dev" != "lo" ]]; then
-            ip link del "$dummy_dev" 2>/dev/null
-        fi
-        return 1
     fi
+    if [[ $created -eq 1 && "$dummy_dev" != "lo" ]]; then
+        ip link del "$dummy_dev" 2>/dev/null
+    fi
+    return $ret
 }
 
 build_cake_params() {
@@ -292,7 +295,7 @@ create_htb_root_qdisc() {
     return 0
 }
 
-# 设置根队列的默认类
+# 设置根队列的默认类（优先 change，失败则使用全匹配过滤器）
 set_htb_default_class() {
     local device="$1"
     local default_classid="$2"
@@ -300,7 +303,7 @@ set_htb_default_class() {
         qos_log "ERROR" "无效的默认类ID: $default_classid (有效范围 2-17)"
         return 1
     fi
-    # 修复：正确使用 tc qdisc change 修改默认类
+    # 优先使用 tc qdisc change 修改默认类
     if tc qdisc change dev "$device" root htb default $default_classid 2>/dev/null; then
         qos_log "INFO" "已设置HTB根队列默认类为 $default_classid"
         return 0
@@ -937,10 +940,10 @@ init_htb_cake_qos() {
         echo "应用速率限制链..." 
         setup_ratelimit_chain
     fi
-	
-	# 增强功能函数（ACK/TCP/UDP/动态分类）
-	apply_enhanced_features
-	
+    
+    # 增强功能函数（ACK/TCP/UDP/动态分类）
+    apply_enhanced_features
+    
     echo "应用ipv6特别规则..." 
     setup_ipv6_specific_rules
     
@@ -1017,16 +1020,17 @@ stop_htb_cake_qos() {
             qos_log "INFO" "IFB设备 $IFB_DEVICE 不存在，跳过"
         fi
     fi
-	
-	# 清理动态检测相关资源
+    
+    # 清理动态检测相关资源
     cleanup_dynamic_detection
-	
+    
     nft delete table inet gargoyle-qos-priority 2>/dev/null || true
     clear_class_marks
     qos_log "INFO" "HTB+CAKE QoS停止完成"
+	
     # 恢复配置
 	restore_main_config
-	
+    
     _QOS_TABLE_FLUSHED=0
     _IPSET_LOADED=0
     cleanup_qos_state
