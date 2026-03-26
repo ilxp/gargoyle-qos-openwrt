@@ -762,89 +762,122 @@ apply_enhanced_direction_rules() {
     return $batch_success
 }
 
-# 应用增强功能（ACK限速、TCP升级、UDP限速,动态分类） 修复：同时设置 meta mark 和 ct mark，并确保 UDP 规则插入链首
-apply_enhanced_features() {
-    if [[ $ENABLE_ACK_LIMIT -eq 1 ]]; then
-        qos_log "INFO" "ACK 限速已启用，生成规则..."
-        local ack_rules=$(generate_ack_limit_rules)
-        if [[ -n "$ack_rules" ]]; then
-            local ack_file=$(mktemp)
-            register_temp_file "$ack_file"
-            echo "$ack_rules" | while IFS= read -r rule; do
-                [[ -z "$rule" ]] && continue
-                # ACK 限速规则使用 insert，确保在分类之前执行
-                echo "${rule/add rule/insert rule}" >> "$ack_file"
-            done
-            qos_log "INFO" "ACK 规则文件内容:"
-            cat "$ack_file" | logger -t qos_gargoyle
-            if nft -f "$ack_file" 2>&1 | logger -t qos_gargoyle; then
-                qos_log "INFO" "ACK 限速规则添加成功"
-            else
-                qos_log "WARN" "ACK 限速规则添加失败"
-            fi
-        else
-            qos_log "WARN" "ACK 限速规则生成失败（返回空）"
-        fi
-    else
-        qos_log "INFO" "ACK 限速未启用"
+# ========== ACK 限速规则 ==========
+generate_ack_limit_rules() {
+    [[ $ENABLE_ACK_LIMIT != 1 ]] && return
+    local ack_enabled=$(uci -q get ${CONFIG_FILE}.ack_limit.enabled 2>/dev/null)
+    case "$ack_enabled" in 1|yes|true|on) ;; *) return ;; esac
+    local slow_rate=$(uci -q get ${CONFIG_FILE}.ack_limit.slow_rate 2>/dev/null)
+    local med_rate=$(uci -q get ${CONFIG_FILE}.ack_limit.med_rate 2>/dev/null)
+    local fast_rate=$(uci -q get ${CONFIG_FILE}.ack_limit.fast_rate 2>/dev/null)
+    local xfast_rate=$(uci -q get ${CONFIG_FILE}.ack_limit.xfast_rate 2>/dev/null)
+    [[ -n "$slow_rate" ]] && ACK_SLOW="$slow_rate"
+    [[ -n "$med_rate" ]] && ACK_MED="$med_rate"
+    [[ -n "$fast_rate" ]] && ACK_FAST="$fast_rate"
+    [[ -n "$xfast_rate" ]] && ACK_XFAST="$xfast_rate"
+    : ${ACK_SLOW:=50}
+    : ${ACK_MED:=100}
+    : ${ACK_FAST:=500}
+    : ${ACK_XFAST:=5000}
+    cat <<EOF
+# ACK rate limiting using dynamic sets (ct id . ct direction key)
+add rule inet gargoyle-qos-priority filter_qos_egress meta length < 100 tcp flags ack limit rate over ${ACK_XFAST}/second add @qos_xfst_ack { ct id . ct direction } counter jump drop995
+add rule inet gargoyle-qos-priority filter_qos_egress meta length < 100 tcp flags ack limit rate over ${ACK_FAST}/second add @qos_fast_ack { ct id . ct direction } counter jump drop95
+add rule inet gargoyle-qos-priority filter_qos_egress meta length < 100 tcp flags ack limit rate over ${ACK_MED}/second add @qos_med_ack { ct id . ct direction } counter jump drop50
+add rule inet gargoyle-qos-priority filter_qos_egress meta length < 100 tcp flags ack limit rate over ${ACK_SLOW}/second add @qos_slow_ack { ct id . ct direction } counter jump drop50
+EOF
+}
+
+# ========== TCP 升级规则 ==========
+generate_tcp_upgrade_rules() {
+    # 从 UCI 读取启用状态（独立节）
+    local tcp_enabled=$(uci -q get ${CONFIG_FILE}.tcp_upgrade.enabled 2>/dev/null)
+    case "$tcp_enabled" in 1|yes|true|on) ;; *) return ;; esac
+
+    # 获取上传方向优先级最高的启用的类
+    local highest_class=$(get_highest_priority_class "upload")
+    if [[ -z "$highest_class" ]]; then
+        log_warn "TCP升级：未找到任何启用的上传类，将禁用此功能"
+        return
     fi
 
-    if [[ $ENABLE_TCP_UPGRADE -eq 1 ]]; then
-        qos_log "INFO" "TCP 升级已启用，生成规则..."
-        local tcp_upgrade_rules=$(generate_tcp_upgrade_rules)
-        if [[ -n "$tcp_upgrade_rules" ]]; then
-            local tcp_file=$(mktemp)
-            register_temp_file "$tcp_file"
-            echo "$tcp_upgrade_rules" | while IFS= read -r rule; do
-                [[ -z "$rule" ]] && continue
-                # 修复：同时设置 meta mark 和 ct mark，使用 insert 确保优先执行
-                rule=$(echo "$rule" | sed 's/meta mark set \([0-9]\+\)/meta mark set \1 ct mark set \1/')
-                echo "${rule/add rule/insert rule}" >> "$tcp_file"
-            done
-            qos_log "INFO" "TCP 升级规则文件内容:"
-            cat "$tcp_file" | logger -t qos_gargoyle
-            if nft -f "$tcp_file" 2>&1 | logger -t qos_gargoyle; then
-                qos_log "INFO" "TCP 升级规则添加成功"
-            else
-                qos_log "WARN" "TCP 升级规则添加失败"
-            fi
-        else
-            qos_log "WARN" "TCP 升级规则生成失败（返回空）"
-        fi
-    else
-        qos_log "INFO" "TCP 升级未启用"
+    local class_mark=$(get_class_mark "upload" "$highest_class" 2>/dev/null)
+    if [[ -z "$class_mark" || "$class_mark" == "0" || "$class_mark" == "0x0" ]]; then
+        log_error "TCP升级：类 $highest_class 的标记无效（值为 $class_mark），跳过规则生成"
+        return
     fi
 
-    if [[ $UDP_RATE_LIMIT_ENABLE -eq 1 ]]; then
-        qos_log "INFO" "生成 UDP 限速规则..."
-        local udp_limit_rules=$(generate_udp_limit_rules)
-        if [[ -n "$udp_limit_rules" ]]; then
-            local udp_file=$(mktemp)
-            register_temp_file "$udp_file"
-            # 修复：同时设置 meta mark 和 ct mark，并使用 insert rule 确保优先执行
-            udp_limit_rules=$(echo "$udp_limit_rules" | sed 's/meta mark set \([0-9]\+\)/meta mark set \1 ct mark set \1/g')
-            udp_limit_rules=$(echo "$udp_limit_rules" | sed 's/^add rule/insert rule/')
-            echo "$udp_limit_rules" > "$udp_file"
-            qos_log "INFO" "UDP 限速规则文件内容:"
-            cat "$udp_file" | logger -t qos_gargoyle
-            if nft -f "$udp_file" 2>&1 | logger -t qos_gargoyle; then
-                qos_log "INFO" "UDP 限速规则添加成功"
-            else
-                qos_log "WARN" "UDP 限速规则添加失败"
-            fi
-        else
-            qos_log "WARN" "UDP 限速规则生成失败（返回空）"
+    cat <<EOF
+# TCP upgrade for slow connections (using dynamic set, ct id . ct direction key)
+add rule inet gargoyle-qos-priority filter_qos_egress meta l4proto tcp ct state established meta nfproto ipv4 limit rate 150/second burst 150 packets add @qos_slow_tcp { ct id . ct direction } meta mark set $class_mark ct mark set meta mark counter
+add rule inet gargoyle-qos-priority filter_qos_egress meta l4proto tcp ct state established meta nfproto ipv6 limit rate 150/second burst 150 packets add @qos_slow_tcp { ct id . ct direction } meta mark set $class_mark ct mark set meta mark counter
+EOF
+}
+# ========== UDP 限速规则 ==========
+generate_udp_limit_rules() {
+    local udp_enable=$(uci -q get ${CONFIG_FILE}.udp_limit.enabled 2>/dev/null)
+    local udp_rate=$(uci -q get ${CONFIG_FILE}.udp_limit.rate 2>/dev/null)
+    local udp_action=$(uci -q get ${CONFIG_FILE}.udp_limit.action 2>/dev/null)
+    local udp_mark_class=$(uci -q get ${CONFIG_FILE}.udp_limit.mark_class 2>/dev/null)
+
+    case "$udp_enable" in 1|yes|true|on) udp_enable=1 ;; *) udp_enable=0 ;; esac
+    [[ -z "$udp_rate" ]] && udp_rate=450
+    [[ -z "$udp_action" ]] && udp_action="mark"
+    [[ -z "$udp_mark_class" ]] && udp_mark_class="bulk"
+
+    if [[ "$udp_enable" != "1" ]] || [[ "$udp_rate" -le 0 ]]; then
+        return
+    fi
+
+    local upload_mark="" download_mark=""
+    if [[ "$udp_action" == "mark" ]]; then
+        if [[ -z "$upload_class_list" ]]; then
+            load_upload_class_configurations
         fi
-    else
-        qos_log "INFO" "UDP 限速未启用"
+        if [[ -z "$download_class_list" ]]; then
+            load_download_class_configurations
+        fi
+        for class in $upload_class_list; do
+            local name=$(uci -q get ${CONFIG_FILE}.${class}.name 2>/dev/null)
+            if [[ "$name" == "$udp_mark_class" ]]; then
+                upload_mark=$(get_class_mark "upload" "$class")
+                break
+            fi
+        done
+        for class in $download_class_list; do
+            local name=$(uci -q get ${CONFIG_FILE}.${class}.name 2>/dev/null)
+            if [[ "$name" == "$udp_mark_class" ]]; then
+                download_mark=$(get_class_mark "download" "$class")
+                break
+            fi
+        done
+        if [[ -z "$upload_mark" ]] || [[ -z "$download_mark" ]]; then
+            log_warn "UDP 速率限制目标类 '$udp_mark_class' 未同时存在于上传/下载类中，将回退到丢弃动作"
+            udp_action="drop"
+        fi
     fi
-    
-    if [[ $ENABLE_DYNAMIC_CLASSIFY -eq 1 ]]; then
-        qos_log "INFO" "动态分类总开关已启用，初始化动态检测..."
-        setup_dynamic_classification
-    else
-        qos_log "INFO" "动态分类未启用"
+
+    local wan_if="${qos_interface:-$(uci -q get ${CONFIG_FILE}.global.wan_interface 2>/dev/null)}"
+    if [[ -z "$wan_if" ]]; then
+        log_warn "无法确定 WAN 接口，UDP 速率限制规则将被跳过"
+        return
     fi
+
+    local rules=""
+    if [[ "$udp_action" == "mark" ]] && [[ -n "$upload_mark" ]] && [[ -n "$download_mark" ]]; then
+        rules="${rules}
+# Global UDP rate limit - upload direction (mark)
+add rule inet gargoyle-qos-priority filter_qos_egress oifname \"$wan_if\" meta l4proto udp limit rate over ${udp_rate}/second counter meta mark set $upload_mark
+# Global UDP rate limit - download direction (mark)
+add rule inet gargoyle-qos-priority filter_qos_ingress iifname \"$wan_if\" meta l4proto udp limit rate over ${udp_rate}/second counter meta mark set $download_mark"
+    elif [[ "$udp_action" == "drop" ]]; then
+        rules="${rules}
+# Global UDP rate limit - drop
+add rule inet gargoyle-qos-priority filter_qos_egress meta l4proto udp limit rate over ${udp_rate}/second counter drop
+add rule inet gargoyle-qos-priority filter_qos_ingress meta l4proto udp limit rate over ${udp_rate}/second counter drop"
+    fi
+
+    echo "$rules"
 }
 
 # ========== 动态检测函数 ==========
@@ -1124,6 +1157,91 @@ apply_all_rules() {
     load_custom_full_table
     
     return 0
+}
+
+# 应用增强功能（ACK限速、TCP升级、UDP限速,动态分类） 修复：同时设置 meta mark 和 ct mark，并确保 UDP 规则插入链首
+apply_enhanced_features() {
+    if [[ $ENABLE_ACK_LIMIT -eq 1 ]]; then
+        qos_log "INFO" "ACK 限速已启用，生成规则..."
+        local ack_rules=$(generate_ack_limit_rules)
+        if [[ -n "$ack_rules" ]]; then
+            local ack_file=$(mktemp)
+            register_temp_file "$ack_file"
+            echo "$ack_rules" | while IFS= read -r rule; do
+                [[ -z "$rule" ]] && continue
+                # ACK 限速规则使用 insert，确保在分类之前执行
+                echo "${rule/add rule/insert rule}" >> "$ack_file"
+            done
+            qos_log "INFO" "ACK 规则文件内容:"
+            cat "$ack_file" | logger -t qos_gargoyle
+            if nft -f "$ack_file" 2>&1 | logger -t qos_gargoyle; then
+                qos_log "INFO" "ACK 限速规则添加成功"
+            else
+                qos_log "WARN" "ACK 限速规则添加失败"
+            fi
+        else
+            qos_log "WARN" "ACK 限速规则生成失败（返回空）"
+        fi
+    else
+        qos_log "INFO" "ACK 限速未启用"
+    fi
+
+    if [[ $ENABLE_TCP_UPGRADE -eq 1 ]]; then
+        qos_log "INFO" "TCP 升级已启用，生成规则..."
+        local tcp_upgrade_rules=$(generate_tcp_upgrade_rules)
+        if [[ -n "$tcp_upgrade_rules" ]]; then
+            local tcp_file=$(mktemp)
+            register_temp_file "$tcp_file"
+            echo "$tcp_upgrade_rules" | while IFS= read -r rule; do
+                [[ -z "$rule" ]] && continue
+                # 修复：同时设置 meta mark 和 ct mark，使用 insert 确保优先执行
+                rule=$(echo "$rule" | sed 's/meta mark set \([0-9]\+\)/meta mark set \1 ct mark set \1/')
+                echo "${rule/add rule/insert rule}" >> "$tcp_file"
+            done
+            qos_log "INFO" "TCP 升级规则文件内容:"
+            cat "$tcp_file" | logger -t qos_gargoyle
+            if nft -f "$tcp_file" 2>&1 | logger -t qos_gargoyle; then
+                qos_log "INFO" "TCP 升级规则添加成功"
+            else
+                qos_log "WARN" "TCP 升级规则添加失败"
+            fi
+        else
+            qos_log "WARN" "TCP 升级规则生成失败（返回空）"
+        fi
+    else
+        qos_log "INFO" "TCP 升级未启用"
+    fi
+
+    if [[ $UDP_RATE_LIMIT_ENABLE -eq 1 ]]; then
+        qos_log "INFO" "生成 UDP 限速规则..."
+        local udp_limit_rules=$(generate_udp_limit_rules)
+        if [[ -n "$udp_limit_rules" ]]; then
+            local udp_file=$(mktemp)
+            register_temp_file "$udp_file"
+            # 修复：同时设置 meta mark 和 ct mark，并使用 insert rule 确保优先执行
+            udp_limit_rules=$(echo "$udp_limit_rules" | sed 's/meta mark set \([0-9]\+\)/meta mark set \1 ct mark set \1/g')
+            udp_limit_rules=$(echo "$udp_limit_rules" | sed 's/^add rule/insert rule/')
+            echo "$udp_limit_rules" > "$udp_file"
+            qos_log "INFO" "UDP 限速规则文件内容:"
+            cat "$udp_file" | logger -t qos_gargoyle
+            if nft -f "$udp_file" 2>&1 | logger -t qos_gargoyle; then
+                qos_log "INFO" "UDP 限速规则添加成功"
+            else
+                qos_log "WARN" "UDP 限速规则添加失败"
+            fi
+        else
+            qos_log "WARN" "UDP 限速规则生成失败（返回空）"
+        fi
+    else
+        qos_log "INFO" "UDP 限速未启用"
+    fi
+    
+    if [[ $ENABLE_DYNAMIC_CLASSIFY -eq 1 ]]; then
+        qos_log "INFO" "动态分类总开关已启用，初始化动态检测..."
+        setup_dynamic_classification
+    else
+        qos_log "INFO" "动态分类未启用"
+    fi
 }
 
 # ========== 入口重定向 ==========

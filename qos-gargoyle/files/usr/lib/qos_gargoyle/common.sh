@@ -1092,142 +1092,6 @@ setup_ratelimit_chain() {
     fi
 }
 
-# ========== ACK 限速规则 ==========
-generate_ack_limit_rules() {
-    [[ $ENABLE_ACK_LIMIT != 1 ]] && return
-    local ack_enabled=$(uci -q get ${CONFIG_FILE}.ack_limit.enabled 2>/dev/null)
-    case "$ack_enabled" in 1|yes|true|on) ;; *) return ;; esac
-    local slow_rate=$(uci -q get ${CONFIG_FILE}.ack_limit.slow_rate 2>/dev/null)
-    local med_rate=$(uci -q get ${CONFIG_FILE}.ack_limit.med_rate 2>/dev/null)
-    local fast_rate=$(uci -q get ${CONFIG_FILE}.ack_limit.fast_rate 2>/dev/null)
-    local xfast_rate=$(uci -q get ${CONFIG_FILE}.ack_limit.xfast_rate 2>/dev/null)
-    [[ -n "$slow_rate" ]] && ACK_SLOW="$slow_rate"
-    [[ -n "$med_rate" ]] && ACK_MED="$med_rate"
-    [[ -n "$fast_rate" ]] && ACK_FAST="$fast_rate"
-    [[ -n "$xfast_rate" ]] && ACK_XFAST="$xfast_rate"
-    : ${ACK_SLOW:=50}
-    : ${ACK_MED:=100}
-    : ${ACK_FAST:=500}
-    : ${ACK_XFAST:=5000}
-    cat <<EOF
-# ACK rate limiting using dynamic sets (ct id . ct direction key)
-add rule inet gargoyle-qos-priority filter_qos_egress meta length < 100 tcp flags ack limit rate over ${ACK_XFAST}/second add @qos_xfst_ack { ct id . ct direction } counter jump drop995
-add rule inet gargoyle-qos-priority filter_qos_egress meta length < 100 tcp flags ack limit rate over ${ACK_FAST}/second add @qos_fast_ack { ct id . ct direction } counter jump drop95
-add rule inet gargoyle-qos-priority filter_qos_egress meta length < 100 tcp flags ack limit rate over ${ACK_MED}/second add @qos_med_ack { ct id . ct direction } counter jump drop50
-add rule inet gargoyle-qos-priority filter_qos_egress meta length < 100 tcp flags ack limit rate over ${ACK_SLOW}/second add @qos_slow_ack { ct id . ct direction } counter jump drop50
-EOF
-}
-
-# ========== TCP 升级规则 ==========
-generate_tcp_upgrade_rules() {
-    # 从 UCI 读取启用状态（独立节）
-    local tcp_enabled=$(uci -q get ${CONFIG_FILE}.tcp_upgrade.enabled 2>/dev/null)
-    case "$tcp_enabled" in 1|yes|true|on) ;; *) return ;; esac
-
-    local realtime_class=""
-    local upload_classes=$(load_all_config_sections "$CONFIG_FILE" "upload_class")
-    for cls in $upload_classes; do
-        local name=$(uci -q get ${CONFIG_FILE}.${cls}.name 2>/dev/null)
-        [[ "$name" == "realtime" ]] && { realtime_class="$cls"; break; }
-    done
-    if [[ -z "$realtime_class" ]]; then
-        for cls in $upload_classes; do
-            local enabled=$(uci -q get ${CONFIG_FILE}.${cls}.enabled 2>/dev/null)
-            if [[ "$enabled" == "1" ]] || [[ -z "$enabled" ]]; then
-                realtime_class="$cls"
-                log_warn "TCP升级：未找到 realtime 类，将使用第一个启用的上传类 $realtime_class"
-                break
-            fi
-        done
-    fi
-    if [[ -z "$realtime_class" ]]; then
-        log_warn "TCP升级：未找到任何上传类，将禁用此功能"
-        return
-    fi
-    local enabled=$(uci -q get ${CONFIG_FILE}.${realtime_class}.enabled 2>/dev/null)
-    if [[ "$enabled" != "1" ]] && [[ -n "$enabled" ]]; then
-        log_warn "TCP升级：realtime 类 $realtime_class 未启用，跳过规则生成"
-        return
-    fi
-    local realtime_mark=$(get_class_mark "upload" "$realtime_class" 2>/dev/null)
-    if [[ -z "$realtime_mark" || "$realtime_mark" == "0" || "$realtime_mark" == "0x0" ]]; then
-        log_error "TCP升级：realtime 类 $realtime_class 的标记无效（值为 $realtime_mark），跳过规则生成"
-        return
-    fi
-    cat <<EOF
-# TCP upgrade for slow connections (using dynamic set, ct id . ct direction key)
-add rule inet gargoyle-qos-priority filter_qos_egress meta l4proto tcp ct state established meta nfproto ipv4 limit rate 150/second burst 150 packets add @qos_slow_tcp { ct id . ct direction } meta mark set $realtime_mark counter
-add rule inet gargoyle-qos-priority filter_qos_egress meta l4proto tcp ct state established meta nfproto ipv6 limit rate 150/second burst 150 packets add @qos_slow_tcp { ct id . ct direction } meta mark set $realtime_mark counter
-EOF
-}
-
-# ========== UDP 限速规则 ==========
-generate_udp_limit_rules() {
-    local udp_enable=$(uci -q get ${CONFIG_FILE}.udp_limit.enabled 2>/dev/null)
-    local udp_rate=$(uci -q get ${CONFIG_FILE}.udp_limit.rate 2>/dev/null)
-    local udp_action=$(uci -q get ${CONFIG_FILE}.udp_limit.action 2>/dev/null)
-    local udp_mark_class=$(uci -q get ${CONFIG_FILE}.udp_limit.mark_class 2>/dev/null)
-
-    case "$udp_enable" in 1|yes|true|on) udp_enable=1 ;; *) udp_enable=0 ;; esac
-    [[ -z "$udp_rate" ]] && udp_rate=450
-    [[ -z "$udp_action" ]] && udp_action="mark"
-    [[ -z "$udp_mark_class" ]] && udp_mark_class="bulk"
-
-    if [[ "$udp_enable" != "1" ]] || [[ "$udp_rate" -le 0 ]]; then
-        return
-    fi
-
-    local upload_mark="" download_mark=""
-    if [[ "$udp_action" == "mark" ]]; then
-        if [[ -z "$upload_class_list" ]]; then
-            load_upload_class_configurations
-        fi
-        if [[ -z "$download_class_list" ]]; then
-            load_download_class_configurations
-        fi
-        for class in $upload_class_list; do
-            local name=$(uci -q get ${CONFIG_FILE}.${class}.name 2>/dev/null)
-            if [[ "$name" == "$udp_mark_class" ]]; then
-                upload_mark=$(get_class_mark "upload" "$class")
-                break
-            fi
-        done
-        for class in $download_class_list; do
-            local name=$(uci -q get ${CONFIG_FILE}.${class}.name 2>/dev/null)
-            if [[ "$name" == "$udp_mark_class" ]]; then
-                download_mark=$(get_class_mark "download" "$class")
-                break
-            fi
-        done
-        if [[ -z "$upload_mark" ]] || [[ -z "$download_mark" ]]; then
-            log_warn "UDP 速率限制目标类 '$udp_mark_class' 未同时存在于上传/下载类中，将回退到丢弃动作"
-            udp_action="drop"
-        fi
-    fi
-
-    local wan_if="${qos_interface:-$(uci -q get ${CONFIG_FILE}.global.wan_interface 2>/dev/null)}"
-    if [[ -z "$wan_if" ]]; then
-        log_warn "无法确定 WAN 接口，UDP 速率限制规则将被跳过"
-        return
-    fi
-
-    local rules=""
-    if [[ "$udp_action" == "mark" ]] && [[ -n "$upload_mark" ]] && [[ -n "$download_mark" ]]; then
-        rules="${rules}
-# Global UDP rate limit - upload direction (mark)
-add rule inet gargoyle-qos-priority filter_qos_egress oifname \"$wan_if\" meta l4proto udp limit rate over ${udp_rate}/second counter meta mark set $upload_mark
-# Global UDP rate limit - download direction (mark)
-add rule inet gargoyle-qos-priority filter_qos_ingress iifname \"$wan_if\" meta l4proto udp limit rate over ${udp_rate}/second counter meta mark set $download_mark"
-    elif [[ "$udp_action" == "drop" ]]; then
-        rules="${rules}
-# Global UDP rate limit - drop
-add rule inet gargoyle-qos-priority filter_qos_egress meta l4proto udp limit rate over ${udp_rate}/second counter drop
-add rule inet gargoyle-qos-priority filter_qos_ingress meta l4proto udp limit rate over ${udp_rate}/second counter drop"
-    fi
-
-    echo "$rules"
-}
-
 # ========== 集合族缓存 ==========
 get_set_family() {
     local setname="$1"
@@ -1519,77 +1383,46 @@ check_tc_ctinfo_support() {
 }
 
 # ========== 规则集合并 ==========
+RULESET_D_DIR="/etc/config/qos_gargoyle.d"
+
 init_ruleset() {
     local nofix="$1"
-    if [[ "$nofix" == "1" ]]; then
-        [[ -f "$RULESET_MERGED_FLAG" ]] && return 0
-        return 0
+    [[ "$nofix" == "1" ]] && return 0
+
+    # 确保主配置文件包含 include 指令
+    if ! grep -q "^include /etc/config/qos_gargoyle\.d/\*\.conf" "/etc/config/${CONFIG_FILE}" 2>/dev/null; then
+        echo "include /etc/config/qos_gargoyle.d/*.conf" >> "/etc/config/${CONFIG_FILE}"
+        uci commit "${CONFIG_FILE}"
+        log_info "已向主配置文件添加 include 指令"
     fi
-    [[ -f "$RULESET_MERGED_FLAG" ]] && return 0
-    local ruleset ruleset_file
+
+    local ruleset
     ruleset=$(uci -q get ${CONFIG_FILE}.global.ruleset 2>/dev/null)
-    [[ -z "$ruleset" ]] && ruleset="default.conf"
-    case "$ruleset" in *.conf) ;; *) ruleset="${ruleset}.conf" ;; esac
-    ruleset_file="$RULESET_DIR/$ruleset"
+    [[ -z "$ruleset" ]] && ruleset="default.ru"
+    case "$ruleset" in *.ru) ;; *) ruleset="${ruleset}.ru" ;; esac
+
+    local ruleset_file="$RULESET_DIR/$ruleset"
     if [[ ! -f "$ruleset_file" ]]; then
-        log_error "规则集文件 $ruleset_file 不存在，无法加载任何规则！"
+        log_error "规则集文件 $ruleset_file 不存在"
         return 1
     fi
-    local backup_base="/etc/config/${CONFIG_FILE}.bak"
-    local backup_file="${backup_base}.$(date +%s)"
-    cp "/etc/config/${CONFIG_FILE}" "$backup_file"
-    log_info "已备份主配置文件到 $backup_file"
-    # 清理旧备份，保留最近3个
-    local backups=($(ls -t ${backup_base}.* 2>/dev/null))
-    if [[ ${#backups[@]} -gt 3 ]]; then
-        for ((i=3; i<${#backups[@]}; i++)); do
-            rm -f "${backups[$i]}" 2>/dev/null
-            log_debug "删除旧备份: ${backups[$i]}"
-        done
-    fi
-    if grep -q "^# === RULESET_" "/etc/config/${CONFIG_FILE}"; then
-        local tmp_conf=$(mktemp /tmp/qos_config_$$.tmp)
-        register_temp_file "$tmp_conf"
-        sed '/^# === RULESET_/,/^# === RULESET_END ===/d' "/etc/config/${CONFIG_FILE}" > "$tmp_conf"
-        mv "$tmp_conf" "/etc/config/${CONFIG_FILE}"
-        log_info "已清理旧的规则集内容"
-    fi
-    {
-        echo ""
-        echo "# === RULESET_${ruleset} ==="
-        cat "$ruleset_file"
-        echo "# === RULESET_END ==="
-    } >> "/etc/config/${CONFIG_FILE}"
-    uci commit ${CONFIG_FILE}
-    touch "$RULESET_MERGED_FLAG"
-    log_info "已将规则集 $ruleset 合并到主配置文件"
+
+    # 清空规则集目录并安装新规则集
+    mkdir -p "$RULESET_D_DIR"
+    rm -f "$RULESET_D_DIR"/*.ru
+    cp "$ruleset_file" "$RULESET_D_DIR/"
+    log_info "已安装规则集 $ruleset 到 $RULESET_D_DIR"
+
+    # 重新提交 UCI 配置，使 include 生效（可选，因为 uci commit 会重写文件）
+    uci commit "${CONFIG_FILE}"
     return 0
 }
 
 restore_main_config() {
-    local latest_backup=$(ls -t /etc/config/${CONFIG_FILE}.bak.* 2>/dev/null | head -1)
-    if [[ -n "$latest_backup" ]]; then
-        # 检查备份文件有效性（至少包含 config qos_gargoyle）
-        if grep -q "config ${CONFIG_FILE}" "$latest_backup" 2>/dev/null; then
-            mv "$latest_backup" "/etc/config/${CONFIG_FILE}"
-            uci commit ${CONFIG_FILE}
-            log_info "已恢复主配置文件备份: $latest_backup"
-        else
-            log_warn "备份文件 $latest_backup 无效，跳过恢复"
-        fi
-    elif [[ -f "/etc/config/${CONFIG_FILE}.bak" ]]; then
-        if grep -q "config ${CONFIG_FILE}" "/etc/config/${CONFIG_FILE}.bak" 2>/dev/null; then
-            mv "/etc/config/${CONFIG_FILE}.bak" "/etc/config/${CONFIG_FILE}"
-            uci commit ${CONFIG_FILE}
-            log_info "已恢复主配置文件备份"
-        else
-            log_warn "备份文件 /etc/config/${CONFIG_FILE}.bak 无效，跳过恢复"
-        fi
-    else
-        log_warn "未找到配置文件备份"
-    fi
+    # 清理规则集目录，可选（如果希望停止后完全清除规则集）
+    rm -f "$RULESET_D_DIR"/*.ru 2>/dev/null
     rm -f "$RULESET_MERGED_FLAG"
-    log_info "已清理规则集标记"
+    log_info "已清理规则集标记和规则集目录"
 }
 
 # ========== 内存限制计算（增强版） ==========
