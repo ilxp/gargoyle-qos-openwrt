@@ -63,7 +63,7 @@ config download_class 'bulk'  # bulk (大文件/后台流量) - 低优先级
 # 上传规则配置
 config upload_rule 'upload_rule_1'  # DNS查询 (realtime类别)
 	option enabled '1'
-	option class 'uclass_1'
+	option class 'realtime'
 	option order '1'
 	option family 'inet'
 	option dstport '53,5353'
@@ -72,7 +72,7 @@ config upload_rule 'upload_rule_1'  # DNS查询 (realtime类别)
 
 config upload_rule 'upload_rule_2'  # 游戏/语音 (realtime类别)
 	option enabled '1'
-	option class 'uclass_1'
+	option class 'realtime'
 	option order '2'
 	option family 'inet'
 	option proto 'udp'
@@ -80,7 +80,7 @@ config upload_rule 'upload_rule_2'  # 游戏/语音 (realtime类别)
 
 config upload_rule 'upload_rule_3'  # VoIP/SIP (realtime类别)
 	option enabled '1'
-	option class 'uclass_1'
+	option class 'realtime'
 	option order '3'
 	option family 'inet'
 	option proto 'udp'
@@ -89,7 +89,7 @@ config upload_rule 'upload_rule_3'  # VoIP/SIP (realtime类别)
 # 排除规则，将实时通信流量排除在bulk外
 config upload_rule 'upload_realtime_exclude'
 	option enabled '1'
-	option class 'uclass_1'  # 归类到 realtime
+	option class 'realtime'  # 归类到 realtime
 	option order '4'
 	option family 'inet'
 	option proto 'udp'
@@ -99,7 +99,7 @@ config upload_rule 'upload_realtime_exclude'
 # 上传视频控制流量
 config upload_rule 'upload_video_1'  # 流媒体协议端口
 	option enabled '1'
-	option class 'uclass_2'
+	option class 'normal'
 	option order '5'
 	option family 'inet'
 	option proto 'tcp'
@@ -108,7 +108,7 @@ config upload_rule 'upload_video_1'  # 流媒体协议端口
 
 config upload_rule 'upload_video_2'  # 视频信令
 	option enabled '1'
-	option class 'uclass_2'
+	option class 'normal'
 	option order '6'
 	option family 'inet'
 	option proto 'tcp'
@@ -117,7 +117,7 @@ config upload_rule 'upload_video_2'  # 视频信令
 
 config upload_rule 'upload_rule_4'  # 小文件HTTPS (normal类别)
 	option enabled '1'
-	option class 'uclass_2'
+	option class 'normal'
 	option order '7'
 	option family 'inet'
 	option dstport '80,443,853'
@@ -126,7 +126,7 @@ config upload_rule 'upload_rule_4'  # 小文件HTTPS (normal类别)
 
 config upload_rule 'upload_rule_5'  # 游戏相关端口 (realtime类别)
 	option enabled '1'
-	option class 'uclass_1'
+	option class 'realtime'
 	option order '8'
 	option family 'inet'
 	option proto 'udp'
@@ -135,7 +135,7 @@ config upload_rule 'upload_rule_5'  # 游戏相关端口 (realtime类别)
 # 保护规则，防止将小流量上传误分类到bulk
 config upload_rule 'upload_protect_tcp'
 	option enabled '1'
-	option class 'uclass_2'  # 归类到 normal
+	option class 'normal'  # 归类到 normal
 	option order '9'
 	option family 'inet'
 	option proto 'tcp'
@@ -145,7 +145,7 @@ config upload_rule 'upload_protect_tcp'
 
 config upload_rule 'upload_protect_udp'
 	option enabled '1'
-	option class 'uclass_2'  # 归类到 normal
+	option class 'normal'  # 归类到 normal
 	option order '10'
 	option family 'inet'
 	option proto 'udp'
@@ -155,7 +155,7 @@ config upload_rule 'upload_protect_udp'
 
 config upload_rule 'upload_rule_6'  # 网页浏览中等流量 (normal类别)
 	option enabled '1'
-	option class 'uclass_2'
+	option class 'normal'
 	option order '11'
 	option family 'inet'
 	option proto 'tcp'
@@ -164,7 +164,7 @@ config upload_rule 'upload_rule_6'  # 网页浏览中等流量 (normal类别)
 
 config upload_rule 'upload_rule_7'  # 大文件上传 (bulk类别)
 	option enabled '1'
-	option class 'uclass_3'
+	option class 'bulk'
 	option order '12'
 	option family 'inet'
 	option proto 'tcp'
@@ -174,7 +174,7 @@ config upload_rule 'upload_rule_7'  # 大文件上传 (bulk类别)
 
 config upload_rule 'upload_rule_8'  # UDP动态端口 (normal类别)
 	option enabled '1'
-	option class 'uclass_2'
+	option class 'normal'
 	option order '13'
 	option family 'inet'
 	option proto 'udp'
@@ -182,7 +182,7 @@ config upload_rule 'upload_rule_8'  # UDP动态端口 (normal类别)
 
 config upload_rule 'upload_rule_9'  # TCP动态端口小流量 (normal类别)
 	option enabled '1'
-	option class 'uclass_2'
+	option class 'normal'
 	option order '14'
 	option family 'inet'
 	option proto 'tcp'
@@ -191,7 +191,7 @@ config upload_rule 'upload_rule_9'  # TCP动态端口小流量 (normal类别)
 
 config upload_rule 'upload_rule_10'  # P2P上传 (bulk类别)
 	option enabled '1'
-	option class 'uclass_3'
+	option class 'bulk'
 	option order '15'
 	option family 'inet'
 	option proto 'tcp'
@@ -200,7 +200,7 @@ config upload_rule 'upload_rule_10'  # P2P上传 (bulk类别)
 
 config upload_rule 'upload_rule_11'  # P2P上传UDP (bulk类别)
 	option enabled '1'
-	option class 'uclass_3'
+	option class 'bulk'
 	option order '16'
 	option family 'inet'
 	option proto 'udp'
@@ -209,7 +209,7 @@ config upload_rule 'upload_rule_11'  # P2P上传UDP (bulk类别)
 
 config upload_rule 'upload_rule_12'
 	option enabled '1'
-	option class 'uclass_3'
+	option class 'bulk'
 	option order '17'
 	option family 'inet'
 	option proto 'tcp_udp'  # 使用tcp_udp协议标记
@@ -219,7 +219,7 @@ config upload_rule 'upload_rule_12'
 
 config upload_rule 'upload_rule_13'
 	option enabled '1'
-	option class 'uclass_3'
+	option class 'bulk'
 	option order '18'
 	option family 'inet'
 	option proto 'tcp'
@@ -229,7 +229,7 @@ config upload_rule 'upload_rule_13'
 
 config upload_rule 'upload_rule_14'
 	option enabled '1'
-	option class 'uclass_3'
+	option class 'bulk'
 	option order '19'
 	option family 'inet'
 	option proto 'udp'
@@ -239,7 +239,7 @@ config upload_rule 'upload_rule_14'
 
 config upload_rule 'upload_rule_15'
 	option enabled '1'
-	option class 'uclass_3'
+	option class 'bulk'
 	option order '20'
 	option family 'inet'
 	option proto 'tcp'
@@ -248,7 +248,7 @@ config upload_rule 'upload_rule_15'
 
 config upload_rule 'upload_rule_16'
 	option enabled '1'
-	option class 'uclass_3'
+	option class 'bulk'
 	option order '21'
 	option family 'inet'
 	option proto 'tcp_udp'  # 使用tcp_udp协议标记
@@ -258,7 +258,7 @@ config upload_rule 'upload_rule_16'
 
 config upload_rule 'upload_rule_17'
 	option enabled '1'
-	option class 'uclass_3'
+	option class 'bulk'
 	option order '22'
 	option family 'inet'
 	option proto 'tcp'
@@ -268,7 +268,7 @@ config upload_rule 'upload_rule_17'
 
 config upload_rule 'upload_rule_18'
 	option enabled '1'
-	option class 'uclass_3'
+	option class 'bulk'
 	option order '23'
 	option family 'inet'
 	option proto 'udp'
@@ -278,7 +278,7 @@ config upload_rule 'upload_rule_18'
 
 config upload_rule 'upload_rule_19'
 	option enabled '1'
-	option class 'uclass_3'
+	option class 'bulk'
 	option order '24'
 	option family 'inet'
 	option proto 'tcp'
@@ -287,7 +287,7 @@ config upload_rule 'upload_rule_19'
 
 config upload_rule 'upload_rule_20'
 	option enabled '1'
-	option class 'uclass_3'
+	option class 'bulk'
 	option order '25'
 	option family 'inet'
 	option proto 'tcp_udp'  # 使用tcp_udp协议标记
@@ -298,7 +298,7 @@ config upload_rule 'upload_rule_20'
 # 下载规则配置
 config download_rule 'download_rule_1'  # DNS查询 (realtime类别)
 	option enabled '1'
-	option class 'dclass_1'
+	option class 'realtime'
 	option order '1'
 	option family 'inet'
 	option srcport '53,5353'
@@ -307,7 +307,7 @@ config download_rule 'download_rule_1'  # DNS查询 (realtime类别)
 
 config download_rule 'download_rule_2'  # 游戏/语音 (realtime类别)
 	option enabled '1'
-	option class 'dclass_1'
+	option class 'realtime'
 	option order '2'
 	option family 'inet'
 	option proto 'udp'
@@ -315,7 +315,7 @@ config download_rule 'download_rule_2'  # 游戏/语音 (realtime类别)
 
 config download_rule 'download_rule_3'  # VoIP/SIP (realtime类别)
 	option enabled '1'
-	option class 'dclass_1'
+	option class 'realtime'
 	option order '3'
 	option family 'inet'
 	option proto 'udp'
@@ -323,7 +323,7 @@ config download_rule 'download_rule_3'  # VoIP/SIP (realtime类别)
 
 config download_rule 'download_rule_4'  # 小文件HTTPS (normal类别)
 	option enabled '1'
-	option class 'dclass_2'
+	option class 'normal'
 	option order '4'
 	option family 'inet'
 	option srcport '443,853'
@@ -332,7 +332,7 @@ config download_rule 'download_rule_4'  # 小文件HTTPS (normal类别)
 
 config download_rule 'download_rule_5'  # 网页浏览 (normal类别)
 	option enabled '1'
-	option class 'dclass_2'
+	option class 'normal'
 	option order '5'
 	option family 'inet'
 	option srcport '80,443'
@@ -341,7 +341,7 @@ config download_rule 'download_rule_5'  # 网页浏览 (normal类别)
 
 config download_rule 'download_rule_6'  # 游戏相关端口 (realtime类别)
 	option enabled '1'
-	option class 'dclass_1'
+	option class 'realtime'
 	option order '6'
 	option family 'inet'
 	option proto 'udp'
@@ -350,7 +350,7 @@ config download_rule 'download_rule_6'  # 游戏相关端口 (realtime类别)
 # 视频流媒体规则
 config download_rule 'download_video_1'  # 流媒体协议端口
 	option enabled '1'
-	option class 'dclass_2'
+	option class 'normal'
 	option order '7'
 	option family 'inet'
 	option proto 'tcp'
@@ -358,7 +358,7 @@ config download_rule 'download_video_1'  # 流媒体协议端口
 
 config download_rule 'download_video_2'  # 视频CDN端口范围
 	option enabled '1'
-	option class 'dclass_2'
+	option class 'normal'
 	option order '8'
 	option family 'inet'
 	option proto 'tcp'
@@ -367,7 +367,7 @@ config download_rule 'download_video_2'  # 视频CDN端口范围
 
 config download_rule 'download_video_3'  # HTTP视频流
 	option enabled '1'
-	option class 'dclass_2'
+	option class 'normal'
 	option order '9'
 	option family 'inet'
 	option proto 'tcp'
@@ -376,7 +376,7 @@ config download_rule 'download_video_3'  # HTTP视频流
 
 config download_rule 'download_video_4'  # QUIC/HTTP3视频
 	option enabled '1'
-	option class 'dclass_2'
+	option class 'normal'
 	option order '10'
 	option family 'inet'
 	option proto 'udp'
@@ -386,7 +386,7 @@ config download_rule 'download_video_4'  # QUIC/HTTP3视频
 # 保护规则：防止将正常视频流误分类到 bulk
 config download_rule 'download_video_protect_tcp'
 	option enabled '1'
-	option class 'dclass_2'  # 归类到 normal
+	option class 'normal'  # 归类到 normal
 	option order '11'
 	option family 'inet'
 	option proto 'tcp'
@@ -396,7 +396,7 @@ config download_rule 'download_video_protect_tcp'
 
 config download_rule 'download_video_protect_udp'
 	option enabled '1'
-	option class 'dclass_2'  # 归类到 normal
+	option class 'normal'  # 归类到 normal
 	option order '12'
 	option family 'inet'
 	option proto 'udp'
@@ -406,7 +406,7 @@ config download_rule 'download_video_protect_udp'
 
 config download_rule 'download_rule_7'  # 大文件下载 (bulk类别)
 	option enabled '1'
-	option class 'dclass_3'
+	option class 'bulk'
 	option order '13'
 	option family 'inet'
 	option srcport '80,443,8080,20,21'
@@ -415,7 +415,7 @@ config download_rule 'download_rule_7'  # 大文件下载 (bulk类别)
 
 config download_rule 'download_rule_8'  # UDP动态端口 (normal类别)
 	option enabled '1'
-	option class 'dclass_2'
+	option class 'normal'
 	option order '14'
 	option family 'inet'
 	option proto 'udp'
@@ -423,7 +423,7 @@ config download_rule 'download_rule_8'  # UDP动态端口 (normal类别)
 
 config download_rule 'download_rule_9'  # TCP动态端口小流量 (normal类别)
 	option enabled '1'
-	option class 'dclass_2'
+	option class 'normal'
 	option order '15'
 	option family 'inet'
 	option proto 'tcp'
@@ -432,7 +432,7 @@ config download_rule 'download_rule_9'  # TCP动态端口小流量 (normal类别
 
 config download_rule 'download_rule_10'  # P2P流量 (bulk类别)
 	option enabled '1'
-	option class 'dclass_3'
+	option class 'bulk'
 	option order '16'
 	option family 'inet'
 	option proto 'tcp'
@@ -441,7 +441,7 @@ config download_rule 'download_rule_10'  # P2P流量 (bulk类别)
 
 config download_rule 'download_rule_11'  # P2P流量UDP (bulk类别)
 	option enabled '1'
-	option class 'dclass_3'
+	option class 'bulk'
 	option order '17'
 	option family 'inet'
 	option proto 'udp'
@@ -449,7 +449,7 @@ config download_rule 'download_rule_11'  # P2P流量UDP (bulk类别)
 
 config download_rule 'download_rule_12'
 	option enabled '1'
-	option class 'dclass_3'
+	option class 'bulk'
 	option order '18'
 	option family 'inet'
 	option proto 'tcp_udp'  # 使用tcp_udp协议标记
@@ -459,7 +459,7 @@ config download_rule 'download_rule_12'
 
 config download_rule 'download_rule_13'
 	option enabled '1'
-	option class 'dclass_3'
+	option class 'bulk'
 	option order '19'
 	option family 'inet'
 	option proto 'tcp'
@@ -469,7 +469,7 @@ config download_rule 'download_rule_13'
 
 config download_rule 'download_rule_14'
 	option enabled '1'
-	option class 'dclass_3'
+	option class 'bulk'
 	option order '20'
 	option family 'inet'
 	option proto 'udp'
@@ -479,7 +479,7 @@ config download_rule 'download_rule_14'
 
 config download_rule 'download_rule_15'
 	option enabled '1'
-	option class 'dclass_3'
+	option class 'bulk'
 	option order '21'
 	option family 'inet'
 	option proto 'tcp'
@@ -488,7 +488,7 @@ config download_rule 'download_rule_15'
 
 config download_rule 'download_rule_16'
 	option enabled '1'
-	option class 'dclass_3'
+	option class 'bulk'
 	option order '22'
 	option family 'inet'
 	option proto 'tcp_udp'  # 使用tcp_udp协议标记
@@ -498,7 +498,7 @@ config download_rule 'download_rule_16'
 
 config download_rule 'download_rule_17'
 	option enabled '1'
-	option class 'dclass_3'
+	option class 'bulk'
 	option order '23'
 	option family 'inet'
 	option proto 'tcp'
@@ -508,7 +508,7 @@ config download_rule 'download_rule_17'
 
 config download_rule 'download_rule_18'
 	option enabled '1'
-	option class 'dclass_3'
+	option class 'bulk'
 	option order '24'
 	option family 'inet'
 	option proto 'udp'
@@ -519,7 +519,7 @@ config download_rule 'download_rule_18'
 # 特定P2P应用端口
 config download_rule 'download_rule_19'
 	option enabled '1'
-	option class 'dclass_3'
+	option class 'bulk'
 	option order '25'
 	option family 'inet'
 	option proto 'tcp'
@@ -528,7 +528,7 @@ config download_rule 'download_rule_19'
 
 config download_rule 'download_rule_20'
 	option enabled '1'
-	option class 'dclass_3'
+	option class 'bulk'
 	option order '26'
 	option family 'inet'
 	option proto 'tcp_udp'  # 使用tcp_udp协议标记

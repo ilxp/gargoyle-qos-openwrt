@@ -24,7 +24,6 @@ SERVICE_NAME="qos_gargoyle"
 # 算法模块路径
 QOS_MODULES_DIR="/usr/lib/qos_gargoyle"
 CAKE_MODULE="$QOS_MODULES_DIR/cake.sh"
-CAKE_DSCP_MODULE="$QOS_MODULES_DIR/cake_dscp.sh"
 HFSC_CAKE_MODULE="$QOS_MODULES_DIR/hfsc_cake.sh"      
 HTB_CAKE_MODULE="$QOS_MODULES_DIR/htb_cake.sh" 
 HTB_MODULE="$QOS_MODULES_DIR/htb_fqcodel.sh"  
@@ -316,7 +315,6 @@ load_algorithm_module() {
         "hfsc_cake") module="$HFSC_CAKE_MODULE" ;;
         "htb_cake") module="$HTB_CAKE_MODULE" ;;
         "cake") module="$CAKE_MODULE" ;;
-        "cake_dscp") module="$CAKE_DSCP_MODULE" ;;
         "htb_fqcodel") module="$HTB_MODULE" ;;
         *)
             echo "Unknown algorithm: $algo, using htb_cake as default"
@@ -653,7 +651,7 @@ init_qos() {
     
     local ALGO_RET=0
     case "$algorithm" in
-        "cake"|"cake_dscp")
+        "cake")
             export RULES_ALREADY_APPLIED=1
             if type init_cake_qos >/dev/null 2>&1; then
                 init_cake_qos start
@@ -733,7 +731,7 @@ display_algorithm_specific_status() {
     fi
     
     case "$algorithm" in
-        "cake"|"cake_dscp")
+        "cake")
             if type show_cake_status >/dev/null 2>&1; then
                 show_cake_status
             else

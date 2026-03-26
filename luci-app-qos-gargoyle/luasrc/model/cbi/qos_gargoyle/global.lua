@@ -63,7 +63,6 @@ o = s:option(ListValue, "algorithm", translate("QoS Algorithm"),
 o:value("hfsc_cake", "HFSC+CAKE (HFSC With CAKE)")
 o:value("htb_cake", "HTB+CAKE (HTB With CAKE)")
 o:value("cake", "CAKE (Common Applications Kept Enhanced)")
-o:value("cake_dscp", "CAKE+DSCP (CAKE With Dscp)")
 o:value("htb_fqcodel", "HTB+Fq_Codel (HTB With Fq_Codel)")
 o.default = "htb_cake"
 
