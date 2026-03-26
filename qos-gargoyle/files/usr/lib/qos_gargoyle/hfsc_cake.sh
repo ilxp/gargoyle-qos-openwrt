@@ -1,6 +1,6 @@
 #!/bin/bash
 # HFSC_CAKE算法实现模块
-# 版本: 3.4.3 - 移除锁机制（改用 procd），适配 common.sh/rule.sh 更新
+# 版本: 3.4.4 - 修复 CAKE 带宽指定，修复 check_cake_param_support 回退 lo
 # 基于HFSC与CAKE组合算法实现QoS流量控制。
 
 # ========== 全局配置常量 ==========
@@ -214,36 +214,54 @@ set_hfsc_default_class() {
     fi
 }
 
-# 检测内核是否支持特定 CAKE 参数（使用唯一 dummy 设备，确保清理）
+# ========== CAKE 参数支持检查（修复：避免回退 lo）==========
 check_cake_param_support() {
     local param="$1"
-    local dummy_dev="qos_test_dummy_$$"
+    local dummy_dev="qos_test_cake_$$"
     local created=0
-    if ! ip link show "$dummy_dev" >/dev/null 2>&1; then
-        ip link add "$dummy_dev" type dummy 2>/dev/null || {
-            dummy_dev="lo"
-        }
-        created=1
+    if ! ip link add "$dummy_dev" type dummy 2>/dev/null; then
+        qos_log "DEBUG" "无法创建 dummy 设备，假定 $param 不支持"
+        return 1
     fi
+    created=1
     tc qdisc del dev "$dummy_dev" root 2>/dev/null
     local ret=1
     if tc qdisc add dev "$dummy_dev" root cake bandwidth 1mbit "$param" 2>/dev/null; then
         ret=0
         tc qdisc del dev "$dummy_dev" root 2>/dev/null
     fi
-    if [[ $created -eq 1 && "$dummy_dev" != "lo" ]]; then
+    if [[ $created -eq 1 ]]; then
         ip link del "$dummy_dev" 2>/dev/null
     fi
     return $ret
 }
 
-# 构建CAKE参数字符串
+# ========== 构建CAKE参数串（修复：显式指定带宽）==========
 build_cake_params() {
+    local direction="$1"   # upload 或 download
     local params=""
+    local bandwidth=""
+    
+    # 根据方向选择对应的总带宽
+    if [[ "$direction" == "upload" ]]; then
+        bandwidth="$total_upload_bandwidth"
+    elif [[ "$direction" == "download" ]]; then
+        bandwidth="$total_download_bandwidth"
+    else
+        qos_log "ERROR" "build_cake_params: 未知方向 $direction"
+        return 1
+    fi
+    
+    # 如果用户显式配置了 CAKE_BANDWIDTH，则优先使用，否则使用 HFSC 总带宽（避免二次整形）
     if [[ -n "$CAKE_BANDWIDTH" ]]; then
         params="$params bandwidth $CAKE_BANDWIDTH"
         qos_log "INFO" "用户显式配置了CAKE bandwidth: $CAKE_BANDWIDTH，CAKE将进行二次整形（可能影响HFSC调度）"
+    else
+        # 默认使用 HFSC 该方向的总带宽，使 CAKE 只作为队列调度而不做速率整形
+        params="$params bandwidth ${bandwidth}kbit"
+        qos_log "DEBUG" "CAKE 使用 HFSC 总带宽 ${bandwidth}kbit，避免二次整形"
     fi
+    
     [[ -n "$CAKE_RTT" ]] && params="$params rtt $CAKE_RTT"
     [[ -n "$CAKE_FLOWMODE" ]] && params="$params $CAKE_FLOWMODE"
     [[ -n "$CAKE_DIFFSERV" ]] && params="$params $CAKE_DIFFSERV"
@@ -374,7 +392,7 @@ create_hfsc_upload_class() {
         qos_log "ERROR" "创建上传类别 1:$class_index 失败"
         return 1
     fi
-    local cake_params=$(build_cake_params)
+    local cake_params=$(build_cake_params "upload")
     qos_log "INFO" "添加上传CAKE队列参数: $cake_params"
     if ! tc qdisc add dev "$qos_interface" parent 1:$class_index \
         handle ${class_index}:1 cake $cake_params; then
@@ -500,7 +518,7 @@ create_hfsc_download_class() {
         qos_log "ERROR" "创建下载类别 1:$class_index 失败"
         return 1
     fi
-    local cake_params=$(build_cake_params)
+    local cake_params=$(build_cake_params "download")
     qos_log "INFO" "添加下载CAKE队列参数: $cake_params"
     if ! tc qdisc add dev "$ifb_dev" parent 1:$class_index \
         handle ${class_index}:1 cake $cake_params; then
