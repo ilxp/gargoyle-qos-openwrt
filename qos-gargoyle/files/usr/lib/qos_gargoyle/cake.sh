@@ -1,6 +1,6 @@
 #!/bin/bash
 # CAKE算法实现模块 - 多队列增强版
-# 版本: 3.4.1 - 添加 DSCP 映射、IFB 队列数回退优化、自动调优覆盖修复
+# 版本: 3.4.2 - 修复带宽加载、IFB状态检查、check_cake_param_support 污染问题
 # 支持与 idclass 集成，通过 DSCP 进行分类（diffserv4 模式）
 # 必要工具：tc, nft, conntrack, ethtool, sysctl
 # 内核模块：sch_cake
@@ -34,11 +34,11 @@ trap cleanup_temp_files EXIT INT TERM HUP QUIT
 CLASS_MARKS_FILE="${CLASS_MARKS_FILE:-/etc/qos_gargoyle/class_marks}"
 RUNTIME_PARAMS_FILE="${RUNTIME_PARAMS_FILE:-/tmp/cake_runtime_params}"
 
-# 掩码变量（DSCP 模式下未使用，但 rule.sh 需要）
-UPLOAD_MASK=0
-DOWNLOAD_MASK=0
+# 掩码变量（CAKE 模式下未使用，但 rule.sh 需要）
+UPLOAD_MASK=0xFFFF
+DOWNLOAD_MASK=0xFFFF0000
 
-echo "CAKE 模块初始化完成 (v3.4.1)"
+echo "CAKE 模块初始化完成 (v3.4.2)"
 echo "  网络接口: $qos_interface"
 echo "  IFB 设备: $IFB_DEVICE"
 echo "  上传带宽: ${total_upload_bandwidth:-未配置}kbit/s"
@@ -69,35 +69,8 @@ RUNTIME_AUTORATE_INGRESS=0
 
 # ========== 辅助函数 ==========
 
-# 获取类别的数字 ID（用于 class_mark 映射）
-get_class_id() {
-    local direction="$1"
-    local class="$2"
-    local cid
-
-    # 尝试从 UCI 读取 class_id 字段
-    cid=$(uci -q get ${CONFIG_FILE}.${class}.class_id 2>/dev/null)
-    if [ -n "$cid" ] && validate_number "$cid" "class_id" 1 16 2>/dev/null; then
-        echo "$cid"
-        return 0
-    fi
-
-    # 回退：根据标记索引推断
-    local mark
-    mark=$(get_class_mark "$direction" "$class")
-    if [ -z "$mark" ] || [ "$mark" = "0" ]; then
-        return 1
-    fi
-    local idx=1
-    while [ $idx -le 16 ]; do
-        if [ $(( (mark >> (idx-1)) & 1 )) -eq 1 ]; then
-            echo "$idx"
-            return 0
-        fi
-        idx=$((idx + 1))
-    done
-    return 1
-}
+# 获取类别的数字 ID（用于 class_mark 映射）—— 未使用，保留以备后用
+# get_class_id() { ... }
 
 # 参数消毒
 sanitize_param() {
@@ -245,24 +218,28 @@ get_tx_queues() {
     echo "$queues"
 }
 
-# ========== 检测内核是否支持特定 CAKE 参数 ==========
+# ========== 检测内核是否支持特定 CAKE 参数（修复：避免污染 lo）==========
 check_cake_param_support() {
     local param="$1"
-    local dummy_dev="dummy_test_$$"
+    local dummy_dev="cake_test_$$"
     local created=0
+
     if ! ip link show "$dummy_dev" >/dev/null 2>&1; then
-        ip link add "$dummy_dev" type dummy 2>/dev/null || {
-            dummy_dev="lo"
-        }
+        if ! ip link add "$dummy_dev" type dummy 2>/dev/null; then
+            qos_log "DEBUG" "无法创建 dummy 设备，假定 $param 不支持"
+            return 1
+        fi
         created=1
     fi
+
     tc qdisc del dev "$dummy_dev" root 2>/dev/null
     local ret=1
     if tc qdisc add dev "$dummy_dev" root cake bandwidth 1mbit "$param" 2>/dev/null; then
         ret=0
         tc qdisc del dev "$dummy_dev" root 2>/dev/null
     fi
-    if [[ $created -eq 1 && "$dummy_dev" != "lo" ]]; then
+
+    if [ $created -eq 1 ]; then
         ip link del "$dummy_dev" 2>/dev/null
     fi
     return $ret
@@ -667,14 +644,17 @@ init_cake_download() {
         fi
     fi
 
-    if ! ip link show dev "$IFB_DEVICE" | grep -q "UP"; then
-        ip link set dev "$IFB_DEVICE" up || {
-            qos_log "ERROR" "无法启动IFB设备 $IFB_DEVICE"
-            return 1
-        }
-    else
-        qos_log "INFO" "IFB设备 $IFB_DEVICE 已是 UP 状态"
+    # 启动 IFB 设备并检查状态
+    if ! ip link set dev "$IFB_DEVICE" up; then
+        qos_log "ERROR" "无法启动IFB设备 $IFB_DEVICE"
+        return 1
     fi
+    # 再次确认状态
+    if ! ip link show dev "$IFB_DEVICE" | grep -q "UP"; then
+        qos_log "ERROR" "IFB设备 $IFB_DEVICE 未成功进入 UP 状态"
+        return 1
+    fi
+    qos_log "INFO" "IFB设备 $IFB_DEVICE 已启动"
 
     # 使用 rule.sh 中的入口重定向函数
     if ! setup_ingress_redirect; then
@@ -729,7 +709,7 @@ health_check_cake() {
 
 # ========== 状态显示 ==========
 show_cake_status() {
-    echo "===== CAKE QoS状态报告 (v3.4.1) ====="
+    echo "===== CAKE QoS状态报告 (v3.4.2) ====="
     echo "时间: $(date)"
     echo "网络接口: ${qos_interface:-未知}"
 
@@ -919,6 +899,17 @@ init_cake_qos() {
             RUNTIME_SPLIT_GSO=0
             RUNTIME_INGRESS=0
             RUNTIME_AUTORATE_INGRESS=0
+
+            # 加载全局配置（自动测速等）
+            load_global_config
+
+            # 加载带宽配置（必须在 load_cake_config 之前，因为 auto_tune 需要带宽）
+            if ! load_bandwidth_from_config; then
+                qos_log "ERROR" "加载带宽配置失败"
+                release_lock
+                rm -f "$QOS_RUNNING_FILE"
+                exit 1
+            fi
 
             load_cake_config
 
