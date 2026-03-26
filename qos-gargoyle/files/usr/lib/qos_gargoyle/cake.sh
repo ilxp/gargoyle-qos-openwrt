@@ -1,6 +1,6 @@
 #!/bin/bash
 # CAKE算法实现模块 - 多队列增强版
-# 版本: 3.4.3 - 移除锁机制（改用 procd），修复带宽加载、IFB状态检查
+# 版本: 3.4.4 - 修复标记分配缺失，确保启动成功
 # 支持与 idclass 集成，通过 DSCP 进行分类（diffserv4 模式）
 # 必要工具：tc, nft, conntrack, ethtool, sysctl
 # 内核模块：sch_cake
@@ -38,7 +38,7 @@ RUNTIME_PARAMS_FILE="${RUNTIME_PARAMS_FILE:-/tmp/cake_runtime_params}"
 UPLOAD_MASK=0xFFFF
 DOWNLOAD_MASK=0xFFFF0000
 
-echo "CAKE 模块初始化完成 (v3.4.3)"
+echo "CAKE 模块初始化完成 (v3.4.4)"
 echo "  网络接口: $qos_interface"
 echo "  IFB 设备: $IFB_DEVICE"
 echo "  上传带宽: ${total_upload_bandwidth:-未配置}kbit/s"
@@ -695,7 +695,7 @@ health_check_cake() {
 
 # ========== 状态显示 ==========
 show_cake_status() {
-    echo "===== CAKE QoS状态报告 (v3.4.3) ====="
+    echo "===== CAKE QoS状态报告 (v3.4.4) ====="
     echo "时间: $(date)"
     echo "网络接口: ${qos_interface:-未知}"
 
@@ -909,6 +909,25 @@ init_cake_qos() {
 
             load_upload_class_configurations
             load_download_class_configurations
+
+            # ====== 关键修复：分配标记 ======
+            if [ -n "$upload_class_list" ]; then
+                if ! allocate_class_marks "upload" "$upload_class_list"; then
+                    qos_log "ERROR" "上传方向标记分配失败"
+                    stop_cake_qos
+                    rm -f "$QOS_RUNNING_FILE"
+                    exit 1
+                fi
+            fi
+            if [ -n "$download_class_list" ]; then
+                if ! allocate_class_marks "download" "$download_class_list"; then
+                    qos_log "ERROR" "下载方向标记分配失败"
+                    stop_cake_qos
+                    rm -f "$QOS_RUNNING_FILE"
+                    exit 1
+                fi
+            fi
+            # ====== 标记分配结束 ======
 
             if [ ! -s "$CLASS_MARKS_FILE" ]; then
                 qos_log "ERROR" "Class marks file $CLASS_MARKS_FILE is missing or empty"
