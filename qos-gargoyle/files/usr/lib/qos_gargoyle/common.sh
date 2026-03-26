@@ -1383,46 +1383,68 @@ check_tc_ctinfo_support() {
 }
 
 # ========== 规则集合并 ==========
-RULESET_D_DIR="/etc/config/qos_gargoyle.d"
-
 init_ruleset() {
     local nofix="$1"
-    [[ "$nofix" == "1" ]] && return 0
-
-    # 确保主配置文件包含 include 指令
-    if ! grep -q "^include /etc/config/qos_gargoyle\.d/\*\.conf" "/etc/config/${CONFIG_FILE}" 2>/dev/null; then
-        echo "include /etc/config/qos_gargoyle.d/*.conf" >> "/etc/config/${CONFIG_FILE}"
-        uci commit "${CONFIG_FILE}"
-        log_info "已向主配置文件添加 include 指令"
+    if [[ "$nofix" == "1" ]]; then
+        [[ -f "$RULESET_MERGED_FLAG" ]] && return 0
+        return 0
     fi
-
-    local ruleset
+    [[ -f "$RULESET_MERGED_FLAG" ]] && return 0
+    local ruleset ruleset_file
     ruleset=$(uci -q get ${CONFIG_FILE}.global.ruleset 2>/dev/null)
     [[ -z "$ruleset" ]] && ruleset="default.ru"
     case "$ruleset" in *.ru) ;; *) ruleset="${ruleset}.ru" ;; esac
-
-    local ruleset_file="$RULESET_DIR/$ruleset"
+    ruleset_file="$RULESET_DIR/$ruleset"
     if [[ ! -f "$ruleset_file" ]]; then
-        log_error "规则集文件 $ruleset_file 不存在"
+        log_error "规则集文件 $ruleset_file 不存在，无法加载任何规则！"
         return 1
     fi
-
-    # 清空规则集目录并安装新规则集
-    mkdir -p "$RULESET_D_DIR"
-    rm -f "$RULESET_D_DIR"/*.ru
-    cp "$ruleset_file" "$RULESET_D_DIR/"
-    log_info "已安装规则集 $ruleset 到 $RULESET_D_DIR"
-
-    # 重新提交 UCI 配置，使 include 生效（可选，因为 uci commit 会重写文件）
-    uci commit "${CONFIG_FILE}"
+    local backup_base="/etc/config/${CONFIG_FILE}.bak"
+    local backup_file="${backup_base}.$(date +%s)"
+    cp "/etc/config/${CONFIG_FILE}" "$backup_file"
+    log_info "已备份主配置文件到 $backup_file"
+    # 清理旧备份，保留最近3个
+    local backups=($(ls -t ${backup_base}.* 2>/dev/null))
+    if [[ ${#backups[@]} -gt 3 ]]; then
+        for ((i=3; i<${#backups[@]}; i++)); do
+            rm -f "${backups[$i]}" 2>/dev/null
+            log_debug "删除旧备份: ${backups[$i]}"
+        done
+    fi
+    if grep -q "^# === RULESET_" "/etc/config/${CONFIG_FILE}"; then
+        local tmp_conf=$(mktemp /tmp/qos_config_$$.tmp)
+        TEMP_FILES+=("$tmp_conf")
+        sed '/^# === RULESET_/,/^# === RULESET_END ===/d' "/etc/config/${CONFIG_FILE}" > "$tmp_conf"
+        mv "$tmp_conf" "/etc/config/${CONFIG_FILE}"
+        log_info "已清理旧的规则集内容"
+    fi
+    {
+        echo ""
+        echo "# === RULESET_${ruleset} ==="
+        cat "$ruleset_file"
+        echo "# === RULESET_END ==="
+    } >> "/etc/config/${CONFIG_FILE}"
+    uci commit ${CONFIG_FILE}
+    touch "$RULESET_MERGED_FLAG"
+    log_info "已将规则集 $ruleset 合并到主配置文件"
     return 0
 }
 
 restore_main_config() {
-    # 清理规则集目录，可选（如果希望停止后完全清除规则集）
-    rm -f "$RULESET_D_DIR"/*.ru 2>/dev/null
+    local latest_backup=$(ls -t /etc/config/${CONFIG_FILE}.bak.* 2>/dev/null | head -1)
+    if [[ -n "$latest_backup" ]]; then
+        mv "$latest_backup" "/etc/config/${CONFIG_FILE}"
+        uci commit ${CONFIG_FILE}
+        log_info "已恢复主配置文件备份: $latest_backup"
+    elif [[ -f "/etc/config/${CONFIG_FILE}.bak" ]]; then
+        mv "/etc/config/${CONFIG_FILE}.bak" "/etc/config/${CONFIG_FILE}"
+        uci commit ${CONFIG_FILE}
+        log_info "已恢复主配置文件备份"
+    else
+        log_warn "未找到配置文件备份"
+    fi
     rm -f "$RULESET_MERGED_FLAG"
-    log_info "已清理规则集标记和规则集目录"
+    log_info "已清理规则集标记"
 }
 
 # ========== 内存限制计算（增强版） ==========
@@ -1499,6 +1521,34 @@ get_highest_priority_class() {
         fi
         if (( prio < highest_prio )); then
             highest_prio=$prio
+            best_class="$class"
+        fi
+    done
+    echo "$best_class"
+}
+
+# 获取最低优先级的类（priority 数值最大的启用类）
+get_lowest_priority_class() {
+    local direction="$1"
+    local class_list=""
+    if [[ "$direction" == "upload" ]]; then
+        class_list="$upload_class_list"
+    else
+        class_list="$download_class_list"
+    fi
+    local lowest_prio=-1
+    local best_class=""
+    for class in $class_list; do
+        local enabled=$(uci -q get ${CONFIG_FILE}.${class}.enabled 2>/dev/null)
+        if [[ "$enabled" == "0" ]]; then
+            continue
+        fi
+        local prio=$(uci -q get ${CONFIG_FILE}.${class}.priority 2>/dev/null)
+        if [[ -z "$prio" ]]; then
+            prio=999
+        fi
+        if (( prio > lowest_prio )); then
+            lowest_prio=$prio
             best_class="$class"
         fi
     done

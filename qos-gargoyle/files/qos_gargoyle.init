@@ -1,4 +1,4 @@
-#!/bin/sh /etc/rc.common
+#!/bin/bash /etc/rc.common
 # QoS Gargoyle 初始化脚本 - procd 版本
 # 支持多算法：HFSC, CAKE, FQ_CoDel, HTB, CAKE with DSCPclassify, HFSC+CAKE, HTB+CAKE
 # 版本：3.5.0 - 改用 procd 管理，移除手动锁，优化启动流程

@@ -1,4 +1,4 @@
-#!/bin/sh
+#!/bin/bash
 # dscpclassify_core.sh - 修复 meter 名称问题，完整规则解析版本
 # 用于 qos_gargoyle 集成
 # 使用方法: . /path/to/dscpclassify_core.sh

@@ -480,18 +480,36 @@ build_icmp_cond() {
     echo "$cond"
 }
 
-# ========== class_mark 映射设置（修复：使用 add rule 而非 insert rule，确保在分类之后） ==========
+# ========== class_mark 映射设置（直接规则，支持 priority 自动映射，适配 diffserv8） ==========
 setup_class_mark_map() {
-    qos_log "INFO" "设置 class_mark 映射..."
+    qos_log "信息" "设置 class_mark 映射（直接规则）..."
     local tmp_nft_file=$(mktemp)
     register_temp_file "$tmp_nft_file"
 
-    cat << EOF >> "$tmp_nft_file"
-delete map inet gargoyle-qos-priority class_mark 2>/dev/null
-add map inet gargoyle-qos-priority class_mark { type mark : dscp; }
-EOF
+    # 收集所有需要映射的标记和对应的 DSCP 值
+    declare -A mark_to_dscp
 
     config_load "$CONFIG_FILE"
+
+    # 根据 priority 映射到标准 DSCP（适配 CAKE diffserv8）
+    map_priority_to_dscp() {
+        local priority="$1"
+        # 将 priority 映射到 diffserv8 的队列（1=最高，8=最低）
+        # 队列 1: EF (46)         - 语音/游戏
+        # 队列 2: AF41 (34)       - 视频会议
+        # 队列 3: AF31 (26)       - 高优先级数据
+        # 队列 4: AF21 (18)       - 中优先级数据
+        # 队列 5: AF11 (10)       - 低优先级数据 (CS1)
+        # 队列 6-8: CS0 (0)       - Best Effort
+        case "$priority" in
+            1) echo 46 ;;   # EF
+            2) echo 34 ;;   # AF41
+            3) echo 26 ;;   # AF31
+            4) echo 18 ;;   # AF21
+            5) echo 10 ;;   # AF11
+            *) echo 0 ;;    # 其他优先级默认 Best Effort (CS0)
+        esac
+    }
 
     while IFS=: read -r dir cls mark_raw; do
         [ -z "$dir" ] || [ -z "$cls" ] && continue
@@ -500,44 +518,53 @@ EOF
         mark=$(echo "$mark" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
         [ -z "$mark" ] && continue
 
+        # 获取该类的 DSCP 值（优先使用用户配置的 dscp，否则根据 priority 自动映射）
         local dscp_raw=$(uci -q get "${CONFIG_FILE}.${cls_clean}.dscp" 2>/dev/null)
         local dscp=$(echo "$dscp_raw" | tr -d '\r' | tr -d '[:space:]')
         if [ -z "$dscp" ]; then
-            local priority_raw=$(uci -q get "${CONFIG_FILE}.${cls_clean}.priority" 2>/dev/null)
-            local priority=$(echo "$priority_raw" | tr -d '\r' | tr -d '[:space:]')
-            if [ -n "$priority" ] && [ "$priority" -ge 0 ] 2>/dev/null && [ "$priority" -le 7 ] 2>/dev/null; then
-                dscp=$priority
-            else
-                dscp=0
+            # 未配置 dscp，根据 priority 自动映射
+            local priority=$(uci -q get "${CONFIG_FILE}.${cls_clean}.priority" 2>/dev/null)
+            # 如果 priority 未配置或无效，默认为 6（Best Effort）
+            if ! echo "$priority" | grep -qE '^[0-9]+$' || [ "$priority" -lt 1 ] 2>/dev/null; then
+                priority=6
             fi
+            dscp=$(map_priority_to_dscp "$priority")
+            qos_log "调试" "类别 $cls_clean 未配置 DSCP，根据优先级 $priority 自动映射为 $dscp"
         else
             if ! [ "$dscp" -ge 0 ] 2>/dev/null || ! [ "$dscp" -le 63 ] 2>/dev/null; then
                 dscp=0
             fi
         fi
 
-        echo "add element inet gargoyle-qos-priority class_mark { $mark : $dscp }" >> "$tmp_nft_file"
-        qos_log "DEBUG" "Added map element $mark : $dscp for $cls_clean"
+        mark_to_dscp["$mark"]="$dscp"
+        qos_log "调试" "收集映射: 标记 $mark -> DSCP $dscp (类 $cls_clean)"
     done < "$CLASS_MARKS_FILE"
 
+    # 生成直接设置 DSCP 的规则（使用 ct mark）
     cat << EOF >> "$tmp_nft_file"
 # DSCP mapping rules: apply after classification (use add rule, not insert)
-add rule inet gargoyle-qos-priority filter_qos_egress ct mark != 0 ip dscp set @class_mark[ct mark]
-add rule inet gargoyle-qos-priority filter_qos_egress ct mark != 0 ip6 dscp set @class_mark[ct mark]
-add rule inet gargoyle-qos-priority filter_qos_ingress ct mark != 0 ip dscp set @class_mark[ct mark]
-add rule inet gargoyle-qos-priority filter_qos_ingress ct mark != 0 ip6 dscp set @class_mark[ct mark]
-add rule inet gargoyle-qos-priority filter_qos_egress ct state established,related ip dscp set @class_mark[ct mark]
-add rule inet gargoyle-qos-priority filter_qos_egress ct state established,related ip6 dscp set @class_mark[ct mark]
-add rule inet gargoyle-qos-priority filter_qos_ingress ct state established,related ip dscp set @class_mark[ct mark]
-add rule inet gargoyle-qos-priority filter_qos_ingress ct state established,related ip6 dscp set @class_mark[ct mark]
 EOF
 
+    for mark in "${!mark_to_dscp[@]}"; do
+        dscp="${mark_to_dscp[$mark]}"
+        cat << EOF >> "$tmp_nft_file"
+add rule inet gargoyle-qos-priority filter_qos_egress ct mark $mark ip dscp set $dscp
+add rule inet gargoyle-qos-priority filter_qos_egress ct mark $mark ip6 dscp set $dscp
+add rule inet gargoyle-qos-priority filter_qos_ingress ct mark $mark ip dscp set $dscp
+add rule inet gargoyle-qos-priority filter_qos_ingress ct mark $mark ip6 dscp set $dscp
+add rule inet gargoyle-qos-priority filter_qos_egress ct state established,related ct mark $mark ip dscp set $dscp
+add rule inet gargoyle-qos-priority filter_qos_egress ct state established,related ct mark $mark ip6 dscp set $dscp
+add rule inet gargoyle-qos-priority filter_qos_ingress ct state established,related ct mark $mark ip dscp set $dscp
+add rule inet gargoyle-qos-priority filter_qos_ingress ct state established,related ct mark $mark ip6 dscp set $dscp
+EOF
+    done
+
     if nft -f "$tmp_nft_file" 2>&1 | logger -t qos_gargoyle; then
-        qos_log "INFO" "class_mark map and recovery rules loaded successfully"
+        qos_log "信息" "class_mark 直接规则加载成功"
         rm -f "$tmp_nft_file"
         return 0
     else
-        qos_log "ERROR" "Failed to load class_mark map and recovery rules"
+        qos_log "错误" "加载 class_mark 直接规则失败"
         cat "$tmp_nft_file" | logger -t qos_gargoyle
         rm -f "$tmp_nft_file"
         return 1
@@ -884,14 +911,23 @@ add rule inet gargoyle-qos-priority filter_qos_ingress meta l4proto udp limit ra
 check_meter_support() {
     local test_file=$(mktemp)
     register_temp_file "$test_file"
-    echo "add table inet qos_meter_test" > "$test_file"
-    echo "add chain inet qos_meter_test test { type filter hook forward priority 0; }" >> "$test_file"
-    echo "add rule inet qos_meter_test test meter test_meter { ip daddr timeout 1s } limit rate 1/minute counter" >> "$test_file"
+    # 使用与动态分类相同的 meter 结构进行测试
+    cat > "$test_file" <<EOF
+add table inet qos_meter_test
+add set inet qos_meter_test test_set { type ipv4_addr . inet_service . inet_proto; flags timeout; }
+add chain inet qos_meter_test test
+add rule inet qos_meter_test test meter test_meter { ip daddr . th dport . meta l4proto timeout 5s limit rate over 1/minute } add @test_set { ip daddr . th dport . meta l4proto timeout 30s }
+EOF
     if nft -c -f "$test_file" 2>/dev/null; then
-        rm -f "$test_file"
         nft delete table inet qos_meter_test 2>/dev/null
+        rm -f "$test_file"
         return 0
     else
+        if [[ "$DEBUG" == "1" ]]; then
+            local error_output=$(nft -c -f "$test_file" 2>&1)
+            log_debug "meter 支持检测失败: $error_output"
+        fi
+        nft delete table inet qos_meter_test 2>/dev/null
         rm -f "$test_file"
         return 1
     fi
@@ -921,7 +957,8 @@ get_class_mark_for_dynamic() {
     echo "$class_mark"
 }
 
-# 修复：meter 语法修正，同时设置 meta mark 和 ct mark
+# 修复：meter 语法修正（兼容 nftables 1.1.1），同时设置 meta mark 和 ct mark
+# 批量客户端检测（优先使用用户配置的类，否则使用最低优先级类）
 create_bulk_client_rules() {
     local enabled=1 min_bytes=10000 min_connections=10 class="bulk"
     
@@ -939,10 +976,32 @@ create_bulk_client_rules() {
     [ "$min_bytes" -le 0 ] && min_bytes=10000
     [ "$min_connections" -le 1 ] && min_connections=10
     
-    local dscp=$(get_class_mark_for_dynamic "$class")
-    if [ -z "$dscp" ] || [ "$dscp" -eq 0 ]; then
-        qos_log "WARN" "bulk_client_detection: class '$class' not found or class_mark=0, using default 8 (CS1)"
-        dscp=8
+    local dscp
+    # 优先使用用户配置的类
+    if [[ -n "$uci_class" ]]; then
+        dscp=$(get_class_mark_for_dynamic "$uci_class")
+        if [ -z "$dscp" ] || [ "$dscp" -eq 0 ]; then
+            qos_log "警告" "批量客户端检测: 用户指定的类 '$uci_class' 不存在或标记无效，将自动选择最低优先级类"
+            dscp=""
+        else
+            qos_log "信息" "批量客户端检测: 使用用户指定的类 '$uci_class' (DSCP=$dscp)"
+        fi
+    fi
+    # 如果用户未配置类或配置无效，则自动选择最低优先级类
+    if [ -z "$dscp" ]; then
+        local lowest_class=$(get_lowest_priority_class "upload")
+        if [ -n "$lowest_class" ]; then
+            dscp=$(get_class_mark_for_dynamic "$lowest_class")
+            if [ -z "$dscp" ] || [ "$dscp" -eq 0 ]; then
+                dscp=8
+                qos_log "警告" "批量客户端检测: 最低优先级类 '$lowest_class' 标记无效，使用默认 DSCP 8 (CS1)"
+            else
+                qos_log "信息" "批量客户端检测: 自动使用最低优先级类 '$lowest_class' (DSCP=$dscp)"
+            fi
+        else
+            dscp=8
+            qos_log "警告" "批量客户端检测: 未找到任何启用的上传类，使用默认 DSCP 8 (CS1)"
+        fi
     fi
 
     nft add set inet gargoyle-qos-priority qos_bulk_clients '{ type ipv4_addr . inet_service . inet_proto; flags timeout; }' 2>/dev/null || true
@@ -955,30 +1014,48 @@ create_bulk_client_rules() {
     nft add chain inet gargoyle-qos-priority qos_bulk_client_reply 2>/dev/null || true
 
     if ! check_meter_support; then
-        qos_log "WARN" "内核不支持 nftables meter 关键字，动态分类 bulk_client 功能将禁用"
+        qos_log "警告" "内核不支持 nftables meter 关键字，动态分类 bulk_client 功能将禁用"
         return 0
     fi
 
-    # 修正 meter 语法：将 limit rate over 移到花括号外面
-    nft add rule inet gargoyle-qos-priority qos_established_connection meter qos_bulk_detect { ip daddr . th dport . meta l4proto timeout 5s } limit rate over $((min_connections - 1))/minute add @qos_bulk_clients { ip daddr . th dport . meta l4proto timeout 30s } 2>/dev/null || true
-    nft add rule inet gargoyle-qos-priority qos_established_connection meter qos_bulk_detect6 { ip6 daddr . th dport . meta l4proto timeout 5s } limit rate over $((min_connections - 1))/minute add @qos_bulk_clients6 { ip6 daddr . th dport . meta l4proto timeout 30s } 2>/dev/null || true
+    # meter 规则（已修复语法）
+    nft add rule inet gargoyle-qos-priority qos_established_connection \
+        meter qos_bulk_detect '{ ip daddr . th dport . meta l4proto timeout 5s limit rate over '"$((min_connections - 1))"'/minute }' \
+        add @qos_bulk_clients '{ ip daddr . th dport . meta l4proto timeout 30s }' 2>/dev/null || true
 
-    # 同时设置 meta mark 和 ct mark
-    nft add rule inet gargoyle-qos-priority qos_bulk_client meter qos_bulk_orig { ip saddr . th sport . meta l4proto timeout 5m } limit rate over $((min_bytes - 1)) bytes/hour update @qos_bulk_clients { ip saddr . th sport . meta l4proto timeout 5m } meta mark set $dscp ct mark set meta mark return 2>/dev/null || true
-    nft add rule inet gargoyle-qos-priority qos_bulk_client meter qos_bulk_orig6 { ip6 saddr . th sport . meta l4proto timeout 5m } limit rate over $((min_bytes - 1)) bytes/hour update @qos_bulk_clients6 { ip6 saddr . th sport . meta l4proto timeout 5m } meta mark set $dscp ct mark set meta mark return 2>/dev/null || true
+    nft add rule inet gargoyle-qos-priority qos_established_connection \
+        meter qos_bulk_detect6 '{ ip6 daddr . th dport . meta l4proto timeout 5s limit rate over '"$((min_connections - 1))"'/minute }' \
+        add @qos_bulk_clients6 '{ ip6 daddr . th dport . meta l4proto timeout 30s }' 2>/dev/null || true
 
-    nft add rule inet gargoyle-qos-priority qos_bulk_client_reply meter qos_bulk_reply { ip daddr . th dport . meta l4proto timeout 5m } limit rate over $((min_bytes - 1)) bytes/hour update @qos_bulk_clients { ip daddr . th dport . meta l4proto timeout 5m } meta mark set $dscp ct mark set meta mark return 2>/dev/null || true
-    nft add rule inet gargoyle-qos-priority qos_bulk_client_reply meter qos_bulk_reply6 { ip6 daddr . th dport . meta l4proto timeout 5m } limit rate over $((min_bytes - 1)) bytes/hour update @qos_bulk_clients6 { ip6 daddr . th dport . meta l4proto timeout 5m } meta mark set $dscp ct mark set meta mark return 2>/dev/null || true
+    nft add rule inet gargoyle-qos-priority qos_bulk_client \
+        meter qos_bulk_orig '{ ip saddr . th sport . meta l4proto timeout 5m limit rate over '"$((min_bytes - 1))"' bytes/hour }' \
+        update @qos_bulk_clients '{ ip saddr . th sport . meta l4proto timeout 5m }' \
+        meta mark set $dscp ct mark set meta mark return 2>/dev/null || true
 
-    nft add rule inet gargoyle-qos-priority qos_dynamic_classify ct mark & 0x3f == 0 ip saddr . th sport . meta l4proto @qos_bulk_clients goto qos_bulk_client 2>/dev/null || true
-    nft add rule inet gargoyle-qos-priority qos_dynamic_classify ct mark & 0x3f == 0 ip6 saddr . th sport . meta l4proto @qos_bulk_clients6 goto qos_bulk_client 2>/dev/null || true
-    nft add rule inet gargoyle-qos-priority qos_dynamic_classify_reply ct mark & 0x3f == 0 ip daddr . th dport . meta l4proto @qos_bulk_clients goto qos_bulk_client_reply 2>/dev/null || true
-    nft add rule inet gargoyle-qos-priority qos_dynamic_classify_reply ct mark & 0x3f == 0 ip6 daddr . th dport . meta l4proto @qos_bulk_clients6 goto qos_bulk_client_reply 2>/dev/null || true
+    nft add rule inet gargoyle-qos-priority qos_bulk_client \
+        meter qos_bulk_orig6 '{ ip6 saddr . th sport . meta l4proto timeout 5m limit rate over '"$((min_bytes - 1))"' bytes/hour }' \
+        update @qos_bulk_clients6 '{ ip6 saddr . th sport . meta l4proto timeout 5m }' \
+        meta mark set $dscp ct mark set meta mark return 2>/dev/null || true
 
-    qos_log "INFO" "bulk_client_detection enabled: min_conn=$min_connections, min_bytes=$min_bytes, class=$class (DSCP=$dscp)"
+    nft add rule inet gargoyle-qos-priority qos_bulk_client_reply \
+        meter qos_bulk_reply '{ ip daddr . th dport . meta l4proto timeout 5m limit rate over '"$((min_bytes - 1))"' bytes/hour }' \
+        update @qos_bulk_clients '{ ip daddr . th dport . meta l4proto timeout 5m }' \
+        meta mark set $dscp ct mark set meta mark return 2>/dev/null || true
+
+    nft add rule inet gargoyle-qos-priority qos_bulk_client_reply \
+        meter qos_bulk_reply6 '{ ip6 daddr . th dport . meta l4proto timeout 5m limit rate over '"$((min_bytes - 1))"' bytes/hour }' \
+        update @qos_bulk_clients6 '{ ip6 daddr . th dport . meta l4proto timeout 5m }' \
+        meta mark set $dscp ct mark set meta mark return 2>/dev/null || true
+
+    nft add rule inet gargoyle-qos-priority qos_dynamic_classify "ct mark & 0x3f == 0" ip saddr . th sport . meta l4proto @qos_bulk_clients goto qos_bulk_client 2>/dev/null || true
+    nft add rule inet gargoyle-qos-priority qos_dynamic_classify "ct mark & 0x3f == 0" ip6 saddr . th sport . meta l4proto @qos_bulk_clients6 goto qos_bulk_client 2>/dev/null || true
+    nft add rule inet gargoyle-qos-priority qos_dynamic_classify_reply "ct mark & 0x3f == 0" ip daddr . th dport . meta l4proto @qos_bulk_clients goto qos_bulk_client_reply 2>/dev/null || true
+    nft add rule inet gargoyle-qos-priority qos_dynamic_classify_reply "ct mark & 0x3f == 0" ip6 daddr . th dport . meta l4proto @qos_bulk_clients6 goto qos_bulk_client_reply 2>/dev/null || true
+
+    qos_log "信息" "批量客户端检测已启用: 最小连接数=$min_connections, 最小字节数=$min_bytes, 使用类=$class (DSCP=$dscp)"
 }
 
-# 修复：high_throughput 规则，meter 语法修正，同时设置 meta mark 和 ct mark
+# 高吞吐服务检测（优先使用用户配置的类，否则使用最高优先级类）
 create_high_throughput_service_rules() {
     local enabled=1 min_bytes=1000000 min_connections=3 class="realtime"
     
@@ -996,14 +1073,36 @@ create_high_throughput_service_rules() {
     [ "$min_bytes" -le 0 ] && min_bytes=1000000
     [ "$min_connections" -le 1 ] && min_connections=3
 
-    local dscp=$(get_class_mark_for_dynamic "$class")
-    if [ -z "$dscp" ] || [ "$dscp" -eq 0 ]; then
-        qos_log "WARN" "high_throughput_service_detection: class '$class' not found or class_mark=0, using default 46 (EF)"
-        dscp=46
+    local dscp
+    # 优先使用用户配置的类
+    if [[ -n "$uci_class" ]]; then
+        dscp=$(get_class_mark_for_dynamic "$uci_class")
+        if [ -z "$dscp" ] || [ "$dscp" -eq 0 ]; then
+            qos_log "警告" "高吞吐服务检测: 用户指定的类 '$uci_class' 不存在或标记无效，将自动选择最高优先级类"
+            dscp=""
+        else
+            qos_log "信息" "高吞吐服务检测: 使用用户指定的类 '$uci_class' (DSCP=$dscp)"
+        fi
+    fi
+    # 如果用户未配置类或配置无效，则自动选择最高优先级类
+    if [ -z "$dscp" ]; then
+        local highest_class=$(get_highest_priority_class "upload")
+        if [ -n "$highest_class" ]; then
+            dscp=$(get_class_mark_for_dynamic "$highest_class")
+            if [ -z "$dscp" ] || [ "$dscp" -eq 0 ]; then
+                dscp=46
+                qos_log "警告" "高吞吐服务检测: 最高优先级类 '$highest_class' 标记无效，使用默认 DSCP 46 (EF)"
+            else
+                qos_log "信息" "高吞吐服务检测: 自动使用最高优先级类 '$highest_class' (DSCP=$dscp)"
+            fi
+        else
+            dscp=46
+            qos_log "警告" "高吞吐服务检测: 未找到任何启用的上传类，使用默认 DSCP 46 (EF)"
+        fi
     fi
 
     if ! check_meter_support; then
-        qos_log "WARN" "内核不支持 nftables meter 关键字，动态分类 high_throughput_service 功能将禁用"
+        qos_log "警告" "内核不支持 nftables meter 关键字，动态分类 high_throughput_service 功能将禁用"
         return 0
     fi
 
@@ -1013,39 +1112,49 @@ create_high_throughput_service_rules() {
     nft add chain inet gargoyle-qos-priority qos_high_throughput_service 2>/dev/null || true
     nft add chain inet gargoyle-qos-priority qos_high_throughput_service_reply 2>/dev/null || true
 
-    # 修正 meter 语法
-    nft add rule inet gargoyle-qos-priority qos_established_connection meter qos_htp_detect { ip daddr . ip saddr and 255.255.255.0 . th sport . meta l4proto timeout 5s } limit rate over $((min_connections - 1))/minute add @qos_high_throughput_services { ip daddr . ip saddr and 255.255.255.0 . th sport . meta l4proto timeout 30s } 2>/dev/null || true
-    nft add rule inet gargoyle-qos-priority qos_established_connection meter qos_htp_detect6 { ip6 daddr . ip6 saddr and ffff:ffff:ffff:: . th sport . meta l4proto timeout 5s } limit rate over $((min_connections - 1))/minute add @qos_high_throughput_services6 { ip6 daddr . ip6 saddr and ffff:ffff:ffff:: . th sport . meta l4proto timeout 30s } 2>/dev/null || true
+    # meter 规则（已修复语法）
+    nft add rule inet gargoyle-qos-priority qos_established_connection \
+        meter qos_htp_detect '{ ip daddr . ip saddr and 255.255.255.0 . th sport . meta l4proto timeout 5s limit rate over '"$((min_connections - 1))"'/minute }' \
+        add @qos_high_throughput_services '{ ip daddr . ip saddr and 255.255.255.0 . th sport . meta l4proto timeout 30s }' 2>/dev/null || true
 
-    nft add rule inet gargoyle-qos-priority qos_high_throughput_service ct bytes original < $min_bytes return 2>/dev/null || true
-    nft add rule inet gargoyle-qos-priority qos_high_throughput_service update @qos_high_throughput_services { ip saddr . ip daddr and 255.255.255.0 . th dport . meta l4proto timeout 5m } 2>/dev/null || true
-    nft add rule inet gargoyle-qos-priority qos_high_throughput_service update @qos_high_throughput_services6 { ip6 saddr . ip6 daddr and ffff:ffff:ffff:: . th dport . meta l4proto timeout 5m } 2>/dev/null || true
+    nft add rule inet gargoyle-qos-priority qos_established_connection \
+        meter qos_htp_detect6 '{ ip6 daddr . ip6 saddr and ffff:ffff:ffff:: . th sport . meta l4proto timeout 5s limit rate over '"$((min_connections - 1))"'/minute }' \
+        add @qos_high_throughput_services6 '{ ip6 daddr . ip6 saddr and ffff:ffff:ffff:: . th sport . meta l4proto timeout 30s }' 2>/dev/null || true
+
+    nft add rule inet gargoyle-qos-priority qos_high_throughput_service "ct bytes original < $min_bytes return" 2>/dev/null || true
+    nft add rule inet gargoyle-qos-priority qos_high_throughput_service update @qos_high_throughput_services '{ ip saddr . ip daddr and 255.255.255.0 . th dport . meta l4proto timeout 5m }' 2>/dev/null || true
+    nft add rule inet gargoyle-qos-priority qos_high_throughput_service update @qos_high_throughput_services6 '{ ip6 saddr . ip6 daddr and ffff:ffff:ffff:: . th dport . meta l4proto timeout 5m }' 2>/dev/null || true
     nft add rule inet gargoyle-qos-priority qos_high_throughput_service meta mark set $dscp ct mark set meta mark return 2>/dev/null || true
 
-    nft add rule inet gargoyle-qos-priority qos_high_throughput_service_reply ct bytes reply < $min_bytes return 2>/dev/null || true
-    nft add rule inet gargoyle-qos-priority qos_high_throughput_service_reply update @qos_high_throughput_services { ip daddr . ip saddr and 255.255.255.0 . th sport . meta l4proto timeout 5m } 2>/dev/null || true
-    nft add rule inet gargoyle-qos-priority qos_high_throughput_service_reply update @qos_high_throughput_services6 { ip6 daddr . ip6 saddr and ffff:ffff:ffff:: . th sport . meta l4proto timeout 5m } 2>/dev/null || true
+    nft add rule inet gargoyle-qos-priority qos_high_throughput_service_reply "ct bytes reply < $min_bytes return" 2>/dev/null || true
+    nft add rule inet gargoyle-qos-priority qos_high_throughput_service_reply update @qos_high_throughput_services '{ ip daddr . ip saddr and 255.255.255.0 . th sport . meta l4proto timeout 5m }' 2>/dev/null || true
+    nft add rule inet gargoyle-qos-priority qos_high_throughput_service_reply update @qos_high_throughput_services6 '{ ip6 daddr . ip6 saddr and ffff:ffff:ffff:: . th sport . meta l4proto timeout 5m }' 2>/dev/null || true
     nft add rule inet gargoyle-qos-priority qos_high_throughput_service_reply meta mark set $dscp ct mark set meta mark return 2>/dev/null || true
 
-    nft add rule inet gargoyle-qos-priority qos_dynamic_classify ct mark & 0x3f == 0 ip saddr . ip daddr and 255.255.255.0 . th dport . meta l4proto @qos_high_throughput_services goto qos_high_throughput_service 2>/dev/null || true
-    nft add rule inet gargoyle-qos-priority qos_dynamic_classify ct mark & 0x3f == 0 ip6 saddr . ip6 daddr and ffff:ffff:ffff:: . th dport . meta l4proto @qos_high_throughput_services6 goto qos_high_throughput_service 2>/dev/null || true
-    nft add rule inet gargoyle-qos-priority qos_dynamic_classify_reply ct mark & 0x3f == 0 ip daddr . ip saddr and 255.255.255.0 . th sport . meta l4proto @qos_high_throughput_services goto qos_high_throughput_service_reply 2>/dev/null || true
-    nft add rule inet gargoyle-qos-priority qos_dynamic_classify_reply ct mark & 0x3f == 0 ip6 daddr . ip6 saddr and ffff:ffff:ffff:: . th sport . meta l4proto @qos_high_throughput_services6 goto qos_high_throughput_service_reply 2>/dev/null || true
+    nft add rule inet gargoyle-qos-priority qos_dynamic_classify "ct mark & 0x3f == 0" ip saddr . ip daddr and 255.255.255.0 . th dport . meta l4proto @qos_high_throughput_services goto qos_high_throughput_service 2>/dev/null || true
+    nft add rule inet gargoyle-qos-priority qos_dynamic_classify "ct mark & 0x3f == 0" ip6 saddr . ip6 daddr and ffff:ffff:ffff:: . th dport . meta l4proto @qos_high_throughput_services6 goto qos_high_throughput_service 2>/dev/null || true
+    nft add rule inet gargoyle-qos-priority qos_dynamic_classify_reply "ct mark & 0x3f == 0" ip daddr . ip saddr and 255.255.255.0 . th sport . meta l4proto @qos_high_throughput_services goto qos_high_throughput_service_reply 2>/dev/null || true
+    nft add rule inet gargoyle-qos-priority qos_dynamic_classify_reply "ct mark & 0x3f == 0" ip6 daddr . ip6 saddr and ffff:ffff:ffff:: . th sport . meta l4proto @qos_high_throughput_services6 goto qos_high_throughput_service_reply 2>/dev/null || true
 
-    qos_log "INFO" "high_throughput_service_detection enabled: min_conn=$min_connections, min_bytes=$min_bytes, class=$class (DSCP=$dscp)"
+    qos_log "信息" "高吞吐服务检测已启用: 最小连接数=$min_connections, 最小字节数=$min_bytes, 使用类=$class (DSCP=$dscp)"
 }
 
 setup_dynamic_classification() {
-    qos_log "INFO" "初始化动态分类链..."
+    qos_log "信息" "初始化动态分类链..."
     nft add chain inet gargoyle-qos-priority qos_established_connection 2>/dev/null || true
     nft add chain inet gargoyle-qos-priority qos_dynamic_classify 2>/dev/null || true
     nft add chain inet gargoyle-qos-priority qos_dynamic_classify_reply 2>/dev/null || true
 
-    # 使用 insert rule 确保动态分类在静态分类之前执行
-    nft insert rule inet gargoyle-qos-priority filter_input ct mark & 0x3f == 0 jump qos_dynamic_classify 2>/dev/null || true
-    nft insert rule inet gargoyle-qos-priority filter_output ct mark & 0x3f == 0 jump qos_dynamic_classify 2>/dev/null || true
-    nft insert rule inet gargoyle-qos-priority filter_forward ct mark & 0x3f == 0 jump qos_dynamic_classify 2>/dev/null || true
-    nft insert rule inet gargoyle-qos-priority filter_forward ct mark & 0x3f == 0 jump qos_dynamic_classify_reply 2>/dev/null || true
+    # 为已建立的连接添加检测（动态分类的核心，必须插入）
+    nft insert rule inet gargoyle-qos-priority filter_forward ct state established jump qos_established_connection 2>/dev/null || true
+    nft insert rule inet gargoyle-qos-priority filter_input ct state established jump qos_established_connection 2>/dev/null || true
+    nft insert rule inet gargoyle-qos-priority filter_output ct state established jump qos_established_connection 2>/dev/null || true
+
+    # 动态分类跳转（仅当 ct mark 为 0 时，确保在静态分类之前执行）
+    nft insert rule inet gargoyle-qos-priority filter_input "ct mark & 0x3f == 0" jump qos_dynamic_classify 2>/dev/null || true
+    nft insert rule inet gargoyle-qos-priority filter_output "ct mark & 0x3f == 0" jump qos_dynamic_classify 2>/dev/null || true
+    nft insert rule inet gargoyle-qos-priority filter_forward "ct mark & 0x3f == 0" jump qos_dynamic_classify 2>/dev/null || true
+    nft insert rule inet gargoyle-qos-priority filter_forward "ct mark & 0x3f == 0" jump qos_dynamic_classify_reply 2>/dev/null || true
 
     create_bulk_client_rules
     create_high_throughput_service_rules
