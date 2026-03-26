@@ -204,6 +204,10 @@ load_global_config() {
     case "$udp_enabled" in 1|yes|true|on) ENABLE_UDP_LIMIT=1 ;; *) ENABLE_UDP_LIMIT=0 ;; esac
     local speedtest_enabled=$(uci -q get ${CONFIG_FILE}.speedtest.enabled 2>/dev/null)
     case "$speedtest_enabled" in 1|yes|true|on) AUTO_SPEEDTEST=1 ;; *) AUTO_SPEEDTEST=0 ;; esac
+	
+	# 动态分类总开关
+    val=$(uci -q get ${CONFIG_FILE}.global.enable_dynamic_classify 2>/dev/null)
+    case "$val" in 1|yes|true|on) ENABLE_DYNAMIC_CLASSIFY=1 ;; *) ENABLE_DYNAMIC_CLASSIFY=0 ;; esac
 }
 
 # ========== eBPF 支持函数 ==========

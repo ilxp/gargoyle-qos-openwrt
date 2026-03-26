@@ -1005,10 +1005,16 @@ stop_htb_fqcodel_qos() {
             qos_log "INFO" "IFB设备 $IFB_DEVICE 不存在，跳过"
         fi
     fi
+	
+	# 清理动态检测相关资源
+    cleanup_dynamic_detection
+	
     nft delete table inet gargoyle-qos-priority 2>/dev/null || true
     clear_class_marks
     qos_log "INFO" "HTB+FQ_CODEL QoS停止完成"
-    restore_main_config
+    # 恢复配置
+	restore_main_config
+	
     _QOS_TABLE_FLUSHED=0
     _IPSET_LOADED=0
     cleanup_qos_state

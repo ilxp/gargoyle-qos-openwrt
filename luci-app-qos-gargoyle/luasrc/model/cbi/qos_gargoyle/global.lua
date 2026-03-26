@@ -1,7 +1,7 @@
 -- Copyright 2017 Xingwang Liao <kuoruan@gmail.com>
 -- Licensed to the public under the Apache License 2.0.
 -- Modified 2026 by ilxp <https://github.com/ilxp/gargoyle-qos-openwrt>
--- 版本: 支持带宽为 0（禁用对应方向），新增 ACK/TCP 升级开关
+-- 版本: 支持带宽为 0（禁用对应方向），新增 ACK/TCP/UDP 限速开关，动态分类总开关
 
 local sys = require "luci.sys"
 local uci = require "luci.model.uci".cursor()
@@ -121,6 +121,18 @@ o.rmempty = false
 -- TCP 升级开关
 o = s:option(Flag, "enable_tcp_upgrade", translate("Enable TCP Upgrade"),
              translate("Prioritize slow TCP connections (e.g., web browsing) to improve responsiveness."))
+o.default = "1"
+o.rmempty = false
+
+-- UDP 限速开关
+o = s:option(Flag, "enable_udp_limit", translate("Enable UDP Limit"),
+             translate("Rate limit UDP packets to prevent abuse. Packets exceeding the limit will be dropped or marked as bulk."))
+o.default = "1"
+o.rmempty = false
+
+-- 动态分类总开关
+o = s:option(Flag, "enable_dynamic_classify", translate("Enable Dynamic Classification"),
+             translate("Automatically detect bulk clients and high-throughput services, and adjust their priority accordingly."))
 o.default = "1"
 o.rmempty = false
 
@@ -331,6 +343,35 @@ local function after_apply(self)
     sys.call("logger -t qos_gargoyle '配置已应用，正在处理服务启停'")
     os.execute("sleep 0.5")
     handle_service_control()
+    
+    -- 同步增强功能开关到各自的配置节
+    local ack_enabled = self.uci:get(qos_gargoyle, "global", "enable_ack_limit") or "1"
+    local tcp_enabled = self.uci:get(qos_gargoyle, "global", "enable_tcp_upgrade") or "1"
+    local udp_enabled = self.uci:get(qos_gargoyle, "global", "enable_udp_limit") or "1"
+
+    -- 确保 ack_limit 节存在
+    if not self.uci:get(qos_gargoyle, "ack_limit") then
+        self.uci:set(qos_gargoyle, "ack_limit", "ack_limit")
+    end
+    self.uci:set(qos_gargoyle, "ack_limit", "enabled", ack_enabled)
+
+    -- 确保 tcp_upgrade 节存在
+    if not self.uci:get(qos_gargoyle, "tcp_upgrade") then
+        self.uci:set(qos_gargoyle, "tcp_upgrade", "tcp_upgrade")
+    end
+    self.uci:set(qos_gargoyle, "tcp_upgrade", "enabled", tcp_enabled)
+
+    -- 确保 udp_limit 节存在
+    if not self.uci:get(qos_gargoyle, "udp_limit") then
+        self.uci:set(qos_gargoyle, "udp_limit", "udp_limit")
+    end
+    self.uci:set(qos_gargoyle, "udp_limit", "enabled", udp_enabled)
+
+    -- 动态分类总开关（已直接存储在 global 节，无需额外同步，但确保存在）
+    local dynamic_enabled = self.uci:get(qos_gargoyle, "global", "enable_dynamic_classify") or "1"
+    self.uci:set(qos_gargoyle, "global", "enable_dynamic_classify", dynamic_enabled)
+
+    self.uci:commit(qos_gargoyle)
     
     -- 检查自动调整开关
     local auto_adjust = self.uci:get(qos_gargoyle, "global", "auto_adjust_percentages") or "1"
