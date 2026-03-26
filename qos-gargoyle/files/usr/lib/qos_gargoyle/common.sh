@@ -1,6 +1,6 @@
 #!/bin/bash
 # 核心库模块 (common.sh)
-# 版本: 3.3.9 - 修复锁机制、UCI函数作用域、未定义函数、变量作用域等问题
+# 版本: 3.4.0 - 修复锁机制、UCI函数作用域、未定义函数、变量作用域等问题
 # 提供 QoS 系统基础功能
 
 # ========== 加载 OpenWrt 标准函数库 ==========
@@ -43,6 +43,7 @@ if [[ -z "$_QOS_LIB_SH_LOADED" ]]; then
     UDP_RATE_LIMIT_ACTION="mark"
     UDP_RATE_LIMIT_MARK_CLASS="bulk"
     AUTO_SPEEDTEST=0
+    ENABLE_DYNAMIC_CLASSIFY=0          # 新增：动态分类总开关默认值
     _QOS_TABLE_FLUSHED=0
     _IPSET_LOADED=0
     _HOOKS_SETUP=0
@@ -55,7 +56,7 @@ if [[ -z "$_QOS_LIB_SH_LOADED" ]]; then
     TEMP_FILES=()
 fi
 
-# ========== 锁机制（基于文件描述符，支持嵌套） ==========
+# ========== 锁机制（基于文件描述符，简化版） ==========
 LOCK_FILE="/var/run/qos_gargoyle.lock"
 _LOCK_HELD=0
 
@@ -72,27 +73,10 @@ acquire_lock() {
         _LOCK_HELD=1
         return 0
     fi
-    # 加锁失败，检查是否有进程持有
-    local pid=$(fuser "$LOCK_FILE" 2>/dev/null | awk '{print $1}')
-    if [ -n "$pid" ]; then
-        log_error "锁已被进程 $pid 持有"
-        exec 3>&-
-        return 1
-    else
-        # 无进程，删除残留文件并重试
-        log_warn "发现残留锁文件，删除后重试"
-        rm -f "$LOCK_FILE"
-        exec 3> "$LOCK_FILE"
-        if flock -n 3; then
-            echo $$ > "$LOCK_FILE"
-            _LOCK_HELD=1
-            return 0
-        else
-            log_error "仍无法获取锁"
-            exec 3>&-
-            return 1
-        fi
-    fi
+    # 加锁失败，直接返回错误（不再使用 fuser 和删除文件）
+    log_error "锁已被占用"
+    exec 3>&-
+    return 1
 }
 
 release_lock() {
@@ -127,7 +111,7 @@ strip_leading_zeros() {
     echo "$val"
 }
 
-# ========== 日志函数 ==========
+# ========== 日志函数（优化多行输出） ==========
 log_debug() { [[ "$DEBUG" == "1" ]] && log "DEBUG" "$@"; }
 log_info()  { log "INFO" "$@"; }
 log_warn()  { log "WARN" "$@"; }
@@ -143,9 +127,11 @@ log() {
         DEBUG|debug)   prefix="调试:" ;;
         *)             prefix="$level:" ;;
     esac
-    echo "$message" | while IFS= read -r line; do
-        logger -t "$tag" "$prefix $line"
-    done
+    # 将整个消息通过管道传给 logger（一次调用处理多行）
+    echo "$message" | logger -t "$tag" -p "user.$level" 2>/dev/null || \
+        echo "$message" | while IFS= read -r line; do
+            logger -t "$tag" "$prefix $line"
+        done
     [[ "$DEBUG" == "1" ]] && echo "$message" | while IFS= read -r line; do
         echo "[$(date '+%H:%M:%S')] $tag $prefix $line" >&2
     done
@@ -159,8 +145,13 @@ cleanup_temp_files() {
     TEMP_FILES=()
 }
 
-# 设置退出时清理临时文件
-trap cleanup_temp_files EXIT
+# 设置退出时清理临时文件（保留已有 trap 链）
+_old_trap=$(trap -p EXIT | awk '{print $3}')
+if [[ -n "$_old_trap" ]]; then
+    trap "cleanup_temp_files; $_old_trap" EXIT
+else
+    trap cleanup_temp_files EXIT
+fi
 
 # ========== 外部辅助函数 ==========
 cleanup_qos_state() {
@@ -200,12 +191,12 @@ load_global_config() {
     case "$ack_enabled" in 1|yes|true|on) ENABLE_ACK_LIMIT=1 ;; *) ENABLE_ACK_LIMIT=0 ;; esac
     local tcp_enabled=$(uci -q get ${CONFIG_FILE}.tcp_upgrade.enabled 2>/dev/null)
     case "$tcp_enabled" in 1|yes|true|on) ENABLE_TCP_UPGRADE=1 ;; *) ENABLE_TCP_UPGRADE=0 ;; esac
-	local udp_enabled=$(uci -q get ${CONFIG_FILE}.udp_limit.enabled 2>/dev/null)
-    case "$udp_enabled" in 1|yes|true|on) ENABLE_UDP_LIMIT=1 ;; *) ENABLE_UDP_LIMIT=0 ;; esac
+    local udp_enabled=$(uci -q get ${CONFIG_FILE}.udp_limit.enabled 2>/dev/null)
+    case "$udp_enabled" in 1|yes|true|on) UDP_RATE_LIMIT_ENABLE=1 ;; *) UDP_RATE_LIMIT_ENABLE=0 ;; esac
     local speedtest_enabled=$(uci -q get ${CONFIG_FILE}.speedtest.enabled 2>/dev/null)
     case "$speedtest_enabled" in 1|yes|true|on) AUTO_SPEEDTEST=1 ;; *) AUTO_SPEEDTEST=0 ;; esac
-	
-	# 动态分类总开关
+
+    # 动态分类总开关
     val=$(uci -q get ${CONFIG_FILE}.global.enable_dynamic_classify 2>/dev/null)
     case "$val" in 1|yes|true|on) ENABLE_DYNAMIC_CLASSIFY=1 ;; *) ENABLE_DYNAMIC_CLASSIFY=0 ;; esac
 }
@@ -1605,12 +1596,13 @@ restore_main_config() {
     log_info "已清理规则集标记"
 }
 
-# ========== 内存限制计算 ==========
+# ========== 内存限制计算（增强版） ==========
 calculate_memory_limit() {
     local config_value="$1" result
     [[ -z "$config_value" ]] && { echo ""; return; }
     if [[ "$config_value" == "auto" ]]; then
         local total_mem_mb=0
+        # 尝试 cgroup v2
         if [[ -f /sys/fs/cgroup/memory.max ]]; then
             local total_mem_bytes=$(cat /sys/fs/cgroup/memory.max 2>/dev/null)
             if [[ "$total_mem_bytes" =~ ^[0-9]+$ ]] && (( total_mem_bytes > 0 )); then
@@ -1618,6 +1610,7 @@ calculate_memory_limit() {
                 log_info "从 cgroup v2 memory.max 获取内存限制: ${total_mem_mb}MB"
             fi
         fi
+        # 如果上面未成功，尝试 cgroup v1
         if (( total_mem_mb == 0 )) && [[ -f /sys/fs/cgroup/memory/memory.limit_in_bytes ]]; then
             local total_mem_bytes=$(cat /sys/fs/cgroup/memory/memory.limit_in_bytes 2>/dev/null)
             if [[ -n "$total_mem_bytes" ]] && (( total_mem_bytes > 0 )); then
@@ -1625,6 +1618,7 @@ calculate_memory_limit() {
                 log_info "从 cgroup v1 memory.limit_in_bytes 获取内存限制: ${total_mem_mb}MB"
             fi
         fi
+        # 最后回退到 /proc/meminfo
         if (( total_mem_mb == 0 )); then
             local total_mem_kb=$(grep MemTotal /proc/meminfo 2>/dev/null | awk '{print $2}')
             if [[ -n "$total_mem_kb" ]] && (( total_mem_kb > 0 )); then
@@ -1633,6 +1627,7 @@ calculate_memory_limit() {
             fi
         fi
         if (( total_mem_mb > 0 )); then
+            # 使用总内存的 1/64 到 1/32 之间，但限制在 8-32MB
             result="$(((total_mem_mb + 63) / 64))Mb"
             local min_limit=8 max_limit=32
             local result_value=${result%Mb}
@@ -1680,6 +1675,7 @@ get_highest_priority_class() {
     echo "$best_class"
 }
 
+# ========== 自动测速（增加交互超时） ==========
 auto_speedtest() {
     local noninteractive=0 force=0 gaming_ip=""
     local WAN_IF="" DOWNLOAD_SPEED="" UPLOAD_SPEED="" SPEEDTEST_CMD=""
@@ -1731,8 +1727,13 @@ auto_speedtest() {
         if [[ $noninteractive -eq 0 ]]; then
             echo "当前已配置带宽：上传 ${cur_upload} kbit，下载 ${cur_download} kbit"
             echo "是否覆盖并重新测速？[y/N]"
-            read -r response
-            [[ ! "$response" =~ ^[Yy]$ ]] && { echo "已取消"; return 0; }
+            # 设置30秒超时，避免卡死
+            read -t 30 -r response
+            # 若超时或用户未输入，则退出
+            if [[ $? -ne 0 ]] || [[ ! "$response" =~ ^[Yy]$ ]]; then
+                echo "已取消"
+                return 0
+            fi
         else
             log_info "非交互模式且未指定 -f，跳过测速（已有带宽配置）"
             return 0
@@ -1778,8 +1779,11 @@ auto_speedtest() {
     else
         echo "准备进行速度测试。请确保网络连接正常。"
         echo "是否继续? [y/N]"
-        read -r response
-        [[ ! "$response" =~ ^[Yy]$ ]] && { echo "已取消"; return 0; }
+        read -t 30 -r response
+        if [[ $? -ne 0 ]] || [[ ! "$response" =~ ^[Yy]$ ]]; then
+            echo "已取消"
+            return 0
+        fi
         SPEED_RESULT=$($SPEEDTEST_CMD 2>/dev/null)
     fi
 
