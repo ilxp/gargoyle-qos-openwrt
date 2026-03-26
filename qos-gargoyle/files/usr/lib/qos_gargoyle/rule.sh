@@ -1,6 +1,6 @@
 #!/bin/bash
 # 规则辅助模块 (rule.sh)
-# 版本: 3.4.2 - 修复 setup_class_mark_map 顺序、否定集合拆分、nft 语法错误
+# 版本: 3.4.3 - 修复 ICMP 否定组合语法，移除锁机制（改用 procd）
 # 新增 setup_class_mark_map 函数供所有算法模块使用
 
 # 加载核心库（已修复）
@@ -10,6 +10,12 @@ else
     echo "错误: 核心库 /usr/lib/qos_gargoyle/common.sh 未找到" >&2
     exit 1
 fi
+
+# ========== 清理函数（仅清理临时文件，不再处理锁） ==========
+main_cleanup() {
+    cleanup_temp_files 2>/dev/null
+}
+trap main_cleanup EXIT INT TERM HUP QUIT
 
 # ========== 获取 WAN 接口 ==========
 get_wan_interface() {
@@ -465,7 +471,7 @@ build_icmp_cond() {
         local type="${icmp_val%/*}" code="${icmp_val#*/}"
         if [[ -n "$neg" ]]; then
             # 否定组合：要求 type != type 或 code != code
-            cond="(icmp type != $type) || (icmp code != $code)"
+            cond="(icmp type != $type) or (icmp code != $code)"
         else
             cond="icmp type $type icmp code $code"
         fi
