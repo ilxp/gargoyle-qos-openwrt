@@ -1,6 +1,6 @@
 #!/bin/bash
 # CAKE算法实现模块 - 多队列增强版
-# 版本: 3.4.2 - 修复带宽加载、IFB状态检查、check_cake_param_support 污染问题
+# 版本: 3.4.3 - 移除锁机制（改用 procd），修复带宽加载、IFB状态检查
 # 支持与 idclass 集成，通过 DSCP 进行分类（diffserv4 模式）
 # 必要工具：tc, nft, conntrack, ethtool, sysctl
 # 内核模块：sch_cake
@@ -38,7 +38,7 @@ RUNTIME_PARAMS_FILE="${RUNTIME_PARAMS_FILE:-/tmp/cake_runtime_params}"
 UPLOAD_MASK=0xFFFF
 DOWNLOAD_MASK=0xFFFF0000
 
-echo "CAKE 模块初始化完成 (v3.4.2)"
+echo "CAKE 模块初始化完成 (v3.4.3)"
 echo "  网络接口: $qos_interface"
 echo "  IFB 设备: $IFB_DEVICE"
 echo "  上传带宽: ${total_upload_bandwidth:-未配置}kbit/s"
@@ -68,9 +68,6 @@ RUNTIME_INGRESS=0
 RUNTIME_AUTORATE_INGRESS=0
 
 # ========== 辅助函数 ==========
-
-# 获取类别的数字 ID（用于 class_mark 映射）—— 未使用，保留以备后用
-# get_class_id() { ... }
 
 # 参数消毒
 sanitize_param() {
@@ -250,8 +247,6 @@ load_cake_config() {
     qos_log "INFO" "加载CAKE配置"
     local uci_ifb val
 
-    # 注意：带宽变量已由主脚本（load_bandwidth_from_config）设置，此处不再重复读取
-
     uci_ifb=$(uci -q get ${CONFIG_FILE}.download.ifb_device 2>/dev/null)
     [ -n "$uci_ifb" ] && IFB_DEVICE=$(sanitize_param "$uci_ifb")
 
@@ -328,7 +323,6 @@ auto_tune_cake() {
     local total_bw=0
     local user_set_rtt user_set_mem
 
-    # 检查用户是否显式配置了 RTT 和内存限制
     user_set_rtt=$(uci -q get ${CONFIG_FILE}.cake.rtt 2>/dev/null)
     user_set_mem=$(uci -q get ${CONFIG_FILE}.cake.memlimit 2>/dev/null)
 
@@ -340,7 +334,6 @@ auto_tune_cake() {
         total_bw=$total_download_bandwidth
     fi
 
-    # 仅在用户未配置时调整
     if [ -z "$user_set_mem" ]; then
         if [ "$total_bw" -gt 200000 ]; then
             CAKE_MEMORY_LIMIT="128mb"
@@ -507,7 +500,6 @@ create_cake_root_qdisc() {
         qos_log "INFO" "CAKE-MQ 已被禁用，使用普通 CAKE"
     fi
 
-    # 修复：当总带宽小于队列数时，自动降级为单队列
     if [ "$use_mq" = "1" ] && [ "$bandwidth" -lt "$queues" ] 2>/dev/null; then
         qos_log "WARN" "总带宽 ${bandwidth}kbit 小于队列数 $queues，多队列可能导致部分队列带宽为0，已自动回退到单队列模式。"
         use_mq=0
@@ -624,17 +616,14 @@ init_cake_download() {
 
     if ! ip link show dev "$IFB_DEVICE" >/dev/null 2>&1; then
         qos_log "INFO" "创建IFB设备 $IFB_DEVICE，期望队列数: $expected_queues"
-        # 尝试带队列数参数创建，如果失败则回退到普通创建
         if ! ip link add "$IFB_DEVICE" numtxqueues "$expected_queues" numrxqueues "$expected_queues" type ifb 2>/dev/null; then
             qos_log "WARN" "无法使用 numtxqueues 参数创建 IFB 设备，尝试普通创建"
             if ! ip link add "$IFB_DEVICE" type ifb 2>/dev/null; then
                 qos_log "ERROR" "无法创建IFB设备 $IFB_DEVICE"
                 return 1
             fi
-            # 回退到普通创建后，禁用多队列模式
             qos_log "WARN" "由于 IFB 创建时无法设置队列数，将禁用多队列模式"
             CAKE_MQ_ENABLED="0"
-            # 重新获取实际队列数（可能为1）
             actual_queues=$(get_tx_queues "$IFB_DEVICE")
             if [ "$actual_queues" -lt "$expected_queues" ]; then
                 qos_log "WARN" "IFB设备实际队列数 ($actual_queues) 小于期望 ($expected_queues)，多队列功能已禁用"
@@ -644,19 +633,16 @@ init_cake_download() {
         fi
     fi
 
-    # 启动 IFB 设备并检查状态
     if ! ip link set dev "$IFB_DEVICE" up; then
         qos_log "ERROR" "无法启动IFB设备 $IFB_DEVICE"
         return 1
     fi
-    # 再次确认状态
     if ! ip link show dev "$IFB_DEVICE" | grep -q "UP"; then
         qos_log "ERROR" "IFB设备 $IFB_DEVICE 未成功进入 UP 状态"
         return 1
     fi
     qos_log "INFO" "IFB设备 $IFB_DEVICE 已启动"
 
-    # 使用 rule.sh 中的入口重定向函数
     if ! setup_ingress_redirect; then
         qos_log "ERROR" "入口重定向设置失败"
         return 1
@@ -709,7 +695,7 @@ health_check_cake() {
 
 # ========== 状态显示 ==========
 show_cake_status() {
-    echo "===== CAKE QoS状态报告 (v3.4.2) ====="
+    echo "===== CAKE QoS状态报告 (v3.4.3) ====="
     echo "时间: $(date)"
     echo "网络接口: ${qos_interface:-未知}"
 
@@ -765,7 +751,6 @@ show_cake_status() {
         echo "状态: IFB设备未创建"
     fi
 
-    # conntrack 标记显示
     if command -v conntrack >/dev/null 2>&1; then
         echo -e "\n===== conntrack 标记示例 (最近5条) ====="
         conntrack -L 2>/dev/null | grep -E "mark=[1-9][0-9]*" | head -n 10 | while IFS= read -r line; do
@@ -844,7 +829,6 @@ show_cake_status() {
 # ========== 停止清理 ==========
 stop_cake_qos() {
     qos_log "INFO" "停止CAKE QoS"
-    acquire_lock
 
     if tc qdisc show dev "$qos_interface" root 2>/dev/null | grep -q "cake"; then
         tc qdisc del dev "$qos_interface" root 2>/dev/null && \
@@ -872,15 +856,10 @@ stop_cake_qos() {
     rm -f "$RUNTIME_PARAMS_FILE"
     rm -f "$QOS_RUNNING_FILE"
 
-    # 重置全局状态（调用 common.sh 中的函数）
     cleanup_qos_state
-    # 清理动态检测相关资源
     cleanup_dynamic_detection
-    
-    # 恢复配置
     restore_main_config
 
-    release_lock
     qos_log "INFO" "CAKE QoS停止完成"
 }
 
@@ -893,70 +872,59 @@ init_cake_qos() {
             qos_log "INFO" "启动CAKE QoS"
             check_dependencies || exit 1
             init_ruleset || exit 1
-            acquire_lock || exit 1
-            check_already_running || { release_lock; exit 1; }
+
+            if ! check_already_running; then
+                qos_log "ERROR" "CAKE QoS 已经在运行中"
+                exit 1
+            fi
 
             RUNTIME_SPLIT_GSO=0
             RUNTIME_INGRESS=0
             RUNTIME_AUTORATE_INGRESS=0
 
-            # 加载全局配置（自动测速等）
             load_global_config
 
-            # 加载带宽配置（必须在 load_cake_config 之前，因为 auto_tune 需要带宽）
             if ! load_bandwidth_from_config; then
                 qos_log "ERROR" "加载带宽配置失败"
-                release_lock
                 rm -f "$QOS_RUNNING_FILE"
                 exit 1
             fi
 
             load_cake_config
 
-            # 确保带宽变量已转换为 kbit
             total_upload_bandwidth=$(convert_bandwidth_to_kbit "$total_upload_bandwidth") || {
-                release_lock
                 rm -f "$QOS_RUNNING_FILE"
                 exit 1
             }
             total_download_bandwidth=$(convert_bandwidth_to_kbit "$total_download_bandwidth") || {
-                release_lock
                 rm -f "$QOS_RUNNING_FILE"
                 exit 1
             }
 
             [ "$ENABLE_AUTO_TUNE" = "1" ] && auto_tune_cake
             validate_cake_config || {
-                release_lock
                 rm -f "$QOS_RUNNING_FILE"
                 exit 1
             }
 
-            # ========== 集成 rule.sh 生成静态规则和 conntrack 恢复 ==========
-            # 加载类别列表（来自 UCI）
             load_upload_class_configurations
             load_download_class_configurations
 
-            # 检查硬编码的标记文件是否存在且非空
             if [ ! -s "$CLASS_MARKS_FILE" ]; then
                 qos_log "ERROR" "Class marks file $CLASS_MARKS_FILE is missing or empty"
                 stop_cake_qos
-                release_lock
                 rm -f "$QOS_RUNNING_FILE"
                 exit 1
             fi
             qos_log "INFO" "Using existing class marks file: $CLASS_MARKS_FILE"
 
-            # 创建 nftables 表（如果不存在）
             nft add table inet gargoyle-qos-priority 2>/dev/null || true
 
-            # 创建 vmap（用于纯端口规则）
             nft add map inet gargoyle-qos-priority upload_tcp_dport_map '{ type mark : verdict; flags interval; }' 2>/dev/null || true
             nft add map inet gargoyle-qos-priority upload_udp_dport_map '{ type mark : verdict; flags interval; }' 2>/dev/null || true
             nft add map inet gargoyle-qos-priority download_tcp_sport_map '{ type mark : verdict; flags interval; }' 2>/dev/null || true
             nft add map inet gargoyle-qos-priority download_udp_sport_map '{ type mark : verdict; flags interval; }' 2>/dev/null || true
 
-            # 创建基于类别的集合（用于 DNS 学习）
             if [ -f "$CLASS_MARKS_FILE" ]; then
                 for class_name in $(cut -d: -f2 "$CLASS_MARKS_FILE" | sort -u); do
                     realname=$(uci -q get ${CONFIG_FILE}.${class_name}.name 2>/dev/null | tr '[:upper:]' '[:lower:]')
@@ -968,38 +936,31 @@ init_cake_qos() {
                 done
             fi
 
-            # 应用规则（DSCP 模式）
             if ! apply_all_rules "upload_rule" "$UPLOAD_MASK" "filter_qos_egress"; then
                 qos_log "ERROR" "上传规则应用失败"
                 stop_cake_qos
-                release_lock
                 rm -f "$QOS_RUNNING_FILE"
                 exit 1
             fi
             if ! apply_all_rules "download_rule" "$DOWNLOAD_MASK" "filter_qos_ingress"; then
                 qos_log "ERROR" "下载规则应用失败"
                 stop_cake_qos
-                release_lock
                 rm -f "$QOS_RUNNING_FILE"
                 exit 1
             fi
 
-            # 设置 class_mark 映射
             if ! setup_class_mark_map; then
                 qos_log "ERROR" "class_mark 映射设置失败"
                 stop_cake_qos
-                release_lock
                 rm -f "$QOS_RUNNING_FILE"
                 exit 1
             fi
 
-            # 增强功能函数（ACK/TCP/UDP/动态分类）
             apply_enhanced_features
 
             echo "应用ipv6特别规则..."
             setup_ipv6_specific_rules
 
-            # 继续原有的 CAKE 队列配置
             local upload_success=0 download_success=0
             init_cake_upload || upload_success=1
             init_cake_download || download_success=1
@@ -1007,7 +968,6 @@ init_cake_qos() {
             if [ $upload_success -eq 1 ] || [ $download_success -eq 1 ]; then
                 qos_log "ERROR" "CAKE QoS 初始化部分失败"
                 stop_cake_qos
-                release_lock
                 rm -f "$QOS_RUNNING_FILE"
                 exit 1
             fi
@@ -1026,7 +986,6 @@ init_cake_qos() {
 
             health_check_cake
             qos_log "INFO" "CAKE QoS 启动成功"
-            release_lock
             return 0
             ;;
 

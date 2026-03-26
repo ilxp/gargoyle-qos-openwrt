@@ -1,6 +1,6 @@
 #!/bin/bash
 # HFSC_CAKE算法实现模块
-# 版本: 3.4.1 - 添加 DSCP 映射，优化与 common.sh/rule.sh 的兼容性
+# 版本: 3.4.3 - 移除锁机制（改用 procd），适配 common.sh/rule.sh 更新
 # 基于HFSC与CAKE组合算法实现QoS流量控制。
 
 # ========== 全局配置常量 ==========
@@ -30,10 +30,9 @@ else
     exit 1
 fi
 
-# 清理函数：合并 rule.sh 的临时文件清理和锁释放
+# 清理函数：仅清理临时文件（锁已由 procd 管理）
 main_cleanup() {
     cleanup_temp_files 2>/dev/null
-    release_lock 2>/dev/null
 }
 trap main_cleanup EXIT INT TERM HUP QUIT
 
@@ -775,30 +774,31 @@ init_hfsc_cake_download() {
 init_hfsc_cake_qos() {
     local action="${1:-start}"
     qos_log "INFO" "开始初始化HFSC+CAKE QoS系统 (action=$action)"
-    acquire_lock
+    
+    # 检查是否已在运行（由 procd 保证，但保留辅助检查）
     if ! check_already_running; then
         qos_log "ERROR" "HFSC+CAKE QoS 已经在运行中"
-        release_lock
         return 1
     fi
+    
     if ! init_ruleset; then
         qos_log "ERROR" "初始化规则集失败，QoS 无法启动"
-        release_lock
         rm -f "$QOS_RUNNING_FILE"
         return 1
     fi
+    
     nft flush chain inet gargoyle-qos-priority filter_qos_egress 2>/dev/null
     nft flush chain inet gargoyle-qos-priority filter_qos_ingress 2>/dev/null
     qos_log "INFO" "已清空 nft 规则链"
+    
     if ! check_required_commands; then
         qos_log "ERROR" "缺少必需的命令，请安装对应软件包"
-        release_lock
         rm -f "$QOS_RUNNING_FILE"
         return 1
     fi
+    
     if ! load_required_modules; then
         qos_log "ERROR" "无法加载必需的内核模块"
-        release_lock
         rm -f "$QOS_RUNNING_FILE"
         return 1
     fi
@@ -817,7 +817,6 @@ init_hfsc_cake_qos() {
     done
     if (( missing )); then
         qos_log "ERROR" "HFSC/CAKE 内核模块加载失败"
-        release_lock
         rm -f "$QOS_RUNNING_FILE"
         return 1
     fi
@@ -831,7 +830,6 @@ init_hfsc_cake_qos() {
         fi
         if [[ -z "$qos_interface" ]]; then
             qos_log "ERROR" "无法确定 WAN 接口，请检查配置"
-            release_lock
             rm -f "$QOS_RUNNING_FILE"
             return 1
         fi
@@ -851,7 +849,6 @@ init_hfsc_cake_qos() {
     # 加载带宽配置（会设置 total_upload_bandwidth 和 total_download_bandwidth）
     if ! load_bandwidth_from_config; then
         qos_log "ERROR" "加载带宽配置失败"
-        release_lock
         rm -f "$QOS_RUNNING_FILE"
         return 1
     fi
@@ -859,14 +856,12 @@ init_hfsc_cake_qos() {
     
     if ! load_hfsc_cake_config; then
         qos_log "ERROR" "加载HFSC+CAKE配置失败"
-        release_lock
         rm -f "$QOS_RUNNING_FILE"
         return 1
     fi
     
     if [[ "$UPLOAD_MASK" == "0" ]] || [[ "$DOWNLOAD_MASK" == "0" ]]; then
         qos_log "ERROR" "UPLOAD_MASK 或 DOWNLOAD_MASK 为 0，无法正确匹配标记"
-        release_lock
         rm -f "$QOS_RUNNING_FILE"
         return 1
     fi
@@ -894,7 +889,6 @@ init_hfsc_cake_qos() {
     if (( upload_enabled == 0 )) && (( download_enabled == 0 )); then
         qos_log "WARN" "上传和下载带宽均为0，QoS未启动任何方向"
         check_and_handle_zero_bandwidth "$total_upload_bandwidth" "$total_download_bandwidth"
-        release_lock
         rm -f "$QOS_RUNNING_FILE"
         return 0
     fi
@@ -902,7 +896,6 @@ init_hfsc_cake_qos() {
     if (( upload_enabled == 1 )) && [[ -n "$upload_class_list" ]]; then
         if ! allocate_class_marks "upload" "$upload_class_list"; then
             qos_log "ERROR" "上传方向标记分配失败"
-            release_lock
             rm -f "$QOS_RUNNING_FILE"
             return 1
         fi
@@ -911,7 +904,6 @@ init_hfsc_cake_qos() {
     if (( download_enabled == 1 )) && [[ -n "$download_class_list" ]]; then
         if ! allocate_class_marks "download" "$download_class_list"; then
             qos_log "ERROR" "下载方向标记分配失败"
-            release_lock
             rm -f "$QOS_RUNNING_FILE"
             return 1
         fi
@@ -922,7 +914,6 @@ init_hfsc_cake_qos() {
         if ! apply_all_rules "upload_rule" "$UPLOAD_MASK" "filter_qos_egress"; then
             qos_log "ERROR" "上传规则应用失败，回滚"
             stop_hfsc_cake_qos
-            release_lock
             return 1
         fi
     fi
@@ -932,7 +923,6 @@ init_hfsc_cake_qos() {
         if ! apply_all_rules "download_rule" "$DOWNLOAD_MASK" "filter_qos_ingress"; then
             qos_log "ERROR" "下载规则应用失败，回滚"
             stop_hfsc_cake_qos
-            release_lock
             return 1
         fi
     fi
@@ -941,8 +931,6 @@ init_hfsc_cake_qos() {
     if ! setup_class_mark_map; then
         qos_log "ERROR" "class_mark 映射设置失败"
         stop_hfsc_cake_qos
-        release_lock
-        rm -f "$QOS_RUNNING_FILE"
         return 1
     fi
 
@@ -984,8 +972,6 @@ init_hfsc_cake_qos() {
     if (( upload_failed == 1 )) || (( download_failed == 1 )); then
         qos_log "ERROR" "HFSC+CAKE QoS 初始化部分失败"
         stop_hfsc_cake_qos
-        release_lock
-        rm -f "$QOS_RUNNING_FILE"
         return 1
     fi
 
@@ -994,14 +980,12 @@ init_hfsc_cake_qos() {
     fi
     
     qos_log "INFO" "HFSC+CAKE QoS初始化完成"
-    release_lock
     return 0
 }
 
 # ========== 停止函数 ==========
 stop_hfsc_cake_qos() {
     qos_log "INFO" "停止HFSC+CAKE QoS"
-    acquire_lock
     rm -f "$QOS_RUNNING_FILE"
     if [[ "$SAVE_NFT_RULES" == "1" ]]; then
         rm -f /etc/nftables.d/qos_gargoyle_*.nft 2>/dev/null
@@ -1046,7 +1030,6 @@ stop_hfsc_cake_qos() {
     _IPSET_LOADED=0
     cleanup_qos_state
     cleanup_temp_files
-    release_lock
 }
 
 # ========== 状态显示函数 ==========
