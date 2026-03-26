@@ -1,7 +1,7 @@
 #!/bin/bash
 # 规则辅助模块 (rule.sh)
 # 版本: 3.4.1 - 修复ICMP否定组合、动态分类集合检查、笛卡尔积爆炸警告、临时文件清理增强
-# 提供 nftables 规则生成与系统钩子挂载
+# 新增 setup_class_mark_map 函数供所有算法模块使用
 
 # 加载核心库（已修复）
 if [[ -f "/usr/lib/qos_gargoyle/common.sh" ]]; then
@@ -447,8 +447,6 @@ build_icmp_cond() {
         local type="${icmp_val%/*}" code="${icmp_val#*/}"
         if [[ -n "$neg" ]]; then
             # 否定组合：要求 type != type 或 code != code
-            # 注意：nftables 中 (icmp type != type) || (icmp code != code) 会匹配除了特定组合外的所有包
-            # 使用括号和逻辑或
             cond="(icmp type != $type) || (icmp code != $code)"
         else
             cond="icmp type $type icmp code $code"
@@ -459,18 +457,91 @@ build_icmp_cond() {
     echo "$cond"
 }
 
+# ========== class_mark 映射设置（供所有算法模块使用） ==========
+setup_class_mark_map() {
+    qos_log "INFO" "设置 class_mark 映射..."
+    local tmp_nft_file=$(mktemp)
+    register_temp_file "$tmp_nft_file"
+
+    # 写入 map 定义
+    cat << EOF >> "$tmp_nft_file"
+delete map inet gargoyle-qos-priority class_mark 2>/dev/null
+add map inet gargoyle-qos-priority class_mark { type mark : dscp; }
+EOF
+
+    # 读取硬编码的三列标记文件（格式 direction:class:mark）
+    # 先加载 UCI 配置
+    config_load "$CONFIG_FILE"
+
+    while IFS=: read -r dir cls mark_raw; do
+        [ -z "$dir" ] || [ -z "$cls" ] && continue
+        # 清理 cls
+        local cls_clean=$(echo "$cls" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' | tr -d '\r')
+        local mark="${mark_raw%%#*}"
+        mark=$(echo "$mark" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+        [ -z "$mark" ] && continue
+
+        # 优先读取 dscp
+        local dscp_raw=$(uci -q get "${CONFIG_FILE}.${cls_clean}.dscp" 2>/dev/null)
+        local dscp=$(echo "$dscp_raw" | tr -d '\r' | tr -d '[:space:]')
+        if [ -z "$dscp" ]; then
+            # 无 dscp，尝试读取 priority
+            local priority_raw=$(uci -q get "${CONFIG_FILE}.${cls_clean}.priority" 2>/dev/null)
+            local priority=$(echo "$priority_raw" | tr -d '\r' | tr -d '[:space:]')
+            if [ -n "$priority" ] && [ "$priority" -ge 0 ] 2>/dev/null && [ "$priority" -le 7 ] 2>/dev/null; then
+                dscp=$priority
+            else
+                dscp=0
+            fi
+        else
+            # 确保 dscp 值在 0-63 范围内
+            if ! [ "$dscp" -ge 0 ] 2>/dev/null || ! [ "$dscp" -le 63 ] 2>/dev/null; then
+                dscp=0
+            fi
+        fi
+
+        nft delete element inet gargoyle-qos-priority class_mark { $mark } 2>/dev/null
+        nft add element inet gargoyle-qos-priority class_mark { $mark : $dscp } 2>/dev/null
+        qos_log "DEBUG" "Added map element $mark : $dscp for $cls_clean"
+    done < "$CLASS_MARKS_FILE"
+
+    # 写入恢复规则
+    cat << EOF >> "$tmp_nft_file"
+insert rule inet gargoyle-qos-priority filter_qos_egress ct mark != 0 ip dscp set @class_mark[ct mark]
+insert rule inet gargoyle-qos-priority filter_qos_egress ct mark != 0 ip6 dscp set @class_mark[ct mark]
+insert rule inet gargoyle-qos-priority filter_qos_ingress ct mark != 0 ip dscp set @class_mark[ct mark]
+insert rule inet gargoyle-qos-priority filter_qos_ingress ct mark != 0 ip6 dscp set @class_mark[ct mark]
+insert rule inet gargoyle-qos-priority filter_qos_egress ct state established,related ip dscp set @class_mark[ct mark]
+insert rule inet gargoyle-qos-priority filter_qos_egress ct state established,related ip6 dscp set @class_mark[ct mark]
+insert rule inet gargoyle-qos-priority filter_qos_ingress ct state established,related ip dscp set @class_mark[ct mark]
+insert rule inet gargoyle-qos-priority filter_qos_ingress ct state established,related ip6 dscp set @class_mark[ct mark]
+EOF
+
+    # 执行批量命令
+    if nft -f "$tmp_nft_file" 2>&1 | logger -t qos_gargoyle; then
+        qos_log "INFO" "class_mark map and recovery rules loaded successfully"
+        rm -f "$tmp_nft_file"
+        return 0
+    else
+        qos_log "ERROR" "Failed to load class_mark map and recovery rules"
+        cat "$tmp_nft_file" | logger -t qos_gargoyle
+        rm -f "$tmp_nft_file"
+        return 1
+    fi
+}
+
 # ========== 增强规则应用 ==========
 apply_enhanced_direction_rules() {
     local rule_type="$1" chain="$2" mask="$3"
-    log_info "应用增强$rule_type规则到链: $chain, 掩码: $mask"
+    qos_log "INFO" "应用增强$rule_type规则到链: $chain, 掩码: $mask"
     nft add chain inet gargoyle-qos-priority "$chain" 2>/dev/null || true
     nft flush chain inet gargoyle-qos-priority "$chain" 2>/dev/null || true
     local direction=""
     [[ "$chain" == "filter_qos_egress" ]] && direction="upload"
     [[ "$chain" == "filter_qos_ingress" ]] && direction="download"
     local rule_list=$(load_all_config_sections "$CONFIG_FILE" "$rule_type")
-    [[ -z "$rule_list" ]] && { log_info "未找到$rule_type规则配置"; return 0; }
-    log_info "找到$rule_type规则: $rule_list"
+    [[ -z "$rule_list" ]] && { qos_log "INFO" "未找到$rule_type规则配置"; return 0; }
+    qos_log "INFO" "找到$rule_type规则: $rule_list"
     declare -A class_priority_map
     local class_list=""
     [[ "$direction" == "upload" ]] && class_list="$upload_class_list"
@@ -480,7 +551,7 @@ apply_enhanced_direction_rules() {
         class_priority_map["$class"]=${prio:-999}
     done
     local rule_prio_file=$(mktemp)
-    TEMP_FILES+=("$rule_prio_file")
+    register_temp_file "$rule_prio_file"
     local rule
     for rule in $rule_list; do
         [[ -n "$rule" ]] || continue
@@ -494,7 +565,7 @@ apply_enhanced_direction_rules() {
     local sorted_rule_list=$(sort -n -k1,1 -k2,2 "$rule_prio_file" | awk '{print $3}' | tr '\n' ' ')
     rm -f "$rule_prio_file"
     if [[ -z "$sorted_rule_list" ]]; then
-        log_info "没有可用的启用规则"
+        qos_log "INFO" "没有可用的启用规则"
         return 0
     fi
     local all_sets=()
@@ -525,14 +596,14 @@ apply_enhanced_direction_rules() {
             fi
         done
         if [[ ${#missing_sets[@]} -gt 0 ]]; then
-            log_error "以下集合不存在于 nftables 表中: ${missing_sets[*]}，请检查 UCI ipset 配置"
+            qos_log "ERROR" "以下集合不存在于 nftables 表中: ${missing_sets[*]}，请检查 UCI ipset 配置"
             return 1
         fi
-        log_info "所有引用的集合验证通过"
+        qos_log "INFO" "所有引用的集合验证通过"
     fi
     local nft_batch_file=$(mktemp /tmp/qos_nft_batch_XXXXXX)
-    TEMP_FILES+=("$nft_batch_file")
-    log_info "按优先级顺序生成nft规则..."
+    register_temp_file "$nft_batch_file"
+    qos_log "INFO" "按优先级顺序生成nft规则..."
     local rule_count=0
     # 笛卡尔积爆炸警告阈值
     local MAX_COMBINATIONS=1000
@@ -542,12 +613,12 @@ apply_enhanced_direction_rules() {
         fi
         [[ "$tmp_enabled" == "1" ]] || continue
         if [[ -z "$tmp_class" ]]; then
-            log_warn "规则 $rule_name 缺少 class 参数，跳过"
+            qos_log "WARN" "规则 $rule_name 缺少 class 参数，跳过"
             continue
         fi
         local class_mark=$(get_class_mark "$direction" "$tmp_class")
         if [[ -z "$class_mark" ]]; then
-            log_error "规则 $rule_name 的类 $tmp_class 无法获取标记，跳过"
+            qos_log "ERROR" "规则 $rule_name 的类 $tmp_class 无法获取标记，跳过"
             continue
         fi
         [[ -z "$tmp_family" ]] && tmp_family="inet"
@@ -577,7 +648,7 @@ apply_enhanced_direction_rules() {
         fi
         local total_combinations=$(( ${#srcport_list[@]} * ${#dstport_list[@]} * ${#src_ip_list[@]} * ${#dest_ip_list[@]} ))
         if [[ $total_combinations -gt $MAX_COMBINATIONS ]]; then
-            log_warn "规则 $rule_name 的组合数 $total_combinations 超过阈值 $MAX_COMBINATIONS，可能导致性能问题，请检查配置（端口/IP 集合过多）"
+            qos_log "WARN" "规则 $rule_name 的组合数 $total_combinations 超过阈值 $MAX_COMBINATIONS，可能导致性能问题，请检查配置（端口/IP 集合过多）"
         fi
         for srcp in "${srcport_list[@]}"; do
             for dstp in "${dstport_list[@]}"; do
@@ -600,16 +671,16 @@ apply_enhanced_direction_rules() {
         custom_file="/etc/qos_gargoyle/ingress_custom.nft"
     fi
     if [[ -s "$custom_file" ]]; then
-        log_info "验证自定义规则: $custom_file"
+        qos_log "INFO" "验证自定义规则: $custom_file"
         local check_file=$(mktemp)
-        TEMP_FILES+=("$check_file")
+        register_temp_file "$check_file"
         {
             printf '%s\n\t%s\n' "table inet __qos_custom_check {" "chain __temp_chain {"
             cat "$custom_file"
             printf '\n\t%s\n%s\n' "}" "}"
         } > "$check_file"
         if nft --check --file "$check_file" 2>/dev/null; then
-            log_info "自定义规则语法正确: $custom_file"
+            qos_log "INFO" "自定义规则语法正确: $custom_file"
             while IFS= read -r line || [[ -n "$line" ]]; do
                 line="${line#"${line%%[![:space:]]*}"}"
                 line="${line%"${line##*[![:space:]]}"}"
@@ -618,42 +689,42 @@ apply_enhanced_direction_rules() {
                 ((rule_count++))
             done < "$custom_file"
         else
-            log_warn "自定义规则文件 $custom_file 语法错误，已忽略"
+            qos_log "WARN" "自定义规则文件 $custom_file 语法错误，已忽略"
             nft --check --file "$check_file" 2>&1 | while IFS= read -r err; do
-                log_error "nft语法错误: $err"
+                qos_log "ERROR" "nft语法错误: $err"
             done
         fi
         rm -f "$check_file"
     fi
     local batch_success=0
     if [[ -s "$nft_batch_file" ]]; then
-        log_info "执行批量nft规则语法检查 (共 $rule_count 条)..."
+        qos_log "INFO" "执行批量nft规则语法检查 (共 $rule_count 条)..."
         local check_output
         if check_output=$(nft --check --file "$nft_batch_file" 2>&1); then
-            log_info "语法检查通过，开始应用规则..."
+            qos_log "INFO" "语法检查通过，开始应用规则..."
             local nft_output
             nft_output=$(nft -f "$nft_batch_file" 2>&1)
             local nft_ret=$?
             if [[ $nft_ret -eq 0 ]]; then
-                log_info "✅ 批量规则应用成功"
+                qos_log "INFO" "✅ 批量规则应用成功"
                 if [[ $SAVE_NFT_RULES -eq 1 ]]; then
                     mkdir -p /etc/nftables.d
                     local nft_save_file="/etc/nftables.d/qos_gargoyle_${chain}.nft"
                     cp "$nft_batch_file" "$nft_save_file"
-                    log_info "规则已保存到 $nft_save_file"
+                    qos_log "INFO" "规则已保存到 $nft_save_file"
                 fi
             else
-                log_error "❌ 批量规则应用失败 (退出码: $nft_ret)"
-                log_error "nft 错误输出: $nft_output"
+                qos_log "ERROR" "❌ 批量规则应用失败 (退出码: $nft_ret)"
+                qos_log "ERROR" "nft 错误输出: $nft_output"
                 batch_success=1
             fi
         else
-            log_error "❌ 批量规则语法检查失败，无法应用规则"
-            log_error "检查错误: $check_output"
+            qos_log "ERROR" "❌ 批量规则语法检查失败，无法应用规则"
+            qos_log "ERROR" "检查错误: $check_output"
             batch_success=1
         fi
     else
-        log_info "没有生成任何规则，跳过应用"
+        qos_log "INFO" "没有生成任何规则，跳过应用"
     fi
     rm -f "$nft_batch_file"
     return $batch_success
@@ -663,82 +734,82 @@ apply_enhanced_direction_rules() {
 apply_enhanced_features() {
     # ACK 限速
     if [[ $ENABLE_ACK_LIMIT -eq 1 ]]; then
-        log_info "ACK 限速已启用，生成规则..."
+        qos_log "INFO" "ACK 限速已启用，生成规则..."
         local ack_rules=$(generate_ack_limit_rules)
         if [[ -n "$ack_rules" ]]; then
             local ack_file=$(mktemp)
-            TEMP_FILES+=("$ack_file")
+            register_temp_file "$ack_file"
             echo "$ack_rules" | while IFS= read -r rule; do
                 [[ -z "$rule" ]] && continue
                 echo "${rule/add rule/insert rule}" >> "$ack_file"
             done
-            log_info "ACK 规则文件内容:"
+            qos_log "INFO" "ACK 规则文件内容:"
             cat "$ack_file" | logger -t qos_gargoyle
             if nft -f "$ack_file" 2>&1 | logger -t qos_gargoyle; then
-                log_info "ACK 限速规则添加成功"
+                qos_log "INFO" "ACK 限速规则添加成功"
             else
-                log_warn "ACK 限速规则添加失败"
+                qos_log "WARN" "ACK 限速规则添加失败"
             fi
         else
-            log_warn "ACK 限速规则生成失败（返回空）"
+            qos_log "WARN" "ACK 限速规则生成失败（返回空）"
         fi
     else
-        log_info "ACK 限速未启用"
+        qos_log "INFO" "ACK 限速未启用"
     fi
 
     # TCP 升级
     if [[ $ENABLE_TCP_UPGRADE -eq 1 ]]; then
-        log_info "TCP 升级已启用，生成规则..."
+        qos_log "INFO" "TCP 升级已启用，生成规则..."
         local tcp_upgrade_rules=$(generate_tcp_upgrade_rules)
         if [[ -n "$tcp_upgrade_rules" ]]; then
             local tcp_file=$(mktemp)
-            TEMP_FILES+=("$tcp_file")
+            register_temp_file "$tcp_file"
             echo "$tcp_upgrade_rules" | while IFS= read -r rule; do
                 [[ -z "$rule" ]] && continue
                 echo "${rule/add rule/insert rule}" >> "$tcp_file"
             done
-            log_info "TCP 升级规则文件内容:"
+            qos_log "INFO" "TCP 升级规则文件内容:"
             cat "$tcp_file" | logger -t qos_gargoyle
             if nft -f "$tcp_file" 2>&1 | logger -t qos_gargoyle; then
-                log_info "TCP 升级规则添加成功"
+                qos_log "INFO" "TCP 升级规则添加成功"
             else
-                log_warn "TCP 升级规则添加失败"
+                qos_log "WARN" "TCP 升级规则添加失败"
             fi
         else
-            log_warn "TCP 升级规则生成失败（返回空）"
+            qos_log "WARN" "TCP 升级规则生成失败（返回空）"
         fi
     else
-        log_info "TCP 升级未启用"
+        qos_log "INFO" "TCP 升级未启用"
     fi
 
     # UDP 限速
     if [[ $UDP_RATE_LIMIT_ENABLE -eq 1 ]]; then
-        log_info "生成 UDP 限速规则..."
+        qos_log "INFO" "生成 UDP 限速规则..."
         local udp_limit_rules=$(generate_udp_limit_rules)
         if [[ -n "$udp_limit_rules" ]]; then
             local udp_file=$(mktemp)
-            TEMP_FILES+=("$udp_file")
+            register_temp_file "$udp_file"
             echo "$udp_limit_rules" > "$udp_file"
-            log_info "UDP 限速规则文件内容:"
+            qos_log "INFO" "UDP 限速规则文件内容:"
             cat "$udp_file" | logger -t qos_gargoyle
             if nft -f "$udp_file" 2>&1 | logger -t qos_gargoyle; then
-                log_info "UDP 限速规则添加成功"
+                qos_log "INFO" "UDP 限速规则添加成功"
             else
-                log_warn "UDP 限速规则添加失败"
+                qos_log "WARN" "UDP 限速规则添加失败"
             fi
         else
-            log_warn "UDP 限速规则生成失败（返回空）"
+            qos_log "WARN" "UDP 限速规则生成失败（返回空）"
         fi
     else
-        log_info "UDP 限速未启用"
+        qos_log "INFO" "UDP 限速未启用"
     fi
     
     # 动态分类（总开关）
     if [[ $ENABLE_DYNAMIC_CLASSIFY -eq 1 ]]; then
-        log_info "动态分类总开关已启用，初始化动态检测..."
+        qos_log "INFO" "动态分类总开关已启用，初始化动态检测..."
         setup_dynamic_classification
     else
-        log_info "动态分类未启用"
+        qos_log "INFO" "动态分类未启用"
     fi
 }
 
@@ -750,7 +821,7 @@ apply_enhanced_features() {
 # 检测内核是否支持 meter 关键字
 check_meter_support() {
     local test_file=$(mktemp)
-    TEMP_FILES+=("$test_file")
+    register_temp_file "$test_file"
     echo "add table inet qos_meter_test" > "$test_file"
     echo "add chain inet qos_meter_test test { type filter hook forward priority 0; }" >> "$test_file"
     echo "add rule inet qos_meter_test test meter test_meter { ip daddr timeout 1s limit rate 1/minute } counter" >> "$test_file"
@@ -814,7 +885,7 @@ create_bulk_client_rules() {
     # 获取该类的 DSCP 值
     local dscp=$(get_class_mark_for_dynamic "$class")
     if [ -z "$dscp" ] || [ "$dscp" -eq 0 ]; then
-        log_warn "bulk_client_detection: class '$class' not found or class_mark=0, using default 8 (CS1)"
+        qos_log "WARN" "bulk_client_detection: class '$class' not found or class_mark=0, using default 8 (CS1)"
         dscp=8
     fi
 
@@ -831,7 +902,7 @@ create_bulk_client_rules() {
 
     # 检测内核是否支持 meter
     if ! check_meter_support; then
-        log_warn "内核不支持 nftables meter 关键字，动态分类 bulk_client 功能将禁用"
+        qos_log "WARN" "内核不支持 nftables meter 关键字，动态分类 bulk_client 功能将禁用"
         return 0
     fi
 
@@ -852,7 +923,7 @@ create_bulk_client_rules() {
     nft add rule inet gargoyle-qos-priority qos_dynamic_classify_reply ct mark & 0x3f == 0 ip daddr . th dport . meta l4proto @qos_bulk_clients goto qos_bulk_client_reply 2>/dev/null || true
     nft add rule inet gargoyle-qos-priority qos_dynamic_classify_reply ct mark & 0x3f == 0 ip6 daddr . th dport . meta l4proto @qos_bulk_clients6 goto qos_bulk_client_reply 2>/dev/null || true
 
-    log_info "bulk_client_detection enabled: min_conn=$min_connections, min_bytes=$min_bytes, class=$class (DSCP=$dscp)"
+    qos_log "INFO" "bulk_client_detection enabled: min_conn=$min_connections, min_bytes=$min_bytes, class=$class (DSCP=$dscp)"
 }
 
 # 创建高吞吐服务检测规则（升级）
@@ -876,12 +947,12 @@ create_high_throughput_service_rules() {
 
     local dscp=$(get_class_mark_for_dynamic "$class")
     if [ -z "$dscp" ] || [ "$dscp" -eq 0 ]; then
-        log_warn "high_throughput_service_detection: class '$class' not found or class_mark=0, using default 46 (EF)"
+        qos_log "WARN" "high_throughput_service_detection: class '$class' not found or class_mark=0, using default 46 (EF)"
         dscp=46
     fi
 
     if ! check_meter_support; then
-        log_warn "内核不支持 nftables meter 关键字，动态分类 high_throughput_service 功能将禁用"
+        qos_log "WARN" "内核不支持 nftables meter 关键字，动态分类 high_throughput_service 功能将禁用"
         return 0
     fi
 
@@ -914,12 +985,12 @@ create_high_throughput_service_rules() {
     nft add rule inet gargoyle-qos-priority qos_dynamic_classify_reply ct mark & 0x3f == 0 ip daddr . ip saddr and 255.255.255.0 . th sport . meta l4proto @qos_high_throughput_services goto qos_high_throughput_service_reply 2>/dev/null || true
     nft add rule inet gargoyle-qos-priority qos_dynamic_classify_reply ct mark & 0x3f == 0 ip6 daddr . ip6 saddr and ffff:ffff:ffff:: . th sport . meta l4proto @qos_high_throughput_services6 goto qos_high_throughput_service_reply 2>/dev/null || true
 
-    log_info "high_throughput_service_detection enabled: min_conn=$min_connections, min_bytes=$min_bytes, class=$class (DSCP=$dscp)"
+    qos_log "INFO" "high_throughput_service_detection enabled: min_conn=$min_connections, min_bytes=$min_bytes, class=$class (DSCP=$dscp)"
 }
 
 # 设置动态分类
 setup_dynamic_classification() {
-    log_info "初始化动态分类链..."
+    qos_log "INFO" "初始化动态分类链..."
     nft add chain inet gargoyle-qos-priority qos_established_connection 2>/dev/null || true
     nft add chain inet gargoyle-qos-priority qos_dynamic_classify 2>/dev/null || true
     nft add chain inet gargoyle-qos-priority qos_dynamic_classify_reply 2>/dev/null || true
@@ -940,13 +1011,13 @@ setup_dynamic_classification() {
 # ========== 应用所有规则 ==========
 apply_all_rules() {
     local rule_type="$1" mask="$2" chain="$3"
-    log_info "开始应用 $rule_type 规则到链 $chain (掩码: $mask)"
+    qos_log "INFO" "开始应用 $rule_type 规则到链 $chain (掩码: $mask)"
     load_global_config
-    log_info "ENABLE_ACK_LIMIT=$ENABLE_ACK_LIMIT, ENABLE_TCP_UPGRADE=$ENABLE_TCP_UPGRADE"
+    qos_log "INFO" "ENABLE_ACK_LIMIT=$ENABLE_ACK_LIMIT, ENABLE_TCP_UPGRADE=$ENABLE_TCP_UPGRADE"
     if [[ ${#UCI_CACHE[@]} -eq 0 ]]; then
         unset UCI_CACHE 2>/dev/null
         declare -A UCI_CACHE
-        log_info "构建 UCI 配置缓存..."
+        qos_log "INFO" "构建 UCI 配置缓存..."
         while IFS= read -r line; do
             [[ -z "$line" ]] && continue
             local key="${line%%=*}"
@@ -956,17 +1027,17 @@ apply_all_rules() {
                 UCI_CACHE["$key"]="$val"
             fi
         done < <(uci show "${CONFIG_FILE}" 2>/dev/null)
-        log_debug "已加载 UCI 配置缓存 (${#UCI_CACHE[@]} 个选项)"
+        qos_log "DEBUG" "已加载 UCI 配置缓存 (${#UCI_CACHE[@]} 个选项)"
     fi
     if ! nft list table inet gargoyle-qos-priority &>/dev/null; then
-        log_info "nft 表不存在，将重新初始化"
+        qos_log "INFO" "nft 表不存在，将重新初始化"
         _QOS_TABLE_FLUSHED=0
         _IPSET_LOADED=0
         _HOOKS_SETUP=0
         _SET_FAMILY_CACHE=()
     fi
     if [[ $_QOS_TABLE_FLUSHED -eq 0 ]]; then
-        log_info "初始化 nftables 表"
+        qos_log "INFO" "初始化 nftables 表"
         nft add table inet gargoyle-qos-priority 2>/dev/null || true
         nft flush chain inet gargoyle-qos-priority filter_qos_egress 2>/dev/null || true
         nft flush chain inet gargoyle-qos-priority filter_qos_ingress 2>/dev/null || true
@@ -986,7 +1057,7 @@ apply_all_rules() {
             fi
         done
         if [[ $sets_ok -eq 0 ]]; then
-            log_error "动态集合创建失败，ACK 限速和 TCP 升级功能将被禁用"
+            qos_log "ERROR" "动态集合创建失败，ACK 限速和 TCP 升级功能将被禁用"
             ENABLE_ACK_LIMIT=0
             ENABLE_TCP_UPGRADE=0
         fi
@@ -1005,17 +1076,17 @@ apply_all_rules() {
         _QOS_TABLE_FLUSHED=1
     fi
     if [[ $_HOOKS_SETUP -eq 0 ]]; then
-        log_info "挂载 nftables 钩子链"
+        qos_log "INFO" "挂载 nftables 钩子链"
         local wan_if=$(get_wan_interface)
         if [[ -z "$wan_if" ]]; then
-            log_error "无法获取 WAN 接口，钩子链可能不完整，QoS 可能无法正确区分方向"
-            log_warn "未配置 WAN 接口，将不使用方向区分，所有转发流量同时进入上传和下载链（可能导致双重标记）"
+            qos_log "ERROR" "无法获取 WAN 接口，钩子链可能不完整，QoS 可能无法正确区分方向"
+            qos_log "WARN" "未配置 WAN 接口，将不使用方向区分，所有转发流量同时进入上传和下载链（可能导致双重标记）"
             nft add chain inet gargoyle-qos-priority filter_forward '{ type filter hook forward priority 0; policy accept; }' 2>/dev/null || true
             nft flush chain inet gargoyle-qos-priority filter_forward 2>/dev/null || true
             nft add rule inet gargoyle-qos-priority filter_forward jump filter_qos_egress 2>/dev/null || true
             nft add rule inet gargoyle-qos-priority filter_forward jump filter_qos_ingress 2>/dev/null || true
         else
-            log_info "使用 WAN 接口: $wan_if"
+            qos_log "INFO" "使用 WAN 接口: $wan_if"
             nft add chain inet gargoyle-qos-priority filter_output '{ type filter hook output priority 0; policy accept; }' 2>/dev/null || true
             nft add chain inet gargoyle-qos-priority filter_input  '{ type filter hook input priority 0; policy accept; }' 2>/dev/null || true
             nft add chain inet gargoyle-qos-priority filter_forward '{ type filter hook forward priority 0; policy accept; }' 2>/dev/null || true
@@ -1028,16 +1099,16 @@ apply_all_rules() {
             nft add rule inet gargoyle-qos-priority filter_input jump filter_qos_ingress 2>/dev/null || true
         fi
         _HOOKS_SETUP=1
-        log_info "nftables 钩子链挂载完成"
+        qos_log "INFO" "nftables 钩子链挂载完成"
     fi
     if [[ $ENABLE_EBPF -eq 1 ]]; then
-        log_info "eBPF 已启用，尝试加载 eBPF 程序..."
+        qos_log "INFO" "eBPF 已启用，尝试加载 eBPF 程序..."
         if ! load_ebpf_programs; then
-            log_warn "eBPF 程序加载部分失败，将继续使用 nftables 规则"
+            qos_log "WARN" "eBPF 程序加载部分失败，将继续使用 nftables 规则"
         fi
     fi
     if ! apply_enhanced_direction_rules "$rule_type" "$chain" "$mask"; then
-        log_error "应用 $rule_type 规则失败"
+        qos_log "ERROR" "应用 $rule_type 规则失败"
         return 1
     fi
     load_custom_full_table
@@ -1048,34 +1119,34 @@ apply_all_rules() {
 # ========== 入口重定向（增强 IPv6 回退，先清空过滤器） ==========
 setup_ingress_redirect() {
     if [[ -z "$qos_interface" ]]; then
-        log_error "无法确定 WAN 接口"
+        qos_log "ERROR" "无法确定 WAN 接口"
         return 1
     fi
     local sfo_enabled=0
     if check_sfo_enabled; then
         sfo_enabled=1
-        log_info "SFO 已启用，将使用 ctinfo 恢复标记"
+        qos_log "INFO" "SFO 已启用，将使用 ctinfo 恢复标记"
     fi
     local connmark_ok=0
     if check_tc_connmark_support; then
         connmark_ok=1
-        log_info "tc connmark 动作受支持"
+        qos_log "INFO" "tc connmark 动作受支持"
     else
-        log_warn "tc connmark 动作不受支持"
+        qos_log "WARN" "tc connmark 动作不受支持"
     fi
     local ctinfo_ok=0
     if (( sfo_enabled )); then
         if check_tc_ctinfo_support; then
             ctinfo_ok=1
-            log_info "tc ctinfo 动作受支持"
+            qos_log "INFO" "tc ctinfo 动作受支持"
         else
-            log_warn "tc ctinfo 动作不受支持，将回退到 connmark"
+            qos_log "WARN" "tc ctinfo 动作不受支持，将回退到 connmark"
         fi
     fi
-    log_info "设置入口重定向: $qos_interface -> $IFB_DEVICE"
+    qos_log "INFO" "设置入口重定向: $qos_interface -> $IFB_DEVICE"
     tc qdisc del dev "$qos_interface" ingress 2>/dev/null || true
     if ! tc qdisc add dev "$qos_interface" handle ffff: ingress; then
-        log_error "无法在 $qos_interface 上创建入口队列"
+        qos_log "ERROR" "无法在 $qos_interface 上创建入口队列"
         return 1
     fi
     # 先删除所有现有过滤器，避免重复
@@ -1086,39 +1157,39 @@ setup_ingress_redirect() {
             u32 match u32 0 0 \
             action ctinfo mark 0xffffffff 0xffffffff \
             action mirred egress redirect dev "$IFB_DEVICE" 2>&1; then
-            log_error "IPv4入口重定向规则添加失败（使用 ctinfo）"
+            qos_log "ERROR" "IPv4入口重定向规则添加失败（使用 ctinfo）"
             tc qdisc del dev "$qos_interface" ingress 2>/dev/null
             return 1
         else
             ipv4_success=true
-            log_info "IPv4入口重定向规则添加成功（使用 ctinfo，SFO 兼容）"
+            qos_log "INFO" "IPv4入口重定向规则添加成功（使用 ctinfo，SFO 兼容）"
         fi
     elif (( connmark_ok )); then
         if ! tc filter add dev "$qos_interface" parent ffff: protocol ip \
             u32 match u32 0 0 \
             action connmark \
             action mirred egress redirect dev "$IFB_DEVICE" 2>&1; then
-            log_error "IPv4入口重定向规则添加失败（使用 connmark）"
+            qos_log "ERROR" "IPv4入口重定向规则添加失败（使用 connmark）"
             tc qdisc del dev "$qos_interface" ingress 2>/dev/null
             return 1
         else
             ipv4_success=true
-            log_info "IPv4入口重定向规则添加成功（使用 connmark）"
+            qos_log "INFO" "IPv4入口重定向规则添加成功（使用 connmark）"
         fi
     else
         if ! tc filter add dev "$qos_interface" parent ffff: protocol ip \
             u32 match u32 0 0 \
             action mirred egress redirect dev "$IFB_DEVICE" 2>&1; then
-            log_error "IPv4入口重定向规则添加失败（无标记）"
+            qos_log "ERROR" "IPv4入口重定向规则添加失败（无标记）"
             tc qdisc del dev "$qos_interface" ingress 2>/dev/null
             return 1
         else
             ipv4_success=true
-            log_warn "IPv4入口重定向规则添加成功（未使用标记，标记将丢失）"
+            qos_log "WARN" "IPv4入口重定向规则添加成功（未使用标记，标记将丢失）"
         fi
     fi
     if [[ "$ipv4_success" != "true" ]]; then
-        log_error "IPv4入口重定向配置失败"
+        qos_log "ERROR" "IPv4入口重定向配置失败"
         return 1
     fi
     # IPv6 重定向
@@ -1127,9 +1198,9 @@ setup_ingress_redirect() {
     local has_ipv6_global=0
     if ip -6 addr show dev "$qos_interface" scope global 2>/dev/null | grep -q "inet6"; then
         has_ipv6_global=1
-        log_info "接口 $qos_interface 拥有全局 IPv6 地址，将尝试配置 IPv6 重定向，前缀: $ipv6_prefix"
+        qos_log "INFO" "接口 $qos_interface 拥有全局 IPv6 地址，将尝试配置 IPv6 重定向，前缀: $ipv6_prefix"
     else
-        log_info "接口 $qos_interface 无全局 IPv6 地址，IPv6 重定向失败仅警告"
+        qos_log "INFO" "接口 $qos_interface 无全局 IPv6 地址，IPv6 重定向失败仅警告"
     fi
 
     # 确定 IPv6 使用的 action 前缀
@@ -1148,9 +1219,9 @@ setup_ingress_redirect() {
             $ipv6_action \
             action mirred egress redirect dev "$IFB_DEVICE" 2>&1; then
             ipv6_success=true
-            log_info "IPv6入口重定向规则（flower 前缀 $ipv6_prefix，带标记）添加成功"
+            qos_log "INFO" "IPv6入口重定向规则（flower 前缀 $ipv6_prefix，带标记）添加成功"
         else
-            log_warn "flower 带标记规则失败，尝试无标记 flower"
+            qos_log "WARN" "flower 带标记规则失败，尝试无标记 flower"
         fi
     fi
     if [[ "$ipv6_success" != "true" ]]; then
@@ -1158,9 +1229,9 @@ setup_ingress_redirect() {
             flower dst_ip "$ipv6_prefix" \
             action mirred egress redirect dev "$IFB_DEVICE" 2>&1; then
             ipv6_success=true
-            log_info "IPv6入口重定向规则（flower 前缀 $ipv6_prefix，无标记）添加成功"
+            qos_log "INFO" "IPv6入口重定向规则（flower 前缀 $ipv6_prefix，无标记）添加成功"
         else
-            log_warn "flower 无标记规则失败"
+            qos_log "WARN" "flower 无标记规则失败"
         fi
     fi
 
@@ -1172,9 +1243,9 @@ setup_ingress_redirect() {
                 $ipv6_action \
                 action mirred egress redirect dev "$IFB_DEVICE" 2>&1; then
                 ipv6_success=true
-                log_info "IPv6入口重定向规则（u32 全球单播，带标记）添加成功"
+                qos_log "INFO" "IPv6入口重定向规则（u32 全球单播，带标记）添加成功"
             else
-                log_warn "u32 全球单播带标记规则失败"
+                qos_log "WARN" "u32 全球单播带标记规则失败"
             fi
         fi
         if [[ "$ipv6_success" != "true" ]]; then
@@ -1182,9 +1253,9 @@ setup_ingress_redirect() {
                 u32 match u32 0x20000000 0xe0000000 at 24 \
                 action mirred egress redirect dev "$IFB_DEVICE" 2>&1; then
                 ipv6_success=true
-                log_info "IPv6入口重定向规则（u32 全球单播，无标记）添加成功"
+                qos_log "INFO" "IPv6入口重定向规则（u32 全球单播，无标记）添加成功"
             else
-                log_warn "u32 全球单播无标记规则失败"
+                qos_log "WARN" "u32 全球单播无标记规则失败"
             fi
         fi
     fi
@@ -1197,9 +1268,9 @@ setup_ingress_redirect() {
                 $ipv6_action \
                 action mirred egress redirect dev "$IFB_DEVICE" 2>&1; then
                 ipv6_success=true
-                log_info "IPv6入口重定向规则（u32 全匹配，带标记）添加成功"
+                qos_log "INFO" "IPv6入口重定向规则（u32 全匹配，带标记）添加成功"
             else
-                log_warn "u32 全匹配带标记规则失败"
+                qos_log "WARN" "u32 全匹配带标记规则失败"
             fi
         fi
         if [[ "$ipv6_success" != "true" ]]; then
@@ -1207,33 +1278,33 @@ setup_ingress_redirect() {
                 u32 match u32 0 0 \
                 action mirred egress redirect dev "$IFB_DEVICE" 2>&1; then
                 ipv6_success=true
-                log_info "IPv6入口重定向规则（u32 全匹配，无标记）添加成功"
+                qos_log "INFO" "IPv6入口重定向规则（u32 全匹配，无标记）添加成功"
             else
-                log_warn "IPv6全匹配回退规则添加失败"
+                qos_log "WARN" "IPv6全匹配回退规则添加失败"
             fi
         fi
     fi
 
     if (( has_ipv6_global == 1 )); then
         if [[ "$ipv6_success" != "true" ]]; then
-            log_warn "接口存在全局 IPv6 地址，但所有 IPv6 入口重定向配置失败，IPv6 流量可能不受 QoS 控制，但 IPv4 QoS 将继续工作"
+            qos_log "WARN" "接口存在全局 IPv6 地址，但所有 IPv6 入口重定向配置失败，IPv6 流量可能不受 QoS 控制，但 IPv4 QoS 将继续工作"
         else
-            log_info "IPv6 入口重定向成功"
+            qos_log "INFO" "IPv6 入口重定向成功"
         fi
     else
         if [[ "$ipv6_success" == "true" ]]; then
-            log_info "IPv6 入口重定向成功（尽管无全局 IPv6 地址，仍添加了规则）"
+            qos_log "INFO" "IPv6 入口重定向成功（尽管无全局 IPv6 地址，仍添加了规则）"
         else
-            log_warn "IPv6 入口重定向失败，但因接口无全局 IPv6 地址，继续启动"
+            qos_log "WARN" "IPv6 入口重定向失败，但因接口无全局 IPv6 地址，继续启动"
         fi
     fi
 
     local ipv4_rule_count=$(tc filter show dev "$qos_interface" parent ffff: protocol ip 2>/dev/null | grep -c "mirred.*Redirect to device $IFB_DEVICE")
     local ipv6_rule_count=$(tc filter show dev "$qos_interface" parent ffff: protocol ipv6 2>/dev/null | grep -c "mirred.*Redirect to device $IFB_DEVICE")
     if (( ipv4_rule_count >= 1 )) && (( ipv6_rule_count >= 1 )); then
-        log_info "入口重定向已成功设置: IPv4和IPv6规则均生效"
+        qos_log "INFO" "入口重定向已成功设置: IPv4和IPv6规则均生效"
     elif (( ipv4_rule_count >= 1 )); then
-        log_info "入口重定向已成功设置: 仅IPv4生效"
+        qos_log "INFO" "入口重定向已成功设置: 仅IPv4生效"
     fi
     return 0
 }
@@ -1273,7 +1344,7 @@ check_ingress_redirect() {
 
 # ========== IPv6增强支持 ==========
 setup_ipv6_specific_rules() {
-    log_info "设置IPv6特定规则（优化版）"
+    qos_log "INFO" "设置IPv6特定规则（优化版）"
     nft add chain inet gargoyle-qos-priority filter_prerouting '{ type filter hook prerouting priority 0; policy accept; }' 2>/dev/null || true
     nft flush chain inet gargoyle-qos-priority filter_prerouting 2>/dev/null || true
     local ICMPV6_CRITICAL_TYPES="133,134,135,136,137"
@@ -1293,7 +1364,7 @@ setup_ipv6_specific_rules() {
         meta nfproto ipv6 tcp dport { 80, 443 } meta mark set 0x40000000 counter 2>/dev/null || true
     nft add rule inet gargoyle-qos-priority filter_prerouting \
         meta nfproto ipv6 udp dport 123 meta mark set 0x40000000 counter 2>/dev/null || true
-    log_info "IPv6关键流量规则设置完成"
+    qos_log "INFO" "IPv6关键流量规则设置完成"
 }
 
 # ========== 健康检查 ==========
