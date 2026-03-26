@@ -1,16 +1,19 @@
-#!/bin/bash
-# QoS Gargoyle 初始化脚本 - 传统 init.d 版本
+#!/bin/sh /etc/rc.common
+# QoS Gargoyle 初始化脚本 - procd 版本
 # 支持多算法：HFSC, CAKE, FQ_CoDel, HTB, CAKE with DSCPclassify, HFSC+CAKE, HTB+CAKE
-# 版本：2.6.4 - 修复 stop 函数缺少库加载，优化顺序
+# 版本：3.5.0 - 改用 procd 管理，移除手动锁，优化启动流程
 #
 
+USE_PROCD=1
 START=50
 STOP=89
 
-EXTRA_COMMANDS="show status reload"
+EXTRA_COMMANDS="show status reload enable disable"
 EXTRA_HELP="        show    显示当前 QoS 配置状态
         status  显示 QoS 详细状态和统计信息
-        reload  重新加载配置（不重启服务）"
+        reload  重新加载配置（不重启服务）
+        enable  启用开机自启并立即启动
+        disable 禁用开机自启并停止服务"
 
 # ========== 全局配置和常量 ==========
 CONFIG_FILE="qos_gargoyle"
@@ -27,9 +30,6 @@ HTB_CAKE_MODULE="$QOS_MODULES_DIR/htb_cake.sh"
 HTB_MODULE="$QOS_MODULES_DIR/htb_fqcodel.sh"  
 RULE_HELPER="$QOS_MODULES_DIR/rule.sh"
 
-# 服务状态文件
-SERVICE_STATUS_FILE="/var/run/qos_gargoyle.status"
-
 # 公共变量
 qos_interface=""
 wan_ip=""
@@ -43,33 +43,13 @@ upload_shift=0
 download_shift=8
 upload_class_mark_list=""
 download_class_mark_list=""
-IFB_DEVICE=""           # 显式声明，防止未初始化
+IFB_DEVICE=""
 
-# ========== 服务状态管理 ==========
+# ========== 服务状态管理（简化，由 procd 保证单实例） ==========
 
-# 保存服务状态
-save_service_status() {
-    local status="$1"
-    echo "$status" > "$SERVICE_STATUS_FILE"
-    echo "Service status saved: $status" > /dev/null
-}
-
-# 获取服务状态
-get_service_status() {
-    if [ -f "$SERVICE_STATUS_FILE" ]; then
-        cat "$SERVICE_STATUS_FILE" 2>/dev/null || echo "unknown"
-    else
-        echo "unknown"
-    fi
-}
-
-# 检查服务是否正在运行
+# 检查服务是否正在运行（通过 TC 队列判断）
 is_service_running() {
-    # 检查是否有 TC 队列
-    if tc qdisc show 2>/dev/null | grep -qE "qdisc hfsc|qdisc cake|qdisc fq_codel|qdisc htb"; then
-        return 0
-    fi
-    return 1
+    tc qdisc show 2>/dev/null | grep -qE "qdisc hfsc|qdisc cake|qdisc fq_codel|qdisc htb"
 }
 
 # 检查配置是否启用
@@ -78,28 +58,25 @@ is_config_enabled() {
     [ "$enabled" = "1" ] && return 0 || return 1
 }
 
-# 更新配置状态
+# 更新 UCI 配置状态（enable/disable 命令用）
 update_config_state() {
     local state="$1"
     local config_state=$(uci -q get "$CONFIG_FILE.global.enabled" 2>/dev/null)
     
     if [ "$state" = "enable" ] && [ "$config_state" != "1" ]; then
-        echo "Updating UCI config: enabled=1"
         uci set "$CONFIG_FILE.global.enabled=1"
         uci commit "$CONFIG_FILE"
     elif [ "$state" = "disable" ] && [ "$config_state" != "0" ]; then
-        echo "Updating UCI config: enabled=0"
         uci set "$CONFIG_FILE.global.enabled=0"
         uci commit "$CONFIG_FILE"
     fi
 }
 
-# ========== 核心清理函数 ==========
-# 注意：调用此函数前必须已经获取锁（由上层函数负责）
+# ========== 核心清理函数（无锁） ==========
 stop_qos() {
     echo "Stopping QoS system..."
     
-    # 停止监控进程（使用 start-stop-daemon 优雅停止）
+    # 停止监控进程
     if command -v start-stop-daemon >/dev/null 2>&1; then
         start-stop-daemon -K -x /usr/sbin/qosacc 2>/dev/null
     else
@@ -107,7 +84,6 @@ stop_qos() {
     fi
     sleep 1
     
-    # 检查服务是否真的在运行
     if ! is_service_running; then
         echo "QoS is not running, skipping cleanup"
         return 0
@@ -115,21 +91,17 @@ stop_qos() {
     
     echo "Cleaning QoS-specific configuration..."
     
-    # 获取 IFB 设备名（如果未设置，尝试从 UCI 读取或使用默认值）
+    # 获取 IFB 设备名
     local ifb_dev="${IFB_DEVICE:-}"
     if [ -z "$ifb_dev" ]; then
         ifb_dev=$(uci -q get "$CONFIG_FILE.download.ifb_device" 2>/dev/null)
         ifb_dev="${ifb_dev:-ifb0}"
-        echo "IFB_DEVICE not set, using $ifb_dev from UCI/default"
     fi
     
-    # 只清理 QoS 相关的 TC 队列
-    echo "Cleaning TC queues for QoS interfaces..."
-    
-    # 获取 QoS 接口（优先使用已设置的变量，否则从 UCI 读取）
+    # 获取 QoS 接口
     local qos_iface="$qos_interface"
     if [ -z "$qos_iface" ]; then
-        qos_iface=$(uci -q get "$CONFIG_FILE.global.wan_interface")
+        qos_iface=$(uci -q get "$CONFIG_FILE.global.wan_interface" 2>/dev/null)
     fi
     
     if [ -n "$qos_iface" ] && [ "$qos_iface" != "auto" ]; then
@@ -138,7 +110,6 @@ stop_qos() {
             echo "  Deleting root queue on $qos_iface..."
             tc qdisc del dev "$qos_iface" root 2>/dev/null
         fi
-        
         # 清理入口队列
         if tc qdisc show dev "$qos_iface" ingress 2>/dev/null; then
             echo "  Deleting ingress queue on $qos_iface..."
@@ -146,8 +117,7 @@ stop_qos() {
         fi
     fi
     
-    # 清理 IFB 设备的队列（包括 ingress）
-    echo "Cleaning IFB device queues..."
+    # 清理 IFB 设备队列
     if ip link show dev "$ifb_dev" >/dev/null 2>&1; then
         if tc qdisc show dev "$ifb_dev" root 2>/dev/null | grep -qE "hfsc|cake|fq_codel|htb"; then
             echo "  Deleting root queue on $ifb_dev..."
@@ -159,37 +129,26 @@ stop_qos() {
         fi
     fi
     
-    # 清除 QoS 特定的 NFT 规则（由算法模块负责清理，此处只确保清空）
+    # 清除 QoS 特定的 NFT 规则
     echo "Clearing QoS-specific NFT rules..."
     if nft list table inet gargoyle-qos-priority >/dev/null 2>&1; then
-        echo "  Flushing QoS NFT rules..."
         nft flush table inet gargoyle-qos-priority 2>/dev/null
-        # 注意：不删除表，因为算法模块停止时会删除表
-    else
-        echo "  QoS NFT table not found, skipping"
     fi
     
-    # 不删除 IFB 设备
-    echo "Note: IFB device $ifb_dev is not deleted to avoid network disruption"
-    echo "To manually remove IFB device: ip link delete $ifb_dev"
-	
     echo "QoS system stopped (network preserved)"
 }
 
-# ========== OpenWRT 标准函数（传统 init.d 方式）==========
-
-start() {
+# ========== procd 标准函数 ==========
+start_service() {
     echo "Starting QoS Gargoyle service..."
     
-    # 修复：使用临时文件方式处理 Windows 换行符（BusyBox sed 不支持 -i）
+    # 清理 Windows 换行符
     if [ -d "$QOS_MODULES_DIR" ]; then
         echo "Removing Windows line endings from scripts..."
         for f in "$QOS_MODULES_DIR"/*.sh; do
-            [ -f "$f" ] && sed 's/\r$//' "$f" > "$f.tmp" && mv "$f.tmp" "$f" 2>/dev/null || echo "Warning: Failed to process $f"
+            [ -f "$f" ] && sed 's/\r$//' "$f" > "$f.tmp" && mv "$f.tmp" "$f" 2>/dev/null
         done
     fi
-
-    # 清理 UCI 配置文件中的 Windows 换行符
     if [ -f "/etc/config/$CONFIG_FILE" ]; then
         echo "Cleaning Windows line endings from UCI config..."
         sed 's/\r$//' "/etc/config/$CONFIG_FILE" > "/etc/config/$CONFIG_FILE.tmp" && \
@@ -201,146 +160,130 @@ start() {
     
     if ! is_config_enabled; then
         echo "QoS is disabled in configuration. Use 'enable' command first."
-        save_service_status "stopped"
         return 0
     fi
     
     init_qos
-    ret=$?
-    echo "init_qos returned: $ret"
+    local ret=$?
     
     if [ $ret -eq 0 ]; then
         echo "QoS Gargoyle started successfully"
-        save_service_status "running"
-        exit 0
+        # procd 会记录进程状态，无需额外状态文件
+        return 0
     else
         echo "QoS Gargoyle failed to start"
-        save_service_status "error"
-        exit 1
+        return 1
     fi
 }
-stop() {
-    # 确保规则辅助模块已加载（提供 acquire_lock 等函数）
-    load_common_libraries
-    
-    # 获取锁，防止与启动并发
-    acquire_lock || {
-        echo "无法获取锁，停止操作可能冲突" >&2
-        return 1
-    }
-    
+
+stop_service() {
     echo "Stopping QoS Gargoyle service..."
     
-    # 获取当前算法
+    # 加载必要的库（为 stop_qos 提供变量）
+    load_common_libraries
+    
     local algo=$(uci -q get "$CONFIG_FILE.global.algorithm" 2>/dev/null)
     algo=${algo:-htb_cake}
     local module="/usr/lib/qos_gargoyle/${algo}.sh"
     
-    # 先检查停止函数是否存在，若不存在再加载模块（避免重复 source 导致变量重置）
-    if ! type stop_${algo}_qos >/dev/null 2>&1; then
+    # 尝试调用算法模块的停止函数
+    if type stop_${algo}_qos >/dev/null 2>&1; then
+        stop_${algo}_qos 2>/dev/null
+    else
+        # 如果模块未加载，尝试加载
         if [ -f "$module" ]; then
             . "$module"
+            if type stop_${algo}_qos >/dev/null 2>&1; then
+                stop_${algo}_qos 2>/dev/null
+            else
+                echo "Warning: stop_${algo}_qos not found, using generic cleanup"
+                stop_qos
+            fi
         else
             echo "Warning: Algorithm module $module not found, using generic cleanup"
-            # 仍然需要加载必要的变量
-            if [ -z "$IFB_DEVICE" ]; then
-                IFB_DEVICE=$(uci -q get "$CONFIG_FILE.download.ifb_device" 2>/dev/null)
-                IFB_DEVICE="${IFB_DEVICE:-ifb0}"
-            fi
             stop_qos
-            release_lock
-            echo "QoS Gargoyle stopped (generic)"
-            save_service_status "stopped"
-            return 0
         fi
     fi
     
-    # 调用对应的停止函数
-    stop_${algo}_qos 2>/dev/null || {
-        echo "停止函数 stop_${algo}_qos 执行失败，使用通用清理"
-        stop_qos
-    }
-    
     echo "QoS Gargoyle stopped"
-    save_service_status "stopped"
-    release_lock
-    return 0
 }
 
-restart() {
-    echo "Restarting QoS Gargoyle..."
-    stop
-    sleep 2
-    if is_config_enabled; then
-        start
-        return $?
+reload_service() {
+    echo "Reloading QoS Gargoyle configuration..."
+    if is_service_running; then
+        stop_service
+        sleep 1
+        start_service
     else
-        echo "QoS is disabled in configuration, not restarting."
-        return 0
+        load_common_libraries
+        load_qos_config
+        echo "Configuration reloaded (service remains stopped)"
     fi
 }
 
+# ========== 额外命令函数 ==========
 enable() {
     echo "Enabling QoS Gargoyle..."
-    
-    # 手动创建启动链接
-    echo "创建启动链接..."
-    local start_link="/etc/rc.d/S${START}${SERVICE_NAME}"
-    local stop_link="/etc/rc.d/K${STOP}${SERVICE_NAME}"
-    
-    rm -f "/etc/rc.d/S[0-9][0-9]${SERVICE_NAME}" 2>/dev/null
-    rm -f "/etc/rc.d/K[0-9][0-9]${SERVICE_NAME}" 2>/dev/null
-    
-    ln -sf "../init.d/${SERVICE_NAME}" "${start_link}"
-    ln -sf "../init.d/${SERVICE_NAME}" "${stop_link}"
-    
-    echo "启动链接创建完成:"
-    ls -l "${start_link}"
-    ls -l "${stop_link}"
-    
     update_config_state "enable"
-    
-    # 不立即启动服务，由用户通过 start 命令手动启动
-    save_service_status "stopped"
-    
-    echo "✅ QoS Gargoyle enabled (autostart at boot enabled, but service not started automatically)"
-    echo "Use 'start' command to start the service now."
-    return 0
+    # 启用后立即启动
+    start_service
+    # 设置开机自启（procd 自动处理，只需确保 UCI 已启用）
+    echo "✅ QoS Gargoyle enabled and started"
 }
 
 disable() {
     echo "Disabling QoS Gargoyle..."
-    
     update_config_state "disable"
-    
-    echo "Stopping QoS service..."
-    stop
-    
-    echo "删除启动链接..."
-    local start_link="/etc/rc.d/S${START}${SERVICE_NAME}"
-    local stop_link="/etc/rc.d/K${STOP}${SERVICE_NAME}"
-    
-    rm -f "${start_link}" 2>/dev/null && echo "已删除 ${start_link}" || echo "未找到 ${start_link}"
-    rm -f "${stop_link}" 2>/dev/null && echo "已删除 ${stop_link}" || echo "未找到 ${stop_link}"
-    
-    rm -f "/etc/rc.d/S[0-9][0-9]${SERVICE_NAME}" 2>/dev/null
-    rm -f "/etc/rc.d/K[0-9][0-9]${SERVICE_NAME}" 2>/dev/null
-    
-    echo "✅ QoS Gargoyle disabled (configuration updated, service stopped)"
-    echo "Note: Network connectivity is preserved"
-    return 0
+    stop_service
+    echo "✅ QoS Gargoyle disabled and stopped"
 }
 
-reload() {
-    echo "Reloading QoS Gargoyle configuration..."
-    if is_service_running; then
-        echo "Service is running, restarting with new configuration..."
-        restart
+show() {
+    echo "=== QoS Gargoyle Status Report ==="
+    echo "Time: $(date)"
+    echo ""
+    
+    local config_enabled=$(uci -q get "$CONFIG_FILE.global.enabled" 2>/dev/null)
+    local running=$(is_service_running && echo "yes" || echo "no")
+    
+    echo "Service Status:"
+    echo "  Configuration: $( [ "$config_enabled" = "1" ] && echo "enabled" || echo "disabled" )"
+    echo "  Running: $running"
+    echo ""
+    
+    if [ "$running" = "no" ]; then
+        echo "QoS is not currently running."
+        echo "To start, use: /etc/init.d/qos_gargoyle start"
+        return 0
+    fi
+    
+    load_common_libraries
+    load_qos_config
+    display_algorithm_specific_status
+}
+
+status() {
+    show
+    echo ""
+    echo "=== System and Performance Information ==="
+    echo ""
+    echo "1. System Load:"
+    uptime
+    echo ""
+    echo "2. Memory Usage:"
+    free -h | grep -E "Mem:|Swap:"
+    echo ""
+    echo "3. Interface Statistics:"
+    if [ -n "$qos_interface" ]; then
+        echo "   $qos_interface:"
+        ip -s link show dev "$qos_interface" 2>/dev/null | tail -5
+    fi
+    echo ""
+    echo "4. QoS accing:"
+    if pgrep -x "qosacc" >/dev/null; then
+        echo "   QoS acc is running (PID: $(pgrep -x qosacc))"
     else
-        echo "Service is not running, just reloading configuration..."
-        load_common_libraries
-        load_qos_config
-        echo "Configuration reloaded (service remains stopped)"
+        echo "   QoS acc is not running"
     fi
 }
 
@@ -356,7 +299,7 @@ load_common_libraries() {
     if [ -f "/lib/network" ]; then
         include /lib/network
     fi
-    # 加载 rule.sh 以获取锁函数和其他辅助函数
+    # 加载 rule.sh（提供辅助函数，但不含锁）
     if [ -f "$RULE_HELPER" ]; then
         . "$RULE_HELPER"
     else
@@ -365,14 +308,13 @@ load_common_libraries() {
     fi
 }
 
-# 加载算法模块
 load_algorithm_module() {
     local algo="$1"
     local module=""
     
     case "$algo" in
-        "hfsc_cake") module="$HFSC_CAKE_MODULE" ;;   
-        "htb_cake") module="$HTB_CAKE_MODULE" ;; 
+        "hfsc_cake") module="$HFSC_CAKE_MODULE" ;;
+        "htb_cake") module="$HTB_CAKE_MODULE" ;;
         "cake") module="$CAKE_MODULE" ;;
         "cake_dscp") module="$CAKE_DSCP_MODULE" ;;
         "htb_fqcodel") module="$HTB_MODULE" ;;
@@ -393,7 +335,6 @@ load_algorithm_module() {
     fi
 }
 
-# 加载 QoS 配置
 load_qos_config() {
     echo "加载 UCI 配置..." >&2
     
@@ -407,10 +348,8 @@ load_qos_config() {
   
     qos_interface=$(uci -q get "$CONFIG_FILE.global.wan_interface")
     
-    # === 读取 IFB 设备 ===
     IFB_DEVICE=$(uci -q get "$CONFIG_FILE.download.ifb_device")
     IFB_DEVICE="${IFB_DEVICE:-ifb0}"
-    # =========================
     
     if [ -z "$qos_interface" ] || [ "$qos_interface" = "auto" ]; then
         echo "wan_interface 未配置或为 auto，尝试自动检测..." >&2
@@ -437,73 +376,41 @@ load_qos_config() {
 
     echo "加载配置完成：算法=$algorithm, 上传带宽=${total_upload_bandwidth}kbit, 下载带宽=${total_download_bandwidth}kbit, 接口=$qos_interface, IFB=$IFB_DEVICE" >&2
 
-    # 导出变量供算法模块使用（可选）
     export algorithm total_upload_bandwidth total_download_bandwidth qos_interface IFB_DEVICE
 
     return 0
 }
 
-# 获取网络接口信息
 get_network_info() {
     echo "Defining network interfaces..."
 
-    # --- 确定 WAN 接口 ---
     if [ -z "$qos_interface" ]; then
-        # 1. 从 UCI 读取用户配置的 WAN 接口（优先）
-        qos_interface=$(uci -q get "$CONFIG_FILE.global.wan_interface")
-
-        # 2. 如果未配置，使用 network_find_wan 自动查找
-        if [ -z "$qos_interface" ]; then
-            network_find_wan qos_interface 2>/dev/null
-        fi
-
-        # 3. 如果仍为空，尝试常见接口名称（按可能性排序）
-        if [ -z "$qos_interface" ]; then
-            for iface in pppoe-wan eth0.2 wan eth1; do
-                if ip link show "$iface" >/dev/null 2>&1; then
-                    qos_interface="$iface"
-                    break
-                fi
-            done
-        fi
-
-        # 4. 最终检查：若仍为空，报错退出
-        if [ -z "$qos_interface" ]; then
-            echo "错误: 无法确定 WAN 接口，请检查网络配置。" >&2
-            return 1
-        fi
+        echo "错误: 无法确定 WAN 接口，请检查网络配置。" >&2
+        return 1
     fi
 
-    # --- 获取 WAN IPv4 地址 ---
     wan_ip=""
     if ! network_get_ipaddr wan_ip "$qos_interface" 2>/dev/null; then
-        # 后备：使用 ip 命令手动获取
         wan_ip=$(ip -4 addr show dev "$qos_interface" 2>/dev/null | \
                  awk '/inet / {split($2, a, "/"); print a[1]; exit}')
     fi
 
-    # --- 获取 WAN IPv6 地址 ---
     wan_ip6=""
     if ! network_get_ipaddr6 wan_ip6 "$qos_interface" 2>/dev/null; then
-        # 后备：使用 ip 命令，并过滤掉链路本地地址（fe80::/10）
         wan_ip6=$(ip -6 addr show dev "$qos_interface" 2>/dev/null | \
                   awk '/inet6 / && !/fe80/ {split($2, a, "/"); print a[1]; exit}')
     fi
 
-    # --- 获取 LAN IPv4 地址 ---
     local_ip=""
-    # 优先尝试标准 LAN 接口名称
     for l_iface in lan br-lan eth0.1; do
         if network_get_ipaddr local_ip "$l_iface" 2>/dev/null; then
             break
         fi
-        # 后备：使用 ip 命令
         local_ip=$(ip -4 addr show dev "$l_iface" 2>/dev/null | \
                    awk '/inet / {split($2, a, "/"); print a[1]; exit}')
         [ -n "$local_ip" ] && break
     done
 
-    # --- 获取 LAN IPv6 地址 ---
     local_ip6=""
     for l_iface in lan br-lan eth0.1; do
         if network_get_ipaddr6 local_ip6 "$l_iface" 2>/dev/null; then
@@ -514,7 +421,6 @@ get_network_info() {
         [ -n "$local_ip6" ] && break
     done
 
-    # --- 输出信息 ---
     echo " 接口: $qos_interface"
     echo " WAN IPv4: $wan_ip"
     echo " WAN IPv6: $wan_ip6"
@@ -522,7 +428,6 @@ get_network_info() {
     echo " LAN IPv6: $local_ip6"
 }
 
-# 检查配置是否有效
 check_configuration() {
     local enabled=$(uci -q get "$CONFIG_FILE.global.enabled")
     if [ "$enabled" != "1" ]; then
@@ -539,7 +444,6 @@ check_configuration() {
     return 0
 }
 
-# 等待网络接口就绪（使用简单循环计数，避免依赖 date +%s）
 wait_interface() {
     local iface="$1"
     local timeout="${2:-15}"
@@ -554,7 +458,6 @@ wait_interface() {
 
     echo "等待接口 $iface 就绪 (超时 ${timeout}秒, 协议: $proto)..."
 
-    # 等待设备出现
     local wait_exists=$((timeout / 3))
     [ $wait_exists -lt 1 ] && wait_exists=1
     while [ $elapsed -lt $wait_exists ]; do
@@ -570,7 +473,6 @@ wait_interface() {
         return 1
     fi
 
-    # 等待获得地址
     local addr_ok=0
     elapsed=0
     while [ $elapsed -lt $timeout ]; do
@@ -602,12 +504,10 @@ wait_interface() {
     fi
 }
 
-# 创建/检查 IFB 设备（与 ifb.init 配合，不破坏现有设备）
 create_ifb_device() {
     local ifb="${IFB_DEVICE:-ifb0}"
     echo "Ensuring IFB device $ifb is available..."
 
-    # 1. 确保 IFB 内核模块已加载
     if ! lsmod | grep -q "^ifb"; then
         echo "Loading IFB kernel module..."
         modprobe ifb 2>/dev/null || {
@@ -616,28 +516,20 @@ create_ifb_device() {
         }
     fi
 
-    # 2. 检查设备是否存在
     if ip link show dev "$ifb" >/dev/null 2>&1; then
-        # 设备已存在，只需确保 UP
-        ip link set dev "$ifb" up 2>/dev/null || {
-            echo "Warning: Failed to bring $ifb up"
-        }
+        ip link set dev "$ifb" up 2>/dev/null
         echo "IFB device $ifb already exists, using it."
         return 0
     fi
 
-    # 3. 设备不存在，创建并配置
     echo "Creating IFB device $ifb..."
     ip link add "$ifb" type ifb 2>/dev/null || {
         echo "Error: Failed to create IFB device $ifb"
         return 1
     }
 
-    ip link set dev "$ifb" up 2>/dev/null || {
-        echo "Warning: Failed to bring $ifb up"
-    }
+    ip link set dev "$ifb" up 2>/dev/null
 
-    # 从 WAN 接口同步 MTU（若可用）
     local wan_iface="$qos_interface"
     if [ -n "$wan_iface" ] && [ -d "/sys/class/net/$wan_iface" ]; then
         local wan_mtu=$(cat /sys/class/net/$wan_iface/mtu 2>/dev/null)
@@ -647,10 +539,8 @@ create_ifb_device() {
         fi
     fi
 
-    # 设置队列长度：尝试从配置读取，否则自动计算
     local tx_queue_len=$(uci -q get "$CONFIG_FILE.download.tx_queue_len" 2>/dev/null)
     if [ -z "$tx_queue_len" ]; then
-        # 自动计算：基于带宽的简单公式，最小1000
         if [ -n "$total_download_bandwidth" ] && [ "$total_download_bandwidth" -gt 0 ]; then
             tx_queue_len=$(( total_download_bandwidth / 100 ))
             [ "$tx_queue_len" -lt 1000 ] && tx_queue_len=1000
@@ -671,8 +561,6 @@ load_bandwidth_config() {
     echo " Download bandwidth: $total_download_bandwidth kbit/s"
 }
 
-# 启动 QoS 监控（使用 start-stop-daemon）
-# 返回值：0=成功或未启用，1=启动失败
 start_qos_acc() {
     echo "Starting QoS acc..."
     
@@ -687,30 +575,19 @@ start_qos_acc() {
         return 1
     fi
     
-    # 获取目标 IP
     local ptarget_ip=$(uci -q get "$CONFIG_FILE.global.ptarget_ip")
     if [ -z "$ptarget_ip" ]; then
-        echo "自动检测 ping 目标..."
-        # 尝试使用默认网关
         ptarget_ip=$(ip route show default 2>/dev/null | awk '/default/ {print $3}')
-        if [ -z "$ptarget_ip" ]; then
-            echo "Warning: Cannot determine ping target, QoS acc may not work correctly"
-        fi
     fi
     
-    # 获取 pinglimit
     local pinglimit=$(uci -q get "$CONFIG_FILE.download.pinglimit")
     if [ -z "$pinglimit" ]; then
-        # 自动计算：基于带宽的经验公式（参考原 qosmon）
         if [ -n "$total_download_bandwidth" ] && [ "$total_download_bandwidth" -gt 0 ] && \
            [ -n "$total_upload_bandwidth" ] && [ "$total_upload_bandwidth" -gt 0 ]; then
             pinglimit=$((1500 * 10 * 2 / 3 / total_download_bandwidth + 1500 * 10 / total_upload_bandwidth + 2))
-        else
-            pinglimit=""
         fi
     fi
     
-    # 使用 start-stop-daemon 启动 qosacc
     local ret=0
     if command -v start-stop-daemon >/dev/null 2>&1; then
         if [ -n "$ptarget_ip" ] && [ -n "$total_download_bandwidth" ] && [ -n "$pinglimit" ]; then
@@ -721,7 +598,6 @@ start_qos_acc() {
             ret=$?
         fi
     else
-        # 降级方案
         if [ -n "$ptarget_ip" ] && [ -n "$total_download_bandwidth" ] && [ -n "$pinglimit" ]; then
             qosacc -a -b 800 "$ptarget_ip" "$total_download_bandwidth" "$pinglimit" &
             ret=$?
@@ -743,21 +619,12 @@ start_qos_acc() {
 init_qos() {
     echo "init QoS system..."
     
-    # 获取锁（使用 rule.sh 的统一锁函数）
-    if ! acquire_lock; then
-        echo "无法获取锁，启动中止" >&2
-        return 1
-    fi
-    
     if ! load_qos_config; then
-        release_lock
         return 1
     fi
     
-    # 等待接口同时具有 IPv4 和 IPv6 地址（使用 both）
     if ! wait_interface "$qos_interface" 15 both; then
         echo "WAN 接口未就绪（无 IP 地址），启动中止" >&2
-        release_lock
         return 1
     fi
     
@@ -765,33 +632,25 @@ init_qos() {
     
     if ! check_configuration; then
         echo "QoS configuration is invalid or disabled"
-        release_lock
         return 1
     fi
     
     # 先停止现有队列（确保干净状态）
     stop_qos
     
-    # 注意：nftables 基础结构（表、钩子链）完全由算法模块（通过 rule.sh）负责初始化，
-    # 主脚本不再单独创建，避免与算法模块重复。
-    
     if ! create_ifb_device; then
         echo "IFB 设备创建失败，启动中止" >&2
-        release_lock
         return 1
     fi
     
     load_bandwidth_config
     
-    # 加载算法模块
     if ! load_algorithm_module "$algorithm"; then
         echo "Failed to load algorithm module: $algorithm"
         stop_qos
-        release_lock
         return 1
     fi
     
-    # 调用算法特定的初始化，统一传递一个参数（无参数也可，但为了兼容性传递 start）
     local ALGO_RET=0
     case "$algorithm" in
         "cake"|"cake_dscp")
@@ -799,11 +658,9 @@ init_qos() {
             if type init_cake_qos >/dev/null 2>&1; then
                 init_cake_qos start
                 ALGO_RET=$?
-                echo "DEBUG: init_cake_qos start returned $ALGO_RET"
             else
                 echo "CAKE initialization function not found"
                 stop_qos
-                release_lock
                 return 1
             fi
             ;;
@@ -815,7 +672,6 @@ init_qos() {
             else
                 echo "HTB initialization function not found"
                 stop_qos
-                release_lock
                 return 1
             fi
             ;;
@@ -827,7 +683,6 @@ init_qos() {
             else
                 echo "HFSC+CAKE initialization function not found"
                 stop_qos
-                release_lock
                 return 1
             fi
             ;;
@@ -839,74 +694,37 @@ init_qos() {
             else
                 echo "HTB+CAKE initialization function not found"
                 stop_qos
-                release_lock
                 return 1
             fi
             ;;
         *)
             echo "Unknown algorithm: $algorithm"
             stop_qos
-            release_lock
             return 1
             ;;
     esac
     
-    # 检查算法初始化是否成功（通过返回值）
     if [ $ALGO_RET -ne 0 ]; then
         echo "算法模块初始化失败 (返回值: $ALGO_RET)"
         stop_qos
-        release_lock
         return 1
     fi
     
-    # 启动 QoS 监控（失败仅记录警告，不影响主流程）
     start_qos_acc
     if [ $? -ne 0 ]; then
         echo "Warning: QoS acc failed to start, but QoS core is running."
     fi
-	
-    release_lock
     
-	# 锁外，因为加载自定义表不依赖锁保护，且可减少锁持有时间。
     load_custom_full_table
     if [ $? -ne 0 ]; then
         log_warn "完整表规则加载失败，但 QoS 核心已启动"
     fi
-	
+    
     echo "✅ QoS init successfully (Algorithm: $algorithm)"
     return 0
 }
 
-# ========== 状态显示函数 ==========
-
-show() {
-    echo "=== QoS Gargoyle Status Report ==="
-    echo "Time: $(date)"
-    echo ""
-    
-    local service_status=$(get_service_status)
-    local config_enabled=$(uci -q get "$CONFIG_FILE.global.enabled" 2>/dev/null)
-    local running=$(is_service_running && echo "yes" || echo "no")
-    
-    echo "Service Status:"
-    echo "  Configuration: $(if [ "$config_enabled" = "1" ]; then echo "enabled"; else echo "disabled"; fi)"
-    echo "  Service State: $service_status"
-    echo "  Running: $running"
-    echo ""
-    
-    if [ "$running" = "no" ]; then
-        echo "QoS is not currently running."
-        echo "To start, use: /etc/init.d/qos_gargoyle start"
-        echo "Or enable permanently: /etc/init.d/qos_gargoyle enable"
-        return 0
-    fi
-    
-    load_common_libraries
-    load_qos_config
-    
-    display_algorithm_specific_status
-}
-
+# ========== 状态显示辅助 ==========
 display_algorithm_specific_status() {
     if ! load_algorithm_module "$algorithm"; then
         echo "Failed to load algorithm module: $algorithm"
@@ -954,36 +772,6 @@ display_algorithm_specific_status() {
     esac
 }
 
-status() {
-    show
-    
-    echo ""
-    echo "=== System and Performance Information ==="
-    echo ""
-    
-    echo "1. System Load:"
-    uptime
-    echo ""
-    
-    echo "2. Memory Usage:"
-    free -h | grep -E "Mem:|Swap:"
-    echo ""
-    
-    echo "3. Interface Statistics:"
-    if [ -n "$qos_interface" ]; then
-        echo "   $qos_interface:"
-        ip -s link show dev "$qos_interface" 2>/dev/null | tail -5
-    fi
-    echo ""
-    
-    echo "4. QoS accing:"
-    if pgrep -x "qosacc" >/dev/null; then
-        echo "   QoS acc is running (PID: $(pgrep -x qosacc))"
-    else
-        echo "   QoS acc is not running"
-    fi
-}
-
 show_basic_status() {
     echo "TC Queue Status:"
     tc qdisc show 2>/dev/null || echo "  No TC queues found"
@@ -998,18 +786,5 @@ show_basic_status() {
     echo ""
 }
 
-# ========== 开机启动 ==========
-boot() {
-    start
-}
-
-# ========== 命令行参数处理 ==========
-case "$1" in
-    start|stop|restart|enable|disable|reload|show|status|boot)
-        "$1"
-        ;;
-    *)
-        echo "Usage: $0 {start|stop|restart|enable|disable|reload|show|status}"
-        exit 1
-        ;;
-esac
+# ========== 脚本入口（procd 自动处理） ==========
+# 不再需要手动解析参数，procd 会根据 EXTRA_COMMANDS 调用对应函数
