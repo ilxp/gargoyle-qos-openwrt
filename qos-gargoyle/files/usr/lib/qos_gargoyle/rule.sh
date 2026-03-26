@@ -1,6 +1,6 @@
 #!/bin/bash
 # 规则辅助模块 (rule.sh)
-# 版本: 3.4.5 - 修复 meter 语法、DSCP 映射顺序、动态分类标记、增强规则 ct mark、ICMP 否定逻辑
+# 版本: 3.4.6 - 修复 UDP 限速规则插入位置为链首，确保优先执行
 # 完全移除锁机制，适配 procd 管理
 
 # 加载核心库（已修复）
@@ -762,7 +762,7 @@ apply_enhanced_direction_rules() {
     return $batch_success
 }
 
-# 应用增强功能（ACK限速、TCP升级、UDP限速,动态分类） 修复：同时设置 meta mark 和 ct mark
+# 应用增强功能（ACK限速、TCP升级、UDP限速,动态分类） 修复：同时设置 meta mark 和 ct mark，并确保 UDP 规则插入链首
 apply_enhanced_features() {
     if [[ $ENABLE_ACK_LIMIT -eq 1 ]]; then
         qos_log "INFO" "ACK 限速已启用，生成规则..."
@@ -821,8 +821,9 @@ apply_enhanced_features() {
         if [[ -n "$udp_limit_rules" ]]; then
             local udp_file=$(mktemp)
             register_temp_file "$udp_file"
-            # 修复：同时设置 meta mark 和 ct mark
+            # 修复：同时设置 meta mark 和 ct mark，并使用 insert rule 确保优先执行
             udp_limit_rules=$(echo "$udp_limit_rules" | sed 's/meta mark set \([0-9]\+\)/meta mark set \1 ct mark set \1/g')
+            udp_limit_rules=$(echo "$udp_limit_rules" | sed 's/^add rule/insert rule/')
             echo "$udp_limit_rules" > "$udp_file"
             qos_log "INFO" "UDP 限速规则文件内容:"
             cat "$udp_file" | logger -t qos_gargoyle
