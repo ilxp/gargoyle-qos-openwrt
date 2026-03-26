@@ -1,6 +1,6 @@
 #!/bin/bash
 # 核心库模块 (common.sh)
-# 版本: 3.4.0 - 修复锁机制、UCI函数作用域、未定义函数、变量作用域等问题
+# 版本: 3.4.1 - 优化锁机制、模块检测、配置恢复、变量作用域
 # 提供 QoS 系统基础功能
 
 # ========== 加载 OpenWrt 标准函数库 ==========
@@ -43,7 +43,7 @@ if [[ -z "$_QOS_LIB_SH_LOADED" ]]; then
     UDP_RATE_LIMIT_ACTION="mark"
     UDP_RATE_LIMIT_MARK_CLASS="bulk"
     AUTO_SPEEDTEST=0
-    ENABLE_DYNAMIC_CLASSIFY=0          # 新增：动态分类总开关默认值
+    ENABLE_DYNAMIC_CLASSIFY=0
     _QOS_TABLE_FLUSHED=0
     _IPSET_LOADED=0
     _HOOKS_SETUP=0
@@ -52,30 +52,32 @@ if [[ -z "$_QOS_LIB_SH_LOADED" ]]; then
     _EBPF_LOADED=0
 
     declare -A UCI_CACHE
-    declare -A _SET_FAMILY_CACHE=()
+    declare -A _SET_FAMILY_CACHE
     TEMP_FILES=()
 fi
 
-# ========== 锁机制（基于文件描述符，简化版） ==========
+# ========== 锁机制（支持递归） ==========
 LOCK_FILE="/var/run/qos_gargoyle.lock"
 _LOCK_HELD=0
+_LOCK_FD=3
 
 acquire_lock() {
     if [[ $_LOCK_HELD -eq 1 ]]; then
+        # 已持有锁，直接返回成功（递归）
         return 0
     fi
     # 打开文件描述符（用于持锁）
-    exec 3> "$LOCK_FILE"
+    eval "exec $_LOCK_FD> \"$LOCK_FILE\""
     # 非阻塞尝试加锁
-    if flock -n 3; then
+    if flock -n $_LOCK_FD; then
         # 成功加锁
         echo $$ > "$LOCK_FILE"
         _LOCK_HELD=1
         return 0
     fi
-    # 加锁失败，直接返回错误（不再使用 fuser 和删除文件）
+    # 加锁失败，关闭文件描述符并返回错误
     log_error "锁已被占用"
-    exec 3>&-
+    eval "exec $_LOCK_FD>&-"
     return 1
 }
 
@@ -83,8 +85,8 @@ release_lock() {
     if [[ $_LOCK_HELD -eq 0 ]]; then
         return 0
     fi
-    flock -u 3 2>/dev/null || true
-    exec 3>&-
+    flock -u $_LOCK_FD 2>/dev/null || true
+    eval "exec $_LOCK_FD>&-"
     _LOCK_HELD=0
 }
 
@@ -137,7 +139,17 @@ log() {
     done
 }
 
-# ========== 临时文件清理 ==========
+# ========== 临时文件管理 ==========
+register_temp_file() {
+    local file="$1"
+    if [[ -n "$file" && -f "$file" ]]; then
+        TEMP_FILES+=("$file")
+    else
+        # 如果文件不存在，仍记录路径以便清理（可能稍后创建）
+        TEMP_FILES+=("$file")
+    fi
+}
+
 cleanup_temp_files() {
     for f in "${TEMP_FILES[@]}"; do
         rm -f "$f" 2>/dev/null
@@ -518,7 +530,7 @@ check_inline_forbidden_keywords() {
 validate_inline_rules() {
     local file_path="$1"
     local check_file=$(mktemp)
-    TEMP_FILES+=("$check_file")
+    register_temp_file "$check_file"
     local ret=0
     if ! check_inline_forbidden_keywords "$file_path"; then
         rm -f "$check_file"
@@ -584,7 +596,7 @@ allocate_class_marks() {
     local base_value i=1 mark mark_index
     local -a used_indexes=()
     local temp_file=$(mktemp /tmp/qos_marks_XXXXXX)
-    TEMP_FILES+=("$temp_file")
+    register_temp_file "$temp_file"
     init_class_marks_file
     if [[ "$direction" == "upload" ]]; then
         base_value=1
@@ -834,7 +846,7 @@ generate_ipset_sets() {
     fi
     config_load "$CONFIG_FILE" 2>/dev/null
     local IPSET_TEMP_FILE=$(mktemp /tmp/qos_ipset_sets_XXXXXX)
-    TEMP_FILES+=("$IPSET_TEMP_FILE")
+    register_temp_file "$IPSET_TEMP_FILE"
     > "$SET_FAMILIES_FILE"
     local sections=$(load_all_config_sections "$CONFIG_FILE" "ipset")
     for section in $sections; do
@@ -1068,72 +1080,6 @@ process_ratelimit_section() {
     fi
 }
 
-generate_udp_limit_rules() {
-    local udp_enable=$(uci -q get ${CONFIG_FILE}.udp_limit.enabled 2>/dev/null)
-    local udp_rate=$(uci -q get ${CONFIG_FILE}.udp_limit.rate 2>/dev/null)
-    local udp_action=$(uci -q get ${CONFIG_FILE}.udp_limit.action 2>/dev/null)
-    local udp_mark_class=$(uci -q get ${CONFIG_FILE}.udp_limit.mark_class 2>/dev/null)
-
-    case "$udp_enable" in 1|yes|true|on) udp_enable=1 ;; *) udp_enable=0 ;; esac
-    [[ -z "$udp_rate" ]] && udp_rate=450
-    [[ -z "$udp_action" ]] && udp_action="mark"
-    [[ -z "$udp_mark_class" ]] && udp_mark_class="bulk"
-
-    if [[ "$udp_enable" != "1" ]] || [[ "$udp_rate" -le 0 ]]; then
-        return
-    fi
-
-    local upload_mark="" download_mark=""
-    if [[ "$udp_action" == "mark" ]]; then
-        if [[ -z "$upload_class_list" ]]; then
-            load_upload_class_configurations
-        fi
-        if [[ -z "$download_class_list" ]]; then
-            load_download_class_configurations
-        fi
-        for class in $upload_class_list; do
-            local name=$(uci -q get ${CONFIG_FILE}.${class}.name 2>/dev/null)
-            if [[ "$name" == "$udp_mark_class" ]]; then
-                upload_mark=$(get_class_mark "upload" "$class")
-                break
-            fi
-        done
-        for class in $download_class_list; do
-            local name=$(uci -q get ${CONFIG_FILE}.${class}.name 2>/dev/null)
-            if [[ "$name" == "$udp_mark_class" ]]; then
-                download_mark=$(get_class_mark "download" "$class")
-                break
-            fi
-        done
-        if [[ -z "$upload_mark" ]] || [[ -z "$download_mark" ]]; then
-            log_warn "UDP 速率限制目标类 '$udp_mark_class' 未同时存在于上传/下载类中，将回退到丢弃动作"
-            udp_action="drop"
-        fi
-    fi
-
-    local wan_if="${qos_interface:-$(uci -q get ${CONFIG_FILE}.global.wan_interface 2>/dev/null)}"
-    if [[ -z "$wan_if" ]]; then
-        log_warn "无法确定 WAN 接口，UDP 速率限制规则将被跳过"
-        return
-    fi
-
-    local rules=""
-    if [[ "$udp_action" == "mark" ]] && [[ -n "$upload_mark" ]] && [[ -n "$download_mark" ]]; then
-        rules="${rules}
-# Global UDP rate limit - upload direction (mark)
-add rule inet gargoyle-qos-priority filter_qos_egress oifname \"$wan_if\" meta l4proto udp limit rate over ${udp_rate}/second counter meta mark set $upload_mark
-# Global UDP rate limit - download direction (mark)
-add rule inet gargoyle-qos-priority filter_qos_ingress iifname \"$wan_if\" meta l4proto udp limit rate over ${udp_rate}/second counter meta mark set $download_mark"
-    elif [[ "$udp_action" == "drop" ]]; then
-        rules="${rules}
-# Global UDP rate limit - drop
-add rule inet gargoyle-qos-priority filter_qos_egress meta l4proto udp limit rate over ${udp_rate}/second counter drop
-add rule inet gargoyle-qos-priority filter_qos_ingress meta l4proto udp limit rate over ${udp_rate}/second counter drop"
-    fi
-
-    echo "$rules"
-}
-
 generate_ratelimit_rules() {
     [[ $ENABLE_RATELIMIT != 1 ]] && return
     # 确保 config_load 可用
@@ -1142,7 +1088,7 @@ generate_ratelimit_rules() {
     fi
     config_load "$CONFIG_FILE" 2>/dev/null
     local RATELIMIT_TEMP_FILE=$(mktemp /tmp/qos_ratelimit_rules_XXXXXX)
-    TEMP_FILES+=("$RATELIMIT_TEMP_FILE")
+    register_temp_file "$RATELIMIT_TEMP_FILE"
     local sections=$(load_all_config_sections "$CONFIG_FILE" "ratelimit")
     for section in $sections; do
         process_ratelimit_section "$section"
@@ -1163,7 +1109,7 @@ setup_ratelimit_chain() {
         done
 
         local temp_ratelimit_file=$(mktemp /tmp/qos_ratelimit_XXXXXX)
-        TEMP_FILES+=("$temp_ratelimit_file")
+        register_temp_file "$temp_ratelimit_file"
         echo "create chain inet gargoyle-qos-priority $RATELIMIT_CHAIN '{ type filter hook forward priority -10; policy accept; }'" > "$temp_ratelimit_file"
         echo "flush chain inet gargoyle-qos-priority $RATELIMIT_CHAIN" >> "$temp_ratelimit_file"
         echo "$rules" | while IFS= read -r rule; do
@@ -1244,6 +1190,73 @@ generate_tcp_upgrade_rules() {
 add rule inet gargoyle-qos-priority filter_qos_egress meta l4proto tcp ct state established meta nfproto ipv4 limit rate 150/second burst 150 packets add @qos_slow_tcp { ct id . ct direction } meta mark set $realtime_mark counter
 add rule inet gargoyle-qos-priority filter_qos_egress meta l4proto tcp ct state established meta nfproto ipv6 limit rate 150/second burst 150 packets add @qos_slow_tcp { ct id . ct direction } meta mark set $realtime_mark counter
 EOF
+}
+
+# ========== UDP 限速规则 ==========
+generate_udp_limit_rules() {
+    local udp_enable=$(uci -q get ${CONFIG_FILE}.udp_limit.enabled 2>/dev/null)
+    local udp_rate=$(uci -q get ${CONFIG_FILE}.udp_limit.rate 2>/dev/null)
+    local udp_action=$(uci -q get ${CONFIG_FILE}.udp_limit.action 2>/dev/null)
+    local udp_mark_class=$(uci -q get ${CONFIG_FILE}.udp_limit.mark_class 2>/dev/null)
+
+    case "$udp_enable" in 1|yes|true|on) udp_enable=1 ;; *) udp_enable=0 ;; esac
+    [[ -z "$udp_rate" ]] && udp_rate=450
+    [[ -z "$udp_action" ]] && udp_action="mark"
+    [[ -z "$udp_mark_class" ]] && udp_mark_class="bulk"
+
+    if [[ "$udp_enable" != "1" ]] || [[ "$udp_rate" -le 0 ]]; then
+        return
+    fi
+
+    local upload_mark="" download_mark=""
+    if [[ "$udp_action" == "mark" ]]; then
+        if [[ -z "$upload_class_list" ]]; then
+            load_upload_class_configurations
+        fi
+        if [[ -z "$download_class_list" ]]; then
+            load_download_class_configurations
+        fi
+        for class in $upload_class_list; do
+            local name=$(uci -q get ${CONFIG_FILE}.${class}.name 2>/dev/null)
+            if [[ "$name" == "$udp_mark_class" ]]; then
+                upload_mark=$(get_class_mark "upload" "$class")
+                break
+            fi
+        done
+        for class in $download_class_list; do
+            local name=$(uci -q get ${CONFIG_FILE}.${class}.name 2>/dev/null)
+            if [[ "$name" == "$udp_mark_class" ]]; then
+                download_mark=$(get_class_mark "download" "$class")
+                break
+            fi
+        done
+        if [[ -z "$upload_mark" ]] || [[ -z "$download_mark" ]]; then
+            log_warn "UDP 速率限制目标类 '$udp_mark_class' 未同时存在于上传/下载类中，将回退到丢弃动作"
+            udp_action="drop"
+        fi
+    fi
+
+    local wan_if="${qos_interface:-$(uci -q get ${CONFIG_FILE}.global.wan_interface 2>/dev/null)}"
+    if [[ -z "$wan_if" ]]; then
+        log_warn "无法确定 WAN 接口，UDP 速率限制规则将被跳过"
+        return
+    fi
+
+    local rules=""
+    if [[ "$udp_action" == "mark" ]] && [[ -n "$upload_mark" ]] && [[ -n "$download_mark" ]]; then
+        rules="${rules}
+# Global UDP rate limit - upload direction (mark)
+add rule inet gargoyle-qos-priority filter_qos_egress oifname \"$wan_if\" meta l4proto udp limit rate over ${udp_rate}/second counter meta mark set $upload_mark
+# Global UDP rate limit - download direction (mark)
+add rule inet gargoyle-qos-priority filter_qos_ingress iifname \"$wan_if\" meta l4proto udp limit rate over ${udp_rate}/second counter meta mark set $download_mark"
+    elif [[ "$udp_action" == "drop" ]]; then
+        rules="${rules}
+# Global UDP rate limit - drop
+add rule inet gargoyle-qos-priority filter_qos_egress meta l4proto udp limit rate over ${udp_rate}/second counter drop
+add rule inet gargoyle-qos-priority filter_qos_ingress meta l4proto udp limit rate over ${udp_rate}/second counter drop"
+    fi
+
+    echo "$rules"
 }
 
 # ========== 集合族缓存 ==========
@@ -1427,12 +1440,13 @@ check_required_commands() {
     return $missing
 }
 
-# ========== 加载必需的内核模块 ==========
+# ========== 加载必需的内核模块（改进检测） ==========
 load_required_modules() {
     local missing=0
     for mod in ifb sch_ingress; do
-        if ! modprobe "$mod" 2>/dev/null; then
-            if [[ ! -d "/sys/module/$mod" ]]; then
+        # 使用 /sys/module 检测模块是否已加载
+        if [[ ! -d "/sys/module/$mod" ]]; then
+            if ! modprobe "$mod" 2>/dev/null; then
                 log_error "无法加载内核模块 $mod"
                 missing=1
             fi
@@ -1562,7 +1576,7 @@ init_ruleset() {
     fi
     if grep -q "^# === RULESET_" "/etc/config/${CONFIG_FILE}"; then
         local tmp_conf=$(mktemp /tmp/qos_config_$$.tmp)
-        TEMP_FILES+=("$tmp_conf")
+        register_temp_file "$tmp_conf"
         sed '/^# === RULESET_/,/^# === RULESET_END ===/d' "/etc/config/${CONFIG_FILE}" > "$tmp_conf"
         mv "$tmp_conf" "/etc/config/${CONFIG_FILE}"
         log_info "已清理旧的规则集内容"
@@ -1582,13 +1596,22 @@ init_ruleset() {
 restore_main_config() {
     local latest_backup=$(ls -t /etc/config/${CONFIG_FILE}.bak.* 2>/dev/null | head -1)
     if [[ -n "$latest_backup" ]]; then
-        mv "$latest_backup" "/etc/config/${CONFIG_FILE}"
-        uci commit ${CONFIG_FILE}
-        log_info "已恢复主配置文件备份: $latest_backup"
+        # 检查备份文件有效性（至少包含 config qos_gargoyle）
+        if grep -q "config ${CONFIG_FILE}" "$latest_backup" 2>/dev/null; then
+            mv "$latest_backup" "/etc/config/${CONFIG_FILE}"
+            uci commit ${CONFIG_FILE}
+            log_info "已恢复主配置文件备份: $latest_backup"
+        else
+            log_warn "备份文件 $latest_backup 无效，跳过恢复"
+        fi
     elif [[ -f "/etc/config/${CONFIG_FILE}.bak" ]]; then
-        mv "/etc/config/${CONFIG_FILE}.bak" "/etc/config/${CONFIG_FILE}"
-        uci commit ${CONFIG_FILE}
-        log_info "已恢复主配置文件备份"
+        if grep -q "config ${CONFIG_FILE}" "/etc/config/${CONFIG_FILE}.bak" 2>/dev/null; then
+            mv "/etc/config/${CONFIG_FILE}.bak" "/etc/config/${CONFIG_FILE}"
+            uci commit ${CONFIG_FILE}
+            log_info "已恢复主配置文件备份"
+        else
+            log_warn "备份文件 /etc/config/${CONFIG_FILE}.bak 无效，跳过恢复"
+        fi
     else
         log_warn "未找到配置文件备份"
     fi
@@ -1681,7 +1704,7 @@ auto_speedtest() {
     local WAN_IF="" DOWNLOAD_SPEED="" UPLOAD_SPEED="" SPEEDTEST_CMD=""
     local response cur_upload cur_download
     local coeff server spec_interface
-    local SPEED_RESULT=""  # 声明局部变量
+    local SPEED_RESULT=""
 
     while getopts ":nf" opt; do
         case $opt in
@@ -1728,9 +1751,11 @@ auto_speedtest() {
             echo "当前已配置带宽：上传 ${cur_upload} kbit，下载 ${cur_download} kbit"
             echo "是否覆盖并重新测速？[y/N]"
             # 设置30秒超时，避免卡死
-            read -t 30 -r response
-            # 若超时或用户未输入，则退出
-            if [[ $? -ne 0 ]] || [[ ! "$response" =~ ^[Yy]$ ]]; then
+            if ! read -t 30 -r response; then
+                echo "超时，已取消"
+                return 0
+            fi
+            if [[ ! "$response" =~ ^[Yy]$ ]]; then
                 echo "已取消"
                 return 0
             fi
@@ -1779,8 +1804,11 @@ auto_speedtest() {
     else
         echo "准备进行速度测试。请确保网络连接正常。"
         echo "是否继续? [y/N]"
-        read -t 30 -r response
-        if [[ $? -ne 0 ]] || [[ ! "$response" =~ ^[Yy]$ ]]; then
+        if ! read -t 30 -r response; then
+            echo "超时，已取消"
+            return 0
+        fi
+        if [[ ! "$response" =~ ^[Yy]$ ]]; then
             echo "已取消"
             return 0
         fi
