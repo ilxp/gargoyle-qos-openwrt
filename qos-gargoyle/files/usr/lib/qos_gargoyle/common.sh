@@ -1,6 +1,6 @@
 #!/bin/bash
 # 核心库模块 (common.sh)
-# 版本: 3.4.3 - 移除锁机制，改用 procd 管理；修复 dummy 设备回退；增强自动测速超时
+# 版本: 3.4.4 - 修复日志优先级大小写问题，增强规则选项验证错误提示
 # 提供 QoS 系统基础功能
 
 # ========== 加载 OpenWrt 标准函数库 ==========
@@ -80,7 +80,7 @@ strip_leading_zeros() {
     echo "$val"
 }
 
-# ========== 日志函数（优化多行输出） ==========
+# ========== 日志函数（优化多行输出，修复优先级大小写） ==========
 log_debug() { [[ "$DEBUG" == "1" ]] && log "DEBUG" "$@"; }
 log_info()  { log "INFO" "$@"; }
 log_warn()  { log "WARN" "$@"; }
@@ -96,8 +96,10 @@ log() {
         DEBUG|debug)   prefix="调试:" ;;
         *)             prefix="$level:" ;;
     esac
+    # 将日志级别转换为小写供 logger 使用
+    local syslog_level=$(echo "$level" | tr '[:upper:]' '[:lower:]')
     # 将整个消息通过管道传给 logger（一次调用处理多行）
-    echo "$message" | logger -t "$tag" -p "user.$level" 2>/dev/null || \
+    echo "$message" | logger -t "$tag" -p "user.$syslog_level" 2>/dev/null || \
         echo "$message" | while IFS= read -r line; do
             logger -t "$tag" "$prefix $line"
         done
@@ -679,7 +681,7 @@ load_download_class_configurations() {
     return 0
 }
 
-# 加载配置选项
+# 加载配置选项（修复：验证失败时记录错误并返回1，class 缺失视为致命错误）
 load_all_config_options() {
     local config_name="$1" section_id="$2" prefix="$3"
     local var_name val
@@ -690,12 +692,11 @@ load_all_config_options() {
     if [[ ${#UCI_CACHE[@]} -gt 0 ]]; then
         local key="${config_name}.${section_id}.class"
         val="${UCI_CACHE[$key]}"
-        if [[ -n "$val" ]]; then
-            eval "${prefix}class='$val'"
-        else
-            log_warn "配置节 $section_id 缺少 class 参数，忽略此规则"
+        if [[ -z "$val" ]]; then
+            log_error "配置节 $section_id 缺少 class 参数，忽略此规则"
             return 1
         fi
+        eval "${prefix}class='$val'"
         for opt in order enabled proto srcport dstport connbytes_kb family state src_ip dest_ip \
             tcp_flags packet_len dscp iif oif icmp_type udp_length ttl; do
             local key="${config_name}.${section_id}.${opt}"
@@ -705,13 +706,13 @@ load_all_config_options() {
                 order)   val=$(echo "$val" | sed 's/[^0-9]//g') ;;
                 enabled) val=$(echo "$val" | grep -o '^[01]') ;;
                 proto)   if ! validate_protocol "$val" "${section_id}.proto"; then continue; fi ;;
-                srcport) if ! validate_port "$val" "${section_id}.srcport"; then continue; fi ;;
-                dstport) if ! validate_port "$val" "${section_id}.dstport"; then continue; fi ;;
+                srcport) if ! validate_port "$val" "${section_id}.srcport"; then log_warn "规则 $section_id: srcport 无效，已忽略"; continue; fi ;;
+                dstport) if ! validate_port "$val" "${section_id}.dstport"; then log_warn "规则 $section_id: dstport 无效，已忽略"; continue; fi ;;
                 connbytes_kb) if ! validate_connbytes "$val" "${section_id}.connbytes_kb"; then continue; fi ;;
                 family)  if ! validate_family "$val" "${section_id}.family"; then continue; fi ;;
                 state)   val=$(echo "$val" | tr -d '{}' | sed 's/[^a-zA-Z,]//g'); if ! validate_state "$val" "${section_id}.state"; then continue; fi ;;
-                src_ip)  if ! validate_ip "$val"; then continue; fi ;;
-                dest_ip) if ! validate_ip "$val"; then continue; fi ;;
+                src_ip)  if ! validate_ip "$val"; then log_warn "规则 $section_id: src_ip 无效，已忽略"; continue; fi ;;
+                dest_ip) if ! validate_ip "$val"; then log_warn "规则 $section_id: dest_ip 无效，已忽略"; continue; fi ;;
                 tcp_flags) if ! validate_tcp_flags "$val" "${section_id}.tcp_flags"; then continue; fi ;;
                 packet_len) if ! validate_length "$val" "${section_id}.packet_len"; then continue; fi ;;
                 dscp)       if ! validate_dscp "$val" "${section_id}.dscp"; then continue; fi ;;
@@ -729,7 +730,7 @@ load_all_config_options() {
     local tmp_class
     tmp_class=$(uci -q get "${config_name}.${section_id}.class" 2>/dev/null)
     if [[ -z "$tmp_class" ]]; then
-        log_warn "配置节 $section_id 缺少 class 参数，忽略此规则"
+        log_error "配置节 $section_id 缺少 class 参数，忽略此规则"
         return 1
     fi
     eval "${prefix}class='$tmp_class'"
@@ -742,13 +743,13 @@ load_all_config_options() {
             order)   val=$(echo "$val" | sed 's/[^0-9]//g') ;;
             enabled) val=$(echo "$val" | grep -o '^[01]') ;;
             proto)   if ! validate_protocol "$val" "${section_id}.proto"; then continue; fi ;;
-            srcport) if ! validate_port "$val" "${section_id}.srcport"; then continue; fi ;;
-            dstport) if ! validate_port "$val" "${section_id}.dstport"; then continue; fi ;;
+            srcport) if ! validate_port "$val" "${section_id}.srcport"; then log_warn "规则 $section_id: srcport 无效，已忽略"; continue; fi ;;
+            dstport) if ! validate_port "$val" "${section_id}.dstport"; then log_warn "规则 $section_id: dstport 无效，已忽略"; continue; fi ;;
             connbytes_kb) if ! validate_connbytes "$val" "${section_id}.connbytes_kb"; then continue; fi ;;
             family)  if ! validate_family "$val" "${section_id}.family"; then continue; fi ;;
             state)   val=$(echo "$val" | tr -d '{}' | sed 's/[^a-zA-Z,]//g'); if ! validate_state "$val" "${section_id}.state"; then continue; fi ;;
-            src_ip)  if ! validate_ip "$val"; then continue; fi ;;
-            dest_ip) if ! validate_ip "$val"; then continue; fi ;;
+            src_ip)  if ! validate_ip "$val"; then log_warn "规则 $section_id: src_ip 无效，已忽略"; continue; fi ;;
+            dest_ip) if ! validate_ip "$val"; then log_warn "规则 $section_id: dest_ip 无效，已忽略"; continue; fi ;;
             tcp_flags) if ! validate_tcp_flags "$val" "${section_id}.tcp_flags"; then continue; fi ;;
             packet_len) if ! validate_length "$val" "${section_id}.packet_len"; then continue; fi ;;
             dscp)       if ! validate_dscp "$val" "${section_id}.dscp"; then continue; fi ;;
