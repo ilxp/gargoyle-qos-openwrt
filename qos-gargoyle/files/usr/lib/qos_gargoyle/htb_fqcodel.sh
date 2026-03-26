@@ -1,6 +1,6 @@
 #!/bin/bash
 # HTB_FQCODEL算法实现模块
-# 版本: 3.4.0 - 移除停止时的配置恢复，强制忽略 CAKE_BANDWIDTH，集成 common.sh/rule.sh 修复
+# 版本: 3.4.1 - 添加 DSCP 映射，优化与 common.sh/rule.sh 的兼容性
 # 基于HTB与FQ_CODEL组合算法实现QoS流量控制。
 
 # ========== 全局配置常量 ==========
@@ -141,7 +141,7 @@ load_htb_fqcodel_config() {
         qos_log "INFO" "fq_codel ECN: 未配置"
     fi
 
-    # 强制忽略 CAKE_BANDWIDTH，防止二次整形
+    # 强制忽略 CAKE_BANDWIDTH，防止二次整形（此处CAKE未被使用，但保留检查以兼容旧配置）
     local cake_bw=$(uci -q get ${CONFIG_FILE}.cake.bandwidth 2>/dev/null)
     if [[ -n "$cake_bw" ]]; then
         qos_log "ERROR" "检测到 CAKE_BANDWIDTH 已配置 (值: $cake_bw)，这将导致CAKE二次整形，严重影响HTB调度性能。已强制忽略该配置，使用HTB主导整形。"
@@ -930,6 +930,15 @@ init_htb_fqcodel_qos() {
         fi
     fi
 
+    # ========== 添加 DSCP 映射 ==========
+    if ! setup_class_mark_map; then
+        qos_log "ERROR" "class_mark 映射设置失败"
+        stop_htb_fqcodel_qos
+        release_lock
+        rm -f "$QOS_RUNNING_FILE"
+        return 1
+    fi
+
     qos_log "INFO" "应用自定义规则成功"
     if (( ENABLE_RATELIMIT == 1 )); then
         echo "应用速率限制链..." 
@@ -1022,9 +1031,9 @@ stop_htb_fqcodel_qos() {
     nft delete table inet gargoyle-qos-priority 2>/dev/null || true
     clear_class_marks
     qos_log "INFO" "HTB+FQ_CODEL QoS停止完成"
-	
-    # 恢复配置
-	restore_main_config
+    
+    # 恢复配置（已在 common.sh 中增加有效性检查）
+    restore_main_config
     
     _QOS_TABLE_FLUSHED=0
     _IPSET_LOADED=0
