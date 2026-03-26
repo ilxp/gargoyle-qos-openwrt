@@ -481,7 +481,7 @@ build_icmp_cond() {
 }
 
 # ========== class_mark 映射设置（直接规则，支持 priority 自动映射，适配 diffserv8） ==========
-setup_class_mark_map() {
+setup_class_mark_map22() {
     qos_log "信息" "设置 class_mark 映射（直接规则）..."
     local tmp_nft_file=$(mktemp)
     register_temp_file "$tmp_nft_file"
@@ -567,6 +567,87 @@ EOF
         qos_log "错误" "加载 class_mark 直接规则失败"
         cat "$tmp_nft_file" | logger -t qos_gargoyle
         rm -f "$tmp_nft_file"
+        return 1
+    fi
+}
+
+# ========== class_mark 映射设置（使用 map，性能最优） ==========
+setup_class_mark_map() {
+    qos_log "信息" "设置 class_mark 映射（map 方式）..."
+    local tmp_nft_file=$(mktemp)
+    register_temp_file "$tmp_nft_file"
+
+    # 1. 删除可能存在的旧 map，创建新 map
+    cat << EOF >> "$tmp_nft_file"
+delete map inet gargoyle-qos-priority class_mark 2>/dev/null
+add map inet gargoyle-qos-priority class_mark { type mark : dscp; }
+EOF
+
+    config_load "$CONFIG_FILE"
+
+    # 2. 从 class_marks 文件读取标记，并收集 map 元素
+    local elements=""
+    while IFS=: read -r dir cls mark_raw; do
+        [ -z "$dir" ] || [ -z "$cls" ] && continue
+        local cls_clean=$(echo "$cls" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' | tr -d '\r')
+        local mark="${mark_raw%%#*}"
+        mark=$(echo "$mark" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+        [ -z "$mark" ] && continue
+
+        # 获取 DSCP（优先使用用户配置的 dscp，否则根据 priority 映射）
+        local dscp_raw=$(uci -q get "${CONFIG_FILE}.${cls_clean}.dscp" 2>/dev/null)
+        local dscp=$(echo "$dscp_raw" | tr -d '\r' | tr -d '[:space:]')
+        if [ -z "$dscp" ]; then
+            local priority=$(uci -q get "${CONFIG_FILE}.${cls_clean}.priority" 2>/dev/null)
+            if ! echo "$priority" | grep -qE '^[0-9]+$' || [ "$priority" -lt 1 ] 2>/dev/null; then
+                priority=2
+            fi
+            # 根据 priority 映射到 diffserv4 标准 DSCP
+            case "$priority" in
+                1) dscp=46 ;;  # Voice (EF)
+                2) dscp=0 ;;   # Best Effort (CS0)
+                3) dscp=8 ;;   # Bulk (CS1)
+                *) dscp=0 ;;
+            esac
+        else
+            if ! [ "$dscp" -ge 0 ] 2>/dev/null || ! [ "$dscp" -le 63 ] 2>/dev/null; then
+                dscp=0
+            fi
+        fi
+
+        # 添加到元素列表
+        elements="${elements}${elements:+, }${mark} : $dscp"
+        qos_log "调试" "收集映射: 标记 $mark -> DSCP $dscp (类 $cls_clean)"
+    done < "$CLASS_MARKS_FILE"
+
+    # 添加 map 元素（如果元素列表非空）
+    if [ -n "$elements" ]; then
+        echo "add element inet gargoyle-qos-priority class_mark { $elements }" >> "$tmp_nft_file"
+    fi
+
+    # 3. 添加使用 map 的规则（使用 insert 确保在分类规则之前执行？但分类规则已经在 filter_qos_egress 链中，而 DSCP 映射应在分类之后执行，所以使用 add rule）
+    cat << EOF >> "$tmp_nft_file"
+# DSCP mapping rules: apply after classification (use add rule)
+add rule inet gargoyle-qos-priority filter_qos_egress ct mark != 0 ip dscp set @class_mark[ct mark]
+add rule inet gargoyle-qos-priority filter_qos_egress ct mark != 0 ip6 dscp set @class_mark[ct mark]
+add rule inet gargoyle-qos-priority filter_qos_ingress ct mark != 0 ip dscp set @class_mark[ct mark]
+add rule inet gargoyle-qos-priority filter_qos_ingress ct mark != 0 ip6 dscp set @class_mark[ct mark]
+add rule inet gargoyle-qos-priority filter_qos_egress ct state established,related ct mark != 0 ip dscp set @class_mark[ct mark]
+add rule inet gargoyle-qos-priority filter_qos_egress ct state established,related ct mark != 0 ip6 dscp set @class_mark[ct mark]
+add rule inet gargoyle-qos-priority filter_qos_ingress ct state established,related ct mark != 0 ip dscp set @class_mark[ct mark]
+add rule inet gargoyle-qos-priority filter_qos_ingress ct state established,related ct mark != 0 ip6 dscp set @class_mark[ct mark]
+EOF
+
+    # 4. 执行临时文件
+    if nft -f "$tmp_nft_file" 2>&1 | logger -t qos_gargoyle; then
+        qos_log "信息" "class_mark map 规则加载成功"
+        rm -f "$tmp_nft_file"
+        return 0
+    else
+        qos_log "错误" "加载 class_mark map 规则失败"
+        cat "$tmp_nft_file" | logger -t qos_gargoyle
+        rm -f "$tmp_nft_file"
+        # 可选：回退到直接规则（如果需要，可在这里调用直接规则函数）
         return 1
     fi
 }
