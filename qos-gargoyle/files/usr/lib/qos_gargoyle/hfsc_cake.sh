@@ -1,6 +1,6 @@
 #!/bin/bash
 # HFSC_CAKE算法实现模块
-# 版本: 3.4.0 - 强制忽略 CAKE_BANDWIDTH 防止二次整形，移除停止时的配置恢复，优化默认类设置
+# 版本: 3.4.1 - 添加 DSCP 映射，优化与 common.sh/rule.sh 的兼容性
 # 基于HFSC与CAKE组合算法实现QoS流量控制。
 
 # ========== 全局配置常量 ==========
@@ -937,6 +937,15 @@ init_hfsc_cake_qos() {
         fi
     fi
 
+    # ========== 添加 DSCP 映射 ==========
+    if ! setup_class_mark_map; then
+        qos_log "ERROR" "class_mark 映射设置失败"
+        stop_hfsc_cake_qos
+        release_lock
+        rm -f "$QOS_RUNNING_FILE"
+        return 1
+    fi
+
     qos_log "INFO" "应用自定义规则成功"
     if (( ENABLE_RATELIMIT == 1 )); then
         echo "应用速率限制链..." 
@@ -1029,9 +1038,9 @@ stop_hfsc_cake_qos() {
     nft delete table inet gargoyle-qos-priority 2>/dev/null || true
     clear_class_marks
     qos_log "INFO" "HFSC+CAKE QoS停止完成"
-	
-    # 恢复配置
-	restore_main_config
+    
+    # 恢复配置（已在 common.sh 中增加有效性检查）
+    restore_main_config
     
     _QOS_TABLE_FLUSHED=0
     _IPSET_LOADED=0
