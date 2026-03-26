@@ -1,6 +1,6 @@
 #!/bin/bash
 # 规则辅助模块 (rule.sh)
-# 版本: 3.4.0 - 修复多集合分割、ICMP否定语法、动态分类兼容性、跳转优先级、空规则检查等
+# 版本: 3.4.1 - 修复ICMP否定组合、动态分类集合检查、笛卡尔积爆炸警告、临时文件清理增强
 # 提供 nftables 规则生成与系统钩子挂载
 
 # 加载核心库（已修复）
@@ -56,7 +56,6 @@ adjust_proto_for_family() {
 split_multiset() {
     local field="$1"
     local result=()
-    # 如果字段以 @ 开头，且包含逗号，说明是多个集合
     if [[ "$field" == @* && "$field" == *,* ]]; then
         IFS=',' read -ra parts <<< "$field"
         for part in "${parts[@]}"; do
@@ -65,9 +64,6 @@ split_multiset() {
     else
         result+=("$field")
     fi
-    # 同时支持否定前缀 !@set 这种，也作为整体保留
-    # 注意：否定前缀不能出现在集合名中，但实际使用时可能为 "!@set"
-    # 这里简单返回原样，生成规则时会正确处理否定前缀
     printf '%s\n' "${result[@]}"
 }
 
@@ -331,6 +327,18 @@ build_nft_rule_generic() {
         *) log_error "规则 $rule_name 无效的 family '$family'"; return ;;
     esac
     
+    # ICMP 类型处理（修复否定组合）
+    local icmp_v4_cond=""
+    local icmp_v6_cond=""
+    if [[ -n "$icmp_type" ]]; then
+        if [[ "$proto_v4" == "icmp" ]]; then
+            icmp_v4_cond=$(build_icmp_cond "$icmp_type")
+        fi
+        if [[ "$proto_v6" == "icmpv6" ]]; then
+            icmp_v6_cond=$(build_icmp_cond "$icmp_type")
+        fi
+    fi
+    
     if (( has_ipv4 )); then
         local ipv4_full_cond="$common_cond"
         if [[ -n "$proto_v4" && "$proto_v4" != "all" ]]; then
@@ -371,23 +379,7 @@ build_nft_rule_generic() {
                 ipv4_full_cond="$ipv4_full_cond ip ttl eq $ttl_val"
             fi
         fi
-        # ICMP 类型修正：否定不能同时用于类型和代码
-        if [[ -n "$icmp_type" ]] && [[ "$proto_v4" == "icmp" ]]; then
-            local icmp_val="$icmp_type"
-            local neg=""
-            [[ "$icmp_val" == "!="* ]] && { neg="!="; icmp_val="${icmp_val#!=}"; }
-            if [[ "$icmp_val" == */* ]]; then
-                local type="${icmp_val%/*}" code="${icmp_val#*/}"
-                # 否定必须作用于整个类型+代码表达式，因此用括号包围
-                if [[ -n "$neg" ]]; then
-                    ipv4_full_cond="$ipv4_full_cond (icmp type $neg $type) && (icmp code $code)"
-                else
-                    ipv4_full_cond="$ipv4_full_cond icmp type $type icmp code $code"
-                fi
-            else
-                ipv4_full_cond="$ipv4_full_cond icmp type $neg $icmp_val"
-            fi
-        fi
+        [[ -n "$icmp_v4_cond" ]] && ipv4_full_cond="$ipv4_full_cond $icmp_v4_cond"
         [[ -n "$tcp_flag_expr" ]] && ipv4_full_cond="$ipv4_full_cond $tcp_flag_expr"
         add_ipv4_rule "$ipv4_full_cond"
     fi
@@ -432,22 +424,7 @@ build_nft_rule_generic() {
                 ipv6_full_cond="$ipv6_full_cond ip6 hoplimit eq $hop_val"
             fi
         fi
-        # ICMPv6 类型修正
-        if [[ -n "$icmp_type" ]] && [[ "$proto_v6" == "icmpv6" ]]; then
-            local icmp_val="$icmp_type"
-            local neg=""
-            [[ "$icmp_val" == "!="* ]] && { neg="!="; icmp_val="${icmp_val#!=}"; }
-            if [[ "$icmp_val" == */* ]]; then
-                local type="${icmp_val%/*}" code="${icmp_val#*/}"
-                if [[ -n "$neg" ]]; then
-                    ipv6_full_cond="$ipv6_full_cond (icmpv6 type $neg $type) && (icmpv6 code $code)"
-                else
-                    ipv6_full_cond="$ipv6_full_cond icmpv6 type $type icmpv6 code $code"
-                fi
-            else
-                ipv6_full_cond="$ipv6_full_cond icmpv6 type $neg $icmp_val"
-            fi
-        fi
+        [[ -n "$icmp_v6_cond" ]] && ipv6_full_cond="$ipv6_full_cond $icmp_v6_cond"
         [[ -n "$tcp_flag_expr" ]] && ipv6_full_cond="$ipv6_full_cond $tcp_flag_expr"
         add_ipv6_rule "$ipv6_full_cond"
     fi
@@ -458,6 +435,28 @@ build_nft_rule_generic() {
     for rule in "${ipv6_rules[@]}"; do
         echo "$rule"
     done
+}
+
+# 辅助函数：构建 ICMP 条件（修复否定组合）
+build_icmp_cond() {
+    local icmp_val="$1"
+    local cond=""
+    local neg=""
+    [[ "$icmp_val" == "!="* ]] && { neg="!="; icmp_val="${icmp_val#!=}"; }
+    if [[ "$icmp_val" == */* ]]; then
+        local type="${icmp_val%/*}" code="${icmp_val#*/}"
+        if [[ -n "$neg" ]]; then
+            # 否定组合：要求 type != type 或 code != code
+            # 注意：nftables 中 (icmp type != type) || (icmp code != code) 会匹配除了特定组合外的所有包
+            # 使用括号和逻辑或
+            cond="(icmp type != $type) || (icmp code != $code)"
+        else
+            cond="icmp type $type icmp code $code"
+        fi
+    else
+        cond="icmp type $neg $icmp_val"
+    fi
+    echo "$cond"
 }
 
 # ========== 增强规则应用 ==========
@@ -535,6 +534,8 @@ apply_enhanced_direction_rules() {
     TEMP_FILES+=("$nft_batch_file")
     log_info "按优先级顺序生成nft规则..."
     local rule_count=0
+    # 笛卡尔积爆炸警告阈值
+    local MAX_COMBINATIONS=1000
     for rule_name in $sorted_rule_list; do
         if ! load_all_config_options "$CONFIG_FILE" "$rule_name" "tmp_"; then
             continue
@@ -573,6 +574,10 @@ apply_enhanced_direction_rules() {
             mapfile -t dest_ip_list < <(split_multiset "$tmp_dest_ip")
         else
             dest_ip_list=("")
+        fi
+        local total_combinations=$(( ${#srcport_list[@]} * ${#dstport_list[@]} * ${#src_ip_list[@]} * ${#dest_ip_list[@]} ))
+        if [[ $total_combinations -gt $MAX_COMBINATIONS ]]; then
+            log_warn "规则 $rule_name 的组合数 $total_combinations 超过阈值 $MAX_COMBINATIONS，可能导致性能问题，请检查配置（端口/IP 集合过多）"
         fi
         for srcp in "${srcport_list[@]}"; do
             for dstp in "${dstport_list[@]}"; do
@@ -745,6 +750,7 @@ apply_enhanced_features() {
 # 检测内核是否支持 meter 关键字
 check_meter_support() {
     local test_file=$(mktemp)
+    TEMP_FILES+=("$test_file")
     echo "add table inet qos_meter_test" > "$test_file"
     echo "add chain inet qos_meter_test test { type filter hook forward priority 0; }" >> "$test_file"
     echo "add rule inet qos_meter_test test meter test_meter { ip daddr timeout 1s limit rate 1/minute } counter" >> "$test_file"
@@ -767,15 +773,21 @@ cleanup_dynamic_detection() {
     nft delete chain inet gargoyle-qos-priority qos_dynamic_classify 2>/dev/null || true
     nft delete chain inet gargoyle-qos-priority qos_dynamic_classify_reply 2>/dev/null || true
     nft delete chain inet gargoyle-qos-priority qos_established_connection 2>/dev/null || true
+    nft delete chain inet gargoyle-qos-priority qos_high_throughput_service 2>/dev/null || true
+    nft delete chain inet gargoyle-qos-priority qos_high_throughput_service_reply 2>/dev/null || true
+    nft delete set inet gargoyle-qos-priority qos_high_throughput_services 2>/dev/null || true
+    nft delete set inet gargoyle-qos-priority qos_high_throughput_services6 2>/dev/null || true
 }
 
-# 获取类对应的 DSCP 值
-get_dscp_for_class() {
+# 获取类对应的 DSCP 值（实际是标记值，但用在低6位）
+get_class_mark_for_dynamic() {
     local class_name="$1"
     local class_mark=$(get_class_mark "upload" "$class_name" 2>/dev/null)
     if [ -z "$class_mark" ]; then
         class_mark=$(get_class_mark "download" "$class_name" 2>/dev/null)
     fi
+    # 确保只取低6位（因为 DSCP 只有6位）
+    class_mark=$((class_mark & 0x3F))
     echo "$class_mark"
 }
 
@@ -800,9 +812,9 @@ create_bulk_client_rules() {
     [ "$min_connections" -le 1 ] && min_connections=10
     
     # 获取该类的 DSCP 值
-    local dscp=$(get_dscp_for_class "$class")
-    if [ -z "$dscp" ] || [ "$dscp" = "0" ]; then
-        log_warn "bulk_client_detection: class '$class' not found or DSCP=0, using default 8 (CS1)"
+    local dscp=$(get_class_mark_for_dynamic "$class")
+    if [ -z "$dscp" ] || [ "$dscp" -eq 0 ]; then
+        log_warn "bulk_client_detection: class '$class' not found or class_mark=0, using default 8 (CS1)"
         dscp=8
     fi
 
@@ -843,7 +855,7 @@ create_bulk_client_rules() {
     log_info "bulk_client_detection enabled: min_conn=$min_connections, min_bytes=$min_bytes, class=$class (DSCP=$dscp)"
 }
 
-# 类似地，可以添加 high_throughput_service_detection 函数，将高吞吐服务升级到 realtime 类
+# 创建高吞吐服务检测规则（升级）
 create_high_throughput_service_rules() {
     # 默认参数
     local enabled=1 min_bytes=1000000 min_connections=3 class="realtime"
@@ -862,9 +874,9 @@ create_high_throughput_service_rules() {
     [ "$min_bytes" -le 0 ] && min_bytes=1000000
     [ "$min_connections" -le 1 ] && min_connections=3
 
-    local dscp=$(get_dscp_for_class "$class")
-    if [ -z "$dscp" ] || [ "$dscp" = "0" ]; then
-        log_warn "high_throughput_service_detection: class '$class' not found or DSCP=0, using default 46 (EF)"
+    local dscp=$(get_class_mark_for_dynamic "$class")
+    if [ -z "$dscp" ] || [ "$dscp" -eq 0 ]; then
+        log_warn "high_throughput_service_detection: class '$class' not found or class_mark=0, using default 46 (EF)"
         dscp=46
     fi
 
@@ -905,7 +917,7 @@ create_high_throughput_service_rules() {
     log_info "high_throughput_service_detection enabled: min_conn=$min_connections, min_bytes=$min_bytes, class=$class (DSCP=$dscp)"
 }
 
-# 设置动态分类（bulk_client_detection 和 high_throughput_service_detection）
+# 设置动态分类
 setup_dynamic_classification() {
     log_info "初始化动态分类链..."
     nft add chain inet gargoyle-qos-priority qos_established_connection 2>/dev/null || true
