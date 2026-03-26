@@ -1,6 +1,6 @@
 #!/bin/bash
 # 规则辅助模块 (rule.sh)
-# 版本: 3.4.6 - 修复 UDP 限速规则插入位置为链首，确保优先执行
+# 版本: 3.4.7 - 修复动态分类标记值错误，增强参数验证
 # 完全移除锁机制，适配 procd 管理
 
 # 加载核心库（已修复）
@@ -875,24 +875,37 @@ generate_ack_limit_rules() {
     [[ $ENABLE_ACK_LIMIT != 1 ]] && return
     local ack_enabled=$(uci -q get ${CONFIG_FILE}.ack_limit.enabled 2>/dev/null)
     case "$ack_enabled" in 1|yes|true|on) ;; *) return ;; esac
+
+    # 读取配置并验证数值
     local slow_rate=$(uci -q get ${CONFIG_FILE}.ack_limit.slow_rate 2>/dev/null)
     local med_rate=$(uci -q get ${CONFIG_FILE}.ack_limit.med_rate 2>/dev/null)
     local fast_rate=$(uci -q get ${CONFIG_FILE}.ack_limit.fast_rate 2>/dev/null)
     local xfast_rate=$(uci -q get ${CONFIG_FILE}.ack_limit.xfast_rate 2>/dev/null)
-    [[ -n "$slow_rate" ]] && ACK_SLOW="$slow_rate"
-    [[ -n "$med_rate" ]] && ACK_MED="$med_rate"
-    [[ -n "$fast_rate" ]] && ACK_FAST="$fast_rate"
-    [[ -n "$xfast_rate" ]] && ACK_XFAST="$xfast_rate"
-    : ${ACK_SLOW:=50}
-    : ${ACK_MED:=100}
-    : ${ACK_FAST:=500}
-    : ${ACK_XFAST:=5000}
+
+    # 验证并设置默认值
+    if ! validate_number "$slow_rate" "ack_limit.slow_rate" 1 100000 2>/dev/null; then
+        slow_rate=50
+        qos_log "WARN" "ACK slow_rate 无效，使用默认值 50"
+    fi
+    if ! validate_number "$med_rate" "ack_limit.med_rate" 1 100000 2>/dev/null; then
+        med_rate=100
+        qos_log "WARN" "ACK med_rate 无效，使用默认值 100"
+    fi
+    if ! validate_number "$fast_rate" "ack_limit.fast_rate" 1 100000 2>/dev/null; then
+        fast_rate=500
+        qos_log "WARN" "ACK fast_rate 无效，使用默认值 500"
+    fi
+    if ! validate_number "$xfast_rate" "ack_limit.xfast_rate" 1 100000 2>/dev/null; then
+        xfast_rate=5000
+        qos_log "WARN" "ACK xfast_rate 无效，使用默认值 5000"
+    fi
+
     cat <<EOF
 # ACK rate limiting using dynamic sets (ct id . ct direction key)
-add rule inet gargoyle-qos-priority filter_qos_egress meta length < 100 tcp flags ack limit rate over ${ACK_XFAST}/second add @qos_xfst_ack { ct id . ct direction } counter jump drop995
-add rule inet gargoyle-qos-priority filter_qos_egress meta length < 100 tcp flags ack limit rate over ${ACK_FAST}/second add @qos_fast_ack { ct id . ct direction } counter jump drop95
-add rule inet gargoyle-qos-priority filter_qos_egress meta length < 100 tcp flags ack limit rate over ${ACK_MED}/second add @qos_med_ack { ct id . ct direction } counter jump drop50
-add rule inet gargoyle-qos-priority filter_qos_egress meta length < 100 tcp flags ack limit rate over ${ACK_SLOW}/second add @qos_slow_ack { ct id . ct direction } counter jump drop50
+add rule inet gargoyle-qos-priority filter_qos_egress meta length < 100 tcp flags ack limit rate over ${xfast_rate}/second add @qos_xfst_ack { ct id . ct direction } counter jump drop995
+add rule inet gargoyle-qos-priority filter_qos_egress meta length < 100 tcp flags ack limit rate over ${fast_rate}/second add @qos_fast_ack { ct id . ct direction } counter jump drop95
+add rule inet gargoyle-qos-priority filter_qos_egress meta length < 100 tcp flags ack limit rate over ${med_rate}/second add @qos_med_ack { ct id . ct direction } counter jump drop50
+add rule inet gargoyle-qos-priority filter_qos_egress meta length < 100 tcp flags ack limit rate over ${slow_rate}/second add @qos_slow_ack { ct id . ct direction } counter jump drop50
 EOF
 }
 
@@ -921,6 +934,7 @@ add rule inet gargoyle-qos-priority filter_qos_egress meta l4proto tcp ct state 
 add rule inet gargoyle-qos-priority filter_qos_egress meta l4proto tcp ct state established meta nfproto ipv6 limit rate 150/second burst 150 packets add @qos_slow_tcp { ct id . ct direction } meta mark set $class_mark ct mark set meta mark counter
 EOF
 }
+
 # ========== UDP 限速规则 ==========
 generate_udp_limit_rules() {
     local udp_enable=$(uci -q get ${CONFIG_FILE}.udp_limit.enabled 2>/dev/null)
@@ -929,13 +943,19 @@ generate_udp_limit_rules() {
     local udp_mark_class=$(uci -q get ${CONFIG_FILE}.udp_limit.mark_class 2>/dev/null)
 
     case "$udp_enable" in 1|yes|true|on) udp_enable=1 ;; *) udp_enable=0 ;; esac
-    [[ -z "$udp_rate" ]] && udp_rate=450
-    [[ -z "$udp_action" ]] && udp_action="mark"
-    [[ -z "$udp_mark_class" ]] && udp_mark_class="bulk"
 
-    if [[ "$udp_enable" != "1" ]] || [[ "$udp_rate" -le 0 ]]; then
+    if [[ "$udp_enable" != "1" ]]; then
         return
     fi
+
+    # 验证速率值
+    if ! validate_number "$udp_rate" "udp_limit.rate" 1 1000000 2>/dev/null; then
+        qos_log "WARN" "UDP 速率值无效，使用默认 450"
+        udp_rate=450
+    fi
+
+    [[ -z "$udp_action" ]] && udp_action="mark"
+    [[ -z "$udp_mark_class" ]] && udp_mark_class="bulk"
 
     local upload_mark="" download_mark=""
     if [[ "$udp_action" == "mark" ]]; then
@@ -960,14 +980,14 @@ generate_udp_limit_rules() {
             fi
         done
         if [[ -z "$upload_mark" ]] || [[ -z "$download_mark" ]]; then
-            log_warn "UDP 速率限制目标类 '$udp_mark_class' 未同时存在于上传/下载类中，将回退到丢弃动作"
+            qos_log "WARN" "UDP 速率限制目标类 '$udp_mark_class' 未同时存在于上传/下载类中，将回退到丢弃动作"
             udp_action="drop"
         fi
     fi
 
     local wan_if="${qos_interface:-$(uci -q get ${CONFIG_FILE}.global.wan_interface 2>/dev/null)}"
     if [[ -z "$wan_if" ]]; then
-        log_warn "无法确定 WAN 接口，UDP 速率限制规则将被跳过"
+        qos_log "WARN" "无法确定 WAN 接口，UDP 速率限制规则将被跳过"
         return
     fi
 
@@ -975,9 +995,9 @@ generate_udp_limit_rules() {
     if [[ "$udp_action" == "mark" ]] && [[ -n "$upload_mark" ]] && [[ -n "$download_mark" ]]; then
         rules="${rules}
 # Global UDP rate limit - upload direction (mark)
-add rule inet gargoyle-qos-priority filter_qos_egress oifname \"$wan_if\" meta l4proto udp limit rate over ${udp_rate}/second counter meta mark set $upload_mark
+add rule inet gargoyle-qos-priority filter_qos_egress oifname \"$wan_if\" meta l4proto udp limit rate over ${udp_rate}/second counter meta mark set $upload_mark ct mark set $upload_mark
 # Global UDP rate limit - download direction (mark)
-add rule inet gargoyle-qos-priority filter_qos_ingress iifname \"$wan_if\" meta l4proto udp limit rate over ${udp_rate}/second counter meta mark set $download_mark"
+add rule inet gargoyle-qos-priority filter_qos_ingress iifname \"$wan_if\" meta l4proto udp limit rate over ${udp_rate}/second counter meta mark set $download_mark ct mark set $download_mark"
     elif [[ "$udp_action" == "drop" ]]; then
         rules="${rules}
 # Global UDP rate limit - drop
@@ -1028,17 +1048,6 @@ cleanup_dynamic_detection() {
     nft delete set inet gargoyle-qos-priority qos_high_throughput_services6 2>/dev/null || true
 }
 
-get_class_mark_for_dynamic() {
-    local class_name="$1"
-    local class_mark=$(get_class_mark "upload" "$class_name" 2>/dev/null)
-    if [ -z "$class_mark" ]; then
-        class_mark=$(get_class_mark "download" "$class_name" 2>/dev/null)
-    fi
-    class_mark=$((class_mark & 0x3F))
-    echo "$class_mark"
-}
-
-# 修复：meter 语法修正（兼容 nftables 1.1.1），同时设置 meta mark 和 ct mark
 # 批量客户端检测（优先使用用户配置的类，否则使用最低优先级类）
 create_bulk_client_rules() {
     local enabled=1 min_bytes=10000 min_connections=10 class="bulk"
@@ -1057,31 +1066,34 @@ create_bulk_client_rules() {
     [ "$min_bytes" -le 0 ] && min_bytes=10000
     [ "$min_connections" -le 1 ] && min_connections=10
     
-    local dscp
-    # 优先使用用户配置的类
+    # 获取完整的类标记值，而不是 DSCP
+    local class_mark=""
     if [[ -n "$uci_class" ]]; then
-        dscp=$(get_class_mark_for_dynamic "$uci_class")
-        if [ -z "$dscp" ] || [ "$dscp" -eq 0 ]; then
+        class_mark=$(get_class_mark "upload" "$uci_class" 2>/dev/null)
+        if [ -z "$class_mark" ]; then
+            class_mark=$(get_class_mark "download" "$uci_class" 2>/dev/null)
+        fi
+        if [ -z "$class_mark" ] || [ "$class_mark" -eq 0 ]; then
             qos_log "警告" "批量客户端检测: 用户指定的类 '$uci_class' 不存在或标记无效，将自动选择最低优先级类"
-            dscp=""
+            class_mark=""
         else
-            qos_log "信息" "批量客户端检测: 使用用户指定的类 '$uci_class' (DSCP=$dscp)"
+            qos_log "信息" "批量客户端检测: 使用用户指定的类 '$uci_class' (标记=$class_mark)"
         fi
     fi
     # 如果用户未配置类或配置无效，则自动选择最低优先级类
-    if [ -z "$dscp" ]; then
+    if [ -z "$class_mark" ]; then
         local lowest_class=$(get_lowest_priority_class "upload")
         if [ -n "$lowest_class" ]; then
-            dscp=$(get_class_mark_for_dynamic "$lowest_class")
-            if [ -z "$dscp" ] || [ "$dscp" -eq 0 ]; then
-                dscp=8
-                qos_log "警告" "批量客户端检测: 最低优先级类 '$lowest_class' 标记无效，使用默认 DSCP 8 (CS1)"
+            class_mark=$(get_class_mark "upload" "$lowest_class" 2>/dev/null)
+            if [ -z "$class_mark" ] || [ "$class_mark" -eq 0 ]; then
+                class_mark=8  # 回退标记值，对应 bulk 类（实际标记值通常为 8 或更高）
+                qos_log "警告" "批量客户端检测: 最低优先级类 '$lowest_class' 标记无效，使用回退标记 $class_mark"
             else
-                qos_log "信息" "批量客户端检测: 自动使用最低优先级类 '$lowest_class' (DSCP=$dscp)"
+                qos_log "信息" "批量客户端检测: 自动使用最低优先级类 '$lowest_class' (标记=$class_mark)"
             fi
         else
-            dscp=8
-            qos_log "警告" "批量客户端检测: 未找到任何启用的上传类，使用默认 DSCP 8 (CS1)"
+            class_mark=8
+            qos_log "警告" "批量客户端检测: 未找到任何启用的上传类，使用回退标记 $class_mark"
         fi
     fi
 
@@ -1111,29 +1123,29 @@ create_bulk_client_rules() {
     nft add rule inet gargoyle-qos-priority qos_bulk_client \
         meter qos_bulk_orig '{ ip saddr . th sport . meta l4proto timeout 5m limit rate over '"$((min_bytes - 1))"' bytes/hour }' \
         update @qos_bulk_clients '{ ip saddr . th sport . meta l4proto timeout 5m }' \
-        meta mark set $dscp ct mark set meta mark return 2>/dev/null || true
+        meta mark set $class_mark ct mark set $class_mark return 2>/dev/null || true
 
     nft add rule inet gargoyle-qos-priority qos_bulk_client \
         meter qos_bulk_orig6 '{ ip6 saddr . th sport . meta l4proto timeout 5m limit rate over '"$((min_bytes - 1))"' bytes/hour }' \
         update @qos_bulk_clients6 '{ ip6 saddr . th sport . meta l4proto timeout 5m }' \
-        meta mark set $dscp ct mark set meta mark return 2>/dev/null || true
+        meta mark set $class_mark ct mark set $class_mark return 2>/dev/null || true
 
     nft add rule inet gargoyle-qos-priority qos_bulk_client_reply \
         meter qos_bulk_reply '{ ip daddr . th dport . meta l4proto timeout 5m limit rate over '"$((min_bytes - 1))"' bytes/hour }' \
         update @qos_bulk_clients '{ ip daddr . th dport . meta l4proto timeout 5m }' \
-        meta mark set $dscp ct mark set meta mark return 2>/dev/null || true
+        meta mark set $class_mark ct mark set $class_mark return 2>/dev/null || true
 
     nft add rule inet gargoyle-qos-priority qos_bulk_client_reply \
         meter qos_bulk_reply6 '{ ip6 daddr . th dport . meta l4proto timeout 5m limit rate over '"$((min_bytes - 1))"' bytes/hour }' \
         update @qos_bulk_clients6 '{ ip6 daddr . th dport . meta l4proto timeout 5m }' \
-        meta mark set $dscp ct mark set meta mark return 2>/dev/null || true
+        meta mark set $class_mark ct mark set $class_mark return 2>/dev/null || true
 
     nft add rule inet gargoyle-qos-priority qos_dynamic_classify "ct mark & 0x3f == 0" ip saddr . th sport . meta l4proto @qos_bulk_clients goto qos_bulk_client 2>/dev/null || true
     nft add rule inet gargoyle-qos-priority qos_dynamic_classify "ct mark & 0x3f == 0" ip6 saddr . th sport . meta l4proto @qos_bulk_clients6 goto qos_bulk_client 2>/dev/null || true
     nft add rule inet gargoyle-qos-priority qos_dynamic_classify_reply "ct mark & 0x3f == 0" ip daddr . th dport . meta l4proto @qos_bulk_clients goto qos_bulk_client_reply 2>/dev/null || true
     nft add rule inet gargoyle-qos-priority qos_dynamic_classify_reply "ct mark & 0x3f == 0" ip6 daddr . th dport . meta l4proto @qos_bulk_clients6 goto qos_bulk_client_reply 2>/dev/null || true
 
-    qos_log "信息" "批量客户端检测已启用: 最小连接数=$min_connections, 最小字节数=$min_bytes, 使用类=$class (DSCP=$dscp)"
+    qos_log "信息" "批量客户端检测已启用: 最小连接数=$min_connections, 最小字节数=$min_bytes, 使用标记=$class_mark"
 }
 
 # 高吞吐服务检测（优先使用用户配置的类，否则使用最高优先级类）
@@ -1154,31 +1166,32 @@ create_high_throughput_service_rules() {
     [ "$min_bytes" -le 0 ] && min_bytes=1000000
     [ "$min_connections" -le 1 ] && min_connections=3
 
-    local dscp
-    # 优先使用用户配置的类
+    local class_mark=""
     if [[ -n "$uci_class" ]]; then
-        dscp=$(get_class_mark_for_dynamic "$uci_class")
-        if [ -z "$dscp" ] || [ "$dscp" -eq 0 ]; then
+        class_mark=$(get_class_mark "upload" "$uci_class" 2>/dev/null)
+        if [ -z "$class_mark" ]; then
+            class_mark=$(get_class_mark "download" "$uci_class" 2>/dev/null)
+        fi
+        if [ -z "$class_mark" ] || [ "$class_mark" -eq 0 ]; then
             qos_log "警告" "高吞吐服务检测: 用户指定的类 '$uci_class' 不存在或标记无效，将自动选择最高优先级类"
-            dscp=""
+            class_mark=""
         else
-            qos_log "信息" "高吞吐服务检测: 使用用户指定的类 '$uci_class' (DSCP=$dscp)"
+            qos_log "信息" "高吞吐服务检测: 使用用户指定的类 '$uci_class' (标记=$class_mark)"
         fi
     fi
-    # 如果用户未配置类或配置无效，则自动选择最高优先级类
-    if [ -z "$dscp" ]; then
+    if [ -z "$class_mark" ]; then
         local highest_class=$(get_highest_priority_class "upload")
         if [ -n "$highest_class" ]; then
-            dscp=$(get_class_mark_for_dynamic "$highest_class")
-            if [ -z "$dscp" ] || [ "$dscp" -eq 0 ]; then
-                dscp=46
-                qos_log "警告" "高吞吐服务检测: 最高优先级类 '$highest_class' 标记无效，使用默认 DSCP 46 (EF)"
+            class_mark=$(get_class_mark "upload" "$highest_class" 2>/dev/null)
+            if [ -z "$class_mark" ] || [ "$class_mark" -eq 0 ]; then
+                class_mark=1  # 回退标记值，对应最高优先级类（通常标记值为 1）
+                qos_log "警告" "高吞吐服务检测: 最高优先级类 '$highest_class' 标记无效，使用回退标记 $class_mark"
             else
-                qos_log "信息" "高吞吐服务检测: 自动使用最高优先级类 '$highest_class' (DSCP=$dscp)"
+                qos_log "信息" "高吞吐服务检测: 自动使用最高优先级类 '$highest_class' (标记=$class_mark)"
             fi
         else
-            dscp=46
-            qos_log "警告" "高吞吐服务检测: 未找到任何启用的上传类，使用默认 DSCP 46 (EF)"
+            class_mark=1
+            qos_log "警告" "高吞吐服务检测: 未找到任何启用的上传类，使用回退标记 $class_mark"
         fi
     fi
 
@@ -1205,19 +1218,19 @@ create_high_throughput_service_rules() {
     nft add rule inet gargoyle-qos-priority qos_high_throughput_service "ct bytes original < $min_bytes return" 2>/dev/null || true
     nft add rule inet gargoyle-qos-priority qos_high_throughput_service update @qos_high_throughput_services '{ ip saddr . ip daddr and 255.255.255.0 . th dport . meta l4proto timeout 5m }' 2>/dev/null || true
     nft add rule inet gargoyle-qos-priority qos_high_throughput_service update @qos_high_throughput_services6 '{ ip6 saddr . ip6 daddr and ffff:ffff:ffff:: . th dport . meta l4proto timeout 5m }' 2>/dev/null || true
-    nft add rule inet gargoyle-qos-priority qos_high_throughput_service meta mark set $dscp ct mark set meta mark return 2>/dev/null || true
+    nft add rule inet gargoyle-qos-priority qos_high_throughput_service meta mark set $class_mark ct mark set $class_mark return 2>/dev/null || true
 
     nft add rule inet gargoyle-qos-priority qos_high_throughput_service_reply "ct bytes reply < $min_bytes return" 2>/dev/null || true
     nft add rule inet gargoyle-qos-priority qos_high_throughput_service_reply update @qos_high_throughput_services '{ ip daddr . ip saddr and 255.255.255.0 . th sport . meta l4proto timeout 5m }' 2>/dev/null || true
     nft add rule inet gargoyle-qos-priority qos_high_throughput_service_reply update @qos_high_throughput_services6 '{ ip6 daddr . ip6 saddr and ffff:ffff:ffff:: . th sport . meta l4proto timeout 5m }' 2>/dev/null || true
-    nft add rule inet gargoyle-qos-priority qos_high_throughput_service_reply meta mark set $dscp ct mark set meta mark return 2>/dev/null || true
+    nft add rule inet gargoyle-qos-priority qos_high_throughput_service_reply meta mark set $class_mark ct mark set $class_mark return 2>/dev/null || true
 
     nft add rule inet gargoyle-qos-priority qos_dynamic_classify "ct mark & 0x3f == 0" ip saddr . ip daddr and 255.255.255.0 . th dport . meta l4proto @qos_high_throughput_services goto qos_high_throughput_service 2>/dev/null || true
     nft add rule inet gargoyle-qos-priority qos_dynamic_classify "ct mark & 0x3f == 0" ip6 saddr . ip6 daddr and ffff:ffff:ffff:: . th dport . meta l4proto @qos_high_throughput_services6 goto qos_high_throughput_service 2>/dev/null || true
     nft add rule inet gargoyle-qos-priority qos_dynamic_classify_reply "ct mark & 0x3f == 0" ip daddr . ip saddr and 255.255.255.0 . th sport . meta l4proto @qos_high_throughput_services goto qos_high_throughput_service_reply 2>/dev/null || true
     nft add rule inet gargoyle-qos-priority qos_dynamic_classify_reply "ct mark & 0x3f == 0" ip6 daddr . ip6 saddr and ffff:ffff:ffff:: . th sport . meta l4proto @qos_high_throughput_services6 goto qos_high_throughput_service_reply 2>/dev/null || true
 
-    qos_log "信息" "高吞吐服务检测已启用: 最小连接数=$min_connections, 最小字节数=$min_bytes, 使用类=$class (DSCP=$dscp)"
+    qos_log "信息" "高吞吐服务检测已启用: 最小连接数=$min_connections, 最小字节数=$min_bytes, 使用标记=$class_mark"
 }
 
 setup_dynamic_classification() {
@@ -1385,7 +1398,7 @@ apply_enhanced_features() {
             echo "$tcp_upgrade_rules" | while IFS= read -r rule; do
                 [[ -z "$rule" ]] && continue
                 # 修复：同时设置 meta mark 和 ct mark，使用 insert 确保优先执行
-                rule=$(echo "$rule" | sed 's/meta mark set \([0-9]\+\)/meta mark set \1 ct mark set \1/')
+                # 注意：规则中已经包含 meta mark set 和 ct mark set，无需再次 sed
                 echo "${rule/add rule/insert rule}" >> "$tcp_file"
             done
             qos_log "INFO" "TCP 升级规则文件内容:"
@@ -1408,8 +1421,7 @@ apply_enhanced_features() {
         if [[ -n "$udp_limit_rules" ]]; then
             local udp_file=$(mktemp)
             register_temp_file "$udp_file"
-            # 修复：同时设置 meta mark 和 ct mark，并使用 insert rule 确保优先执行
-            udp_limit_rules=$(echo "$udp_limit_rules" | sed 's/meta mark set \([0-9]\+\)/meta mark set \1 ct mark set \1/g')
+            # 规则已经直接包含 meta mark set 和 ct mark set，直接使用 insert
             udp_limit_rules=$(echo "$udp_limit_rules" | sed 's/^add rule/insert rule/')
             echo "$udp_limit_rules" > "$udp_file"
             qos_log "INFO" "UDP 限速规则文件内容:"
