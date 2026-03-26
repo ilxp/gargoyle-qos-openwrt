@@ -1,6 +1,6 @@
 #!/bin/bash
 # CAKE算法实现模块 - 多队列增强版
-# 版本: 3.3.9 - 修复 DSCP 映射（优先使用 dscp，否则使用 priority），修正 class_mark 映射 key
+# 版本: 3.4.0 - 修复多队列带宽分配、IFB队列数回退、移除停止时的配置恢复
 # 支持与 idclass 集成，通过 DSCP 进行分类（diffserv4 模式）
 # 必要工具：tc, nft, conntrack, ethtool, sysctl
 # 内核模块：sch_cake
@@ -38,7 +38,7 @@ RUNTIME_PARAMS_FILE="${RUNTIME_PARAMS_FILE:-/tmp/cake_runtime_params}"
 UPLOAD_MASK=0
 DOWNLOAD_MASK=0
 
-echo "CAKE 模块初始化完成 (v3.3.9)"
+echo "CAKE 模块初始化完成 (v3.4.0)"
 echo "  网络接口: $qos_interface"
 echo "  IFB 设备: $IFB_DEVICE"
 echo "  上传带宽: ${total_upload_bandwidth:-未配置}kbit/s"
@@ -249,18 +249,23 @@ get_tx_queues() {
 check_cake_param_support() {
     local param="$1"
     local dummy_dev="dummy_test_$$"
-    ip link add "$dummy_dev" type dummy 2>/dev/null || {
-        dummy_dev="lo"
-    }
-    tc qdisc del dev "$dummy_dev" root 2>/dev/null
-    if tc qdisc add dev "$dummy_dev" root cake bandwidth 1mbit "$param" 2>/dev/null; then
-        tc qdisc del dev "$dummy_dev" root 2>/dev/null
-        [ "$dummy_dev" != "lo" ] && ip link del "$dummy_dev" 2>/dev/null
-        return 0
-    else
-        [ "$dummy_dev" != "lo" ] && ip link del "$dummy_dev" 2>/dev/null
-        return 1
+    local created=0
+    if ! ip link show "$dummy_dev" >/dev/null 2>&1; then
+        ip link add "$dummy_dev" type dummy 2>/dev/null || {
+            dummy_dev="lo"
+        }
+        created=1
     fi
+    tc qdisc del dev "$dummy_dev" root 2>/dev/null
+    local ret=1
+    if tc qdisc add dev "$dummy_dev" root cake bandwidth 1mbit "$param" 2>/dev/null; then
+        ret=0
+        tc qdisc del dev "$dummy_dev" root 2>/dev/null
+    fi
+    if [[ $created -eq 1 && "$dummy_dev" != "lo" ]]; then
+        ip link del "$dummy_dev" 2>/dev/null
+    fi
+    return $ret
 }
 
 # ========== 配置加载（带消毒）==========
@@ -527,9 +532,11 @@ create_cake_root_qdisc() {
         qos_log "INFO" "CAKE-MQ 已被禁用，使用普通 CAKE"
     fi
 
+    # 修复：当总带宽小于队列数时，自动降级为单队列
     if [ "$use_mq" = "1" ] && [ "$bandwidth" -lt "$queues" ] 2>/dev/null; then
         qos_log "WARN" "总带宽 ${bandwidth}kbit 小于队列数 $queues，多队列可能导致部分队列带宽为0，已自动回退到单队列模式。"
         use_mq=0
+        queues=1
     fi
 
     if [ "$use_mq" = "1" ]; then
@@ -677,7 +684,7 @@ init_cake_upload() {
 # ========== 下载初始化 ==========
 init_cake_download() {
     qos_log "INFO" "初始化下载方向CAKE"
-    local expected_queues=1 current_queues
+    local expected_queues=1 current_queues actual_queues
 
     if [ -z "$total_download_bandwidth" ] || [ "$total_download_bandwidth" -le 0 ] 2>/dev/null; then
         qos_log "INFO" "下载带宽未配置，跳过下载方向初始化"
@@ -692,6 +699,7 @@ init_cake_download() {
         fi
     fi
 
+    # IFB 设备管理
     if ip link show dev "$IFB_DEVICE" >/dev/null 2>&1; then
         qos_log "INFO" "IFB设备 $IFB_DEVICE 已存在，检查队列数一致性"
         current_queues=$(get_tx_queues "$IFB_DEVICE")
@@ -715,7 +723,7 @@ init_cake_download() {
     fi
 
     if ! ip link show dev "$IFB_DEVICE" >/dev/null 2>&1; then
-        qos_log "INFO" "创建IFB设备 $IFB_DEVICE，队列数: $expected_queues"
+        qos_log "INFO" "创建IFB设备 $IFB_DEVICE，期望队列数: $expected_queues"
         # 尝试带队列数参数创建，如果失败则回退到普通创建
         if ! ip link add "$IFB_DEVICE" numtxqueues "$expected_queues" numrxqueues "$expected_queues" type ifb 2>/dev/null; then
             qos_log "WARN" "无法使用 numtxqueues 参数创建 IFB 设备，尝试普通创建"
@@ -723,7 +731,16 @@ init_cake_download() {
                 qos_log "ERROR" "无法创建IFB设备 $IFB_DEVICE"
                 return 1
             fi
-            qos_log "INFO" "IFB设备创建成功，但可能队列数不符预期。如需多队列，请检查内核支持。"
+            # 回退到普通创建后，重新获取实际队列数
+            actual_queues=$(get_tx_queues "$IFB_DEVICE")
+            if [ "$actual_queues" -ne "$expected_queues" ]; then
+                qos_log "WARN" "IFB设备实际队列数 ($actual_queues) 与期望 ($expected_queues) 不符，多队列功能可能受限"
+                # 如果实际队列数小于期望，且多队列已启用，则降级为单队列
+                if [ "$CAKE_MQ_ENABLED" = "1" ] && [ "$actual_queues" -lt "$expected_queues" ]; then
+                    qos_log "WARN" "由于 IFB 队列数不足，将禁用多队列模式，使用普通 CAKE"
+                    CAKE_MQ_ENABLED="0"
+                fi
+            fi
         else
             qos_log "INFO" "IFB设备创建成功，队列数: $expected_queues"
         fi
@@ -791,7 +808,7 @@ health_check_cake() {
 
 # ========== 状态显示 ==========
 show_cake_status() {
-    echo "===== CAKE QoS状态报告 (v3.3.9) ====="
+    echo "===== CAKE QoS状态报告 (v3.4.0) ====="
     echo "时间: $(date)"
     echo "网络接口: ${qos_interface:-未知}"
 
@@ -956,9 +973,10 @@ stop_cake_qos() {
 
     # 重置全局状态（调用 common.sh 中的函数）
     cleanup_qos_state
-	# 清理动态检测相关资源
+    # 清理动态检测相关资源
     cleanup_dynamic_detection
-	# 恢复配置
+	
+    # 恢复配置
 	restore_main_config
 
     release_lock
@@ -973,7 +991,7 @@ init_cake_qos() {
         start)
             qos_log "INFO" "启动CAKE QoS"
             check_dependencies || exit 1
-			init_ruleset || exit 1
+            init_ruleset || exit 1
             acquire_lock || exit 1
             check_already_running || { release_lock; exit 1; }
 
@@ -1062,13 +1080,13 @@ init_cake_qos() {
                 rm -f "$QOS_RUNNING_FILE"
                 exit 1
             fi
-            
-			# 增强功能函数（ACK/TCP/UDP/动态分类）
-			apply_enhanced_features
 
-			echo "应用ipv6特别规则..."
-			setup_ipv6_specific_rules
-	
+            # 增强功能函数（ACK/TCP/UDP/动态分类）
+            apply_enhanced_features
+
+            echo "应用ipv6特别规则..."
+            setup_ipv6_specific_rules
+
             # 继续原有的 CAKE 队列配置
             local upload_success=0 download_success=0
             init_cake_upload || upload_success=1
