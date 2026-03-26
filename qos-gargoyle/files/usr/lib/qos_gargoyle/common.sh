@@ -1,6 +1,6 @@
 #!/bin/bash
 # 核心库模块 (common.sh)
-# 版本: 3.4.1 - 优化锁机制、模块检测、配置恢复、变量作用域
+# 版本: 3.4.2 - 修复锁递归、trap保存、标记分配残留、自动测速验证等问题
 # 提供 QoS 系统基础功能
 
 # ========== 加载 OpenWrt 标准函数库 ==========
@@ -59,11 +59,13 @@ fi
 # ========== 锁机制（支持递归） ==========
 LOCK_FILE="/var/run/qos_gargoyle.lock"
 _LOCK_HELD=0
+_LOCK_COUNT=0          # 递归计数
 _LOCK_FD=3
 
 acquire_lock() {
     if [[ $_LOCK_HELD -eq 1 ]]; then
-        # 已持有锁，直接返回成功（递归）
+        # 已持有锁，增加递归计数
+        ((_LOCK_COUNT++))
         return 0
     fi
     # 打开文件描述符（用于持锁）
@@ -73,6 +75,7 @@ acquire_lock() {
         # 成功加锁
         echo $$ > "$LOCK_FILE"
         _LOCK_HELD=1
+        _LOCK_COUNT=1
         return 0
     fi
     # 加锁失败，关闭文件描述符并返回错误
@@ -85,9 +88,16 @@ release_lock() {
     if [[ $_LOCK_HELD -eq 0 ]]; then
         return 0
     fi
+    if [[ $_LOCK_COUNT -gt 1 ]]; then
+        # 递归锁，减少计数
+        ((_LOCK_COUNT--))
+        return 0
+    fi
+    # 最后释放锁
     flock -u $_LOCK_FD 2>/dev/null || true
     eval "exec $_LOCK_FD>&-"
     _LOCK_HELD=0
+    _LOCK_COUNT=0
 }
 
 # ========== 检查是否已经在运行 ==========
@@ -157,8 +167,8 @@ cleanup_temp_files() {
     TEMP_FILES=()
 }
 
-# 设置退出时清理临时文件（保留已有 trap 链）
-_old_trap=$(trap -p EXIT | awk '{print $3}')
+# 设置退出时清理临时文件（改进：保留原有 trap）
+_old_trap=$(trap -p EXIT | awk '{print $3}' | sed "s/^'//;s/'$//")
 if [[ -n "$_old_trap" ]]; then
     trap "cleanup_temp_files; $_old_trap" EXIT
 else
@@ -603,6 +613,13 @@ allocate_class_marks() {
     else
         base_value=65536
     fi
+
+    # 先删除该方向的旧标记，避免残留
+    if [[ -f "$CLASS_MARKS_FILE" ]]; then
+        grep -v "^$direction:" "$CLASS_MARKS_FILE" > "${temp_file}.clean" 2>/dev/null || true
+        mv "${temp_file}.clean" "$CLASS_MARKS_FILE" 2>/dev/null
+    fi
+
     for class in $class_list; do
         mark_index=$(uci -q get "${CONFIG_FILE}.${class}.mark_index" 2>/dev/null)
         if [[ -n "$mark_index" ]]; then
@@ -639,13 +656,7 @@ allocate_class_marks() {
         log_info "类别 $class 分配标记索引 $mark_index (值: $mark / 0x$(printf '%X' $mark))"
     done
     if [[ -s "$temp_file" ]]; then
-        if [[ -f "$CLASS_MARKS_FILE" ]]; then
-            grep -v "^$direction:" "$CLASS_MARKS_FILE" 2>/dev/null > "${temp_file}.merge"
-            cat "$temp_file" >> "${temp_file}.merge"
-            mv "${temp_file}.merge" "$CLASS_MARKS_FILE"
-        else
-            mv "$temp_file" "$CLASS_MARKS_FILE"
-        fi
+        cat "$temp_file" >> "$CLASS_MARKS_FILE"
         chmod 644 "$CLASS_MARKS_FILE"
     fi
     rm -f "$temp_file"
@@ -1354,9 +1365,11 @@ convert_bandwidth_to_kbit() {
             g|gb|gib) multiplier=8000000 ;;
             *) log_error "未知带宽单位: $unit"; return 1 ;;
         esac
+        # 使用 bc 或 awk 计算，确保精度
         if command -v bc >/dev/null 2>&1; then
             result=$(echo "$num * $multiplier" | bc | awk '{printf "%.0f", $1}')
         else
+            # 尝试使用 awk 进行浮点运算，awk 自动截断小数部分
             result=$(awk "BEGIN {printf \"%.0f\", $num * $multiplier}")
         fi
         [[ -z "$result" || ! "$result" =~ ^[0-9]+$ || $result -lt 0 ]] && result=0
@@ -1698,7 +1711,7 @@ get_highest_priority_class() {
     echo "$best_class"
 }
 
-# ========== 自动测速（增加交互超时） ==========
+# ========== 自动测速（增加交互超时，安装后验证） ==========
 auto_speedtest() {
     local noninteractive=0 force=0 gaming_ip=""
     local WAN_IF="" DOWNLOAD_SPEED="" UPLOAD_SPEED="" SPEEDTEST_CMD=""
@@ -1785,13 +1798,16 @@ auto_speedtest() {
     else
         log_warn "未找到 speedtest 工具，尝试安装 speedtest-go..."
         if command -v opkg >/dev/null 2>&1; then
-            opkg update && opkg install speedtest-go || {
+            opkg update && opkg install speedtest-go
+            # 安装后再次检查
+            if command -v speedtest-go >/dev/null 2>&1; then
+                SPEEDTEST_CMD="speedtest-go"
+                [[ -n "$server" ]] && SPEEDTEST_CMD="$SPEEDTEST_CMD -s $server"
+                [[ -n "$spec_interface" ]] && SPEEDTEST_CMD="$SPEEDTEST_CMD -i $spec_interface"
+            else
                 log_error "安装 speedtest-go 失败，请手动安装"
                 return 1
-            }
-            SPEEDTEST_CMD="speedtest-go"
-            [[ -n "$server" ]] && SPEEDTEST_CMD="$SPEEDTEST_CMD -s $server"
-            [[ -n "$spec_interface" ]] && SPEEDTEST_CMD="$SPEEDTEST_CMD -i $spec_interface"
+            fi
         else
             log_error "无包管理器，请手动安装 speedtest 工具"
             return 1

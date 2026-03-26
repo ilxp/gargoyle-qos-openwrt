@@ -1,6 +1,6 @@
 #!/bin/bash
 # 规则辅助模块 (rule.sh)
-# 版本: 3.4.1 - 修复ICMP否定组合、动态分类集合检查、笛卡尔积爆炸警告、临时文件清理增强
+# 版本: 3.4.2 - 修复 setup_class_mark_map 顺序、否定集合拆分、nft 语法错误
 # 新增 setup_class_mark_map 函数供所有算法模块使用
 
 # 加载核心库（已修复）
@@ -53,16 +53,19 @@ adjust_proto_for_family() {
 }
 
 # ========== 拆分多集合字段（支持否定前缀和逗号） ==========
+# 注意：否定前缀字段（以 != 开头）将不会被拆分，整体返回
 split_multiset() {
     local field="$1"
     local result=()
-    if [[ "$field" == @* && "$field" == *,* ]]; then
+    # 若字段以 != 开头，则不拆分
+    if [[ "$field" == "!="* ]]; then
+        result+=("$field")
+    else
+        # 否则按逗号拆分
         IFS=',' read -ra parts <<< "$field"
         for part in "${parts[@]}"; do
             result+=("$part")
         done
-    else
-        result+=("$field")
     fi
     printf '%s\n' "${result[@]}"
 }
@@ -212,22 +215,37 @@ build_nft_rule_generic() {
         fi
     fi
     
+    # 端口条件处理（支持否定前缀）
     local port_cond=""
     if [[ "$proto" =~ ^(tcp|udp|tcp_udp)$ ]]; then
         if [[ "$chain" == *"ingress"* ]]; then
             if [[ -n "$srcport" ]]; then
-                if [[ "$srcport" == @* ]]; then
-                    port_cond="th sport $srcport"
+                local sport_val="$srcport"
+                local neg=""
+                [[ "$sport_val" == "!="* ]] && { neg="!="; sport_val="${sport_val#!=}"; }
+                if [[ "$sport_val" == @* ]]; then
+                    port_cond="th sport $neg $sport_val"
                 else
-                    port_cond="th sport { $srcport }"
+                    if [[ -n "$neg" ]]; then
+                        port_cond="th sport $neg { $sport_val }"
+                    else
+                        port_cond="th sport { $sport_val }"
+                    fi
                 fi
             fi
         else
             if [[ -n "$dstport" ]]; then
-                if [[ "$dstport" == @* ]]; then
-                    port_cond="th dport $dstport"
+                local dport_val="$dstport"
+                local neg=""
+                [[ "$dport_val" == "!="* ]] && { neg="!="; dport_val="${dport_val#!=}"; }
+                if [[ "$dport_val" == @* ]]; then
+                    port_cond="th dport $neg $dport_val"
                 else
-                    port_cond="th dport { $dstport }"
+                    if [[ -n "$neg" ]]; then
+                        port_cond="th dport $neg { $dport_val }"
+                    else
+                        port_cond="th dport { $dport_val }"
+                    fi
                 fi
             fi
         fi
@@ -500,8 +518,8 @@ EOF
             fi
         fi
 
-        nft delete element inet gargoyle-qos-priority class_mark { $mark } 2>/dev/null
-        nft add element inet gargoyle-qos-priority class_mark { $mark : $dscp } 2>/dev/null
+        # 将元素添加也写入临时文件，确保 map 存在后再添加
+        echo "add element inet gargoyle-qos-priority class_mark { $mark : $dscp }" >> "$tmp_nft_file"
         qos_log "DEBUG" "Added map element $mark : $dscp for $cls_clean"
     done < "$CLASS_MARKS_FILE"
 
@@ -626,26 +644,47 @@ apply_enhanced_direction_rules() {
         local dstport_list=()
         local src_ip_list=()
         local dest_ip_list=()
+        
+        # 处理端口字段：保留否定前缀不拆分
         if [[ -n "$tmp_srcport" ]]; then
-            mapfile -t srcport_list < <(split_multiset "$tmp_srcport")
+            if [[ "$tmp_srcport" == "!="* ]]; then
+                srcport_list=("$tmp_srcport")
+            else
+                mapfile -t srcport_list < <(split_multiset "$tmp_srcport")
+            fi
         else
             srcport_list=("")
         fi
         if [[ -n "$tmp_dstport" ]]; then
-            mapfile -t dstport_list < <(split_multiset "$tmp_dstport")
+            if [[ "$tmp_dstport" == "!="* ]]; then
+                dstport_list=("$tmp_dstport")
+            else
+                mapfile -t dstport_list < <(split_multiset "$tmp_dstport")
+            fi
         else
             dstport_list=("")
         fi
+        
+        # 处理IP字段：保留否定前缀不拆分
         if [[ -n "$tmp_src_ip" ]]; then
-            mapfile -t src_ip_list < <(split_multiset "$tmp_src_ip")
+            if [[ "$tmp_src_ip" == "!="* ]]; then
+                src_ip_list=("$tmp_src_ip")
+            else
+                mapfile -t src_ip_list < <(split_multiset "$tmp_src_ip")
+            fi
         else
             src_ip_list=("")
         fi
         if [[ -n "$tmp_dest_ip" ]]; then
-            mapfile -t dest_ip_list < <(split_multiset "$tmp_dest_ip")
+            if [[ "$tmp_dest_ip" == "!="* ]]; then
+                dest_ip_list=("$tmp_dest_ip")
+            else
+                mapfile -t dest_ip_list < <(split_multiset "$tmp_dest_ip")
+            fi
         else
             dest_ip_list=("")
         fi
+        
         local total_combinations=$(( ${#srcport_list[@]} * ${#dstport_list[@]} * ${#src_ip_list[@]} * ${#dest_ip_list[@]} ))
         if [[ $total_combinations -gt $MAX_COMBINATIONS ]]; then
             qos_log "WARN" "规则 $rule_name 的组合数 $total_combinations 超过阈值 $MAX_COMBINATIONS，可能导致性能问题，请检查配置（端口/IP 集合过多）"
@@ -968,13 +1007,13 @@ create_high_throughput_service_rules() {
     nft add rule inet gargoyle-qos-priority qos_established_connection meter qos_htp_detect '{ ip daddr . ip saddr and 255.255.255.0 . th sport . meta l4proto timeout 5s limit rate over '$((min_connections - 1))'/minute }' add @qos_high_throughput_services '{ ip daddr . ip saddr and 255.255.255.0 . th sport . meta l4proto timeout 30s }' 2>/dev/null || true
     nft add rule inet gargoyle-qos-priority qos_established_connection meter qos_htp_detect6 '{ ip6 daddr . ip6 saddr and ffff:ffff:ffff:: . th sport . meta l4proto timeout 5s limit rate over '$((min_connections - 1))'/minute }' add @qos_high_throughput_services6 '{ ip6 daddr . ip6 saddr and ffff:ffff:ffff:: . th sport . meta l4proto timeout 30s }' 2>/dev/null || true
 
-    # 分类链
-    nft add rule inet gargoyle-qos-priority qos_high_throughput_service ct original bytes < $min_bytes return 2>/dev/null || true
+    # 分类链（修正 ct bytes 语法）
+    nft add rule inet gargoyle-qos-priority qos_high_throughput_service ct bytes original < $min_bytes return 2>/dev/null || true
     nft add rule inet gargoyle-qos-priority qos_high_throughput_service update @qos_high_throughput_services '{ ip saddr . ip daddr and 255.255.255.0 . th dport . meta l4proto timeout 5m }' 2>/dev/null || true
     nft add rule inet gargoyle-qos-priority qos_high_throughput_service update @qos_high_throughput_services6 '{ ip6 saddr . ip6 daddr and ffff:ffff:ffff:: . th dport . meta l4proto timeout 5m }' 2>/dev/null || true
     nft add rule inet gargoyle-qos-priority qos_high_throughput_service ct mark set (ct mark & 0xffffffc0) | $dscp return 2>/dev/null || true
 
-    nft add rule inet gargoyle-qos-priority qos_high_throughput_service_reply ct reply bytes < $min_bytes return 2>/dev/null || true
+    nft add rule inet gargoyle-qos-priority qos_high_throughput_service_reply ct bytes reply < $min_bytes return 2>/dev/null || true
     nft add rule inet gargoyle-qos-priority qos_high_throughput_service_reply update @qos_high_throughput_services '{ ip daddr . ip saddr and 255.255.255.0 . th sport . meta l4proto timeout 5m }' 2>/dev/null || true
     nft add rule inet gargoyle-qos-priority qos_high_throughput_service_reply update @qos_high_throughput_services6 '{ ip6 daddr . ip6 saddr and ffff:ffff:ffff:: . th sport . meta l4proto timeout 5m }' 2>/dev/null || true
     nft add rule inet gargoyle-qos-priority qos_high_throughput_service_reply ct mark set (ct mark & 0xffffffc0) | $dscp return 2>/dev/null || true
