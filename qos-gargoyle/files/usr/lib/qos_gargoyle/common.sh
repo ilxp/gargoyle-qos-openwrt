@@ -1,6 +1,6 @@
 #!/bin/bash
 # 核心库模块 (common.sh)
-# 版本: 3.4.2 - 修复锁递归、trap保存、标记分配残留、自动测速验证等问题
+# 版本: 3.4.3 - 移除锁机制，改用 procd 管理；修复 dummy 设备回退；增强自动测速超时
 # 提供 QoS 系统基础功能
 
 # ========== 加载 OpenWrt 标准函数库 ==========
@@ -56,51 +56,8 @@ if [[ -z "$_QOS_LIB_SH_LOADED" ]]; then
     TEMP_FILES=()
 fi
 
-# ========== 锁机制（支持递归） ==========
-LOCK_FILE="/var/run/qos_gargoyle.lock"
-_LOCK_HELD=0
-_LOCK_COUNT=0          # 递归计数
-_LOCK_FD=3
-
-acquire_lock() {
-    if [[ $_LOCK_HELD -eq 1 ]]; then
-        # 已持有锁，增加递归计数
-        ((_LOCK_COUNT++))
-        return 0
-    fi
-    # 打开文件描述符（用于持锁）
-    eval "exec $_LOCK_FD> \"$LOCK_FILE\""
-    # 非阻塞尝试加锁
-    if flock -n $_LOCK_FD; then
-        # 成功加锁
-        echo $$ > "$LOCK_FILE"
-        _LOCK_HELD=1
-        _LOCK_COUNT=1
-        return 0
-    fi
-    # 加锁失败，关闭文件描述符并返回错误
-    log_error "锁已被占用"
-    eval "exec $_LOCK_FD>&-"
-    return 1
-}
-
-release_lock() {
-    if [[ $_LOCK_HELD -eq 0 ]]; then
-        return 0
-    fi
-    if [[ $_LOCK_COUNT -gt 1 ]]; then
-        # 递归锁，减少计数
-        ((_LOCK_COUNT--))
-        return 0
-    fi
-    # 最后释放锁
-    flock -u $_LOCK_FD 2>/dev/null || true
-    eval "exec $_LOCK_FD>&-"
-    _LOCK_HELD=0
-    _LOCK_COUNT=0
-}
-
 # ========== 检查是否已经在运行 ==========
+# 注意：使用 procd 管理时，此函数仅用于辅助，实际单实例由 procd 保证
 check_already_running() {
     if [ -f "$QOS_RUNNING_FILE" ]; then
         local old_pid=$(cat "$QOS_RUNNING_FILE" 2>/dev/null)
@@ -1489,21 +1446,22 @@ ensure_ifb_device() {
     return 1
 }
 
-# ========== 检查 tc connmark 支持 ==========
+# ========== 检查 tc connmark 支持（修复 dummy 设备回退） ==========
 check_tc_connmark_support() {
     modprobe sch_ingress 2>/dev/null
     modprobe act_connmark 2>/dev/null
-    local dummy_dev="qos_test_dummy_$$"
+    local dummy_dev="qos_test_connmark_$$"
     local created=0
     if ! ip link show "$dummy_dev" >/dev/null 2>&1; then
-        ip link add "$dummy_dev" type dummy 2>/dev/null || {
-            dummy_dev="lo"
-        }
+        if ! ip link add "$dummy_dev" type dummy 2>/dev/null; then
+            log_warn "无法创建 dummy 设备，假定 connmark 不支持"
+            return 1
+        fi
         created=1
     fi
     tc qdisc del dev "$dummy_dev" ingress 2>/dev/null
     if ! tc qdisc add dev "$dummy_dev" ingress 2>/dev/null; then
-        [[ $created -eq 1 && "$dummy_dev" != "lo" ]] && ip link del "$dummy_dev" 2>/dev/null
+        [[ $created -eq 1 ]] && ip link del "$dummy_dev" 2>/dev/null
         log_warn "无法在 $dummy_dev 上创建 ingress 队列，无法测试 connmark 支持"
         return 1
     fi
@@ -1513,7 +1471,7 @@ check_tc_connmark_support() {
         tc filter del dev "$dummy_dev" parent ffff: 2>/dev/null
     fi
     tc qdisc del dev "$dummy_dev" ingress 2>/dev/null
-    if [[ $created -eq 1 && "$dummy_dev" != "lo" ]]; then
+    if [[ $created -eq 1 ]]; then
         ip link del "$dummy_dev" 2>/dev/null
     fi
     return $ret
@@ -1530,19 +1488,20 @@ check_sfo_enabled() {
     fi
 }
 
-# ========== 检查 tc ctinfo 支持 ==========
+# ========== 检查 tc ctinfo 支持（修复 dummy 设备回退） ==========
 check_tc_ctinfo_support() {
-    local dummy_dev="qos_test_dummy_$$"
+    local dummy_dev="qos_test_ctinfo_$$"
     local created=0
     if ! ip link show "$dummy_dev" >/dev/null 2>&1; then
-        ip link add "$dummy_dev" type dummy 2>/dev/null || {
-            dummy_dev="lo"
-        }
+        if ! ip link add "$dummy_dev" type dummy 2>/dev/null; then
+            log_warn "无法创建 dummy 设备，假定 ctinfo 不支持"
+            return 1
+        fi
         created=1
     fi
     tc qdisc del dev "$dummy_dev" ingress 2>/dev/null
     if ! tc qdisc add dev "$dummy_dev" ingress 2>/dev/null; then
-        [[ $created -eq 1 && "$dummy_dev" != "lo" ]] && ip link del "$dummy_dev" 2>/dev/null
+        [[ $created -eq 1 ]] && ip link del "$dummy_dev" 2>/dev/null
         log_warn "无法在 $dummy_dev 上创建 ingress 队列，无法测试 ctinfo 支持"
         return 1
     fi
@@ -1552,7 +1511,7 @@ check_tc_ctinfo_support() {
         tc filter del dev "$dummy_dev" parent ffff: 2>/dev/null
     fi
     tc qdisc del dev "$dummy_dev" ingress 2>/dev/null
-    if [[ $created -eq 1 && "$dummy_dev" != "lo" ]]; then
+    if [[ $created -eq 1 ]]; then
         ip link del "$dummy_dev" 2>/dev/null
     fi
     return $ret
@@ -1683,7 +1642,7 @@ calculate_memory_limit() {
     echo "$result"
 }
 
-# ========== 获取最高优先级的类名称 ==========
+# ========== 获取最高优先级的类名称（修复：检查 enabled） ==========
 get_highest_priority_class() {
     local direction="$1"
     local class_list=""
@@ -1696,7 +1655,8 @@ get_highest_priority_class() {
     local best_class=""
     for class in $class_list; do
         local enabled=$(uci -q get ${CONFIG_FILE}.${class}.enabled 2>/dev/null)
-        if [[ "$enabled" != "1" ]] && [[ -n "$enabled" ]]; then
+        # 如果 enabled 明确为 0，则跳过；否则视为启用（兼容未配置 enabled 的情况）
+        if [[ "$enabled" == "0" ]]; then
             continue
         fi
         local prio=$(uci -q get ${CONFIG_FILE}.${class}.priority 2>/dev/null)
