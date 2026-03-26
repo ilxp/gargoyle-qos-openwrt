@@ -1,6 +1,6 @@
 #!/bin/bash
 # CAKE算法实现模块 - 多队列增强版
-# 版本: 3.4.0 - 修复多队列带宽分配、IFB队列数回退、移除停止时的配置恢复
+# 版本: 3.4.1 - 添加 DSCP 映射、IFB 队列数回退优化、自动调优覆盖修复
 # 支持与 idclass 集成，通过 DSCP 进行分类（diffserv4 模式）
 # 必要工具：tc, nft, conntrack, ethtool, sysctl
 # 内核模块：sch_cake
@@ -38,7 +38,7 @@ RUNTIME_PARAMS_FILE="${RUNTIME_PARAMS_FILE:-/tmp/cake_runtime_params}"
 UPLOAD_MASK=0
 DOWNLOAD_MASK=0
 
-echo "CAKE 模块初始化完成 (v3.4.0)"
+echo "CAKE 模块初始化完成 (v3.4.1)"
 echo "  网络接口: $qos_interface"
 echo "  IFB 设备: $IFB_DEVICE"
 echo "  上传带宽: ${total_upload_bandwidth:-未配置}kbit/s"
@@ -268,24 +268,12 @@ check_cake_param_support() {
     return $ret
 }
 
-# ========== 配置加载（带消毒）==========
+# ========== 配置加载（只加载 CAKE 专属参数，不覆盖带宽）==========
 load_cake_config() {
     qos_log "INFO" "加载CAKE配置"
-    local uci_upload uci_download uci_ifb val
+    local uci_ifb val
 
-    # 如果带宽变量未设置，从 UCI 读取（避免覆盖已由 load_bandwidth_from_config 设置的值）
-    if [ -z "$total_upload_bandwidth" ] || [ "$total_upload_bandwidth" -eq 0 ]; then
-        uci_upload=$(uci -q get ${CONFIG_FILE}.upload.total_bandwidth 2>/dev/null)
-        if [ -n "$uci_upload" ]; then
-            total_upload_bandwidth=$(convert_bandwidth_to_kbit "$(sanitize_param "$uci_upload")")
-        fi
-    fi
-    if [ -z "$total_download_bandwidth" ] || [ "$total_download_bandwidth" -eq 0 ]; then
-        uci_download=$(uci -q get ${CONFIG_FILE}.download.total_bandwidth 2>/dev/null)
-        if [ -n "$uci_download" ]; then
-            total_download_bandwidth=$(convert_bandwidth_to_kbit "$(sanitize_param "$uci_download")")
-        fi
-    fi
+    # 注意：带宽变量已由主脚本（load_bandwidth_from_config）设置，此处不再重复读取
 
     uci_ifb=$(uci -q get ${CONFIG_FILE}.download.ifb_device 2>/dev/null)
     [ -n "$uci_ifb" ] && IFB_DEVICE=$(sanitize_param "$uci_ifb")
@@ -357,11 +345,15 @@ load_cake_config() {
     qos_log "INFO" "CAKE配置加载完成"
 }
 
-# ========== 自动调优 ==========
+# ========== 自动调优（不覆盖用户显式配置）==========
 auto_tune_cake() {
     qos_log "INFO" "自动调整CAKE参数"
     local total_bw=0
     local user_set_rtt user_set_mem
+
+    # 检查用户是否显式配置了 RTT 和内存限制
+    user_set_rtt=$(uci -q get ${CONFIG_FILE}.cake.rtt 2>/dev/null)
+    user_set_mem=$(uci -q get ${CONFIG_FILE}.cake.memlimit 2>/dev/null)
 
     if [ "$total_upload_bandwidth" -gt 0 ] && [ "$total_download_bandwidth" -gt 0 ]; then
         total_bw=$((total_upload_bandwidth + total_download_bandwidth))
@@ -371,29 +363,35 @@ auto_tune_cake() {
         total_bw=$total_download_bandwidth
     fi
 
-    user_set_rtt=$(uci -q get ${CONFIG_FILE}.cake.rtt 2>/dev/null)
-    user_set_mem=$(uci -q get ${CONFIG_FILE}.cake.memlimit 2>/dev/null)
+    # 仅在用户未配置时调整
+    if [ -z "$user_set_mem" ]; then
+        if [ "$total_bw" -gt 200000 ]; then
+            CAKE_MEMORY_LIMIT="128mb"
+        elif [ "$total_bw" -gt 100000 ]; then
+            CAKE_MEMORY_LIMIT="64mb"
+        elif [ "$total_bw" -gt 50000 ]; then
+            CAKE_MEMORY_LIMIT="32mb"
+        elif [ "$total_bw" -gt 10000 ]; then
+            CAKE_MEMORY_LIMIT="16mb"
+        else
+            CAKE_MEMORY_LIMIT="8mb"
+        fi
+        qos_log "INFO" "自动调整 memlimit=${CAKE_MEMORY_LIMIT}"
+    fi
 
-    if [ "$total_bw" -gt 200000 ]; then
-        [ -z "$user_set_mem" ] && CAKE_MEMORY_LIMIT="128mb"
-        [ -z "$user_set_rtt" ] && CAKE_RTT="20ms"
-        qos_log "INFO" "自动调整: 超高带宽场景 (${total_bw}kbit) -> memlimit=${CAKE_MEMORY_LIMIT}, rtt=${CAKE_RTT}"
-    elif [ "$total_bw" -gt 100000 ]; then
-        [ -z "$user_set_mem" ] && CAKE_MEMORY_LIMIT="64mb"
-        [ -z "$user_set_rtt" ] && CAKE_RTT="50ms"
-        qos_log "INFO" "自动调整: 高带宽场景 (${total_bw}kbit) -> memlimit=${CAKE_MEMORY_LIMIT}, rtt=${CAKE_RTT}"
-    elif [ "$total_bw" -gt 50000 ]; then
-        [ -z "$user_set_mem" ] && CAKE_MEMORY_LIMIT="32mb"
-        [ -z "$user_set_rtt" ] && CAKE_RTT="100ms"
-        qos_log "INFO" "自动调整: 中等带宽场景 (${total_bw}kbit) -> memlimit=${CAKE_MEMORY_LIMIT}, rtt=${CAKE_RTT}"
-    elif [ "$total_bw" -gt 10000 ]; then
-        [ -z "$user_set_mem" ] && CAKE_MEMORY_LIMIT="16mb"
-        [ -z "$user_set_rtt" ] && CAKE_RTT="150ms"
-        qos_log "INFO" "自动调整: 低带宽场景 (${total_bw}kbit) -> memlimit=${CAKE_MEMORY_LIMIT}, rtt=${CAKE_RTT}"
-    else
-        [ -z "$user_set_mem" ] && CAKE_MEMORY_LIMIT="8mb"
-        [ -z "$user_set_rtt" ] && CAKE_RTT="200ms"
-        qos_log "INFO" "自动调整: 极低带宽场景 (${total_bw}kbit) -> memlimit=${CAKE_MEMORY_LIMIT}, rtt=${CAKE_RTT}"
+    if [ -z "$user_set_rtt" ]; then
+        if [ "$total_bw" -gt 200000 ]; then
+            CAKE_RTT="20ms"
+        elif [ "$total_bw" -gt 100000 ]; then
+            CAKE_RTT="50ms"
+        elif [ "$total_bw" -gt 50000 ]; then
+            CAKE_RTT="100ms"
+        elif [ "$total_bw" -gt 10000 ]; then
+            CAKE_RTT="150ms"
+        else
+            CAKE_RTT="200ms"
+        fi
+        qos_log "INFO" "自动调整 rtt=${CAKE_RTT}"
     fi
 }
 
@@ -681,7 +679,7 @@ init_cake_upload() {
     create_cake_root_qdisc "$qos_interface" "upload" "$total_upload_bandwidth"
 }
 
-# ========== 下载初始化 ==========
+# ========== 下载初始化（修复 IFB 回退）==========
 init_cake_download() {
     qos_log "INFO" "初始化下载方向CAKE"
     local expected_queues=1 current_queues actual_queues
@@ -731,15 +729,13 @@ init_cake_download() {
                 qos_log "ERROR" "无法创建IFB设备 $IFB_DEVICE"
                 return 1
             fi
-            # 回退到普通创建后，重新获取实际队列数
+            # 回退到普通创建后，禁用多队列模式
+            qos_log "WARN" "由于 IFB 创建时无法设置队列数，将禁用多队列模式"
+            CAKE_MQ_ENABLED="0"
+            # 重新获取实际队列数（可能为1）
             actual_queues=$(get_tx_queues "$IFB_DEVICE")
-            if [ "$actual_queues" -ne "$expected_queues" ]; then
-                qos_log "WARN" "IFB设备实际队列数 ($actual_queues) 与期望 ($expected_queues) 不符，多队列功能可能受限"
-                # 如果实际队列数小于期望，且多队列已启用，则降级为单队列
-                if [ "$CAKE_MQ_ENABLED" = "1" ] && [ "$actual_queues" -lt "$expected_queues" ]; then
-                    qos_log "WARN" "由于 IFB 队列数不足，将禁用多队列模式，使用普通 CAKE"
-                    CAKE_MQ_ENABLED="0"
-                fi
+            if [ "$actual_queues" -lt "$expected_queues" ]; then
+                qos_log "WARN" "IFB设备实际队列数 ($actual_queues) 小于期望 ($expected_queues)，多队列功能已禁用"
             fi
         else
             qos_log "INFO" "IFB设备创建成功，队列数: $expected_queues"
@@ -808,7 +804,7 @@ health_check_cake() {
 
 # ========== 状态显示 ==========
 show_cake_status() {
-    echo "===== CAKE QoS状态报告 (v3.4.0) ====="
+    echo "===== CAKE QoS状态报告 (v3.4.1) ====="
     echo "时间: $(date)"
     echo "网络接口: ${qos_interface:-未知}"
 
@@ -975,9 +971,9 @@ stop_cake_qos() {
     cleanup_qos_state
     # 清理动态检测相关资源
     cleanup_dynamic_detection
-	
+    
     # 恢复配置
-	restore_main_config
+    restore_main_config
 
     release_lock
     qos_log "INFO" "CAKE QoS停止完成"
