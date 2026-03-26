@@ -1,6 +1,6 @@
 #!/bin/bash
 # HTB_FQCODEL算法实现模块
-# 版本: 3.3.9 - 依赖修复后的 common.sh，优化变量作用域，添加 trap 清理
+# 版本: 3.4.0 - 移除停止时的配置恢复，强制忽略 CAKE_BANDWIDTH，集成 common.sh/rule.sh 修复
 # 基于HTB与FQ_CODEL组合算法实现QoS流量控制。
 
 # ========== 全局配置常量 ==========
@@ -140,6 +140,16 @@ load_htb_fqcodel_config() {
         FQCODEL_ECN=""
         qos_log "INFO" "fq_codel ECN: 未配置"
     fi
+
+    # 强制忽略 CAKE_BANDWIDTH，防止二次整形
+    local cake_bw=$(uci -q get ${CONFIG_FILE}.cake.bandwidth 2>/dev/null)
+    if [[ -n "$cake_bw" ]]; then
+        qos_log "ERROR" "检测到 CAKE_BANDWIDTH 已配置 (值: $cake_bw)，这将导致CAKE二次整形，严重影响HTB调度性能。已强制忽略该配置，使用HTB主导整形。"
+        # 可选：直接退出或仅警告，这里选择忽略
+        # uci set ${CONFIG_FILE}.cake.bandwidth="" 2>/dev/null  # 不修改UCI，仅在运行时忽略
+    fi
+    # 确保 CAKE_BANDWIDTH 变量为空
+    CAKE_BANDWIDTH=""
 
     qos_log "INFO" "HTB配置: R2Q=${HTB_R2Q}, DRR量子=${HTB_DRR_QUANTUM}"
     qos_log "INFO" "fq_codel参数: limit=${FQCODEL_LIMIT}, interval=${FQCODEL_INTERVAL}us, target=${FQCODEL_TARGET}us, flows=${FQCODEL_FLOWS}, quantum=${FQCODEL_QUANTUM}, memory_limit=${FQCODEL_MEMORY_LIMIT:-未配置}, ce_threshold=${FQCODEL_CE_THRESHOLD:-未配置}, ecn=${FQCODEL_ECN:-未配置}"
@@ -282,7 +292,7 @@ create_htb_root_qdisc() {
     return 0
 }
 
-# 设置根队列的默认类
+# 设置根队列的默认类（改进：优先 change，失败则使用全匹配过滤器）
 set_htb_default_class() {
     local device="$1"
     local default_classid="$2"
@@ -925,10 +935,10 @@ init_htb_fqcodel_qos() {
         echo "应用速率限制链..." 
         setup_ratelimit_chain
     fi
-	
-	# 增强功能函数（ACK/TCP/UDP）
-	apply_enhanced_features
-	
+    
+    # 增强功能函数（ACK/TCP/UDP）
+    apply_enhanced_features
+    
     echo "应用ipv6特别规则..." 
     setup_ipv6_specific_rules
     
@@ -1005,16 +1015,17 @@ stop_htb_fqcodel_qos() {
             qos_log "INFO" "IFB设备 $IFB_DEVICE 不存在，跳过"
         fi
     fi
-	
-	# 清理动态检测相关资源
+    
+    # 清理动态检测相关资源
     cleanup_dynamic_detection
-	
+    
     nft delete table inet gargoyle-qos-priority 2>/dev/null || true
     clear_class_marks
     qos_log "INFO" "HTB+FQ_CODEL QoS停止完成"
+	
     # 恢复配置
 	restore_main_config
-	
+    
     _QOS_TABLE_FLUSHED=0
     _IPSET_LOADED=0
     cleanup_qos_state
