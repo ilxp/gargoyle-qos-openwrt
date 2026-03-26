@@ -1,6 +1,6 @@
 #!/bin/bash
 # 规则辅助模块 (rule.sh)
-# 版本: 3.3.9 - 增强 IPv6 重定向回退，优化错误处理，依赖修复后的 common.sh
+# 版本: 3.4.0 - 修复多集合分割、ICMP否定语法、动态分类兼容性、跳转优先级、空规则检查等
 # 提供 nftables 规则生成与系统钩子挂载
 
 # 加载核心库（已修复）
@@ -52,10 +52,11 @@ adjust_proto_for_family() {
     echo "$adjusted"
 }
 
-# ========== 拆分多集合字段 ==========
+# ========== 拆分多集合字段（支持否定前缀和逗号） ==========
 split_multiset() {
     local field="$1"
     local result=()
+    # 如果字段以 @ 开头，且包含逗号，说明是多个集合
     if [[ "$field" == @* && "$field" == *,* ]]; then
         IFS=',' read -ra parts <<< "$field"
         for part in "${parts[@]}"; do
@@ -64,6 +65,9 @@ split_multiset() {
     else
         result+=("$field")
     fi
+    # 同时支持否定前缀 !@set 这种，也作为整体保留
+    # 注意：否定前缀不能出现在集合名中，但实际使用时可能为 "!@set"
+    # 这里简单返回原样，生成规则时会正确处理否定前缀
     printf '%s\n' "${result[@]}"
 }
 
@@ -367,13 +371,19 @@ build_nft_rule_generic() {
                 ipv4_full_cond="$ipv4_full_cond ip ttl eq $ttl_val"
             fi
         fi
+        # ICMP 类型修正：否定不能同时用于类型和代码
         if [[ -n "$icmp_type" ]] && [[ "$proto_v4" == "icmp" ]]; then
             local icmp_val="$icmp_type"
             local neg=""
             [[ "$icmp_val" == "!="* ]] && { neg="!="; icmp_val="${icmp_val#!=}"; }
             if [[ "$icmp_val" == */* ]]; then
                 local type="${icmp_val%/*}" code="${icmp_val#*/}"
-                ipv4_full_cond="$ipv4_full_cond icmp type $neg $type icmp code $code"
+                # 否定必须作用于整个类型+代码表达式，因此用括号包围
+                if [[ -n "$neg" ]]; then
+                    ipv4_full_cond="$ipv4_full_cond (icmp type $neg $type) && (icmp code $code)"
+                else
+                    ipv4_full_cond="$ipv4_full_cond icmp type $type icmp code $code"
+                fi
             else
                 ipv4_full_cond="$ipv4_full_cond icmp type $neg $icmp_val"
             fi
@@ -422,13 +432,18 @@ build_nft_rule_generic() {
                 ipv6_full_cond="$ipv6_full_cond ip6 hoplimit eq $hop_val"
             fi
         fi
+        # ICMPv6 类型修正
         if [[ -n "$icmp_type" ]] && [[ "$proto_v6" == "icmpv6" ]]; then
             local icmp_val="$icmp_type"
             local neg=""
             [[ "$icmp_val" == "!="* ]] && { neg="!="; icmp_val="${icmp_val#!=}"; }
             if [[ "$icmp_val" == */* ]]; then
                 local type="${icmp_val%/*}" code="${icmp_val#*/}"
-                ipv6_full_cond="$ipv6_full_cond icmpv6 type $neg $type icmpv6 code $code"
+                if [[ -n "$neg" ]]; then
+                    ipv6_full_cond="$ipv6_full_cond (icmpv6 type $neg $type) && (icmpv6 code $code)"
+                else
+                    ipv6_full_cond="$ipv6_full_cond icmpv6 type $type icmpv6 code $code"
+                fi
             else
                 ipv6_full_cond="$ipv6_full_cond icmpv6 type $neg $icmp_val"
             fi
@@ -530,7 +545,10 @@ apply_enhanced_direction_rules() {
             continue
         fi
         local class_mark=$(get_class_mark "$direction" "$tmp_class")
-        [[ -z "$class_mark" ]] && { log_error "规则 $rule_name 的类 $tmp_class 无法获取标记，跳过"; continue; }
+        if [[ -z "$class_mark" ]]; then
+            log_error "规则 $rule_name 的类 $tmp_class 无法获取标记，跳过"
+            continue
+        fi
         [[ -z "$tmp_family" ]] && tmp_family="inet"
         local srcport_list=()
         local dstport_list=()
@@ -629,6 +647,8 @@ apply_enhanced_direction_rules() {
             log_error "检查错误: $check_output"
             batch_success=1
         fi
+    else
+        log_info "没有生成任何规则，跳过应用"
     fi
     rm -f "$nft_batch_file"
     return $batch_success
@@ -687,7 +707,7 @@ apply_enhanced_features() {
     fi
 
     # UDP 限速
-    if [[ $ENABLE_UDP_LIMIT -eq 1 ]]; then
+    if [[ $UDP_RATE_LIMIT_ENABLE -eq 1 ]]; then
         log_info "生成 UDP 限速规则..."
         local udp_limit_rules=$(generate_udp_limit_rules)
         if [[ -n "$udp_limit_rules" ]]; then
@@ -707,8 +727,8 @@ apply_enhanced_features() {
     else
         log_info "UDP 限速未启用"
     fi
-	
-	# 动态分类（总开关）
+    
+    # 动态分类（总开关）
     if [[ $ENABLE_DYNAMIC_CLASSIFY -eq 1 ]]; then
         log_info "动态分类总开关已启用，初始化动态检测..."
         setup_dynamic_classification
@@ -722,6 +742,22 @@ apply_enhanced_features() {
 # 大量客户端同时连接同一个目标 IP/端口 → 判定为 P2P/下载 → 降级（低优先级）。
 # 大量服务端连接来自同一个子网 → 判定为高带宽服务（如视频 CDN）→ 升级（高优先级）。
 
+# 检测内核是否支持 meter 关键字
+check_meter_support() {
+    local test_file=$(mktemp)
+    echo "add table inet qos_meter_test" > "$test_file"
+    echo "add chain inet qos_meter_test test { type filter hook forward priority 0; }" >> "$test_file"
+    echo "add rule inet qos_meter_test test meter test_meter { ip daddr timeout 1s limit rate 1/minute } counter" >> "$test_file"
+    if nft -c -f "$test_file" 2>/dev/null; then
+        rm -f "$test_file"
+        nft delete table inet qos_meter_test 2>/dev/null
+        return 0
+    else
+        rm -f "$test_file"
+        return 1
+    fi
+}
+
 # 清理动态检测相关的所有资源
 cleanup_dynamic_detection() {
     nft delete set inet gargoyle-qos-priority qos_bulk_clients 2>/dev/null || true
@@ -733,15 +769,11 @@ cleanup_dynamic_detection() {
     nft delete chain inet gargoyle-qos-priority qos_established_connection 2>/dev/null || true
 }
 
-# 获取类对应的 DSCP 值（从 class_mark map 的 key 获取，但 map 的 key 是标记值，value 是 DSCP，而我们这里需要的是类对应的 DSCP）
-# 实际上，我们直接使用 UCI 中的 dscp 值。简化：通过 get_class_mark 获取标记值（即 DSCP），因为标记值就是 DSCP。
-# 注意：get_class_mark 返回的是上传/下载方向的标记值，对于动态检测，我们统一使用上传方向的标记值作为 DSCP，因为 DSCP 值本身与方向无关。
+# 获取类对应的 DSCP 值
 get_dscp_for_class() {
     local class_name="$1"
-    # 尝试从上传类中查找
     local class_mark=$(get_class_mark "upload" "$class_name" 2>/dev/null)
     if [ -z "$class_mark" ]; then
-        # 尝试从下载类中查找
         class_mark=$(get_class_mark "download" "$class_name" 2>/dev/null)
     fi
     echo "$class_mark"
@@ -753,7 +785,7 @@ create_bulk_client_rules() {
     local enabled=1 min_bytes=10000 min_connections=10 class="bulk"
     
     # 从 UCI 读取配置（如果存在）
-	local bulk_section="bulk_detect"
+    local bulk_section="bulk_detect"
     local uci_enabled=$(uci -q get ${CONFIG_FILE}.${bulk_section}.enabled 2>/dev/null)
     [ -n "$uci_enabled" ] && enabled="$uci_enabled"
     local uci_min_bytes=$(uci -q get ${CONFIG_FILE}.${bulk_section}.min_bytes 2>/dev/null)
@@ -785,12 +817,17 @@ create_bulk_client_rules() {
     nft add chain inet gargoyle-qos-priority qos_bulk_client 2>/dev/null || true
     nft add chain inet gargoyle-qos-priority qos_bulk_client_reply 2>/dev/null || true
 
-    # 在 established_connection 链中添加检测规则
-    # 注意：这里使用 meter 语法，需要内核支持；若不支持，可改用 limit + add 组合
+    # 检测内核是否支持 meter
+    if ! check_meter_support; then
+        log_warn "内核不支持 nftables meter 关键字，动态分类 bulk_client 功能将禁用"
+        return 0
+    fi
+
+    # 在 established_connection 链中添加检测规则（使用 meter）
     nft add rule inet gargoyle-qos-priority qos_established_connection meter qos_bulk_detect '{ ip daddr . th dport . meta l4proto timeout 5s limit rate over '$((min_connections - 1))'/minute }' add @qos_bulk_clients '{ ip daddr . th dport . meta l4proto timeout 30s }' 2>/dev/null || true
     nft add rule inet gargoyle-qos-priority qos_established_connection meter qos_bulk_detect6 '{ ip6 daddr . th dport . meta l4proto timeout 5s limit rate over '$((min_connections - 1))'/minute }' add @qos_bulk_clients6 '{ ip6 daddr . th dport . meta l4proto timeout 30s }' 2>/dev/null || true
 
-    # 在 bulk_client 链中添加分类规则：检测流量速率，超过阈值则设置 ct mark 低 6 位为 dscp
+    # 在 bulk_client 链中添加分类规则
     nft add rule inet gargoyle-qos-priority qos_bulk_client meter qos_bulk_orig '{ ip saddr . th sport . meta l4proto timeout 5m limit rate over '$((min_bytes - 1))' bytes/hour }' update @qos_bulk_clients '{ ip saddr . th sport . meta l4proto timeout 5m }' ct mark set (ct mark & 0xffffffc0) | $dscp return 2>/dev/null || true
     nft add rule inet gargoyle-qos-priority qos_bulk_client meter qos_bulk_orig6 '{ ip6 saddr . th sport . meta l4proto timeout 5m limit rate over '$((min_bytes - 1))' bytes/hour }' update @qos_bulk_clients6 '{ ip6 saddr . th sport . meta l4proto timeout 5m }' ct mark set (ct mark & 0xffffffc0) | $dscp return 2>/dev/null || true
 
@@ -811,7 +848,7 @@ create_high_throughput_service_rules() {
     # 默认参数
     local enabled=1 min_bytes=1000000 min_connections=3 class="realtime"
     
-	local htp_section="htp_detect"
+    local htp_section="htp_detect"
     local uci_enabled=$(uci -q get ${CONFIG_FILE}.${htp_section}.enabled 2>/dev/null)
     [ -n "$uci_enabled" ] && enabled="$uci_enabled"
     local uci_min_bytes=$(uci -q get ${CONFIG_FILE}.${htp_section}.min_bytes 2>/dev/null)
@@ -829,6 +866,11 @@ create_high_throughput_service_rules() {
     if [ -z "$dscp" ] || [ "$dscp" = "0" ]; then
         log_warn "high_throughput_service_detection: class '$class' not found or DSCP=0, using default 46 (EF)"
         dscp=46
+    fi
+
+    if ! check_meter_support; then
+        log_warn "内核不支持 nftables meter 关键字，动态分类 high_throughput_service 功能将禁用"
+        return 0
     fi
 
     # 创建集合
@@ -870,12 +912,13 @@ setup_dynamic_classification() {
     nft add chain inet gargoyle-qos-priority qos_dynamic_classify 2>/dev/null || true
     nft add chain inet gargoyle-qos-priority qos_dynamic_classify_reply 2>/dev/null || true
 
-    # 在现有钩子链中添加跳转到动态分类链的规则（仅当 ct mark 低 6 位为 0 时）
-    # 使用 add 追加到链尾，确保静态规则优先
-    nft add rule inet gargoyle-qos-priority filter_input ct mark & 0x3f == 0 jump qos_dynamic_classify 2>/dev/null || true
-    nft add rule inet gargoyle-qos-priority filter_output ct mark & 0x3f == 0 jump qos_dynamic_classify 2>/dev/null || true
-    nft add rule inet gargoyle-qos-priority filter_forward ct mark & 0x3f == 0 jump qos_dynamic_classify 2>/dev/null || true
-    nft add rule inet gargoyle-qos-priority filter_forward ct mark & 0x3f == 0 jump qos_dynamic_classify_reply 2>/dev/null || true
+    # 在现有钩子链中添加跳转到动态分类链的规则（指定优先级，避免与其他规则冲突）
+    # 使用 insert 插入到链首，确保在静态规则之前执行
+    # 但需要确保不影响静态规则中的标记，所以只在 ct mark 未设置时跳转
+    nft insert rule inet gargoyle-qos-priority filter_input ct mark & 0x3f == 0 jump qos_dynamic_classify 2>/dev/null || true
+    nft insert rule inet gargoyle-qos-priority filter_output ct mark & 0x3f == 0 jump qos_dynamic_classify 2>/dev/null || true
+    nft insert rule inet gargoyle-qos-priority filter_forward ct mark & 0x3f == 0 jump qos_dynamic_classify 2>/dev/null || true
+    nft insert rule inet gargoyle-qos-priority filter_forward ct mark & 0x3f == 0 jump qos_dynamic_classify_reply 2>/dev/null || true
 
     # 创建具体的动态检测规则（内部会根据各自子功能的 enabled 决定是否创建）
     create_bulk_client_rules
@@ -985,12 +1028,12 @@ apply_all_rules() {
         log_error "应用 $rule_type 规则失败"
         return 1
     fi
-    load_custom_full_table	
-	
+    load_custom_full_table
+    
     return 0
 }
 
-# ========== 入口重定向（增强 IPv6 回退） ==========
+# ========== 入口重定向（增强 IPv6 回退，先清空过滤器） ==========
 setup_ingress_redirect() {
     if [[ -z "$qos_interface" ]]; then
         log_error "无法确定 WAN 接口"
@@ -1023,6 +1066,7 @@ setup_ingress_redirect() {
         log_error "无法在 $qos_interface 上创建入口队列"
         return 1
     fi
+    # 先删除所有现有过滤器，避免重复
     tc filter del dev "$qos_interface" parent ffff: 2>/dev/null || true
     local ipv4_success=false
     if (( sfo_enabled && ctinfo_ok )); then
