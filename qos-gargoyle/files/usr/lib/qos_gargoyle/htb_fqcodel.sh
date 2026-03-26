@@ -1,6 +1,6 @@
 #!/bin/bash
 # HTB_FQCODEL算法实现模块
-# 版本: 3.4.3 - 移除锁机制（改用 procd），适配 common.sh/rule.sh 更新
+# 版本: 3.4.4 - 添加 fq_codel 参数支持检测，优化临时设备清理
 # 基于HTB与FQ_CODEL组合算法实现QoS流量控制。
 
 # ========== 全局配置常量 ==========
@@ -40,7 +40,32 @@ trap main_cleanup EXIT INT TERM HUP QUIT
 . /lib/functions/network.sh
 include /lib/network
 
-# ========== HTB 与 FQ_CODEL 专属配置加载 ==========
+# ========== 辅助函数：检测 fq_codel 参数支持 ==========
+check_fq_codel_param_support() {
+    local param_string="$1"
+    local dummy_dev="qos_test_fq_$$"
+    local created=0
+    local ret=1
+
+    if ! ip link add "$dummy_dev" type dummy 2>/dev/null; then
+        qos_log "DEBUG" "无法创建 dummy 设备，假定参数不支持"
+        return 1
+    fi
+    created=1
+
+    tc qdisc del dev "$dummy_dev" root 2>/dev/null
+    if tc qdisc add dev "$dummy_dev" root fq_codel $param_string 2>/dev/null; then
+        ret=0
+        tc qdisc del dev "$dummy_dev" root 2>/dev/null
+    fi
+
+    if [[ $created -eq 1 ]]; then
+        ip link del "$dummy_dev" 2>/dev/null
+    fi
+    return $ret
+}
+
+# ========== HTB 与 FQ_CODEL 专属配置加载（增加参数检测） ==========
 load_htb_fqcodel_config() {
     qos_log "INFO" "加载HTB与fq_codel配置"
     if [[ -z "$total_upload_bandwidth" ]] || [[ -z "$total_download_bandwidth" ]]; then
@@ -62,7 +87,8 @@ load_htb_fqcodel_config() {
     HTB_DRR_QUANTUM=$(uci -q get ${CONFIG_FILE}.htb.drr_quantum 2>/dev/null)
     [[ -z "$HTB_DRR_QUANTUM" ]] && HTB_DRR_QUANTUM="auto"
 
-    # fq_codel 参数：提供合理的默认值
+    # fq_codel 参数：提供合理的默认值，并进行内核支持检测
+    # 1. limit
     FQCODEL_LIMIT=$(uci -q get ${CONFIG_FILE}.fq_codel.limit 2>/dev/null)
     if [[ -z "$FQCODEL_LIMIT" ]]; then
         FQCODEL_LIMIT=1000
@@ -72,7 +98,13 @@ load_htb_fqcodel_config() {
         qos_log "ERROR" "fq_codel limit 无效，使用默认值 1000"
         FQCODEL_LIMIT=1000
     fi
+    # 检测 limit 参数支持
+    if ! check_fq_codel_param_support "limit $FQCODEL_LIMIT"; then
+        qos_log "WARN" "内核不支持 fq_codel limit=$FQCODEL_LIMIT，将使用默认值 1000"
+        FQCODEL_LIMIT=1000
+    fi
 
+    # 2. interval
     FQCODEL_INTERVAL=$(uci -q get ${CONFIG_FILE}.fq_codel.interval 2>/dev/null)
     if [[ -z "$FQCODEL_INTERVAL" ]]; then
         FQCODEL_INTERVAL=100
@@ -82,7 +114,12 @@ load_htb_fqcodel_config() {
         qos_log "ERROR" "fq_codel interval 无效，使用默认值 100"
         FQCODEL_INTERVAL=100
     fi
+    if ! check_fq_codel_param_support "interval ${FQCODEL_INTERVAL}us"; then
+        qos_log "WARN" "内核不支持 fq_codel interval=${FQCODEL_INTERVAL}us，将使用默认值 100us"
+        FQCODEL_INTERVAL=100
+    fi
 
+    # 3. target
     FQCODEL_TARGET=$(uci -q get ${CONFIG_FILE}.fq_codel.target 2>/dev/null)
     if [[ -z "$FQCODEL_TARGET" ]]; then
         FQCODEL_TARGET=5
@@ -92,7 +129,12 @@ load_htb_fqcodel_config() {
         qos_log "ERROR" "fq_codel target 无效，使用默认值 5"
         FQCODEL_TARGET=5
     fi
+    if ! check_fq_codel_param_support "target ${FQCODEL_TARGET}us"; then
+        qos_log "WARN" "内核不支持 fq_codel target=${FQCODEL_TARGET}us，将使用默认值 5us"
+        FQCODEL_TARGET=5
+    fi
 
+    # 4. flows
     FQCODEL_FLOWS=$(uci -q get ${CONFIG_FILE}.fq_codel.flows 2>/dev/null)
     if [[ -z "$FQCODEL_FLOWS" ]]; then
         FQCODEL_FLOWS=1024
@@ -102,7 +144,12 @@ load_htb_fqcodel_config() {
         qos_log "ERROR" "fq_codel flows 无效，使用默认值 1024"
         FQCODEL_FLOWS=1024
     fi
+    if ! check_fq_codel_param_support "flows $FQCODEL_FLOWS"; then
+        qos_log "WARN" "内核不支持 fq_codel flows=$FQCODEL_FLOWS，将使用默认值 1024"
+        FQCODEL_FLOWS=1024
+    fi
 
+    # 5. quantum
     FQCODEL_QUANTUM=$(uci -q get ${CONFIG_FILE}.fq_codel.quantum 2>/dev/null)
     if [[ -z "$FQCODEL_QUANTUM" ]]; then
         FQCODEL_QUANTUM=300
@@ -112,29 +159,58 @@ load_htb_fqcodel_config() {
         qos_log "ERROR" "fq_codel quantum 无效，使用默认值 300"
         FQCODEL_QUANTUM=300
     fi
-
-    FQCODEL_MEMORY_LIMIT=$(uci -q get ${CONFIG_FILE}.fq_codel.memory_limit 2>/dev/null)
-    if [[ -n "$FQCODEL_MEMORY_LIMIT" ]]; then
-        FQCODEL_MEMORY_LIMIT=$(calculate_memory_limit "$FQCODEL_MEMORY_LIMIT")
-        FQCODEL_MEMORY_LIMIT=$(echo "$FQCODEL_MEMORY_LIMIT" | tr 'A-Z' 'a-z')
+    if ! check_fq_codel_param_support "quantum $FQCODEL_QUANTUM"; then
+        qos_log "WARN" "内核不支持 fq_codel quantum=$FQCODEL_QUANTUM，将使用默认值 300"
+        FQCODEL_QUANTUM=300
     fi
 
+    # 6. memory_limit（可选）
+    FQCODEL_MEMORY_LIMIT=$(uci -q get ${CONFIG_FILE}.fq_codel.memory_limit 2>/dev/null)
+    if [[ -n "$FQCODEL_MEMORY_LIMIT" ]]; then
+        local original_mem="$FQCODEL_MEMORY_LIMIT"
+        FQCODEL_MEMORY_LIMIT=$(calculate_memory_limit "$FQCODEL_MEMORY_LIMIT")
+        FQCODEL_MEMORY_LIMIT=$(echo "$FQCODEL_MEMORY_LIMIT" | tr 'A-Z' 'a-z')
+        if ! check_fq_codel_param_support "memory_limit $FQCODEL_MEMORY_LIMIT"; then
+            qos_log "WARN" "内核不支持 fq_codel memory_limit=$FQCODEL_MEMORY_LIMIT，将禁用此参数"
+            FQCODEL_MEMORY_LIMIT=""
+        fi
+    fi
+
+    # 7. ce_threshold（可选）
     FQCODEL_CE_THRESHOLD=$(uci -q get ${CONFIG_FILE}.fq_codel.ce_threshold 2>/dev/null)
     if [[ -n "$FQCODEL_CE_THRESHOLD" ]]; then
         if ! echo "$FQCODEL_CE_THRESHOLD" | grep -qiE '^0$|^[0-9]+(\.[0-9]+)?(us|ms)?$'; then
             qos_log "WARN" "无效的 ce_threshold 格式 '$FQCODEL_CE_THRESHOLD'，将忽略此设置"
             FQCODEL_CE_THRESHOLD=""
+        else
+            if ! check_fq_codel_param_support "ce_threshold $FQCODEL_CE_THRESHOLD"; then
+                qos_log "WARN" "内核不支持 fq_codel ce_threshold=$FQCODEL_CE_THRESHOLD，将禁用此参数"
+                FQCODEL_CE_THRESHOLD=""
+            fi
         fi
     fi
 
+    # 8. ecn（可选）
     FQCODEL_ECN=$(uci -q get ${CONFIG_FILE}.fq_codel.ecn 2>/dev/null)
     if [[ -n "$FQCODEL_ECN" ]]; then
+        local ecn_val=""
         case "$FQCODEL_ECN" in
-            yes|1|enable|on|true) FQCODEL_ECN="ecn"; qos_log "INFO" "fq_codel ECN: 启用" ;;
-            no|0|disable|off|false) FQCODEL_ECN="noecn"; qos_log "INFO" "fq_codel ECN: 禁用" ;;
-            ecn|noecn) qos_log "INFO" "fq_codel ECN: 使用配置值 ($FQCODEL_ECN)" ;;
+            yes|1|enable|on|true) ecn_val="ecn" ;;
+            no|0|disable|off|false) ecn_val="noecn" ;;
+            ecn|noecn) ecn_val="$FQCODEL_ECN" ;;
             *) qos_log "WARN" "无效的ECN配置值 '$FQCODEL_ECN'，将不使用ECN"; FQCODEL_ECN="" ;;
         esac
+        if [[ -n "$ecn_val" ]]; then
+            if ! check_fq_codel_param_support "$ecn_val"; then
+                qos_log "WARN" "内核不支持 fq_codel $ecn_val，将禁用 ECN"
+                FQCODEL_ECN=""
+            else
+                FQCODEL_ECN="$ecn_val"
+                qos_log "INFO" "fq_codel ECN: 使用 $FQCODEL_ECN"
+            fi
+        else
+            FQCODEL_ECN=""
+        fi
     else
         FQCODEL_ECN=""
         qos_log "INFO" "fq_codel ECN: 未配置"
