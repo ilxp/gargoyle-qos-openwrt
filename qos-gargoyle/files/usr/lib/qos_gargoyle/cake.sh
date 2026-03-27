@@ -690,7 +690,7 @@ health_check_cake() {
 
 # ========== 状态显示 ==========
 show_cake_status() {
-    echo "===== CAKE QoS状态报告 (v3.4.6) ====="
+    echo "===== CAKE QoS状态报告 ====="
     echo "时间: $(date)"
     echo "网络接口: ${qos_interface:-未知}"
 
