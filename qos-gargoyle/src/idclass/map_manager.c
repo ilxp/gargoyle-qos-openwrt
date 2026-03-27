@@ -38,6 +38,9 @@ struct idclass_map_file {
     char filename[];
 };
 
+/* 比较函数声明（必须在 AVL_TREE 宏之前） */
+static int idclass_map_entry_cmp(const void *k1, const void *k2, void *ptr);
+
 /* Global configuration instances */
 struct global_config global_config;
 struct idclass_flow_config global_flow_config;
@@ -56,9 +59,6 @@ static struct uloop_timeout idclass_map_timer;
 static int ip_conn_fd = -1;
 static int flow_stats_fd = -1;
 static struct uloop_timeout ip_conn_timer;
-
-/* 比较函数原型（供 AVL_TREE 使用） */
-static int idclass_map_entry_cmp(const void *k1, const void *k2, void *ptr);
 
 /* Helper: compare two map data entries for AVL tree */
 static int idclass_map_entry_cmp(const void *k1, const void *k2, void *ptr) {
