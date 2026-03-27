@@ -1,6 +1,6 @@
 #!/bin/bash
 # 规则辅助模块 (rule.sh)
-# 版本: 3.4.13 - 修复动态分类方向标记、ACK集合冗余、TCP升级注释
+# 版本: 3.4.16 - 恢复 ACK 和 TCP 升级的集合限速，实现每个连接的精细控制
 # 完全移除锁机制，适配 procd 管理
 
 # 加载核心库
@@ -97,7 +97,7 @@ flags_to_mask() {
     printf "0x%x" "$mask"
 }
 
-# ========== 通用规则构建函数（移除 mask 参数） ==========
+# ========== 通用规则构建函数 ==========
 build_nft_rule_generic() {
     local rule_name="$1" chain="$2" class_mark="$3" family="$4" proto="$5"
     local srcport="$6" dstport="$7" connbytes_kb="$8" state="$9" src_ip="${10}" dest_ip="${11}"
@@ -805,7 +805,7 @@ apply_enhanced_direction_rules() {
     return $batch_success
 }
 
-# ========== ACK 限速规则（移除无用的集合添加） ==========
+# ========== ACK 限速规则（使用集合元素限速） ==========
 generate_ack_limit_rules() {
     [[ $ENABLE_ACK_LIMIT != 1 ]] && return
     local ack_enabled=$(uci -q get ${CONFIG_FILE}.ack_limit.enabled 2>/dev/null)
@@ -841,24 +841,36 @@ generate_ack_limit_rules() {
         qos_log "WARN" "ACK xfast_rate 无效，使用默认值 5000"
     fi
 
-    # 只保留限速跳转，移除集合添加动作，减少开销
     cat <<EOF
-# ACK rate limiting (no set addition, only random drop)
-add rule inet gargoyle-qos-priority filter_qos_egress meta length < 100 tcp flags ack limit rate over ${xfast_rate}/second counter jump drop995
-add rule inet gargoyle-qos-priority filter_qos_egress meta length < 100 tcp flags ack limit rate over ${fast_rate}/second counter jump drop95
-add rule inet gargoyle-qos-priority filter_qos_egress meta length < 100 tcp flags ack limit rate over ${med_rate}/second counter jump drop50
-add rule inet gargoyle-qos-priority filter_qos_egress meta length < 100 tcp flags ack limit rate over ${slow_rate}/second counter jump drop50
+# ACK rate limiting using per-connection dynamic sets
+add rule inet gargoyle-qos-priority filter_qos_egress meta length < 100 tcp flags ack add @qos_xfst_ack { ct id . ct direction limit rate over ${xfast_rate}/second } counter jump drop995
+add rule inet gargoyle-qos-priority filter_qos_egress meta length < 100 tcp flags ack add @qos_fast_ack { ct id . ct direction limit rate over ${fast_rate}/second } counter jump drop95
+add rule inet gargoyle-qos-priority filter_qos_egress meta length < 100 tcp flags ack add @qos_med_ack { ct id . ct direction limit rate over ${med_rate}/second } counter jump drop50
+add rule inet gargoyle-qos-priority filter_qos_egress meta length < 100 tcp flags ack add @qos_slow_ack { ct id . ct direction limit rate over ${slow_rate}/second } counter jump drop50
 EOF
 }
 
-# ========== TCP 升级规则（修正注释，逻辑保持高速升级） ==========
+# ========== TCP 升级规则（可配置速率，使用集合元素限速） ==========
 generate_tcp_upgrade_rules() {
     local tcp_enabled=$(uci -q get ${CONFIG_FILE}.tcp_upgrade.enabled 2>/dev/null)
     case "$tcp_enabled" in 1|yes|true|on) ;; *) return ;; esac
 
+    # 检查集合是否存在
     if ! nft list set inet gargoyle-qos-priority qos_slow_tcp &>/dev/null; then
         qos_log "WARN" "TCP 升级所需集合 qos_slow_tcp 不存在，功能已禁用"
         return
+    fi
+
+    local rate=$(uci -q get ${CONFIG_FILE}.tcp_upgrade.rate 2>/dev/null)
+    local burst=$(uci -q get ${CONFIG_FILE}.tcp_upgrade.burst 2>/dev/null)
+
+    if ! validate_number "$rate" "tcp_upgrade.rate" 1 1000000 2>/dev/null; then
+        rate=150
+        qos_log "WARN" "TCP upgrade rate 无效，使用默认值 150"
+    fi
+    if ! validate_number "$burst" "tcp_upgrade.burst" 1 1000000 2>/dev/null; then
+        burst=150
+        qos_log "WARN" "TCP upgrade burst 无效，使用默认值 150"
     fi
 
     local highest_class=$(get_highest_priority_class "upload")
@@ -874,13 +886,13 @@ generate_tcp_upgrade_rules() {
     fi
 
     cat <<EOF
-# TCP upgrade for high-rate connections (提升高速连接优先级)
-add rule inet gargoyle-qos-priority filter_qos_egress meta l4proto tcp ct state established meta nfproto ipv4 limit rate 150/second burst 150 packets add @qos_slow_tcp { ct id . ct direction } meta mark set $class_mark ct mark set meta mark counter
-add rule inet gargoyle-qos-priority filter_qos_egress meta l4proto tcp ct state established meta nfproto ipv6 limit rate 150/second burst 150 packets add @qos_slow_tcp { ct id . ct direction } meta mark set $class_mark ct mark set meta mark counter
+# TCP upgrade for connections exceeding rate (per-connection)
+add rule inet gargoyle-qos-priority filter_qos_egress meta l4proto tcp ct state established meta nfproto ipv4 add @qos_slow_tcp { ct id . ct direction limit rate over ${rate}/second burst ${burst} packets } meta mark set $class_mark ct mark set meta mark counter
+add rule inet gargoyle-qos-priority filter_qos_egress meta l4proto tcp ct state established meta nfproto ipv6 add @qos_slow_tcp { ct id . ct direction limit rate over ${rate}/second burst ${burst} packets } meta mark set $class_mark ct mark set meta mark counter
 EOF
 }
 
-# ========== UDP 限速规则 ==========
+# ========== UDP 限速规则（类名大小写不敏感） ==========
 generate_udp_limit_rules() {
     local udp_enable=$(uci -q get ${CONFIG_FILE}.udp_limit.enabled 2>/dev/null)
     local udp_rate=$(uci -q get ${CONFIG_FILE}.udp_limit.rate 2>/dev/null)
@@ -907,6 +919,8 @@ generate_udp_limit_rules() {
         return
     fi
 
+    # 将类名转为小写进行匹配（大小写不敏感）
+    local lower_mark_class=$(echo "$udp_mark_class" | tr '[:upper:]' '[:lower:]')
     local upload_mark="" download_mark=""
     if [[ "$udp_action" == "mark" ]]; then
         if [[ -z "$upload_class_list" ]]; then
@@ -916,15 +930,15 @@ generate_udp_limit_rules() {
             load_download_class_configurations
         fi
         for class in $upload_class_list; do
-            local name=$(uci -q get ${CONFIG_FILE}.${class}.name 2>/dev/null)
-            if [[ "$name" == "$udp_mark_class" ]]; then
+            local name=$(uci -q get ${CONFIG_FILE}.${class}.name 2>/dev/null | tr '[:upper:]' '[:lower:]')
+            if [[ "$name" == "$lower_mark_class" ]]; then
                 upload_mark=$(get_class_mark "upload" "$class")
                 break
             fi
         done
         for class in $download_class_list; do
-            local name=$(uci -q get ${CONFIG_FILE}.${class}.name 2>/dev/null)
-            if [[ "$name" == "$udp_mark_class" ]]; then
+            local name=$(uci -q get ${CONFIG_FILE}.${class}.name 2>/dev/null | tr '[:upper:]' '[:lower:]')
+            if [[ "$name" == "$lower_mark_class" ]]; then
                 download_mark=$(get_class_mark "download" "$class")
                 break
             fi
@@ -991,7 +1005,7 @@ cleanup_dynamic_detection() {
     nft delete set inet gargoyle-qos-priority qos_high_throughput_services6 2>/dev/null || true
 }
 
-# ========== 批量客户端检测（修复方向标记） ==========
+# ========== 批量客户端检测（方向标记正确） ==========
 create_bulk_client_rules() {
     local enabled=1 min_bytes=10000 min_connections=10 class="bulk"
     
@@ -1006,7 +1020,6 @@ create_bulk_client_rules() {
     [ -n "$uci_class" ] && class="$uci_class"
 
     [ "$enabled" != "1" ] && return 0
-    # 验证输入
     if ! validate_number "$min_bytes" "bulk_detect.min_bytes" 1 1000000000 2>/dev/null; then
         qos_log "WARN" "min_bytes 无效，使用默认值 10000"
         min_bytes=10000
@@ -1016,7 +1029,6 @@ create_bulk_client_rules() {
         min_connections=10
     fi
     
-    # 获取上传和下载标记
     local upload_mark="" download_mark=""
     if [[ -n "$uci_class" ]]; then
         upload_mark=$(get_class_mark "upload" "$uci_class" 2>/dev/null)
@@ -1029,7 +1041,6 @@ create_bulk_client_rules() {
             qos_log "信息" "批量客户端检测: 使用用户指定的类 '$uci_class' (上传标记=$upload_mark, 下载标记=$download_mark)"
         fi
     fi
-    # 如果未指定或无效，自动选择最低优先级类（标记值最小为上传方向，最大为下载方向？实际标记分配中，上传标记从1开始，下载从65536开始）
     if [[ -z "$upload_mark" ]]; then
         local lowest_upload_mark=$(get_min_max_mark "upload" "min")
         if [[ -n "$lowest_upload_mark" && "$lowest_upload_mark" -ne 0 ]]; then
@@ -1051,7 +1062,6 @@ create_bulk_client_rules() {
         fi
     fi
 
-    # 创建必要的集合和链
     nft add set inet gargoyle-qos-priority qos_bulk_clients '{ type ipv4_addr . inet_service . inet_proto; flags timeout; }' 2>/dev/null || true
     nft add set inet gargoyle-qos-priority qos_bulk_clients6 '{ type ipv6_addr . inet_service . inet_proto; flags timeout; }' 2>/dev/null || true
 
@@ -1106,7 +1116,7 @@ create_bulk_client_rules() {
     qos_log "信息" "批量客户端检测已启用: 最小连接数=$min_connections, 最小字节数=$min_bytes 字节/秒, 上传标记=$upload_mark, 下载标记=$download_mark"
 }
 
-# ========== 高吞吐服务检测（修复方向标记） ==========
+# ========== 高吞吐服务检测（方向标记正确） ==========
 create_high_throughput_service_rules() {
     local enabled=1 min_bytes=1000000 min_connections=3 class="realtime"
     
@@ -1121,7 +1131,6 @@ create_high_throughput_service_rules() {
     [ -n "$uci_class" ] && class="$uci_class"
 
     [ "$enabled" != "1" ] && return 0
-    # 验证输入
     if ! validate_number "$min_bytes" "htp_detect.min_bytes" 1 1000000000 2>/dev/null; then
         qos_log "WARN" "min_bytes 无效，使用默认值 1000000"
         min_bytes=1000000
@@ -1131,7 +1140,6 @@ create_high_throughput_service_rules() {
         min_connections=3
     fi
 
-    # 获取上传和下载标记
     local upload_mark="" download_mark=""
     if [[ -n "$uci_class" ]]; then
         upload_mark=$(get_class_mark "upload" "$uci_class" 2>/dev/null)
@@ -1144,7 +1152,6 @@ create_high_throughput_service_rules() {
             qos_log "信息" "高吞吐服务检测: 使用用户指定的类 '$uci_class' (上传标记=$upload_mark, 下载标记=$download_mark)"
         fi
     fi
-    # 自动选择最高优先级类（标记值最大为上传方向，最小为下载方向？实际标记分配中，上传标记从1开始，下载从65536开始，所以最大标记通常对应高优先级）
     if [[ -z "$upload_mark" ]]; then
         local highest_upload_mark=$(get_min_max_mark "upload" "max")
         if [[ -n "$highest_upload_mark" && "$highest_upload_mark" -ne 0 ]]; then
@@ -1265,8 +1272,9 @@ apply_all_rules() {
         nft add chain inet gargoyle-qos-priority filter_qos_egress 2>/dev/null || true
         nft add chain inet gargoyle-qos-priority filter_qos_ingress 2>/dev/null || true
         generate_ipset_sets
+        
+        # 创建 ACK 限速和 TCP 升级所需的动态集合
         local sets_ok=1
-        # 为 ACK 限速和 TCP 升级创建必要的集合（但 ACK 已不再使用集合添加，保留集合以备可能的功能扩展）
         for set in qos_xfst_ack qos_fast_ack qos_med_ack qos_slow_ack qos_slow_tcp; do
             if ! nft list set inet gargoyle-qos-priority "$set" &>/dev/null; then
                 if ! nft add set inet gargoyle-qos-priority "$set" '{ typeof ct id . ct direction; flags dynamic; timeout 5m; }' 2>/dev/null; then
@@ -1279,6 +1287,7 @@ apply_all_rules() {
             ENABLE_ACK_LIMIT=0
             ENABLE_TCP_UPGRADE=0
         fi
+        
         nft add chain inet gargoyle-qos-priority drop995 2>/dev/null || true
         nft add chain inet gargoyle-qos-priority drop95 2>/dev/null || true
         nft add chain inet gargoyle-qos-priority drop50 2>/dev/null || true
