@@ -1,6 +1,6 @@
 #!/bin/bash
 # 核心库模块 (common.sh)
-# 版本: 3.4.5 - 修复带宽单位转换支持 /s 后缀，更新 qos_interface 全局变量
+# 版本: 3.4.6 - 修复内存限制大小写、清理未使用变量、增强带宽转换、PID检查优化
 # 提供 QoS 系统基础功能
 
 # ========== 加载 OpenWrt 标准函数库 ==========
@@ -34,10 +34,7 @@ if [[ -z "$_QOS_LIB_SH_LOADED" ]]; then
     ENABLE_ACK_LIMIT=0
     ENABLE_TCP_UPGRADE=0
     SAVE_NFT_RULES=0
-    ACK_SLOW=50
-    ACK_MED=100
-    ACK_FAST=500
-    ACK_XFAST=5000
+    # 移除未使用的 ACK_* 变量，具体速率由 UCI 配置
     UDP_RATE_LIMIT_ENABLE=0
     UDP_RATE_LIMIT_RATE=450
     UDP_RATE_LIMIT_ACTION="mark"
@@ -61,7 +58,8 @@ fi
 check_already_running() {
     if [ -f "$QOS_RUNNING_FILE" ]; then
         local old_pid=$(cat "$QOS_RUNNING_FILE" 2>/dev/null)
-        if kill -0 "$old_pid" 2>/dev/null; then
+        # 验证 PID 是否为数字且进程存在
+        if [[ "$old_pid" =~ ^[0-9]+$ ]] && kill -0 "$old_pid" 2>/dev/null; then
             return 1
         else
             rm -f "$QOS_RUNNING_FILE"
@@ -74,7 +72,8 @@ check_already_running() {
 # ========== 公共辅助函数 ==========
 strip_leading_zeros() {
     local val="$1"
-    [[ -z "$val" ]] && { echo "0"; return; }
+    # 处理空值或非数字
+    [[ -z "$val" || ! "$val" =~ ^[0-9]+$ ]] && { echo "0"; return; }
     val=$(echo "$val" | sed 's/^0*//')
     [[ -z "$val" ]] && val=0
     echo "$val"
@@ -96,9 +95,7 @@ log() {
         DEBUG|debug)   prefix="调试:" ;;
         *)             prefix="$level:" ;;
     esac
-    # 将日志级别转换为小写供 logger 使用
     local syslog_level=$(echo "$level" | tr '[:upper:]' '[:lower:]')
-    # 将整个消息通过管道传给 logger（一次调用处理多行）
     echo "$message" | logger -t "$tag" -p "user.$syslog_level" 2>/dev/null || \
         echo "$message" | while IFS= read -r line; do
             logger -t "$tag" "$prefix $line"
@@ -111,10 +108,7 @@ log() {
 # ========== 临时文件管理 ==========
 register_temp_file() {
     local file="$1"
-    if [[ -n "$file" && -f "$file" ]]; then
-        TEMP_FILES+=("$file")
-    else
-        # 如果文件不存在，仍记录路径以便清理（可能稍后创建）
+    if [[ -n "$file" ]]; then
         TEMP_FILES+=("$file")
     fi
 }
@@ -167,7 +161,6 @@ load_global_config() {
     val=$(uci -q get ${CONFIG_FILE}.global.enable_ebpf 2>/dev/null)
     case "$val" in 1|yes|true|on) ENABLE_EBPF=1 ;; *) ENABLE_EBPF=0 ;; esac
 
-    # 从各自的配置节读取启用状态（覆盖全局变量）
     local ack_enabled=$(uci -q get ${CONFIG_FILE}.ack_limit.enabled 2>/dev/null)
     case "$ack_enabled" in 1|yes|true|on) ENABLE_ACK_LIMIT=1 ;; *) ENABLE_ACK_LIMIT=0 ;; esac
     local tcp_enabled=$(uci -q get ${CONFIG_FILE}.tcp_upgrade.enabled 2>/dev/null)
@@ -177,7 +170,6 @@ load_global_config() {
     local speedtest_enabled=$(uci -q get ${CONFIG_FILE}.speedtest.enabled 2>/dev/null)
     case "$speedtest_enabled" in 1|yes|true|on) AUTO_SPEEDTEST=1 ;; *) AUTO_SPEEDTEST=0 ;; esac
 
-    # 动态分类总开关
     val=$(uci -q get ${CONFIG_FILE}.global.enable_dynamic_classify 2>/dev/null)
     case "$val" in 1|yes|true|on) ENABLE_DYNAMIC_CLASSIFY=1 ;; *) ENABLE_DYNAMIC_CLASSIFY=0 ;; esac
 }
@@ -402,7 +394,6 @@ validate_ip() {
 # ========== TCP 标志验证 ==========
 validate_tcp_flags() {
     local val="$1" param_name="$2"
-    # 清理字符串：去除所有空白和回车
     val=$(echo "$val" | tr -d '[:space:]' | tr -d '\r')
     [[ -z "$val" ]] && return 0
     IFS=',' read -ra flags <<< "$val"
@@ -573,7 +564,6 @@ allocate_class_marks() {
         base_value=65536
     fi
 
-    # 先删除该方向的旧标记，避免残留
     if [[ -f "$CLASS_MARKS_FILE" ]]; then
         grep -v "^$direction:" "$CLASS_MARKS_FILE" > "${temp_file}.clean" 2>/dev/null || true
         mv "${temp_file}.clean" "$CLASS_MARKS_FILE" 2>/dev/null
@@ -650,7 +640,6 @@ load_all_config_sections() {
         local anonymous=$(echo "$output" | grep -E "^${config_name}\\.@${section_type}\\[[0-9]+\\]=" | cut -d= -f1 | sed "s/^${config_name}\\.//")
         local named=$(echo "$output" | grep -E "^${config_name}\\.[a-zA-Z0-9_]+=${section_type}"'$' | cut -d= -f1 | cut -d. -f2)
         local old=$(echo "$output" | grep -E "^${config_name}\\.${section_type}_[0-9]+=" | cut -d= -f1 | cut -d. -f2)
-        # 合并并过滤空值
         echo "$anonymous $named $old" | tr ' ' '\n' | grep -v '^$' | sort -u | tr '\n' ' ' | sed 's/^[[:space:]]*//; s/[[:space:]]*$//'
     else
         echo "$output" | grep -E "^${config_name}\\.[a-zA-Z_]+[0-9]*=" | cut -d= -f1 | cut -d. -f2
@@ -681,7 +670,7 @@ load_download_class_configurations() {
     return 0
 }
 
-# 加载配置选项（修复：验证失败时记录错误并返回1，class 缺失视为致命错误）
+# 加载配置选项（验证失败时记录错误并返回1，class 缺失视为致命错误）
 load_all_config_options() {
     local config_name="$1" section_id="$2" prefix="$3"
     local var_name val
@@ -765,7 +754,6 @@ load_all_config_options() {
 }
 
 # ========== UCI ipset 生成 nftables 集合 ==========
-# 定义全局处理函数供 config_load 调用
 process_ipset_section() {
     local section="$1" name enabled mode family timeout ip4 ip6 ip4_list ip6_list
     local elements=""
@@ -809,7 +797,6 @@ process_ipset_section() {
 generate_ipset_sets() {
     [[ $_IPSET_LOADED -eq 1 ]] && return 0
     nft add table inet gargoyle-qos-priority 2>/dev/null || true
-    # 确保 config_load 可用
     if ! type config_load >/dev/null 2>&1; then
         . /lib/functions.sh
     fi
@@ -858,7 +845,6 @@ build_ip_conditions_for_direction() {
     eval "${result_var}=\"\${result}\""
 }
 
-# 定义全局处理函数供 config_load 调用
 process_ratelimit_section() {
     local section="$1" name enabled download_limit upload_limit burst_factor target_values
     local set_name_dl4 set_name_ul4 set_name_dl6 set_name_ul6
@@ -1051,7 +1037,6 @@ process_ratelimit_section() {
 
 generate_ratelimit_rules() {
     [[ $ENABLE_RATELIMIT != 1 ]] && return
-    # 确保 config_load 可用
     if ! type config_load >/dev/null 2>&1; then
         . /lib/functions.sh
     fi
@@ -1071,7 +1056,6 @@ setup_ratelimit_chain() {
     [[ $ENABLE_RATELIMIT != 1 ]] && return 0
     local rules=$(generate_ratelimit_rules)
     if [[ -n "$rules" ]]; then
-        # 删除旧的速率限制集合（避免 create set 失败）
         local old_sets=$(nft list set inet gargoyle-qos-priority 2>/dev/null | sed -n 's/^[[:space:]]*set \([a-zA-Z0-9_]\+\).*/\1/p' | grep '^rl_')
         for set in $old_sets; do
             nft delete set inet gargoyle-qos-priority "$set" 2>/dev/null || true
@@ -1194,7 +1178,6 @@ convert_bandwidth_to_kbit() {
         if command -v bc >/dev/null 2>&1; then
             result=$(echo "$num * $multiplier" | bc | awk '{printf "%.0f", $1}')
         else
-            # 尝试使用 awk 进行浮点运算，awk 自动截断小数部分
             result=$(awk "BEGIN {printf \"%.0f\", $num * $multiplier}")
         fi
         [[ -z "$result" || ! "$result" =~ ^[0-9]+$ || $result -lt 0 ]] && result=0
@@ -1257,7 +1240,6 @@ load_bandwidth_from_config() {
             log_info "下载总带宽: ${total_download_bandwidth}kbit/s"
         fi
     fi
-    # 将检测到的 WAN 接口赋值给全局变量 qos_interface
     if [[ -n "$wan_if" ]]; then
         qos_interface="$wan_if"
         log_info "已设置 WAN 接口: $qos_interface"
@@ -1287,7 +1269,6 @@ check_required_commands() {
 load_required_modules() {
     local missing=0
     for mod in ifb sch_ingress; do
-        # 使用 /sys/module 检测模块是否已加载
         if [[ ! -d "/sys/module/$mod" ]]; then
             if ! modprobe "$mod" 2>/dev/null; then
                 log_error "无法加载内核模块 $mod"
@@ -1411,7 +1392,6 @@ init_ruleset() {
     local backup_file="${backup_base}.$(date +%s)"
     cp "/etc/config/${CONFIG_FILE}" "$backup_file"
     log_info "已备份主配置文件到 $backup_file"
-    # 清理旧备份，保留最近3个
     local backups=($(ls -t ${backup_base}.* 2>/dev/null))
     if [[ ${#backups[@]} -gt 3 ]]; then
         for ((i=3; i<${#backups[@]}; i++)); do
@@ -1455,13 +1435,14 @@ restore_main_config() {
     log_info "已清理规则集标记"
 }
 
-# ========== 内存限制计算（增强版） ==========
+# ========== 内存限制计算（增强版，支持大小写不敏感） ==========
 calculate_memory_limit() {
     local config_value="$1" result
     [[ -z "$config_value" ]] && { echo ""; return; }
-    if [[ "$config_value" == "auto" ]]; then
+    # 转为小写，便于匹配
+    local lower_val=$(echo "$config_value" | tr '[:upper:]' '[:lower:]')
+    if [[ "$lower_val" == "auto" ]]; then
         local total_mem_mb=0
-        # 尝试 cgroup v2
         if [[ -f /sys/fs/cgroup/memory.max ]]; then
             local total_mem_bytes=$(cat /sys/fs/cgroup/memory.max 2>/dev/null)
             if [[ "$total_mem_bytes" =~ ^[0-9]+$ ]] && (( total_mem_bytes > 0 )); then
@@ -1469,7 +1450,6 @@ calculate_memory_limit() {
                 log_info "从 cgroup v2 memory.max 获取内存限制: ${total_mem_mb}MB"
             fi
         fi
-        # 如果上面未成功，尝试 cgroup v1
         if (( total_mem_mb == 0 )) && [[ -f /sys/fs/cgroup/memory/memory.limit_in_bytes ]]; then
             local total_mem_bytes=$(cat /sys/fs/cgroup/memory/memory.limit_in_bytes 2>/dev/null)
             if [[ -n "$total_mem_bytes" ]] && (( total_mem_bytes > 0 )); then
@@ -1477,7 +1457,6 @@ calculate_memory_limit() {
                 log_info "从 cgroup v1 memory.limit_in_bytes 获取内存限制: ${total_mem_mb}MB"
             fi
         fi
-        # 最后回退到 /proc/meminfo
         if (( total_mem_mb == 0 )); then
             local total_mem_kb=$(grep MemTotal /proc/meminfo 2>/dev/null | awk '{print $2}')
             if [[ -n "$total_mem_kb" ]] && (( total_mem_kb > 0 )); then
@@ -1486,7 +1465,6 @@ calculate_memory_limit() {
             fi
         fi
         if (( total_mem_mb > 0 )); then
-            # 使用总内存的 1/64 到 1/32 之间，但限制在 8-32MB
             result="$(((total_mem_mb + 63) / 64))Mb"
             local min_limit=8 max_limit=32
             local result_value=${result%Mb}
@@ -1497,8 +1475,10 @@ calculate_memory_limit() {
             log_warn "无法读取内存信息，使用默认值 16Mb"; result="16Mb"
         fi
     else
-        if [[ "$config_value" =~ ^[0-9]+Mb$ ]]; then
-            result="$config_value"; log_info "使用用户配置的 memlimit: ${result}"
+        # 大小写不敏感匹配：支持 "32mb", "32Mb", "32MB", "32mB"
+        if [[ "$lower_val" =~ ^[0-9]+mb$ ]]; then
+            result="$config_value"  # 保留用户原始大小写
+            log_info "使用用户配置的 memlimit: ${result}"
         else
             log_warn "无效的 memlimit 格式 '$config_value'，使用默认值 16Mb"; result="16Mb"
         fi
@@ -1519,7 +1499,6 @@ get_highest_priority_class() {
     local best_class=""
     for class in $class_list; do
         local enabled=$(uci -q get ${CONFIG_FILE}.${class}.enabled 2>/dev/null)
-        # 如果 enabled 明确为 0，则跳过；否则视为启用（兼容未配置 enabled 的情况）
         if [[ "$enabled" == "0" ]]; then
             continue
         fi
@@ -1615,7 +1594,6 @@ auto_speedtest() {
         if [[ $noninteractive -eq 0 ]]; then
             echo "当前已配置带宽：上传 ${cur_upload} kbit，下载 ${cur_download} kbit"
             echo "是否覆盖并重新测速？[y/N]"
-            # 设置30秒超时，避免卡死
             if ! read -t 30 -r response; then
                 echo "超时，已取消"
                 return 0
@@ -1651,7 +1629,6 @@ auto_speedtest() {
         log_warn "未找到 speedtest 工具，尝试安装 speedtest-go..."
         if command -v opkg >/dev/null 2>&1; then
             opkg update && opkg install speedtest-go
-            # 安装后再次检查
             if command -v speedtest-go >/dev/null 2>&1; then
                 SPEEDTEST_CMD="speedtest-go"
                 [[ -n "$server" ]] && SPEEDTEST_CMD="$SPEEDTEST_CMD -s $server"
