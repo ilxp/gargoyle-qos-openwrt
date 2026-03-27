@@ -1,6 +1,6 @@
 #!/bin/bash
 # 规则辅助模块 (rule.sh)
-# 版本: 3.4.10 - 修复 DSCP 映射统一、UDP 限速条件优化、移除未使用参数
+# 版本: 3.4.11 - 修复 UDP 限速条件、DSCP 映射同步、动态集合检查、回退标记优化、IPv6 警告增强
 # 完全移除锁机制，适配 procd 管理
 
 # 加载核心库
@@ -97,7 +97,7 @@ flags_to_mask() {
     printf "0x%x" "$mask"
 }
 
-# ========== 通用规则构建函数（移除未使用的 mask 参数） ==========
+# ========== 通用规则构建函数 ==========
 build_nft_rule_generic() {
     local rule_name="$1" chain="$2" class_mark="$3" family="$4" proto="$5"
     local srcport="$6" dstport="$7" connbytes_kb="$8" state="$9" src_ip="${10}" dest_ip="${11}"
@@ -506,6 +506,20 @@ map_priority_to_dscp() {
     esac
 }
 
+# ========== 获取 CAKE diffserv 模式（兼容非 CAKE 场景） ==========
+get_cake_diffserv_mode() {
+    local mode
+    mode=$(uci -q get ${CONFIG_FILE}.cake.diffserv_mode 2>/dev/null)
+    case "$mode" in
+        diffserv3|diffserv4|diffserv5|diffserv8|besteffort)
+            echo "$mode"
+            ;;
+        *)
+            echo "diffserv4"
+            ;;
+    esac
+}
+
 # ========== class_mark 映射设置（使用 map，支持 diffserv 模式） ==========
 setup_class_mark_map() {
     qos_log "信息" "设置 class_mark 映射（map 方式）..."
@@ -521,8 +535,7 @@ EOF
     config_load "$CONFIG_FILE"
 
     # 获取 CAKE diffserv 模式（用于自动映射）
-    local diffserv_mode=$(uci -q get ${CONFIG_FILE}.cake.diffserv_mode 2>/dev/null)
-    [[ -z "$diffserv_mode" ]] && diffserv_mode="diffserv4"
+    local diffserv_mode=$(get_cake_diffserv_mode)
 
     # 2. 从 class_marks 文件读取标记，并收集 map 元素
     local elements=""
@@ -809,6 +822,14 @@ generate_ack_limit_rules() {
     local ack_enabled=$(uci -q get ${CONFIG_FILE}.ack_limit.enabled 2>/dev/null)
     case "$ack_enabled" in 1|yes|true|on) ;; *) return ;; esac
 
+    # 检查所需动态集合是否存在，若不存在则跳过（避免失败）
+    for set in qos_xfst_ack qos_fast_ack qos_med_ack qos_slow_ack; do
+        if ! nft list set inet gargoyle-qos-priority "$set" &>/dev/null; then
+            qos_log "WARN" "ACK 限速所需集合 $set 不存在，功能已禁用"
+            return
+        fi
+    done
+
     local slow_rate=$(uci -q get ${CONFIG_FILE}.ack_limit.slow_rate 2>/dev/null)
     local med_rate=$(uci -q get ${CONFIG_FILE}.ack_limit.med_rate 2>/dev/null)
     local fast_rate=$(uci -q get ${CONFIG_FILE}.ack_limit.fast_rate 2>/dev/null)
@@ -845,6 +866,12 @@ generate_tcp_upgrade_rules() {
     local tcp_enabled=$(uci -q get ${CONFIG_FILE}.tcp_upgrade.enabled 2>/dev/null)
     case "$tcp_enabled" in 1|yes|true|on) ;; *) return ;; esac
 
+    # 检查所需动态集合是否存在
+    if ! nft list set inet gargoyle-qos-priority qos_slow_tcp &>/dev/null; then
+        qos_log "WARN" "TCP 升级所需集合 qos_slow_tcp 不存在，功能已禁用"
+        return
+    fi
+
     local highest_class=$(get_highest_priority_class "upload")
     if [[ -z "$highest_class" ]]; then
         log_warn "TCP升级：未找到任何启用的上传类，将禁用此功能"
@@ -864,7 +891,7 @@ add rule inet gargoyle-qos-priority filter_qos_egress meta l4proto tcp ct state 
 EOF
 }
 
-# ========== UDP 限速规则（添加 ct mark == 0 条件） ==========
+# ========== UDP 限速规则（修复条件为 ct mark == 0） ==========
 generate_udp_limit_rules() {
     local udp_enable=$(uci -q get ${CONFIG_FILE}.udp_limit.enabled 2>/dev/null)
     local udp_rate=$(uci -q get ${CONFIG_FILE}.udp_limit.rate 2>/dev/null)
@@ -921,16 +948,16 @@ generate_udp_limit_rules() {
 
     local rules=""
     if [[ "$udp_action" == "mark" ]] && [[ -n "$upload_mark" ]] && [[ -n "$download_mark" ]]; then
-        # 添加条件 ct mark & 0x3f == 0，避免覆盖已分类的流量
+        # 修复：使用 ct mark == 0 确保仅对未分类流量生效，避免覆盖已有标记
         rules="${rules}
 # Global UDP rate limit - upload direction (mark) - only for unclassified flows
-add rule inet gargoyle-qos-priority filter_qos_egress oifname \"$wan_if\" meta l4proto udp ct mark & 0x3f == 0 limit rate over ${udp_rate}/second counter meta mark set $upload_mark ct mark set $upload_mark
+add rule inet gargoyle-qos-priority filter_qos_egress oifname \"$wan_if\" meta l4proto udp ct mark == 0 limit rate over ${udp_rate}/second counter meta mark set $upload_mark ct mark set $upload_mark
 # Global UDP rate limit - download direction (mark) - only for unclassified flows
-add rule inet gargoyle-qos-priority filter_qos_ingress iifname \"$wan_if\" meta l4proto udp ct mark & 0x3f == 0 limit rate over ${udp_rate}/second counter meta mark set $download_mark ct mark set $download_mark"
+add rule inet gargoyle-qos-priority filter_qos_ingress iifname \"$wan_if\" meta l4proto udp ct mark == 0 limit rate over ${udp_rate}/second counter meta mark set $download_mark ct mark set $download_mark"
     elif [[ "$udp_action" == "drop" ]]; then
-        # 丢弃规则也应避免覆盖已分类的流量，但丢弃无影响，可以不设条件
+        # 丢弃规则不设条件（丢弃不影响已分类流量）
         rules="${rules}
-# Global UDP rate limit - drop (applies to all UDP)
+# Global UDP rate limit - drop
 add rule inet gargoyle-qos-priority filter_qos_egress meta l4proto udp limit rate over ${udp_rate}/second counter drop
 add rule inet gargoyle-qos-priority filter_qos_ingress meta l4proto udp limit rate over ${udp_rate}/second counter drop"
     fi
@@ -977,7 +1004,33 @@ cleanup_dynamic_detection() {
     nft delete set inet gargoyle-qos-priority qos_high_throughput_services6 2>/dev/null || true
 }
 
-# 批量客户端检测（优先使用用户配置的类，否则使用最低优先级类）
+# ========== 辅助函数：获取已分配标记中的最小/最大值 ==========
+get_min_max_mark() {
+    local direction="$1"  # upload 或 download
+    local which="$2"      # min 或 max
+    local marks=()
+    if [[ ! -f "$CLASS_MARKS_FILE" ]]; then
+        echo "0"
+        return
+    fi
+    while IFS=: read -r dir cls mark; do
+        if [[ "$dir" == "$direction" && -n "$mark" ]]; then
+            marks+=("$mark")
+        fi
+    done < "$CLASS_MARKS_FILE"
+    if [[ ${#marks[@]} -eq 0 ]]; then
+        echo "0"
+        return
+    fi
+    local sorted=($(printf "%s\n" "${marks[@]}" | sort -n))
+    if [[ "$which" == "min" ]]; then
+        echo "${sorted[0]}"
+    else
+        echo "${sorted[-1]}"
+    fi
+}
+
+# 批量客户端检测（使用实际最小/最大标记作为回退）
 create_bulk_client_rules() {
     local enabled=1 min_bytes=10000 min_connections=10 class="bulk"
     
@@ -1009,18 +1062,15 @@ create_bulk_client_rules() {
         fi
     fi
     if [ -z "$class_mark" ]; then
-        local lowest_class=$(get_lowest_priority_class "upload")
-        if [ -n "$lowest_class" ]; then
-            class_mark=$(get_class_mark "upload" "$lowest_class" 2>/dev/null)
-            if [ -z "$class_mark" ] || [ "$class_mark" -eq 0 ]; then
-                qos_log "警告" "批量客户端检测: 最低优先级类 '$lowest_class' 标记无效，使用回退标记 8"
-                class_mark=8
-            else
-                qos_log "信息" "批量客户端检测: 自动使用最低优先级类 '$lowest_class' (标记=$class_mark)"
-            fi
+        # 使用实际已分配标记中的最小值（通常为最低优先级类）
+        local lowest_mark=$(get_min_max_mark "upload" "min")
+        if [ -n "$lowest_mark" ] && [ "$lowest_mark" -ne 0 ]; then
+            class_mark="$lowest_mark"
+            qos_log "信息" "批量客户端检测: 自动使用最小标记 $class_mark (对应最低优先级类)"
         else
+            # 回退标记 8（但尽量避免）
             class_mark=8
-            qos_log "警告" "批量客户端检测: 未找到任何启用的上传类，使用回退标记 $class_mark"
+            qos_log "警告" "批量客户端检测: 未找到有效标记，使用回退标记 $class_mark"
         fi
     fi
 
@@ -1074,7 +1124,7 @@ create_bulk_client_rules() {
     qos_log "信息" "批量客户端检测已启用: 最小连接数=$min_connections, 最小字节数=$min_bytes, 使用标记=$class_mark"
 }
 
-# 高吞吐服务检测（优先使用用户配置的类，否则使用最高优先级类）
+# 高吞吐服务检测（使用实际最大标记作为回退）
 create_high_throughput_service_rules() {
     local enabled=1 min_bytes=1000000 min_connections=3 class="realtime"
     
@@ -1106,18 +1156,14 @@ create_high_throughput_service_rules() {
         fi
     fi
     if [ -z "$class_mark" ]; then
-        local highest_class=$(get_highest_priority_class "upload")
-        if [ -n "$highest_class" ]; then
-            class_mark=$(get_class_mark "upload" "$highest_class" 2>/dev/null)
-            if [ -z "$class_mark" ] || [ "$class_mark" -eq 0 ]; then
-                qos_log "警告" "高吞吐服务检测: 最高优先级类 '$highest_class' 标记无效，使用回退标记 1"
-                class_mark=1
-            else
-                qos_log "信息" "高吞吐服务检测: 自动使用最高优先级类 '$highest_class' (标记=$class_mark)"
-            fi
+        # 使用实际已分配标记中的最大值（通常为最高优先级类）
+        local highest_mark=$(get_min_max_mark "upload" "max")
+        if [ -n "$highest_mark" ] && [ "$highest_mark" -ne 0 ]; then
+            class_mark="$highest_mark"
+            qos_log "信息" "高吞吐服务检测: 自动使用最大标记 $class_mark (对应最高优先级类)"
         else
             class_mark=1
-            qos_log "警告" "高吞吐服务检测: 未找到任何启用的上传类，使用回退标记 $class_mark"
+            qos_log "警告" "高吞吐服务检测: 未找到有效标记，使用回退标记 $class_mark"
         fi
     fi
 
@@ -1531,9 +1577,12 @@ setup_ingress_redirect() {
         fi
     fi
 
+    # 增强 IPv6 失败警告
     if (( has_ipv6_global == 1 )); then
         if [[ "$ipv6_success" != "true" ]]; then
             qos_log "WARN" "接口存在全局 IPv6 地址，但所有 IPv6 入口重定向配置失败，IPv6 流量可能不受 QoS 控制，但 IPv4 QoS 将继续工作"
+            # 可选：返回失败，但通常仍允许 IPv4 QoS 运行
+            # return 1  # 如果严格要求 IPv6 必须成功，可取消注释
         else
             qos_log "INFO" "IPv6 入口重定向成功"
         fi
