@@ -1,6 +1,6 @@
 #!/bin/bash
 # CAKE算法实现模块 - 多队列增强版
-# 版本: 3.4.5 - 与 common.sh 3.4.5 和 rule.sh 3.4.9 协同，优化参数验证和变量同步
+# 版本: 3.4.6 - 修复参数验证、IFB队列数处理、自动调优覆盖问题
 # 支持与 idclass 集成，通过 DSCP 进行分类（diffserv4 模式）
 # 必要工具：tc, nft, conntrack, ethtool, sysctl
 # 内核模块：sch_cake
@@ -38,7 +38,7 @@ RUNTIME_PARAMS_FILE="${RUNTIME_PARAMS_FILE:-/tmp/cake_runtime_params}"
 UPLOAD_MASK=0xFFFF
 DOWNLOAD_MASK=0xFFFF0000
 
-echo "CAKE 模块初始化完成 (v3.4.5)"
+echo "CAKE 模块初始化完成 (v3.4.6)"
 echo "  网络接口: $qos_interface"
 echo "  IFB 设备: $IFB_DEVICE"
 echo "  上传带宽: ${total_upload_bandwidth:-未配置}kbit/s"
@@ -102,12 +102,17 @@ validate_cake_parameters() {
 
     case "$param_name" in
         bandwidth)
+            # 允许0表示禁用，但若启用则至少1kbit
+            if [ "$param_value" -eq 0 ] 2>/dev/null; then
+                return 0
+            fi
             if ! echo "$param_value" | grep -qE '^[0-9]+$'; then
                 qos_log "ERROR" "无效的带宽值 (必须是数字): $1"
                 return 1
             fi
-            if [ "$param_value" -lt 8 ] 2>/dev/null; then
-                qos_log "WARN" "带宽过小: ${param_value}kbit (建议至少8kbit)"
+            if [ "$param_value" -lt 1 ] 2>/dev/null; then
+                qos_log "WARN" "带宽过小: ${param_value}kbit (至少需要1kbit)"
+                return 1
             fi
             if [ "$param_value" -gt 10000000 ] 2>/dev/null; then
                 qos_log "WARN" "带宽过大: ${param_value}kbit (超过10Gbit)"
@@ -140,21 +145,7 @@ validate_cake_parameters() {
                 qos_log "WARN" "无效的内存限制格式: $param_value"
                 return 1
             fi
-            if [ -n "$param_value" ]; then
-                num=$(echo "$param_value" | grep -oE '[0-9]+')
-                unit=$(echo "$param_value" | grep -oiE '(b|kb|mb|gb)$' | tr 'A-Z' 'a-z')
-                case "$unit" in
-                    b)  mb=$((num / 1024 / 1024)) ;;
-                    kb) mb=$((num / 1024)) ;;
-                    mb) mb=$num ;;
-                    gb) mb=$((num * 1024)) ;;
-                esac
-                if [ "$mb" -gt 512 ] 2>/dev/null; then
-                    qos_log "WARN" "内存限制过大 (>512MB): $param_value"
-                elif [ "$mb" -lt 1 ] 2>/dev/null && [ "$mb" -ne 0 ]; then
-                    qos_log "WARN" "内存限制过小 (<1MB): $param_value"
-                fi
-            fi
+            # 数值检查由 calculate_memory_limit 完成，此处仅做格式警告
             ;;
     esac
     return 0
@@ -284,8 +275,11 @@ load_cake_config() {
     CAKE_AUTORATE_INGRESS=$(sanitize_param "${val:-0}")
 
     val=$(uci -q get ${CONFIG_FILE}.cake.memlimit 2>/dev/null)
-    CAKE_MEMORY_LIMIT=$(sanitize_param "${val:-32mb}")
-    CAKE_MEMORY_LIMIT=$(echo "$CAKE_MEMORY_LIMIT" | tr 'A-Z' 'a-z')
+    if [ -n "$val" ]; then
+        CAKE_MEMORY_LIMIT=$(calculate_memory_limit "$val")
+    else
+        CAKE_MEMORY_LIMIT="32mb"
+    fi
 
     val=$(uci -q get ${CONFIG_FILE}.cake.ecn 2>/dev/null)
     if [ -n "$val" ]; then
@@ -323,6 +317,7 @@ auto_tune_cake() {
     local total_bw=0
     local user_set_rtt user_set_mem
 
+    # 读取用户是否显式配置了这些参数
     user_set_rtt=$(uci -q get ${CONFIG_FILE}.cake.rtt 2>/dev/null)
     user_set_mem=$(uci -q get ${CONFIG_FILE}.cake.memlimit 2>/dev/null)
 
@@ -695,7 +690,7 @@ health_check_cake() {
 
 # ========== 状态显示 ==========
 show_cake_status() {
-    echo "===== CAKE QoS状态报告 (v3.4.5) ====="
+    echo "===== CAKE QoS状态报告 (v3.4.6) ====="
     echo "时间: $(date)"
     echo "网络接口: ${qos_interface:-未知}"
 
