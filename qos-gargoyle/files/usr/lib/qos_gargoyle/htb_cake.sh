@@ -1,6 +1,6 @@
 #!/bin/bash
 # HTB_CAKE算法实现模块
-# 版本: 3.4.4 - 修复 CAKE 带宽指定，修复 check_cake_param_support 回退 lo
+# 版本: 3.4.5 - 修复 DELETE_IFB_ON_STOP 未读取、类配置变量重置、HTB参数验证
 # 基于 HTB 与 CAKE 组合算法实现 QoS 流量控制
 
 # ========== 全局配置常量 ==========
@@ -57,10 +57,29 @@ load_htb_cake_config() {
         qos_log "WARN" "IFB设备未通过环境变量传递，从 UCI 读取: $IFB_DEVICE"
     fi
 
+    # 读取 HTB 参数
     HTB_R2Q=$(uci -q get ${CONFIG_FILE}.htb.r2q 2>/dev/null)
     [[ -z "$HTB_R2Q" ]] && HTB_R2Q=10
+    # 验证 HTB_R2Q 是否为有效数字
+    if ! validate_number "$HTB_R2Q" "htb.r2q" 1 1000 2>/dev/null; then
+        qos_log "WARN" "HTB R2Q 参数无效，使用默认值 10"
+        HTB_R2Q=10
+    fi
+
     HTB_DRR_QUANTUM=$(uci -q get ${CONFIG_FILE}.htb.drr_quantum 2>/dev/null)
     [[ -z "$HTB_DRR_QUANTUM" ]] && HTB_DRR_QUANTUM="auto"
+    # 验证 drr_quantum，如果是数字且大于0，则保留；否则视为 auto
+    if [[ "$HTB_DRR_QUANTUM" != "auto" ]] && ! validate_number "$HTB_DRR_QUANTUM" "htb.drr_quantum" 1 1048576 2>/dev/null; then
+        qos_log "WARN" "HTB DRR quantum 无效，使用 auto"
+        HTB_DRR_QUANTUM="auto"
+    fi
+
+    # 读取 DELETE_IFB_ON_STOP 配置
+    local delete_ifb=$(uci -q get ${CONFIG_FILE}.cake.delete_ifb_on_stop 2>/dev/null)
+    case "$delete_ifb" in
+        1|yes|true|on) DELETE_IFB_ON_STOP=1 ;;
+        *) DELETE_IFB_ON_STOP=0 ;;
+    esac
 
     # 强制忽略 CAKE_BANDWIDTH，防止二次整形
     local cake_bw=$(uci -q get ${CONFIG_FILE}.cake.bandwidth 2>/dev/null)
@@ -107,17 +126,23 @@ load_htb_cake_config() {
     return 0
 }
 
-# 加载HTB类别配置（使用全局变量传递）
+# 加载HTB类别配置（使用全局变量传递，并在函数开头重置）
 load_htb_class_config() {
     local class_name="$1"
-    local percent_bandwidth per_min_bandwidth per_max_bandwidth priority name
+    # 重置全局变量，避免前一个类的配置残留
+    HTB_CLASS_PERCENT=""
+    HTB_CLASS_MIN=""
+    HTB_CLASS_MAX=""
+    HTB_CLASS_PRIO=""
+    HTB_CLASS_NAME=""
+
     qos_log "INFO" "加载HTB类别配置: $class_name"
     percent_bandwidth=$(uci -q get ${CONFIG_FILE}.$class_name.percent_bandwidth 2>/dev/null)
     per_min_bandwidth=$(uci -q get ${CONFIG_FILE}.$class_name.per_min_bandwidth 2>/dev/null)
     per_max_bandwidth=$(uci -q get ${CONFIG_FILE}.$class_name.per_max_bandwidth 2>/dev/null)
     priority=$(uci -q get ${CONFIG_FILE}.$class_name.priority 2>/dev/null)
     name=$(uci -q get ${CONFIG_FILE}.$class_name.name 2>/dev/null)
-    
+
     if [[ -n "$percent_bandwidth" ]]; then
         if validate_number "$percent_bandwidth" "$class_name.percent_bandwidth" 0 100; then
             percent_bandwidth=$(strip_leading_zeros "$percent_bandwidth")
@@ -146,7 +171,7 @@ load_htb_class_config() {
             priority=""
         fi
     fi
-    
+
     qos_log "DEBUG" "HTB配置: $class_name -> percent=$percent_bandwidth, min=$per_min_bandwidth, max=$per_max_bandwidth, priority=$priority"
     if [[ -z "$percent_bandwidth" ]] && [[ -z "$per_min_bandwidth" ]] && [[ -z "$per_max_bandwidth" ]]; then
         qos_log "WARN" "未找到 $class_name 的带宽参数"

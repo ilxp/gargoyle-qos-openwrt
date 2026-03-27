@@ -15,8 +15,28 @@
 #include <bpf/bpf.h>
 #include <libubox/avl-cmp.h>
 #include <libubox/uloop.h>
+#include <libubox/list.h>
+#include <ctype.h>
+#include <sys/wait.h>
 
 #define PERSISTENT_CLASS_MARKS "/etc/qos_gargoyle/class_marks"
+
+/* 内部结构体定义（仅用于 map_manager 内部） */
+struct idclass_map_entry {
+    struct avl_node avl;
+    uint32_t timeout;
+    struct idclass_map_data data;
+};
+
+struct idclass_class_entry {
+    const char *name;
+    struct idclass_class data;
+};
+
+struct idclass_map_file {
+    struct list_head list;
+    char filename[];
+};
 
 /* Global configuration instances */
 struct global_config global_config;
@@ -36,6 +56,9 @@ static struct uloop_timeout idclass_map_timer;
 static int ip_conn_fd = -1;
 static int flow_stats_fd = -1;
 static struct uloop_timeout ip_conn_timer;
+
+/* 比较函数原型声明（供 AVL_TREE 使用） */
+static int idclass_map_entry_cmp(const void *k1, const void *k2, void *ptr);
 
 /* Helper: compare two map data entries for AVL tree */
 static int idclass_map_entry_cmp(const void *k1, const void *k2, void *ptr) {
