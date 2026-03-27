@@ -23,7 +23,7 @@ static struct uloop_timeout uci_reload_timer;
 static time_t last_uci_mtime = 0;
 
 /* 内部函数：读取配置中的浮点数百分比（乘以100） */
-static int read_float_mult100(const char *val) {
+int read_float_mult100(const char *val) {
     double d = atof(val);
     return (int)(d * 100 + 0.5);
 }
