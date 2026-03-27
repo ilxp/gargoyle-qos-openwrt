@@ -1,6 +1,6 @@
 #!/bin/bash
 # 核心库模块 (common.sh)
-# 版本: 3.4.7 - 增加 CAKE diffserv 模式获取、标记辅助函数、清理未使用变量
+# 版本: 3.4.8 - 最终修复：清理冗余变量，优化动态分类阈值单位，移除未使用参数
 # 提供 QoS 系统基础功能
 
 # ========== 加载 OpenWrt 标准函数库 ==========
@@ -67,14 +67,13 @@ check_already_running() {
 # ========== 公共辅助函数 ==========
 strip_leading_zeros() {
     local val="$1"
-    # 处理空值或非数字
     [[ -z "$val" || ! "$val" =~ ^[0-9]+$ ]] && { echo "0"; return; }
     val=$(echo "$val" | sed 's/^0*//')
     [[ -z "$val" ]] && val=0
     echo "$val"
 }
 
-# ========== 日志函数（优化多行输出） ==========
+# ========== 日志函数 ==========
 log_debug() { [[ "$DEBUG" == "1" ]] && log "DEBUG" "$@"; }
 log_info()  { log "INFO" "$@"; }
 log_warn()  { log "WARN" "$@"; }
@@ -1331,7 +1330,7 @@ ensure_ifb_device() {
     return 1
 }
 
-# ========== 检查 tc connmark 支持（修复 dummy 设备回退） ==========
+# ========== 检查 tc connmark 支持 ==========
 check_tc_connmark_support() {
     modprobe sch_ingress 2>/dev/null
     modprobe act_connmark 2>/dev/null
@@ -1373,7 +1372,7 @@ check_sfo_enabled() {
     fi
 }
 
-# ========== 检查 tc ctinfo 支持（修复 dummy 设备回退） ==========
+# ========== 检查 tc ctinfo 支持 ==========
 check_tc_ctinfo_support() {
     local dummy_dev="qos_test_ctinfo_$$"
     local created=0
@@ -1515,7 +1514,7 @@ calculate_memory_limit() {
     echo "$result"
 }
 
-# ========== 获取最高优先级的类名称（修复：检查 enabled） ==========
+# ========== 获取最高优先级的类名称 ==========
 get_highest_priority_class() {
     local direction="$1"
     local class_list=""
@@ -1571,7 +1570,7 @@ get_lowest_priority_class() {
     echo "$best_class"
 }
 
-# ========== 自动测速（增加交互超时，安装后验证） ==========
+# ========== 自动测速 ==========
 auto_speedtest() {
     local noninteractive=0 force=0 gaming_ip=""
     local WAN_IF="" DOWNLOAD_SPEED="" UPLOAD_SPEED="" SPEEDTEST_CMD=""
