@@ -1,6 +1,6 @@
 #!/bin/bash
 # 规则辅助模块 (rule.sh)
-# 版本: 3.4.12 - 最终修复：移除 mask 冗余参数，优化动态分类阈值单位，修复遗留问题
+# 版本: 3.4.13 - 修复动态分类方向标记、ACK集合冗余、TCP升级注释
 # 完全移除锁机制，适配 procd 管理
 
 # 加载核心库
@@ -805,12 +805,13 @@ apply_enhanced_direction_rules() {
     return $batch_success
 }
 
-# ========== ACK 限速规则 ==========
+# ========== ACK 限速规则（移除无用的集合添加） ==========
 generate_ack_limit_rules() {
     [[ $ENABLE_ACK_LIMIT != 1 ]] && return
     local ack_enabled=$(uci -q get ${CONFIG_FILE}.ack_limit.enabled 2>/dev/null)
     case "$ack_enabled" in 1|yes|true|on) ;; *) return ;; esac
 
+    # 检查必要的集合是否存在（由 apply_all_rules 创建）
     for set in qos_xfst_ack qos_fast_ack qos_med_ack qos_slow_ack; do
         if ! nft list set inet gargoyle-qos-priority "$set" &>/dev/null; then
             qos_log "WARN" "ACK 限速所需集合 $set 不存在，功能已禁用"
@@ -840,16 +841,17 @@ generate_ack_limit_rules() {
         qos_log "WARN" "ACK xfast_rate 无效，使用默认值 5000"
     fi
 
+    # 只保留限速跳转，移除集合添加动作，减少开销
     cat <<EOF
-# ACK rate limiting using dynamic sets
-add rule inet gargoyle-qos-priority filter_qos_egress meta length < 100 tcp flags ack limit rate over ${xfast_rate}/second add @qos_xfst_ack { ct id . ct direction } counter jump drop995
-add rule inet gargoyle-qos-priority filter_qos_egress meta length < 100 tcp flags ack limit rate over ${fast_rate}/second add @qos_fast_ack { ct id . ct direction } counter jump drop95
-add rule inet gargoyle-qos-priority filter_qos_egress meta length < 100 tcp flags ack limit rate over ${med_rate}/second add @qos_med_ack { ct id . ct direction } counter jump drop50
-add rule inet gargoyle-qos-priority filter_qos_egress meta length < 100 tcp flags ack limit rate over ${slow_rate}/second add @qos_slow_ack { ct id . ct direction } counter jump drop50
+# ACK rate limiting (no set addition, only random drop)
+add rule inet gargoyle-qos-priority filter_qos_egress meta length < 100 tcp flags ack limit rate over ${xfast_rate}/second counter jump drop995
+add rule inet gargoyle-qos-priority filter_qos_egress meta length < 100 tcp flags ack limit rate over ${fast_rate}/second counter jump drop95
+add rule inet gargoyle-qos-priority filter_qos_egress meta length < 100 tcp flags ack limit rate over ${med_rate}/second counter jump drop50
+add rule inet gargoyle-qos-priority filter_qos_egress meta length < 100 tcp flags ack limit rate over ${slow_rate}/second counter jump drop50
 EOF
 }
 
-# ========== TCP 升级规则 ==========
+# ========== TCP 升级规则（修正注释，逻辑保持高速升级） ==========
 generate_tcp_upgrade_rules() {
     local tcp_enabled=$(uci -q get ${CONFIG_FILE}.tcp_upgrade.enabled 2>/dev/null)
     case "$tcp_enabled" in 1|yes|true|on) ;; *) return ;; esac
@@ -872,7 +874,7 @@ generate_tcp_upgrade_rules() {
     fi
 
     cat <<EOF
-# TCP upgrade for slow connections
+# TCP upgrade for high-rate connections (提升高速连接优先级)
 add rule inet gargoyle-qos-priority filter_qos_egress meta l4proto tcp ct state established meta nfproto ipv4 limit rate 150/second burst 150 packets add @qos_slow_tcp { ct id . ct direction } meta mark set $class_mark ct mark set meta mark counter
 add rule inet gargoyle-qos-priority filter_qos_egress meta l4proto tcp ct state established meta nfproto ipv6 limit rate 150/second burst 150 packets add @qos_slow_tcp { ct id . ct direction } meta mark set $class_mark ct mark set meta mark counter
 EOF
@@ -989,10 +991,7 @@ cleanup_dynamic_detection() {
     nft delete set inet gargoyle-qos-priority qos_high_throughput_services6 2>/dev/null || true
 }
 
-# ========== 辅助函数：获取已分配标记中的最小/最大值 ==========
-# 已在 common.sh 中定义，此处直接使用
-
-# 批量客户端检测（优化阈值单位：bytes/second，默认值调整为合理值）
+# ========== 批量客户端检测（修复方向标记） ==========
 create_bulk_client_rules() {
     local enabled=1 min_bytes=10000 min_connections=10 class="bulk"
     
@@ -1007,33 +1006,52 @@ create_bulk_client_rules() {
     [ -n "$uci_class" ] && class="$uci_class"
 
     [ "$enabled" != "1" ] && return 0
-    [ "$min_bytes" -le 0 ] && min_bytes=10000
-    [ "$min_connections" -le 1 ] && min_connections=10
+    # 验证输入
+    if ! validate_number "$min_bytes" "bulk_detect.min_bytes" 1 1000000000 2>/dev/null; then
+        qos_log "WARN" "min_bytes 无效，使用默认值 10000"
+        min_bytes=10000
+    fi
+    if ! validate_number "$min_connections" "bulk_detect.min_connections" 1 10000 2>/dev/null; then
+        qos_log "WARN" "min_connections 无效，使用默认值 10"
+        min_connections=10
+    fi
     
-    local class_mark=""
+    # 获取上传和下载标记
+    local upload_mark="" download_mark=""
     if [[ -n "$uci_class" ]]; then
-        class_mark=$(get_class_mark "upload" "$uci_class" 2>/dev/null)
-        if [ -z "$class_mark" ]; then
-            class_mark=$(get_class_mark "download" "$uci_class" 2>/dev/null)
-        fi
-        if [ -z "$class_mark" ] || [ "$class_mark" -eq 0 ]; then
-            qos_log "警告" "批量客户端检测: 用户指定的类 '$uci_class' 不存在或标记无效，将自动选择最低优先级类"
-            class_mark=""
+        upload_mark=$(get_class_mark "upload" "$uci_class" 2>/dev/null)
+        download_mark=$(get_class_mark "download" "$uci_class" 2>/dev/null)
+        if [[ -z "$upload_mark" ]] && [[ -z "$download_mark" ]]; then
+            qos_log "警告" "批量客户端检测: 用户指定的类 '$uci_class' 不存在，将自动选择优先级最低的类"
+            upload_mark=""
+            download_mark=""
         else
-            qos_log "信息" "批量客户端检测: 使用用户指定的类 '$uci_class' (标记=$class_mark)"
+            qos_log "信息" "批量客户端检测: 使用用户指定的类 '$uci_class' (上传标记=$upload_mark, 下载标记=$download_mark)"
         fi
     fi
-    if [ -z "$class_mark" ]; then
-        local lowest_mark=$(get_min_max_mark "upload" "min")
-        if [ -n "$lowest_mark" ] && [ "$lowest_mark" -ne 0 ]; then
-            class_mark="$lowest_mark"
-            qos_log "信息" "批量客户端检测: 自动使用最小标记 $class_mark (对应最低优先级类)"
+    # 如果未指定或无效，自动选择最低优先级类（标记值最小为上传方向，最大为下载方向？实际标记分配中，上传标记从1开始，下载从65536开始）
+    if [[ -z "$upload_mark" ]]; then
+        local lowest_upload_mark=$(get_min_max_mark "upload" "min")
+        if [[ -n "$lowest_upload_mark" && "$lowest_upload_mark" -ne 0 ]]; then
+            upload_mark="$lowest_upload_mark"
+            qos_log "信息" "批量客户端检测: 自动使用上传方向最小标记 $upload_mark (对应最低优先级类)"
         else
-            class_mark=8
-            qos_log "警告" "批量客户端检测: 未找到有效标记，使用回退标记 $class_mark"
+            upload_mark=8
+            qos_log "警告" "批量客户端检测: 未找到有效上传标记，使用回退标记 $upload_mark"
+        fi
+    fi
+    if [[ -z "$download_mark" ]]; then
+        local lowest_download_mark=$(get_min_max_mark "download" "min")
+        if [[ -n "$lowest_download_mark" && "$lowest_download_mark" -ne 0 ]]; then
+            download_mark="$lowest_download_mark"
+            qos_log "信息" "批量客户端检测: 自动使用下载方向最小标记 $download_mark (对应最低优先级类)"
+        else
+            download_mark=65536
+            qos_log "警告" "批量客户端检测: 未找到有效下载标记，使用回退标记 $download_mark"
         fi
     fi
 
+    # 创建必要的集合和链
     nft add set inet gargoyle-qos-priority qos_bulk_clients '{ type ipv4_addr . inet_service . inet_proto; flags timeout; }' 2>/dev/null || true
     nft add set inet gargoyle-qos-priority qos_bulk_clients6 '{ type ipv6_addr . inet_service . inet_proto; flags timeout; }' 2>/dev/null || true
 
@@ -1048,8 +1066,7 @@ create_bulk_client_rules() {
         return 0
     fi
 
-    # 修复：将 bytes/hour 改为 bytes/second，并调整默认值语义
-    # 原 10000 字节/小时 ≈ 2.78 字节/秒，现在改为 10000 字节/秒（10KB/s）
+    # 建立连接检测（上行）
     nft add rule inet gargoyle-qos-priority qos_established_connection \
         meter qos_bulk_detect '{ ip daddr . th dport . meta l4proto timeout 5s limit rate over '"$((min_connections - 1))"'/minute }' \
         add @qos_bulk_clients '{ ip daddr . th dport . meta l4proto timeout 30s }' 2>/dev/null || true
@@ -1058,35 +1075,38 @@ create_bulk_client_rules() {
         meter qos_bulk_detect6 '{ ip6 daddr . th dport . meta l4proto timeout 5s limit rate over '"$((min_connections - 1))"'/minute }' \
         add @qos_bulk_clients6 '{ ip6 daddr . th dport . meta l4proto timeout 30s }' 2>/dev/null || true
 
+    # 上行流量：匹配后设置上传标记
     nft add rule inet gargoyle-qos-priority qos_bulk_client \
         meter qos_bulk_orig '{ ip saddr . th sport . meta l4proto timeout 5m limit rate over '"$((min_bytes - 1))"' bytes/second }' \
         update @qos_bulk_clients '{ ip saddr . th sport . meta l4proto timeout 5m }' \
-        meta mark set $class_mark ct mark set $class_mark return 2>/dev/null || true
+        meta mark set $upload_mark ct mark set $upload_mark return 2>/dev/null || true
 
     nft add rule inet gargoyle-qos-priority qos_bulk_client \
         meter qos_bulk_orig6 '{ ip6 saddr . th sport . meta l4proto timeout 5m limit rate over '"$((min_bytes - 1))"' bytes/second }' \
         update @qos_bulk_clients6 '{ ip6 saddr . th sport . meta l4proto timeout 5m }' \
-        meta mark set $class_mark ct mark set $class_mark return 2>/dev/null || true
+        meta mark set $upload_mark ct mark set $upload_mark return 2>/dev/null || true
 
+    # 下行流量：匹配后设置下载标记
     nft add rule inet gargoyle-qos-priority qos_bulk_client_reply \
         meter qos_bulk_reply '{ ip daddr . th dport . meta l4proto timeout 5m limit rate over '"$((min_bytes - 1))"' bytes/second }' \
         update @qos_bulk_clients '{ ip daddr . th dport . meta l4proto timeout 5m }' \
-        meta mark set $class_mark ct mark set $class_mark return 2>/dev/null || true
+        meta mark set $download_mark ct mark set $download_mark return 2>/dev/null || true
 
     nft add rule inet gargoyle-qos-priority qos_bulk_client_reply \
         meter qos_bulk_reply6 '{ ip6 daddr . th dport . meta l4proto timeout 5m limit rate over '"$((min_bytes - 1))"' bytes/second }' \
         update @qos_bulk_clients6 '{ ip6 daddr . th dport . meta l4proto timeout 5m }' \
-        meta mark set $class_mark ct mark set $class_mark return 2>/dev/null || true
+        meta mark set $download_mark ct mark set $download_mark return 2>/dev/null || true
 
+    # 挂载规则到动态分类链
     nft add rule inet gargoyle-qos-priority qos_dynamic_classify "ct mark & 0x3f == 0" ip saddr . th sport . meta l4proto @qos_bulk_clients goto qos_bulk_client 2>/dev/null || true
     nft add rule inet gargoyle-qos-priority qos_dynamic_classify "ct mark & 0x3f == 0" ip6 saddr . th sport . meta l4proto @qos_bulk_clients6 goto qos_bulk_client 2>/dev/null || true
     nft add rule inet gargoyle-qos-priority qos_dynamic_classify_reply "ct mark & 0x3f == 0" ip daddr . th dport . meta l4proto @qos_bulk_clients goto qos_bulk_client_reply 2>/dev/null || true
     nft add rule inet gargoyle-qos-priority qos_dynamic_classify_reply "ct mark & 0x3f == 0" ip6 daddr . th dport . meta l4proto @qos_bulk_clients6 goto qos_bulk_client_reply 2>/dev/null || true
 
-    qos_log "信息" "批量客户端检测已启用: 最小连接数=$min_connections, 最小字节数=$min_bytes 字节/秒, 使用标记=$class_mark"
+    qos_log "信息" "批量客户端检测已启用: 最小连接数=$min_connections, 最小字节数=$min_bytes 字节/秒, 上传标记=$upload_mark, 下载标记=$download_mark"
 }
 
-# 高吞吐服务检测（优化阈值单位：bytes/second）
+# ========== 高吞吐服务检测（修复方向标记） ==========
 create_high_throughput_service_rules() {
     local enabled=1 min_bytes=1000000 min_connections=3 class="realtime"
     
@@ -1101,30 +1121,48 @@ create_high_throughput_service_rules() {
     [ -n "$uci_class" ] && class="$uci_class"
 
     [ "$enabled" != "1" ] && return 0
-    [ "$min_bytes" -le 0 ] && min_bytes=1000000
-    [ "$min_connections" -le 1 ] && min_connections=3
+    # 验证输入
+    if ! validate_number "$min_bytes" "htp_detect.min_bytes" 1 1000000000 2>/dev/null; then
+        qos_log "WARN" "min_bytes 无效，使用默认值 1000000"
+        min_bytes=1000000
+    fi
+    if ! validate_number "$min_connections" "htp_detect.min_connections" 1 10000 2>/dev/null; then
+        qos_log "WARN" "min_connections 无效，使用默认值 3"
+        min_connections=3
+    fi
 
-    local class_mark=""
+    # 获取上传和下载标记
+    local upload_mark="" download_mark=""
     if [[ -n "$uci_class" ]]; then
-        class_mark=$(get_class_mark "upload" "$uci_class" 2>/dev/null)
-        if [ -z "$class_mark" ]; then
-            class_mark=$(get_class_mark "download" "$uci_class" 2>/dev/null)
-        fi
-        if [ -z "$class_mark" ] || [ "$class_mark" -eq 0 ]; then
-            qos_log "警告" "高吞吐服务检测: 用户指定的类 '$uci_class' 不存在或标记无效，将自动选择最高优先级类"
-            class_mark=""
+        upload_mark=$(get_class_mark "upload" "$uci_class" 2>/dev/null)
+        download_mark=$(get_class_mark "download" "$uci_class" 2>/dev/null)
+        if [[ -z "$upload_mark" ]] && [[ -z "$download_mark" ]]; then
+            qos_log "警告" "高吞吐服务检测: 用户指定的类 '$uci_class' 不存在，将自动选择优先级最高的类"
+            upload_mark=""
+            download_mark=""
         else
-            qos_log "信息" "高吞吐服务检测: 使用用户指定的类 '$uci_class' (标记=$class_mark)"
+            qos_log "信息" "高吞吐服务检测: 使用用户指定的类 '$uci_class' (上传标记=$upload_mark, 下载标记=$download_mark)"
         fi
     fi
-    if [ -z "$class_mark" ]; then
-        local highest_mark=$(get_min_max_mark "upload" "max")
-        if [ -n "$highest_mark" ] && [ "$highest_mark" -ne 0 ]; then
-            class_mark="$highest_mark"
-            qos_log "信息" "高吞吐服务检测: 自动使用最大标记 $class_mark (对应最高优先级类)"
+    # 自动选择最高优先级类（标记值最大为上传方向，最小为下载方向？实际标记分配中，上传标记从1开始，下载从65536开始，所以最大标记通常对应高优先级）
+    if [[ -z "$upload_mark" ]]; then
+        local highest_upload_mark=$(get_min_max_mark "upload" "max")
+        if [[ -n "$highest_upload_mark" && "$highest_upload_mark" -ne 0 ]]; then
+            upload_mark="$highest_upload_mark"
+            qos_log "信息" "高吞吐服务检测: 自动使用上传方向最大标记 $upload_mark (对应最高优先级类)"
         else
-            class_mark=1
-            qos_log "警告" "高吞吐服务检测: 未找到有效标记，使用回退标记 $class_mark"
+            upload_mark=1
+            qos_log "警告" "高吞吐服务检测: 未找到有效上传标记，使用回退标记 $upload_mark"
+        fi
+    fi
+    if [[ -z "$download_mark" ]]; then
+        local highest_download_mark=$(get_min_max_mark "download" "max")
+        if [[ -n "$highest_download_mark" && "$highest_download_mark" -ne 0 ]]; then
+            download_mark="$highest_download_mark"
+            qos_log "信息" "高吞吐服务检测: 自动使用下载方向最大标记 $download_mark (对应最高优先级类)"
+        else
+            download_mark=65536
+            qos_log "警告" "高吞吐服务检测: 未找到有效下载标记，使用回退标记 $download_mark"
         fi
     fi
 
@@ -1139,6 +1177,7 @@ create_high_throughput_service_rules() {
     nft add chain inet gargoyle-qos-priority qos_high_throughput_service 2>/dev/null || true
     nft add chain inet gargoyle-qos-priority qos_high_throughput_service_reply 2>/dev/null || true
 
+    # 上行方向检测
     nft add rule inet gargoyle-qos-priority qos_established_connection \
         meter qos_htp_detect '{ ip daddr . ip saddr and 255.255.255.0 . th sport . meta l4proto timeout 5s limit rate over '"$((min_connections - 1))"'/minute }' \
         add @qos_high_throughput_services '{ ip daddr . ip saddr and 255.255.255.0 . th sport . meta l4proto timeout 30s }' 2>/dev/null || true
@@ -1150,19 +1189,21 @@ create_high_throughput_service_rules() {
     nft add rule inet gargoyle-qos-priority qos_high_throughput_service "ct bytes original < $min_bytes return" 2>/dev/null || true
     nft add rule inet gargoyle-qos-priority qos_high_throughput_service update @qos_high_throughput_services '{ ip saddr . ip daddr and 255.255.255.0 . th dport . meta l4proto timeout 5m }' 2>/dev/null || true
     nft add rule inet gargoyle-qos-priority qos_high_throughput_service update @qos_high_throughput_services6 '{ ip6 saddr . ip6 daddr and ffff:ffff:ffff:: . th dport . meta l4proto timeout 5m }' 2>/dev/null || true
-    nft add rule inet gargoyle-qos-priority qos_high_throughput_service meta mark set $class_mark ct mark set $class_mark return 2>/dev/null || true
+    nft add rule inet gargoyle-qos-priority qos_high_throughput_service meta mark set $upload_mark ct mark set $upload_mark return 2>/dev/null || true
 
+    # 下行方向检测
     nft add rule inet gargoyle-qos-priority qos_high_throughput_service_reply "ct bytes reply < $min_bytes return" 2>/dev/null || true
     nft add rule inet gargoyle-qos-priority qos_high_throughput_service_reply update @qos_high_throughput_services '{ ip daddr . ip saddr and 255.255.255.0 . th sport . meta l4proto timeout 5m }' 2>/dev/null || true
     nft add rule inet gargoyle-qos-priority qos_high_throughput_service_reply update @qos_high_throughput_services6 '{ ip6 daddr . ip6 saddr and ffff:ffff:ffff:: . th sport . meta l4proto timeout 5m }' 2>/dev/null || true
-    nft add rule inet gargoyle-qos-priority qos_high_throughput_service_reply meta mark set $class_mark ct mark set $class_mark return 2>/dev/null || true
+    nft add rule inet gargoyle-qos-priority qos_high_throughput_service_reply meta mark set $download_mark ct mark set $download_mark return 2>/dev/null || true
 
+    # 挂载规则到动态分类链
     nft add rule inet gargoyle-qos-priority qos_dynamic_classify "ct mark & 0x3f == 0" ip saddr . ip daddr and 255.255.255.0 . th dport . meta l4proto @qos_high_throughput_services goto qos_high_throughput_service 2>/dev/null || true
     nft add rule inet gargoyle-qos-priority qos_dynamic_classify "ct mark & 0x3f == 0" ip6 saddr . ip6 daddr and ffff:ffff:ffff:: . th dport . meta l4proto @qos_high_throughput_services6 goto qos_high_throughput_service 2>/dev/null || true
     nft add rule inet gargoyle-qos-priority qos_dynamic_classify_reply "ct mark & 0x3f == 0" ip daddr . ip saddr and 255.255.255.0 . th sport . meta l4proto @qos_high_throughput_services goto qos_high_throughput_service_reply 2>/dev/null || true
     nft add rule inet gargoyle-qos-priority qos_dynamic_classify_reply "ct mark & 0x3f == 0" ip6 daddr . ip6 saddr and ffff:ffff:ffff:: . th sport . meta l4proto @qos_high_throughput_services6 goto qos_high_throughput_service_reply 2>/dev/null || true
 
-    qos_log "信息" "高吞吐服务检测已启用: 最小连接数=$min_connections, 最小字节数=$min_bytes 字节/秒, 使用标记=$class_mark"
+    qos_log "信息" "高吞吐服务检测已启用: 最小连接数=$min_connections, 最小字节数=$min_bytes 字节/秒, 上传标记=$upload_mark, 下载标记=$download_mark"
 }
 
 setup_dynamic_classification() {
@@ -1225,6 +1266,7 @@ apply_all_rules() {
         nft add chain inet gargoyle-qos-priority filter_qos_ingress 2>/dev/null || true
         generate_ipset_sets
         local sets_ok=1
+        # 为 ACK 限速和 TCP 升级创建必要的集合（但 ACK 已不再使用集合添加，保留集合以备可能的功能扩展）
         for set in qos_xfst_ack qos_fast_ack qos_med_ack qos_slow_ack qos_slow_tcp; do
             if ! nft list set inet gargoyle-qos-priority "$set" &>/dev/null; then
                 if ! nft add set inet gargoyle-qos-priority "$set" '{ typeof ct id . ct direction; flags dynamic; timeout 5m; }' 2>/dev/null; then
