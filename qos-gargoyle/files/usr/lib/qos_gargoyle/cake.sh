@@ -1,6 +1,6 @@
 #!/bin/bash
 # CAKE算法实现模块 - 多队列增强版
-# 版本: 3.4.4 - 修复标记分配缺失，确保启动成功
+# 版本: 3.4.5 - 与 common.sh 3.4.5 和 rule.sh 3.4.9 协同，优化参数验证和变量同步
 # 支持与 idclass 集成，通过 DSCP 进行分类（diffserv4 模式）
 # 必要工具：tc, nft, conntrack, ethtool, sysctl
 # 内核模块：sch_cake
@@ -38,15 +38,15 @@ RUNTIME_PARAMS_FILE="${RUNTIME_PARAMS_FILE:-/tmp/cake_runtime_params}"
 UPLOAD_MASK=0xFFFF
 DOWNLOAD_MASK=0xFFFF0000
 
-echo "CAKE 模块初始化完成 (v3.4.4)"
+echo "CAKE 模块初始化完成 (v3.4.5)"
 echo "  网络接口: $qos_interface"
 echo "  IFB 设备: $IFB_DEVICE"
 echo "  上传带宽: ${total_upload_bandwidth:-未配置}kbit/s"
 echo "  下载带宽: ${total_download_bandwidth:-未配置}kbit/s"
 
 # ========= CAKE专属常量 ==========
-CAKE_DIFFSERV_MODE="diffserv4"
-CAKE_FLOWMODE="srchost"          # 流模式，默认 srchost
+CAKE_DIFFSERV_MODE="diffserv4"          # DiffServ 模式
+CAKE_FLOWMODE="srchost"                 # 流模式，默认 srchost
 CAKE_OVERHEAD="0"
 CAKE_MPU="0"
 CAKE_RTT="100ms"
@@ -54,13 +54,13 @@ CAKE_ACK_FILTER="0"
 CAKE_NAT="0"
 CAKE_WASH="0"
 CAKE_SPLIT_GSO="0"
-CAKE_INGRESS="0"          # 用户配置，决定是否附加 ingress 参数
+CAKE_INGRESS="0"                        # 用户配置，决定是否附加 ingress 参数
 CAKE_AUTORATE_INGRESS="0"
 CAKE_MEMORY_LIMIT="32mb"
-CAKE_ECN=""               # ECN 启用标志
+CAKE_ECN=""                             # ECN 启用标志
 ENABLE_AUTO_TUNE="1"
-CAKE_MQ_ENABLED="1"        # 是否启用多队列 CAKE-MQ
-CAKE_DELETE_IFB_ON_STOP="1" # 停止时是否删除 IFB 设备（默认删除）
+CAKE_MQ_ENABLED="1"                     # 是否启用多队列 CAKE-MQ
+CAKE_DELETE_IFB_ON_STOP="1"             # 停止时是否删除 IFB 设备（默认删除）
 
 # 运行时生效的高级参数标志（初始为0）
 RUNTIME_SPLIT_GSO=0
@@ -215,7 +215,7 @@ get_tx_queues() {
     echo "$queues"
 }
 
-# ========== 检测内核是否支持特定 CAKE 参数（修复：避免污染 lo）==========
+# ========== 检测内核是否支持特定 CAKE 参数 ==========
 check_cake_param_support() {
     local param="$1"
     local dummy_dev="cake_test_$$"
@@ -695,7 +695,7 @@ health_check_cake() {
 
 # ========== 状态显示 ==========
 show_cake_status() {
-    echo "===== CAKE QoS状态报告 (v3.4.4) ====="
+    echo "===== CAKE QoS状态报告 (v3.4.5) ====="
     echo "时间: $(date)"
     echo "网络接口: ${qos_interface:-未知}"
 
