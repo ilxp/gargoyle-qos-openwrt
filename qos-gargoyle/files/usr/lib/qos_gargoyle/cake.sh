@@ -1,25 +1,28 @@
 #!/bin/bash
-# CAKE算法实现模块 - 多队列增强版
-# 版本: 3.4.6 - 修复参数验证、IFB队列数处理、自动调优覆盖问题
-# 支持与 idclass 集成，通过 DSCP 进行分类（diffserv4 模式）
-# 必要工具：tc, nft, conntrack, ethtool, sysctl
-# 内核模块：sch_cake
+# HFSC_CAKE算法实现模块
+# 版本: 3.4.7 - 修复内存限制解析、CAKE带宽忽略、IFB删除控制、RTT验证
+# 基于HFSC与CAKE组合算法实现QoS流量控制。
 
-# ========== 变量初始化 ==========
-: ${IFB_DEVICE:=ifb0}
-: ${qos_interface:=$(uci -q get qos_gargoyle.global.wan_interface 2>/dev/null)}
-: ${qos_interface:=pppoe-wan}
+# ========== 全局配置常量 ==========
+: ${CONFIG_FILE:=qos_gargoyle}
+: ${MAX_PHYSICAL_BANDWIDTH:=10000000}
+: ${UPLOAD_MASK:=0xFFFF}
+: ${DOWNLOAD_MASK:=0xFFFF0000}
+: ${DELETE_IFB_ON_STOP:=0}
+: ${DEBUG:=0}
 
-# 加载核心库（必须在最前面）
-if [ -f "/usr/lib/qos_gargoyle/common.sh" ]; then
-    . /usr/lib/qos_gargoyle/common.sh
-else
-    echo "错误: 核心库 /usr/lib/qos_gargoyle/common.sh 未找到" >&2
-    exit 1
-fi
+# 全局变量
+upload_class_list=""
+download_class_list=""
+upload_class_mark_list=""
+download_class_mark_list=""
+qos_interface=""
+IFB_DEVICE=""
+
+CLASS_MARKS_FILE="/etc/qos_gargoyle/class_marks"
 
 # 加载规则辅助模块（必须）
-if [ -f "/usr/lib/qos_gargoyle/rule.sh" ]; then
+if [[ -f "/usr/lib/qos_gargoyle/rule.sh" ]]; then
     . /usr/lib/qos_gargoyle/rule.sh
     qos_log() { log "$@"; }
 else
@@ -27,585 +30,737 @@ else
     exit 1
 fi
 
-# 设置退出时清理临时文件
-trap cleanup_temp_files EXIT INT TERM HUP QUIT
+# 清理函数：仅清理临时文件（锁已由 procd 管理）
+main_cleanup() {
+    cleanup_temp_files 2>/dev/null
+}
+trap main_cleanup EXIT INT TERM HUP QUIT
 
-# 确保全局变量定义（避免未定义）
-CLASS_MARKS_FILE="${CLASS_MARKS_FILE:-/etc/qos_gargoyle/class_marks}"
-RUNTIME_PARAMS_FILE="${RUNTIME_PARAMS_FILE:-/tmp/cake_runtime_params}"
+. /lib/functions.sh
+. /lib/functions/network.sh
+include /lib/network
 
-# 掩码变量（CAKE 模式下未使用，但 rule.sh 需要）
-UPLOAD_MASK=0xFFFF
-DOWNLOAD_MASK=0xFFFF0000
-
-echo "CAKE 模块初始化完成 (v3.4.6)"
-echo "  网络接口: $qos_interface"
-echo "  IFB 设备: $IFB_DEVICE"
-echo "  上传带宽: ${total_upload_bandwidth:-未配置}kbit/s"
-echo "  下载带宽: ${total_download_bandwidth:-未配置}kbit/s"
-
-# ========= CAKE专属常量 ==========
-CAKE_DIFFSERV_MODE="diffserv4"          # DiffServ 模式
-CAKE_FLOWMODE="srchost"                 # 流模式，默认 srchost
-CAKE_OVERHEAD="0"
-CAKE_MPU="0"
-CAKE_RTT="100ms"
-CAKE_ACK_FILTER="0"
-CAKE_NAT="0"
-CAKE_WASH="0"
-CAKE_SPLIT_GSO="0"
-CAKE_INGRESS="0"                        # 用户配置，决定是否附加 ingress 参数
-CAKE_AUTORATE_INGRESS="0"
-CAKE_MEMORY_LIMIT="32mb"
-CAKE_ECN=""                             # ECN 启用标志
-ENABLE_AUTO_TUNE="1"
-CAKE_MQ_ENABLED="1"                     # 是否启用多队列 CAKE-MQ
-CAKE_DELETE_IFB_ON_STOP="1"             # 停止时是否删除 IFB 设备（默认删除）
-
-# 运行时生效的高级参数标志（初始为0）
-RUNTIME_SPLIT_GSO=0
-RUNTIME_INGRESS=0
-RUNTIME_AUTORATE_INGRESS=0
-
-# ========== 辅助函数 ==========
-
-# 参数消毒
+# ========== 参数消毒 ==========
 sanitize_param() {
     echo "$1" | sed 's/[^a-zA-Z0-9_./:-]//g'
 }
 
-# ========== 依赖检查 ==========
-check_dependencies() {
-    if ! command -v tc >/dev/null 2>&1; then
-        qos_log "ERROR" "tc 命令未找到，请安装 iproute2"
+# ========== HFSC 与 CAKE 专属配置加载 ==========
+load_hfsc_cake_config() {
+    qos_log "INFO" "加载HFSC与CAKE配置"
+    if [[ -z "$total_upload_bandwidth" ]] || [[ -z "$total_download_bandwidth" ]]; then
+        qos_log "ERROR" "带宽环境变量未设置，请确保主脚本已正确加载带宽配置"
         return 1
     fi
-    if ! command -v ip >/dev/null 2>&1; then
-        qos_log "ERROR" "ip 命令未找到，请安装 iproute2"
-        return 1
+    qos_log "INFO" "使用主脚本提供的带宽: 上传=${total_upload_bandwidth}kbit, 下载=${total_download_bandwidth}kbit"
+
+    if [[ -n "$IFB_DEVICE" ]]; then
+        qos_log "INFO" "使用环境变量 IFB_DEVICE=$IFB_DEVICE"
+    else
+        IFB_DEVICE=$(uci -q get ${CONFIG_FILE}.download.ifb_device 2>/dev/null)
+        [[ -z "$IFB_DEVICE" ]] && IFB_DEVICE="ifb0"
+        qos_log "WARN" "IFB设备未通过环境变量传递，从 UCI 读取: $IFB_DEVICE"
     fi
-    if ! command -v uci >/dev/null 2>&1; then
-        qos_log "ERROR" "uci 命令未找到，请安装 uci"
-        return 1
+
+    # 读取 HFSC 参数
+    HFSC_LATENCY_MODE=$(uci -q get ${CONFIG_FILE}.hfsc.latency_mode 2>/dev/null)
+    HFSC_MINRTT_ENABLED=$(uci -q get ${CONFIG_FILE}.hfsc.minrtt_enabled 2>/dev/null)
+    [[ -z "$HFSC_MINRTT_ENABLED" ]] && HFSC_MINRTT_ENABLED=0
+    HFSC_MINRTT_DELAY=$(uci -q get ${CONFIG_FILE}.hfsc.minrtt_delay 2>/dev/null)
+    [[ -z "$HFSC_MINRTT_DELAY" ]] && HFSC_MINRTT_DELAY="1000us"
+
+    # 验证 MINRTT_DELAY 格式
+    if [[ -n "$HFSC_MINRTT_DELAY" ]] && ! echo "$HFSC_MINRTT_DELAY" | grep -qiE '^[0-9]+(us|ms|s)$'; then
+        qos_log "WARN" "无效的 minrtt_delay 格式 '$HFSC_MINRTT_DELAY'，使用默认值 1000us"
+        HFSC_MINRTT_DELAY="1000us"
     fi
-    if ! command -v ethtool >/dev/null 2>&1; then
-        qos_log "WARN" "ethtool 命令未找到，队列数检测将回退到 sysfs"
-    fi
-    return 0
-}
 
-# ========== 参数验证 ==========
-validate_cake_parameters() {
-    local param_value="$1"
-    local param_name="$2"
-    local num unit ms mb
-
-    case "$param_name" in
-        bandwidth)
-            # 允许0表示禁用，但若启用则至少1kbit
-            if [ "$param_value" -eq 0 ] 2>/dev/null; then
-                return 0
-            fi
-            if ! echo "$param_value" | grep -qE '^[0-9]+$'; then
-                qos_log "ERROR" "无效的带宽值 (必须是数字): $1"
-                return 1
-            fi
-            if [ "$param_value" -lt 1 ] 2>/dev/null; then
-                qos_log "WARN" "带宽过小: ${param_value}kbit (至少需要1kbit)"
-                return 1
-            fi
-            if [ "$param_value" -gt 10000000 ] 2>/dev/null; then
-                qos_log "WARN" "带宽过大: ${param_value}kbit (超过10Gbit)"
-            fi
-            ;;
-
-        rtt)
-            if [ -n "$param_value" ] && ! echo "$param_value" | grep -qiE '^[0-9]*\.?[0-9]+(us|ms|s)$'; then
-                qos_log "WARN" "无效的RTT格式: $param_value (应为数字+单位: us/ms/s)"
-                return 1
-            fi
-            if [ -n "$param_value" ]; then
-                num=$(echo "$param_value" | grep -oE '^[0-9]*\.?[0-9]+')
-                unit=$(echo "$param_value" | grep -oiE '(us|ms|s)$' | tr 'A-Z' 'a-z')
-                case "$unit" in
-                    us) ms=$(( ${num%.*} / 1000 )) ;;
-                    ms) ms="${num%.*}" ;;
-                    s)  ms=$(( ${num%.*} * 1000 )) ;;
-                esac
-                if [ -n "$ms" ] && [ "$ms" -gt 10000 ] 2>/dev/null; then
-                    qos_log "WARN" "RTT值过大 (>10秒): $param_value"
-                elif [ -n "$ms" ] && [ "$ms" -lt 1 ] 2>/dev/null && [ "$ms" != "0" ]; then
-                    qos_log "WARN" "RTT值过小 (<1ms): $param_value"
-                fi
-            fi
-            ;;
-
-        memory_limit)
-            if [ -n "$param_value" ] && ! echo "$param_value" | grep -qiE '^[0-9]+(b|kb|mb|gb)$'; then
-                qos_log "WARN" "无效的内存限制格式: $param_value"
-                return 1
-            fi
-            # 数值检查由 calculate_memory_limit 完成，此处仅做格式警告
-            ;;
+    # 读取 DELETE_IFB_ON_STOP 配置
+    local delete_ifb=$(uci -q get ${CONFIG_FILE}.cake.delete_ifb_on_stop 2>/dev/null)
+    case "$delete_ifb" in
+        1|yes|true|on) DELETE_IFB_ON_STOP=1 ;;
+        *) DELETE_IFB_ON_STOP=0 ;;
     esac
+
+    # 强制忽略 CAKE_BANDWIDTH，防止二次整形
+    local cake_bw=$(uci -q get ${CONFIG_FILE}.cake.bandwidth 2>/dev/null)
+    if [[ -n "$cake_bw" ]]; then
+        qos_log "ERROR" "检测到 CAKE_BANDWIDTH 已配置 (值: $cake_bw)，这将导致CAKE二次整形，严重影响HFSC调度性能。已强制忽略该配置，使用HFSC主导整形。"
+        # 运行时忽略，不修改UCI
+        CAKE_BANDWIDTH=""
+    else
+        CAKE_BANDWIDTH=""
+    fi
+
+    # 读取 CAKE 参数
+    CAKE_RTT=$(uci -q get ${CONFIG_FILE}.cake.rtt 2>/dev/null)
+    if [[ -n "$CAKE_RTT" ]] && ! echo "$CAKE_RTT" | grep -qiE '^[0-9]+(us|ms|s)$'; then
+        qos_log "WARN" "无效的 RTT 格式: $CAKE_RTT，将使用默认值 100ms"
+        CAKE_RTT="100ms"
+    fi
+
+    CAKE_FLOWMODE=$(uci -q get ${CONFIG_FILE}.cake.flowmode 2>/dev/null)
+    [[ -z "$CAKE_FLOWMODE" ]] && CAKE_FLOWMODE="srchost"
+    CAKE_DIFFSERV=$(uci -q get ${CONFIG_FILE}.cake.diffserv_mode 2>/dev/null)
+    [[ -z "$CAKE_DIFFSERV" ]] && CAKE_DIFFSERV="diffserv4"
+    CAKE_NAT=$(uci -q get ${CONFIG_FILE}.cake.nat 2>/dev/null)
+    [[ -z "$CAKE_NAT" ]] && CAKE_NAT="1"
+    CAKE_WASH=$(uci -q get ${CONFIG_FILE}.cake.wash 2>/dev/null)
+    [[ -z "$CAKE_WASH" ]] && CAKE_WASH="1"
+    CAKE_OVERHEAD=$(uci -q get ${CONFIG_FILE}.cake.overhead 2>/dev/null)
+    CAKE_MPU=$(uci -q get ${CONFIG_FILE}.cake.mpu 2>/dev/null)
+    CAKE_ACK_FILTER=$(uci -q get ${CONFIG_FILE}.cake.ack_filter 2>/dev/null)
+    [[ -z "$CAKE_ACK_FILTER" ]] && CAKE_ACK_FILTER="0"
+    CAKE_SPLIT_GSO=$(uci -q get ${CONFIG_FILE}.cake.split_gso 2>/dev/null)
+    [[ -z "$CAKE_SPLIT_GSO" ]] && CAKE_SPLIT_GSO="0"
+    CAKE_MEMLIMIT=$(uci -q get ${CONFIG_FILE}.cake.memlimit 2>/dev/null)
+    if [[ -n "$CAKE_MEMLIMIT" ]]; then
+        CAKE_MEMLIMIT=$(calculate_memory_limit "$CAKE_MEMLIMIT")
+    fi
+    CAKE_ECN=$(uci -q get ${CONFIG_FILE}.cake.ecn 2>/dev/null)
+    if [[ -n "$CAKE_ECN" ]]; then
+        case "$CAKE_ECN" in
+            yes|1|enable|on|true|ecn) CAKE_ECN="ecn"; qos_log "INFO" "CAKE ECN 已启用" ;;
+            no|0|disable|off|false|noecn) CAKE_ECN=""; qos_log "INFO" "CAKE ECN 已禁用" ;;
+            *) qos_log "WARN" "无效的 ECN 配置值 '$CAKE_ECN'，将禁用 ECN"; CAKE_ECN="" ;;
+        esac
+    else
+        CAKE_ECN=""
+        qos_log "INFO" "CAKE ECN 未配置，使用默认禁用"
+    fi
+
+    qos_log "INFO" "HFSC配置: latency_mode=${HFSC_LATENCY_MODE}, minrtt_enabled=${HFSC_MINRTT_ENABLED}, minrtt_delay=${HFSC_MINRTT_DELAY}"
+    qos_log "INFO" "CAKE参数: bandwidth=${CAKE_BANDWIDTH:-未配置}, rtt=${CAKE_RTT:-未配置}, flowmode=${CAKE_FLOWMODE}, diffserv=${CAKE_DIFFSERV}, nat=${CAKE_NAT}, wash=${CAKE_WASH}, overhead=${CAKE_OVERHEAD:-未配置}, mpu=${CAKE_MPU:-未配置}, ack_filter=${CAKE_ACK_FILTER}, split_gso=${CAKE_SPLIT_GSO}, memlimit=${CAKE_MEMLIMIT:-未配置}, ecn=${CAKE_ECN}"
     return 0
 }
 
-validate_diffserv_mode() {
-    local mode="$1"
-    local valid_modes="besteffort diffserv3 diffserv4 diffserv5 diffserv8"
-    for valid_mode in $valid_modes; do
-        [ "$mode" = "$valid_mode" ] && return 0
-    done
-    qos_log "WARN" "无效的DiffServ模式: $mode，使用默认值diffserv4"
-    return 1
-}
+# 加载HFSC类别配置（使用全局变量传递，并在函数开头重置）
+load_hfsc_class_config() {
+    local class_name="$1"
+    # 重置全局变量，避免前一个类的配置残留
+    HFSC_CLASS_PERCENT=""
+    HFSC_CLASS_MIN=""
+    HFSC_CLASS_MAX=""
+    HFSC_CLASS_MINRTT=""
+    HFSC_CLASS_NAME=""
 
-# ========== 获取设备发送队列数（增强版）==========
-get_tx_queues() {
-    local dev="$1"
-    local queues=1
-    local ethtool_out
+    qos_log "INFO" "加载HFSC类别配置: $class_name"
+    percent_bandwidth=$(uci -q get ${CONFIG_FILE}.$class_name.percent_bandwidth 2>/dev/null)
+    per_min_bandwidth=$(uci -q get ${CONFIG_FILE}.$class_name.per_min_bandwidth 2>/dev/null)
+    per_max_bandwidth=$(uci -q get ${CONFIG_FILE}.$class_name.per_max_bandwidth 2>/dev/null)
+    minRTT=$(uci -q get ${CONFIG_FILE}.$class_name.minRTT 2>/dev/null)
+    priority=$(uci -q get ${CONFIG_FILE}.$class_name.priority 2>/dev/null)  # HFSC 中 priority 无效，保留读取以兼容
+    name=$(uci -q get ${CONFIG_FILE}.$class_name.name 2>/dev/null)
 
-    if ! ip link show dev "$dev" >/dev/null 2>&1; then
-        qos_log "WARN" "设备 $dev 不存在，返回默认队列数 1"
-        echo "1"
-        return
-    fi
-
-    if command -v ethtool >/dev/null 2>&1; then
-        ethtool_out=$(ethtool -l "$dev" 2>/dev/null | awk '
-            /^Current hardware settings:/ { in_current=1; next }
-            /^[^ ]/ { in_current=0 }
-            in_current && /Combined:/ { print $2; exit }
-        ')
-        if [ -n "$ethtool_out" ] && [ "$ethtool_out" -gt 0 ] 2>/dev/null; then
-            queues=$ethtool_out
-            qos_log "DEBUG" "ethtool (current) 获取 $dev 队列数: $queues"
-            echo "$queues"
-            return
+    if [[ -n "$percent_bandwidth" ]]; then
+        if validate_number "$percent_bandwidth" "$class_name.percent_bandwidth" 0 100; then
+            percent_bandwidth=$(strip_leading_zeros "$percent_bandwidth")
+        else
+            percent_bandwidth=""
         fi
-        ethtool_out=$(ethtool -l "$dev" 2>/dev/null | grep "Combined:" | tail -1 | awk '{print $2}')
-        if [ -n "$ethtool_out" ] && [ "$ethtool_out" -gt 0 ] 2>/dev/null; then
-            queues=$ethtool_out
-            qos_log "DEBUG" "ethtool (fallback) 获取 $dev 队列数: $queues"
-            echo "$queues"
-            return
+    fi
+    if [[ -n "$per_min_bandwidth" ]]; then
+        if validate_number "$per_min_bandwidth" "$class_name.per_min_bandwidth" 0 100; then
+            per_min_bandwidth=$(strip_leading_zeros "$per_min_bandwidth")
+        else
+            per_min_bandwidth=""
+        fi
+    fi
+    if [[ -n "$per_max_bandwidth" ]]; then
+        if validate_number "$per_max_bandwidth" "$class_name.per_max_bandwidth" 0 1000; then
+            per_max_bandwidth=$(strip_leading_zeros "$per_max_bandwidth")
+        else
+            per_max_bandwidth=""
         fi
     fi
 
-    if [ -d "/sys/class/net/$dev/queues" ]; then
-        queues=$(ls -d /sys/class/net/$dev/queues/tx-* 2>/dev/null | wc -l)
-        qos_log "DEBUG" "sysfs 获取 $dev 队列数: $queues"
+    qos_log "DEBUG" "HFSC配置: $class_name -> percent=$percent_bandwidth, min=$per_min_bandwidth, max=$per_max_bandwidth, minRTT=$minRTT"
+    if [[ -z "$percent_bandwidth" ]] && [[ -z "$per_min_bandwidth" ]] && [[ -z "$per_max_bandwidth" ]]; then
+        qos_log "WARN" "未找到 $class_name 的带宽参数"
+        return 1
     fi
-
-    if [ -z "$queues" ] || [ "$queues" -eq 0 ] 2>/dev/null; then
-        queues=1
-    fi
-
-    echo "$queues"
+    # 使用全局变量传递
+    HFSC_CLASS_PERCENT="$percent_bandwidth"
+    HFSC_CLASS_MIN="$per_min_bandwidth"
+    HFSC_CLASS_MAX="$per_max_bandwidth"
+    HFSC_CLASS_MINRTT="$minRTT"
+    HFSC_CLASS_NAME="$name"
+    return 0
 }
 
-# ========== 检测内核是否支持特定 CAKE 参数 ==========
+# ========== HFSC 核心队列函数 ==========
+create_hfsc_root_qdisc() {
+    local device="$1"
+    local direction="$2"
+    local root_handle="$3"
+    local root_classid="$4"
+    local bandwidth=""
+    if [[ "$direction" == "upload" ]]; then
+        bandwidth="$total_upload_bandwidth"
+    elif [[ "$direction" == "download" ]]; then
+        bandwidth="$total_download_bandwidth"
+    else
+        qos_log "ERROR" "未知方向: $direction"
+        return 1
+    fi
+    if (( bandwidth <= 0 )); then
+        qos_log "ERROR" "方向 $direction 带宽无效或为0，无法创建根队列"
+        return 1
+    fi
+    if ! validate_number "$bandwidth" "bandwidth" 1 "$MAX_PHYSICAL_BANDWIDTH"; then
+        qos_log "ERROR" "无效的带宽值: $bandwidth"
+        return 1
+    fi
+    qos_log "INFO" "为$device创建$direction方向HFSC根队列 (带宽: ${bandwidth}kbit)"
+    tc qdisc del dev "$device" ingress 2>/dev/null || true
+    tc qdisc del dev "$device" root 2>/dev/null || true
+    if ! tc qdisc add dev "$device" root handle $root_handle hfsc; then
+        qos_log "ERROR" "无法在 $device 上创建HFSC根队列"
+        return 1
+    fi
+    # 修复：HFSC 根类使用 ls m2 和 ul m2，而非 ls rate 和 ul rate
+    if ! tc class add dev "$device" parent $root_handle classid $root_classid hfsc ls m2 ${bandwidth}kbit ul m2 ${bandwidth}kbit; then
+        qos_log "ERROR" "无法在$device上创建HFSC根类"
+        tc qdisc del dev "$device" root 2>/dev/null
+        return 1
+    fi
+    qos_log "INFO" "$device的$direction方向HFSC根队列创建完成"
+    return 0
+}
+
+# 设置默认类（HFSC 无 default 参数，使用全匹配过滤器）
+set_hfsc_default_class() {
+    local device="$1"
+    local default_classid="$2"
+    if ! validate_number "$default_classid" "default_classid" 2 17; then
+        qos_log "ERROR" "无效的默认类ID: $default_classid (有效范围 2-17)"
+        return 1
+    fi
+    # 添加全匹配过滤器作为默认类（优先级 999，确保最后匹配）
+    if tc filter add dev "$device" parent 1:0 protocol all prio 999 u32 match u32 0 0 flowid 1:$default_classid 2>/dev/null; then
+        qos_log "INFO" "已通过全匹配过滤器设置默认类 1:$default_classid"
+        return 0
+    else
+        qos_log "ERROR" "无法设置默认类（全匹配过滤器失败）"
+        return 1
+    fi
+}
+
+# ========== CAKE 参数支持检查 ==========
 check_cake_param_support() {
     local param="$1"
-    local dummy_dev="cake_test_$$"
+    local dummy_dev="qos_test_cake_$$"
     local created=0
-
-    if ! ip link show "$dummy_dev" >/dev/null 2>&1; then
-        if ! ip link add "$dummy_dev" type dummy 2>/dev/null; then
-            qos_log "DEBUG" "无法创建 dummy 设备，假定 $param 不支持"
-            return 1
-        fi
-        created=1
+    if ! ip link add "$dummy_dev" type dummy 2>/dev/null; then
+        qos_log "DEBUG" "无法创建 dummy 设备，假定 $param 不支持"
+        return 1
     fi
-
+    created=1
     tc qdisc del dev "$dummy_dev" root 2>/dev/null
     local ret=1
     if tc qdisc add dev "$dummy_dev" root cake bandwidth 1mbit "$param" 2>/dev/null; then
         ret=0
         tc qdisc del dev "$dummy_dev" root 2>/dev/null
     fi
-
-    if [ $created -eq 1 ]; then
+    if [[ $created -eq 1 ]]; then
         ip link del "$dummy_dev" 2>/dev/null
     fi
     return $ret
 }
 
-# ========== 配置加载（只加载 CAKE 专属参数，不覆盖带宽）==========
-load_cake_config() {
-    qos_log "INFO" "加载CAKE配置"
-    local uci_ifb val
-
-    uci_ifb=$(uci -q get ${CONFIG_FILE}.download.ifb_device 2>/dev/null)
-    [ -n "$uci_ifb" ] && IFB_DEVICE=$(sanitize_param "$uci_ifb")
-
-    val=$(uci -q get ${CONFIG_FILE}.cake.diffserv_mode 2>/dev/null)
-    CAKE_DIFFSERV_MODE=$(sanitize_param "${val:-diffserv4}")
-
-    val=$(uci -q get ${CONFIG_FILE}.cake.flowmode 2>/dev/null)
-    [ -n "$val" ] && CAKE_FLOWMODE=$(sanitize_param "$val")
-
-    val=$(uci -q get ${CONFIG_FILE}.cake.overhead 2>/dev/null)
-    CAKE_OVERHEAD=$(sanitize_param "${val:-0}")
-
-    val=$(uci -q get ${CONFIG_FILE}.cake.mpu 2>/dev/null)
-    CAKE_MPU=$(sanitize_param "${val:-0}")
-
-    val=$(uci -q get ${CONFIG_FILE}.cake.rtt 2>/dev/null)
-    CAKE_RTT=$(sanitize_param "${val:-100ms}")
-
-    val=$(uci -q get ${CONFIG_FILE}.cake.ack_filter 2>/dev/null)
-    CAKE_ACK_FILTER=$(sanitize_param "${val:-0}")
-
-    val=$(uci -q get ${CONFIG_FILE}.cake.nat 2>/dev/null)
-    CAKE_NAT=$(sanitize_param "${val:-0}")
-
-    val=$(uci -q get ${CONFIG_FILE}.cake.wash 2>/dev/null)
-    CAKE_WASH=$(sanitize_param "${val:-0}")
-
-    val=$(uci -q get ${CONFIG_FILE}.cake.split_gso 2>/dev/null)
-    CAKE_SPLIT_GSO=$(sanitize_param "${val:-0}")
-
-    val=$(uci -q get ${CONFIG_FILE}.cake.ingress 2>/dev/null)
-    CAKE_INGRESS=$(sanitize_param "${val:-0}")
-
-    val=$(uci -q get ${CONFIG_FILE}.cake.autorate_ingress 2>/dev/null)
-    CAKE_AUTORATE_INGRESS=$(sanitize_param "${val:-0}")
-
-    val=$(uci -q get ${CONFIG_FILE}.cake.memlimit 2>/dev/null)
-    if [ -n "$val" ]; then
-        CAKE_MEMORY_LIMIT=$(calculate_memory_limit "$val")
-    else
-        CAKE_MEMORY_LIMIT="32mb"
-    fi
-
-    val=$(uci -q get ${CONFIG_FILE}.cake.ecn 2>/dev/null)
-    if [ -n "$val" ]; then
-        case "$val" in
-            yes|1|enable|on|true|ecn)
-                CAKE_ECN="ecn"
-                qos_log "INFO" "CAKE ECN 已启用"
-                ;;
-            no|0|disable|off|false|noecn)
-                CAKE_ECN="noecn"
-                qos_log "INFO" "CAKE ECN 已禁用"
-                ;;
-            *)
-                qos_log "WARN" "无效的 ECN 配置值 '$val'，将忽略"
-                CAKE_ECN=""
-                ;;
-        esac
-    fi
-
-    val=$(uci -q get ${CONFIG_FILE}.cake.enable_auto_tune 2>/dev/null)
-    [ -n "$val" ] && ENABLE_AUTO_TUNE=$(sanitize_param "$val")
-
-    val=$(uci -q get ${CONFIG_FILE}.cake.enable_mq 2>/dev/null)
-    [ -n "$val" ] && CAKE_MQ_ENABLED=$(sanitize_param "$val")
-
-    val=$(uci -q get ${CONFIG_FILE}.cake.delete_ifb_on_stop 2>/dev/null)
-    [ -n "$val" ] && CAKE_DELETE_IFB_ON_STOP=$(sanitize_param "$val")
-
-    qos_log "INFO" "CAKE配置加载完成"
-}
-
-# ========== 自动调优（不覆盖用户显式配置）==========
-auto_tune_cake() {
-    qos_log "INFO" "自动调整CAKE参数"
-    local total_bw=0
-    local user_set_rtt user_set_mem
-
-    # 读取用户是否显式配置了这些参数
-    user_set_rtt=$(uci -q get ${CONFIG_FILE}.cake.rtt 2>/dev/null)
-    user_set_mem=$(uci -q get ${CONFIG_FILE}.cake.memlimit 2>/dev/null)
-
-    if [ "$total_upload_bandwidth" -gt 0 ] && [ "$total_download_bandwidth" -gt 0 ]; then
-        total_bw=$((total_upload_bandwidth + total_download_bandwidth))
-    elif [ "$total_upload_bandwidth" -gt 0 ]; then
-        total_bw=$total_upload_bandwidth
-    elif [ "$total_download_bandwidth" -gt 0 ]; then
-        total_bw=$total_download_bandwidth
-    fi
-
-    if [ -z "$user_set_mem" ]; then
-        if [ "$total_bw" -gt 200000 ]; then
-            CAKE_MEMORY_LIMIT="128mb"
-        elif [ "$total_bw" -gt 100000 ]; then
-            CAKE_MEMORY_LIMIT="64mb"
-        elif [ "$total_bw" -gt 50000 ]; then
-            CAKE_MEMORY_LIMIT="32mb"
-        elif [ "$total_bw" -gt 10000 ]; then
-            CAKE_MEMORY_LIMIT="16mb"
-        else
-            CAKE_MEMORY_LIMIT="8mb"
-        fi
-        qos_log "INFO" "自动调整 memlimit=${CAKE_MEMORY_LIMIT}"
-    fi
-
-    if [ -z "$user_set_rtt" ]; then
-        if [ "$total_bw" -gt 200000 ]; then
-            CAKE_RTT="20ms"
-        elif [ "$total_bw" -gt 100000 ]; then
-            CAKE_RTT="50ms"
-        elif [ "$total_bw" -gt 50000 ]; then
-            CAKE_RTT="100ms"
-        elif [ "$total_bw" -gt 10000 ]; then
-            CAKE_RTT="150ms"
-        else
-            CAKE_RTT="200ms"
-        fi
-        qos_log "INFO" "自动调整 rtt=${CAKE_RTT}"
-    fi
-}
-
-# ========== 配置验证 ==========
-validate_cake_config() {
-    qos_log "INFO" "验证CAKE配置..."
-
-    if [ -z "$qos_interface" ]; then
-        qos_log "ERROR" "缺少必要变量: qos_interface"
-        return 1
-    fi
-    if ! ip link show dev "$qos_interface" >/dev/null 2>&1; then
-        qos_log "ERROR" "接口 $qos_interface 不存在"
-        return 1
-    fi
-
-    if [ "$total_upload_bandwidth" -le 0 ] 2>/dev/null; then
-        qos_log "WARN" "上传带宽未配置或为0，跳过上传方向"
-    else
-        validate_cake_parameters "$total_upload_bandwidth" "bandwidth" || return 1
-    fi
-
-    if [ "$total_download_bandwidth" -le 0 ] 2>/dev/null; then
-        qos_log "WARN" "下载带宽未配置或为0，跳过下载方向"
-    else
-        validate_cake_parameters "$total_download_bandwidth" "bandwidth" || return 1
-    fi
-
-    validate_diffserv_mode "$CAKE_DIFFSERV_MODE" || CAKE_DIFFSERV_MODE="diffserv4"
-    validate_cake_parameters "$CAKE_RTT" "rtt" || return 1
-    validate_cake_parameters "$CAKE_MEMORY_LIMIT" "memory_limit" || return 1
-
-    qos_log "INFO" "✅ CAKE配置验证通过"
-    return 0
-}
-
-# ========== 清理队列 ==========
-cleanup_existing_queues() {
-    local device="$1"
-    local direction="$2"
-
-    qos_log "INFO" "清理$device上的现有$direction队列"
-
-    if [ "$direction" = "upload" ]; then
-        tc qdisc del dev "$device" root 2>/dev/null && \
-            echo "  清理上传队列完成" || echo "  无上传队列可清理"
-    elif [ "$direction" = "download" ]; then
-        if [ "$device" = "$IFB_DEVICE" ]; then
-            tc qdisc del dev "$device" root 2>/dev/null && \
-                echo "  清理IFB队列完成" || echo "  无IFB队列可清理"
-        fi
-    fi
-}
-
-# ========== 构建CAKE参数串（并记录运行时生效的参数）==========
+# ========== 构建CAKE参数串 ==========
 build_cake_params() {
-    local bandwidth="$1"
-    local direction="$2"
-    local params="bandwidth ${bandwidth}kbit $CAKE_DIFFSERV_MODE"
-
-    [ -n "$CAKE_FLOWMODE" ] && params="$params $CAKE_FLOWMODE"
-    [ "$CAKE_OVERHEAD" != "0" ] && params="$params overhead $CAKE_OVERHEAD"
-    [ "$CAKE_MPU" != "0" ] && params="$params mpu $CAKE_MPU"
-    [ -n "$CAKE_RTT" ] && params="$params rtt $CAKE_RTT"
-    [ "$CAKE_ACK_FILTER" = "1" ] && params="$params ack-filter"
-    [ "$CAKE_NAT" = "1" ] && params="$params nat"
-    [ "$CAKE_WASH" = "1" ] && params="$params wash"
-    [ -n "$CAKE_MEMORY_LIMIT" ] && params="$params memlimit $CAKE_MEMORY_LIMIT"
-
-    if [ -n "$CAKE_ECN" ]; then
+    local direction="$1"   # upload 或 download
+    local params=""
+    local bandwidth=""
+    
+    # 根据方向选择对应的总带宽
+    if [[ "$direction" == "upload" ]]; then
+        bandwidth="$total_upload_bandwidth"
+    elif [[ "$direction" == "download" ]]; then
+        bandwidth="$total_download_bandwidth"
+    else
+        qos_log "ERROR" "build_cake_params: 未知方向 $direction"
+        return 1
+    fi
+    
+    # 如果用户显式配置了 CAKE_BANDWIDTH，则优先使用，否则使用 HFSC 总带宽（避免二次整形）
+    if [[ -n "$CAKE_BANDWIDTH" ]]; then
+        params="$params bandwidth $CAKE_BANDWIDTH"
+        qos_log "INFO" "用户显式配置了CAKE bandwidth: $CAKE_BANDWIDTH，CAKE将进行二次整形（可能影响HFSC调度）"
+    else
+        # 默认使用 HFSC 该方向的总带宽，使 CAKE 只作为队列调度而不做速率整形
+        params="$params bandwidth ${bandwidth}kbit"
+        qos_log "DEBUG" "CAKE 使用 HFSC 总带宽 ${bandwidth}kbit，避免二次整形"
+    fi
+    
+    [[ -n "$CAKE_RTT" ]] && params="$params rtt $CAKE_RTT"
+    [[ -n "$CAKE_FLOWMODE" ]] && params="$params $CAKE_FLOWMODE"
+    [[ -n "$CAKE_DIFFSERV" ]] && params="$params $CAKE_DIFFSERV"
+    if [[ "$CAKE_NAT" == "1" ]] || [[ "$CAKE_NAT" == "yes" ]] || [[ "$CAKE_NAT" == "true" ]]; then
+        params="$params nat"
+    else
+        params="$params nonat"
+    fi
+    if [[ "$CAKE_WASH" == "1" ]] || [[ "$CAKE_WASH" == "yes" ]] || [[ "$CAKE_WASH" == "true" ]]; then
+        params="$params wash"
+    else
+        params="$params nowash"
+    fi
+    [[ -n "$CAKE_OVERHEAD" ]] && params="$params overhead $CAKE_OVERHEAD"
+    [[ -n "$CAKE_MPU" ]] && params="$params mpu $CAKE_MPU"
+    if [[ "$CAKE_ACK_FILTER" == "1" ]] || [[ "$CAKE_ACK_FILTER" == "yes" ]] || [[ "$CAKE_ACK_FILTER" == "true" ]]; then
+        params="$params ack-filter"
+    else
+        params="$params noack-filter"
+    fi
+    if [[ "$CAKE_SPLIT_GSO" == "1" ]] || [[ "$CAKE_SPLIT_GSO" == "yes" ]] || [[ "$CAKE_SPLIT_GSO" == "true" ]]; then
+        params="$params split-gso"
+    else
+        params="$params no-split-gso"
+    fi
+    [[ -n "$CAKE_MEMLIMIT" ]] && params="$params memlimit $CAKE_MEMLIMIT"
+    if [[ -n "$CAKE_ECN" ]]; then
         if check_cake_param_support "$CAKE_ECN"; then
             params="$params $CAKE_ECN"
         else
-            qos_log "WARN" "内核不支持 $CAKE_ECN 参数，已忽略 ECN 设置"
-            CAKE_ECN=""
+            logger -t "qos_gargoyle" "CAKE警告: 内核不支持 $CAKE_ECN 参数，已忽略 ECN 设置"
         fi
     fi
-
-    if [ "$CAKE_SPLIT_GSO" = "1" ]; then
-        if check_cake_param_support "split-gso"; then
-            params="$params split-gso"
-            RUNTIME_SPLIT_GSO=1
-        else
-            qos_log "WARN" "内核不支持 split-gso 参数，已禁用"
-        fi
-    fi
-
-    if [ "$direction" = "download" ] && [ "$CAKE_INGRESS" = "1" ]; then
-        if check_cake_param_support "ingress"; then
-            params="$params ingress"
-            RUNTIME_INGRESS=1
-            if [ "$CAKE_AUTORATE_INGRESS" = "1" ]; then
-                if check_cake_param_support "autorate-ingress"; then
-                    params="$params autorate-ingress"
-                    RUNTIME_AUTORATE_INGRESS=1
-                else
-                    qos_log "WARN" "内核不支持 autorate-ingress 参数，已禁用"
-                fi
-            fi
-        else
-            qos_log "WARN" "内核不支持 ingress 参数，已禁用 ingress 相关功能"
-        fi
-    fi
-
     echo "$params"
 }
 
-# ========== 创建CAKE队列（支持多队列）==========
-create_cake_root_qdisc() {
-    local device="$1"
-    local direction="$2"
-    local bandwidth="$3"
-    local queues=1 use_mq=0 base_bw remainder full_params base_params i queue_bw success=0
-
-    qos_log "INFO" "为$device创建$direction方向CAKE队列 (带宽: ${bandwidth}kbit)"
-
-    if ! validate_cake_parameters "$bandwidth" "bandwidth"; then
+# 创建单个上传类
+create_hfsc_upload_class() {
+    local class_name="$1"
+    local class_index="$2"
+    qos_log "INFO" "创建上传类别: $class_name, ID: 1:$class_index"
+    if ! load_hfsc_class_config "$class_name"; then
+        qos_log "ERROR" "加载HFSC配置失败: $class_name"
         return 1
     fi
-
-    cleanup_existing_queues "$device" "$direction"
-
-    if [ "$CAKE_MQ_ENABLED" = "1" ]; then
-        queues=$(get_tx_queues "$device")
-        if ! echo "$queues" | grep -qE '^[0-9]+$' || [ "$queues" -lt 1 ]; then
-            qos_log "WARN" "获取到的队列数无效: $queues，使用默认值1"
-            queues=1
-        fi
-        if [ "$queues" -gt 1 ]; then
-            use_mq=1
-            qos_log "INFO" "设备 $device 支持 $queues 个发送队列，启用 CAKE-MQ"
+    local percent_bandwidth="$HFSC_CLASS_PERCENT"
+    local per_min_bandwidth="$HFSC_CLASS_MIN"
+    local per_max_bandwidth="$HFSC_CLASS_MAX"
+    local minRTT="$HFSC_CLASS_MINRTT"
+    local name="$HFSC_CLASS_NAME"
+    
+    local class_mark
+    class_mark=$(get_class_mark "upload" "$class_name")
+    if [[ -z "$class_mark" ]]; then
+        qos_log "ERROR" "无法获取类别 $class_name 的标记"
+        return 1
+    fi
+    qos_log "INFO" "类别 $class_name 使用的标记: 0x$(printf '%X' $class_mark)"
+    local m1="0bit"
+    local d="0us"
+    local m2=""
+    local ul_m2=""
+    local class_total_bw=0
+    if [[ -z "$percent_bandwidth" ]] || (( percent_bandwidth <= 0 )); then
+        qos_log "ERROR" "类别 $class_name 未配置有效的 percent_bandwidth (>0)"
+        return 1
+    fi
+    if [[ -n "$total_upload_bandwidth" ]] && (( total_upload_bandwidth > 0 )); then
+        class_total_bw=$((total_upload_bandwidth * percent_bandwidth / 100))
+        qos_log "INFO" "类别 $class_name 总带宽: ${class_total_bw}kbit (${percent_bandwidth}% of ${total_upload_bandwidth}kbit)"
+    else
+        qos_log "ERROR" "total_upload_bandwidth无效"
+        return 1
+    fi
+    # 处理最小保证带宽（per_min_bandwidth），缺失时使用 50% 作为默认
+    if [[ -n "$per_min_bandwidth" ]] && (( per_min_bandwidth >= 0 )); then
+        if (( per_min_bandwidth == 0 )); then
+            m2="1kbit"
+            qos_log "INFO" "类别 $class_name 不保证最小带宽 (per_min_bandwidth=0)"
         else
-            qos_log "INFO" "设备 $device 仅单个队列，使用普通 CAKE"
+            m2="$((class_total_bw * per_min_bandwidth / 100))kbit"
+            qos_log "INFO" "类别 $class_name 使用百分比计算保证带宽: $m2 (${per_min_bandwidth}% of ${class_total_bw}kbit)"
         fi
     else
-        qos_log "INFO" "CAKE-MQ 已被禁用，使用普通 CAKE"
+        # 未配置 per_min_bandwidth，使用默认 50%
+        m2="$((class_total_bw * 50 / 100))kbit"
+        qos_log "INFO" "类别 $class_name 使用默认保证带宽: $m2 (50% of ${class_total_bw}kbit)"
     fi
-
-    if [ "$use_mq" = "1" ] && [ "$bandwidth" -lt "$queues" ] 2>/dev/null; then
-        qos_log "WARN" "总带宽 ${bandwidth}kbit 小于队列数 $queues，多队列可能导致部分队列带宽为0，已自动回退到单队列模式。"
-        use_mq=0
-        queues=1
-    fi
-
-    if [ "$use_mq" = "1" ]; then
-        base_bw=$(( bandwidth / queues ))
-        remainder=$(( bandwidth % queues ))
-        if [ "$base_bw" -lt 1 ]; then
-            base_bw=1
-            remainder=0
-            qos_log "WARN" "带宽分配后基础带宽为0，已调整为1kbit/队列"
-        fi
-        if [ "$base_bw" -le 5 ] 2>/dev/null; then
-            qos_log "WARN" "带宽分配后每个队列的基础带宽仅为 ${base_bw}kbit，可能导致部分队列性能不佳。建议关闭多队列或增加总带宽。"
-        fi
-        qos_log "INFO" "带宽分配: 基础 ${base_bw}kbit/队列，余数 ${remainder}kbit 给队列1"
-
-        if ! tc qdisc add dev "$device" root handle 1: mq; then
-            qos_log "ERROR" "无法在$device上创建 mq 根队列"
-            return 1
-        fi
-
-        full_params=$(build_cake_params "$bandwidth" "$direction")
-        base_params=$(echo "$full_params" | sed 's/bandwidth [0-9]*kbit //')
-
-        i=1
-        while [ $i -le $queues ]; do
-            queue_bw=$base_bw
-            [ $i -eq 1 ] && queue_bw=$((queue_bw + remainder))
-            echo "正在为 $device 队列 $i 创建 CAKE 子队列 (带宽: ${queue_bw}kbit)..."
-            if ! tc qdisc add dev "$device" parent 1:$i cake bandwidth ${queue_bw}kbit $base_params; then
-                qos_log "ERROR" "无法在$device队列$i上创建CAKE子队列"
-                success=1
-                break
-            fi
-            i=$((i + 1))
-        done
-
-        if [ "$success" -ne 0 ]; then
-            tc qdisc del dev "$device" root 2>/dev/null
-            return 1
-        fi
-
-        qos_log "INFO" "$device 的 $direction 方向 CAKE-MQ 队列创建完成 (共 $queues 个队列)"
-        echo "✅ $device 的 $direction 方向 CAKE-MQ 队列创建完成 (队列数: $queues)"
+    # 处理上限带宽（per_max_bandwidth），缺失时使用类别总带宽
+    if [[ -n "$per_max_bandwidth" ]] && (( per_max_bandwidth > 0 )); then
+        ul_m2="$((class_total_bw * per_max_bandwidth / 100))kbit"
+        qos_log "INFO" "类别 $class_name 使用百分比计算上限带宽: $ul_m2 (${per_max_bandwidth}% of ${class_total_bw}kbit)"
     else
-        local cake_params=$(build_cake_params "$bandwidth" "$direction")
-        echo "正在为 $device 创建普通CAKE队列..."
-        echo "  参数: $cake_params"
-        if ! tc qdisc add dev "$device" root cake $cake_params; then
-            qos_log "ERROR" "无法在$device上创建普通CAKE队列"
-            return 1
-        fi
-        qos_log "INFO" "$device 的 $direction 方向普通CAKE队列创建完成"
-        echo "✅ $device 的 $direction 方向普通CAKE队列创建完成"
+        ul_m2="${class_total_bw}kbit"
+        qos_log "INFO" "类别 $class_name 使用类别总带宽作为上限带宽: $ul_m2"
     fi
-
+    # 确保 ul_m2 至少为 1kbit（防止为0）
+    local ul_m2_value=$(echo "$ul_m2" | sed 's/kbit//')
+    if (( ul_m2_value < 1 )); then
+        ul_m2="1kbit"
+        ul_m2_value=1
+        qos_log "WARN" "类别 $class_name 上限带宽为0，调整为1kbit"
+    fi
+    local m2_value=$(echo "$m2" | sed 's/kbit//')
+    if (( m2_value > ul_m2_value )); then
+        qos_log "WARN" "类别 $class_name 保证带宽($m2)超过上限带宽($ul_m2)，调整为上限带宽"
+        m2="$ul_m2"
+    fi
+    local enable_minrtt=0
+    if [[ -n "$minRTT" ]]; then
+        case "$minRTT" in
+            [Yy]es|[Yy]|1|[Tt]rue) enable_minrtt=1 ;;
+            [Nn]o|[Nn]|0|[Ff]alse) enable_minrtt=0 ;;
+            *) enable_minrtt="${HFSC_MINRTT_ENABLED:-0}" ;;
+        esac
+    else
+        enable_minrtt="${HFSC_MINRTT_ENABLED:-0}"
+    fi
+    if (( enable_minrtt == 1 )); then
+        d="${HFSC_MINRTT_DELAY:-1000us}"
+        qos_log "INFO" "类别 $class_name 启用最小延迟模式 (d=$d)"
+    fi
+    qos_log "INFO" "正在创建HFSC类别 1:$class_index (带宽: ls=$m2, ul=$ul_m2)"
+    if ! tc class add dev "$qos_interface" parent 1:1 \
+        classid 1:$class_index hfsc \
+        ls m1 $m1 d $d m2 $m2 \
+        ul m2 $ul_m2; then
+        qos_log "ERROR" "创建上传类别 1:$class_index 失败"
+        return 1
+    fi
+    local cake_params=$(build_cake_params "upload")
+    qos_log "INFO" "添加上传CAKE队列参数: $cake_params"
+    if ! tc qdisc add dev "$qos_interface" parent 1:$class_index \
+        handle ${class_index}:1 cake $cake_params; then
+        qos_log "ERROR" "添加上传CAKE队列失败"
+        tc class del dev "$qos_interface" classid 1:$class_index 2>/dev/null
+        return 1
+    fi
+    if [[ "$class_mark" != "0x0" ]]; then
+        if ! tc filter add dev "$qos_interface" parent 1:0 protocol ip \
+            prio $class_index handle ${class_mark}/$UPLOAD_MASK fw classid 1:$class_index 2>/dev/null; then
+            qos_log "WARN" "添加上传IPv4过滤器失败 (标记:$class_mark -> 类别:1:$class_index)"
+        else
+            qos_log "INFO" "添加上传IPv4过滤器: 标记:$class_mark -> 类别:1:$class_index"
+        fi
+    fi
+    if [[ "$class_mark" != "0x0" ]]; then
+        local base_prio=100
+        local ipv6_priority=$((base_prio + class_index))
+        if ! tc filter add dev "$qos_interface" parent 1:0 protocol ipv6 \
+            prio $ipv6_priority handle ${class_mark}/$UPLOAD_MASK fw classid 1:$class_index 2>/dev/null; then
+            qos_log "WARN" "添加上传IPv6过滤器失败 (标记:$class_mark -> 类别:1:$class_index, 优先级:$ipv6_priority)"
+        else
+            qos_log "INFO" "添加上传IPv6过滤器: 标记:$class_mark -> 类别:1:$class_index (优先级:$ipv6_priority)"
+        fi
+    fi
+    qos_log "INFO" "上传类别创建成功: $class_name -> 1:$class_index (标记: $class_mark, 带宽: ls=$m2, ul=$ul_m2)"
     return 0
 }
 
-# ========== 上传初始化 ==========
-init_cake_upload() {
-    qos_log "INFO" "初始化上传方向CAKE"
-    if [ -z "$total_upload_bandwidth" ] || [ "$total_upload_bandwidth" -le 0 ] 2>/dev/null; then
-        qos_log "INFO" "上传带宽未配置，跳过上传方向初始化"
-        return 0
+# 创建单个下载类（使用IFB设备）
+create_hfsc_download_class() {
+    local class_name="$1"
+    local class_index="$2"
+    local filter_prio="$3"
+    local ifb_dev="$IFB_DEVICE"
+    qos_log "INFO" "创建下载类别: $class_name, ID: 1:$class_index, 过滤器优先级: $filter_prio"
+    if ! ip link show dev "$ifb_dev" >/dev/null 2>&1; then
+        qos_log "ERROR" "IFB设备 $ifb_dev 不存在，无法创建下载类"
+        return 1
     fi
-    echo "为 $qos_interface 创建上传CAKE队列 (带宽: ${total_upload_bandwidth}kbit/s)"
-    create_cake_root_qdisc "$qos_interface" "upload" "$total_upload_bandwidth"
-}
-
-# ========== 下载初始化（修复 IFB 回退）==========
-init_cake_download() {
-    qos_log "INFO" "初始化下载方向CAKE"
-    local expected_queues=1 current_queues actual_queues
-
-    if [ -z "$total_download_bandwidth" ] || [ "$total_download_bandwidth" -le 0 ] 2>/dev/null; then
-        qos_log "INFO" "下载带宽未配置，跳过下载方向初始化"
-        return 0
+    if ! load_hfsc_class_config "$class_name"; then
+        qos_log "ERROR" "加载HFSC配置失败: $class_name"
+        return 1
     fi
-
-    if [ "$CAKE_MQ_ENABLED" = "1" ]; then
-        expected_queues=$(get_tx_queues "$qos_interface")
-        if ! echo "$expected_queues" | grep -qE '^[0-9]+$' || [ "$expected_queues" -lt 1 ]; then
-            qos_log "WARN" "获取到的期望队列数无效: $expected_queues，使用默认值1"
-            expected_queues=1
+    local percent_bandwidth="$HFSC_CLASS_PERCENT"
+    local per_min_bandwidth="$HFSC_CLASS_MIN"
+    local per_max_bandwidth="$HFSC_CLASS_MAX"
+    local minRTT="$HFSC_CLASS_MINRTT"
+    local name="$HFSC_CLASS_NAME"
+    
+    local class_mark
+    class_mark=$(get_class_mark "download" "$class_name")
+    if [[ -z "$class_mark" ]]; then
+        qos_log "ERROR" "无法获取类别 $class_name 的标记"
+        return 1
+    fi
+    qos_log "INFO" "类别 $class_name 使用的标记: 0x$(printf '%X' $class_mark)"
+    local m1="0bit"
+    local d="0us"
+    local m2=""
+    local ul_m2=""
+    local class_total_bw=0
+    if [[ -z "$percent_bandwidth" ]] || (( percent_bandwidth <= 0 )); then
+        qos_log "ERROR" "类别 $class_name 未配置有效的 percent_bandwidth (>0)"
+        return 1
+    fi
+    if [[ -n "$total_download_bandwidth" ]] && (( total_download_bandwidth > 0 )); then
+        class_total_bw=$((total_download_bandwidth * percent_bandwidth / 100))
+        qos_log "INFO" "类别 $class_name 总带宽: ${class_total_bw}kbit (${percent_bandwidth}% of ${total_download_bandwidth}kbit)"
+    else
+        qos_log "ERROR" "total_download_bandwidth无效"
+        return 1
+    fi
+    if [[ -n "$per_min_bandwidth" ]] && (( per_min_bandwidth >= 0 )); then
+        if (( per_min_bandwidth == 0 )); then
+            m2="1kbit"
+            qos_log "INFO" "类别 $class_name 不保证最小带宽 (per_min_bandwidth=0)"
+        else
+            m2="$((class_total_bw * per_min_bandwidth / 100))kbit"
+            qos_log "INFO" "类别 $class_name 使用百分比计算保证带宽: $m2 (${per_min_bandwidth}% of ${class_total_bw}kbit)"
+        fi
+    else
+        m2="$((class_total_bw * 50 / 100))kbit"
+        qos_log "INFO" "类别 $class_name 使用默认保证带宽: $m2 (50% of ${class_total_bw}kbit)"
+    fi
+    if [[ -n "$per_max_bandwidth" ]] && (( per_max_bandwidth > 0 )); then
+        ul_m2="$((class_total_bw * per_max_bandwidth / 100))kbit"
+        qos_log "INFO" "类别 $class_name 使用百分比计算上限带宽: $ul_m2 (${per_max_bandwidth}% of ${class_total_bw}kbit)"
+    else
+        ul_m2="${class_total_bw}kbit"
+        qos_log "INFO" "类别 $class_name 使用类别总带宽作为上限带宽: $ul_m2"
+    fi
+    local ul_m2_value=$(echo "$ul_m2" | sed 's/kbit//')
+    if (( ul_m2_value < 1 )); then
+        ul_m2="1kbit"
+        ul_m2_value=1
+        qos_log "WARN" "类别 $class_name 上限带宽为0，调整为1kbit"
+    fi
+    local m2_value=$(echo "$m2" | sed 's/kbit//')
+    if (( m2_value > ul_m2_value )); then
+        qos_log "WARN" "类别 $class_name 保证带宽($m2)超过上限带宽($ul_m2)，调整为上限带宽"
+        m2="$ul_m2"
+    fi
+    local enable_minrtt=0
+    if [[ -n "$minRTT" ]]; then
+        case "$minRTT" in
+            [Yy]es|[Yy]|1|[Tt]rue) enable_minrtt=1 ;;
+            [Nn]o|[Nn]|0|[Ff]alse) enable_minrtt=0 ;;
+            *) enable_minrtt="${HFSC_MINRTT_ENABLED:-0}" ;;
+        esac
+    else
+        enable_minrtt="${HFSC_MINRTT_ENABLED:-0}"
+    fi
+    if (( enable_minrtt == 1 )); then
+        d="${HFSC_MINRTT_DELAY:-1000us}"
+        qos_log "INFO" "类别 $class_name 启用最小延迟模式 (d=$d)"
+    fi
+    qos_log "INFO" "正在创建下载HFSC类别 1:$class_index (带宽: ls=$m2, ul=$ul_m2)"
+    if ! tc class add dev "$ifb_dev" parent 1:1 \
+        classid 1:$class_index hfsc \
+        ls m1 $m1 d $d m2 $m2 \
+        ul m2 $ul_m2; then
+        qos_log "ERROR" "创建下载类别 1:$class_index 失败"
+        return 1
+    fi
+    local cake_params=$(build_cake_params "download")
+    qos_log "INFO" "添加下载CAKE队列参数: $cake_params"
+    if ! tc qdisc add dev "$ifb_dev" parent 1:$class_index \
+        handle ${class_index}:1 cake $cake_params; then
+        qos_log "ERROR" "添加下载CAKE队列失败"
+        tc class del dev "$ifb_dev" classid 1:$class_index 2>/dev/null
+        return 1
+    fi
+    if [[ "$class_mark" != "0x0" ]]; then
+        if ! tc filter add dev "$ifb_dev" parent 1:0 protocol ip \
+            prio $filter_prio handle ${class_mark}/$DOWNLOAD_MASK fw classid 1:$class_index 2>/dev/null; then
+            qos_log "WARN" "添加下载IPv4过滤器失败 (标记:$class_mark -> 类别:1:$class_index)"
+        else
+            qos_log "INFO" "添加下载IPv4过滤器: 标记:$class_mark -> 类别:1:$class_index (优先级:$filter_prio)"
         fi
     fi
-
-    # IFB 设备管理
-    if ip link show dev "$IFB_DEVICE" >/dev/null 2>&1; then
-        qos_log "INFO" "IFB设备 $IFB_DEVICE 已存在，检查队列数一致性"
-        current_queues=$(get_tx_queues "$IFB_DEVICE")
-        if ! echo "$current_queues" | grep -qE '^[0-9]+$' || [ "$current_queues" -lt 1 ]; then
-            qos_log "WARN" "获取到的当前队列数无效: $current_queues，将重建IFB设备"
-            ip link set dev "$IFB_DEVICE" down
-            ip link del "$IFB_DEVICE" 2>/dev/null || {
-                qos_log "ERROR" "无法删除旧的IFB设备 $IFB_DEVICE"
-                return 1
-            }
-        elif [ "$current_queues" -ne "$expected_queues" ]; then
-            qos_log "WARN" "IFB设备队列数 ($current_queues) 与期望值 ($expected_queues) 不符，将删除并重建"
-            ip link set dev "$IFB_DEVICE" down
-            ip link del "$IFB_DEVICE" 2>/dev/null || {
-                qos_log "ERROR" "无法删除旧的IFB设备 $IFB_DEVICE"
-                return 1
-            }
+    if [[ "$class_mark" != "0x0" ]]; then
+        local base_prio=100
+        local ipv6_priority=$((base_prio + filter_prio))
+        if ! tc filter add dev "$ifb_dev" parent 1:0 protocol ipv6 \
+            prio $ipv6_priority handle ${class_mark}/$DOWNLOAD_MASK fw classid 1:$class_index 2>/dev/null; then
+            qos_log "WARN" "添加下载IPv6过滤器失败 (标记:$class_mark -> 类别:1:$class_index, 优先级:$ipv6_priority)"
         else
-            qos_log "INFO" "IFB设备队列数一致 ($current_queues)，继续使用"
+            qos_log "INFO" "添加下载IPv6过滤器: 标记:$class_mark -> 类别:1:$class_index (优先级:$ipv6_priority)"
+        fi
+    fi
+    qos_log "INFO" "下载类别创建成功: $class_name -> 1:$class_index (标记: $class_mark, 带宽: ls=$m2, ul=$ul_m2)"
+    return 0
+}
+
+# ========== 上传方向初始化 ==========
+init_hfsc_cake_upload() {
+    qos_log "INFO" "初始化上传方向HFSC"
+    load_upload_class_configurations
+    if [[ -z "$upload_class_list" ]]; then
+        qos_log "ERROR" "未找到上传类别配置，请至少配置一个上传类"
+        return 1
+    fi
+
+    # 统计启用的类数量，而不是所有类
+    local enabled_class_count=0
+    local class_list="$upload_class_list"
+    for class in $class_list; do
+        local enabled=$(uci -q get ${CONFIG_FILE}.${class}.enabled 2>/dev/null)
+        if [[ "$enabled" == "1" ]] || [[ -z "$enabled" ]]; then
+            ((enabled_class_count++))
+        fi
+    done
+    if (( enabled_class_count > 16 )); then
+        qos_log "ERROR" "上传方向启用的类别数量为 $enabled_class_count，超过16个，将导致标记冲突，启动中止！"
+        return 1
+    fi
+
+    local enabled_classes=""
+    local class_index=2
+    local default_class_index=""
+    local default_class_name=""
+    local first_enabled_class=""
+
+    declare -A class_index_map
+    default_class_name=$(uci -q get ${CONFIG_FILE}.upload.default_class 2>/dev/null)
+
+    for class in $upload_class_list; do
+        local enabled=$(uci -q get ${CONFIG_FILE}.${class}.enabled 2>/dev/null)
+        if [[ "$enabled" == "1" ]] || [[ -z "$enabled" ]]; then
+            enabled_classes="$enabled_classes $class"
+            [[ -z "$first_enabled_class" ]] && first_enabled_class="$class"
+            class_index_map["$class"]=$class_index
+            if [[ -n "$default_class_name" ]] && [[ "$class" == "$default_class_name" ]]; then
+                default_class_index=$class_index
+            fi
+            ((class_index++))
+        fi
+    done
+    enabled_classes=$(echo "$enabled_classes" | xargs)
+
+    if [[ -z "$enabled_classes" ]]; then
+        qos_log "ERROR" "没有启用的上传类，请至少启用一个上传类"
+        return 1
+    fi
+
+    if [[ -z "$default_class_index" ]]; then
+        if [[ -n "$default_class_name" ]]; then
+            qos_log "WARN" "未找到上传默认类别 '$default_class_name' 或该类未启用，将使用第一个启用的类别"
+        fi
+        if [[ -n "$first_enabled_class" ]]; then
+            default_class_index=${class_index_map["$first_enabled_class"]}
+            qos_log "INFO" "自动选择第一个启用的类别: $first_enabled_class (ID: 1:$default_class_index)"
+        else
+            qos_log "ERROR" "没有启用的上传类，无法设置默认类"
+            return 1
+        fi
+    else
+        qos_log "INFO" "上传默认类别: $default_class_name (ID: 1:$default_class_index)"
+    fi
+
+    # 创建根队列
+    if ! create_hfsc_root_qdisc "$qos_interface" "upload" "1:0" "1:1"; then
+        qos_log "ERROR" "创建上传根队列失败"
+        return 1
+    fi
+
+    # 创建各个子类
+    upload_class_mark_list=""
+    for class_name in $enabled_classes; do
+        local idx=${class_index_map["$class_name"]}
+        if create_hfsc_upload_class "$class_name" "$idx"; then
+            local class_mark_hex=$(get_class_mark "upload" "$class_name")
+            upload_class_mark_list="$upload_class_mark_list$class_name:0x$(printf '%X' $class_mark_hex) "
+        else
+            qos_log "ERROR" "创建上传类别 $class_name 失败，停止初始化"
+            tc qdisc del dev "$qos_interface" root 2>/dev/null
+            return 1
+        fi
+    done
+
+    # 设置默认类
+    if ! set_hfsc_default_class "$qos_interface" "$default_class_index"; then
+        qos_log "ERROR" "设置上传默认类失败"
+        tc qdisc del dev "$qos_interface" root 2>/dev/null
+        return 1
+    fi
+
+    qos_log "INFO" "上传方向HFSC初始化完成"
+    return 0
+}
+
+# ========== 下载方向初始化 ==========
+init_hfsc_cake_download() {
+    qos_log "INFO" "初始化下载方向HFSC"
+    load_download_class_configurations
+    if [[ -z "$download_class_list" ]]; then
+        qos_log "ERROR" "未找到下载类别配置，请至少配置一个下载类"
+        return 1
+    fi
+
+    # 统计启用的类数量，而不是所有类
+    local enabled_class_count=0
+    local class_list="$download_class_list"
+    for class in $class_list; do
+        local enabled=$(uci -q get ${CONFIG_FILE}.${class}.enabled 2>/dev/null)
+        if [[ "$enabled" == "1" ]] || [[ -z "$enabled" ]]; then
+            ((enabled_class_count++))
+        fi
+    done
+    if (( enabled_class_count > 16 )); then
+        qos_log "ERROR" "下载方向启用的类别数量为 $enabled_class_count，超过16个，将导致标记冲突，启动中止！"
+        return 1
+    fi
+
+    local enabled_classes=""
+    local class_index=2
+    local default_class_index=""
+    local default_class_name=""
+    local first_enabled_class=""
+
+    declare -A class_index_map
+    default_class_name=$(uci -q get ${CONFIG_FILE}.download.default_class 2>/dev/null)
+
+    for class in $download_class_list; do
+        local enabled=$(uci -q get ${CONFIG_FILE}.${class}.enabled 2>/dev/null)
+        if [[ "$enabled" == "1" ]] || [[ -z "$enabled" ]]; then
+            enabled_classes="$enabled_classes $class"
+            [[ -z "$first_enabled_class" ]] && first_enabled_class="$class"
+            class_index_map["$class"]=$class_index
+            if [[ -n "$default_class_name" ]] && [[ "$class" == "$default_class_name" ]]; then
+                default_class_index=$class_index
+            fi
+            ((class_index++))
+        fi
+    done
+    enabled_classes=$(echo "$enabled_classes" | xargs)
+
+    if [[ -z "$enabled_classes" ]]; then
+        qos_log "ERROR" "没有启用的下载类，请至少启用一个下载类"
+        return 1
+    fi
+
+    if [[ -z "$default_class_index" ]]; then
+        if [[ -n "$default_class_name" ]]; then
+            qos_log "WARN" "未找到下载默认类别 '$default_class_name' 或该类未启用，将使用第一个启用的类别"
+        fi
+        if [[ -n "$first_enabled_class" ]]; then
+            default_class_index=${class_index_map["$first_enabled_class"]}
+            qos_log "INFO" "自动选择第一个启用的类别: $first_enabled_class (ID: 1:$default_class_index)"
+        else
+            qos_log "ERROR" "没有启用的下载类，无法设置默认类"
+            return 1
+        fi
+    else
+        qos_log "INFO" "下载默认类别: $default_class_name (ID: 1:$default_class_index)"
+    fi
+
+    # 检查并创建 IFB 设备（尝试指定队列数）
+    local expected_queues=1
+    if [[ -d "/sys/class/net/$qos_interface/queues" ]]; then
+        expected_queues=$(ls -d /sys/class/net/$qos_interface/queues/tx-* 2>/dev/null | wc -l)
+        (( expected_queues < 1 )) && expected_queues=1
+    fi
+
+    if ip link show dev "$IFB_DEVICE" >/dev/null 2>&1; then
+        qos_log "INFO" "IFB设备 $IFB_DEVICE 已存在"
+        # 检查队列数是否匹配
+        local current_queues=1
+        if [[ -d "/sys/class/net/$IFB_DEVICE/queues" ]]; then
+            current_queues=$(ls -d /sys/class/net/$IFB_DEVICE/queues/tx-* 2>/dev/null | wc -l)
+        fi
+        if (( current_queues != expected_queues )); then
+            qos_log "WARN" "IFB设备队列数 ($current_queues) 与期望 ($expected_queues) 不符，将删除重建"
+            ip link set dev "$IFB_DEVICE" down
+            ip link del "$IFB_DEVICE" 2>/dev/null
         fi
     fi
 
@@ -617,12 +772,7 @@ init_cake_download() {
                 qos_log "ERROR" "无法创建IFB设备 $IFB_DEVICE"
                 return 1
             fi
-            qos_log "WARN" "由于 IFB 创建时无法设置队列数，将禁用多队列模式"
-            CAKE_MQ_ENABLED="0"
-            actual_queues=$(get_tx_queues "$IFB_DEVICE")
-            if [ "$actual_queues" -lt "$expected_queues" ]; then
-                qos_log "WARN" "IFB设备实际队列数 ($actual_queues) 小于期望 ($expected_queues)，多队列功能已禁用"
-            fi
+            qos_log "INFO" "IFB设备创建成功，但可能队列数不符预期。如需多队列，请检查内核支持。"
         else
             qos_log "INFO" "IFB设备创建成功，队列数: $expected_queues"
         fi
@@ -632,435 +782,611 @@ init_cake_download() {
         qos_log "ERROR" "无法启动IFB设备 $IFB_DEVICE"
         return 1
     fi
-    if ! ip link show dev "$IFB_DEVICE" | grep -q "UP"; then
-        qos_log "ERROR" "IFB设备 $IFB_DEVICE 未成功进入 UP 状态"
+
+    # 创建根队列
+    if ! create_hfsc_root_qdisc "$IFB_DEVICE" "download" "1:0" "1:1"; then
+        qos_log "ERROR" "创建下载根队列失败"
         return 1
     fi
-    qos_log "INFO" "IFB设备 $IFB_DEVICE 已启动"
 
+    local filter_prio=3
+    download_class_mark_list=""
+    for class_name in $enabled_classes; do
+        local idx=${class_index_map["$class_name"]}
+        if create_hfsc_download_class "$class_name" "$idx" "$filter_prio"; then
+            local class_mark_hex=$(get_class_mark "download" "$class_name")
+            download_class_mark_list="$download_class_mark_list$class_name:0x$(printf '%X' $class_mark_hex) "
+        else
+            qos_log "ERROR" "创建下载类别 $class_name 失败，停止初始化"
+            tc qdisc del dev "$IFB_DEVICE" root 2>/dev/null
+            return 1
+        fi
+        filter_prio=$((filter_prio + 2))
+    done
+
+    # 设置默认类
+    if ! set_hfsc_default_class "$IFB_DEVICE" "$default_class_index"; then
+        qos_log "ERROR" "设置下载默认类失败"
+        tc qdisc del dev "$IFB_DEVICE" root 2>/dev/null
+        return 1
+    fi
+
+    # 调用 rule.sh 中的入口重定向函数
     if ! setup_ingress_redirect; then
-        qos_log "ERROR" "入口重定向设置失败"
+        qos_log "ERROR" "设置入口重定向失败"
         return 1
     fi
-    create_cake_root_qdisc "$IFB_DEVICE" "download" "$total_download_bandwidth"
-}
-
-# ========== 健康检查 ==========
-health_check_cake() {
-    echo "执行CAKE健康检查..."
-    local health_score=100 issues=""
-
-    if ! ip link show dev "$qos_interface" >/dev/null 2>&1; then
-        health_score=$((health_score - 30))
-        issues="${issues}接口 $qos_interface 不存在\n"
-    fi
-
-    if ! tc qdisc show dev "$qos_interface" root 2>/dev/null | grep -q "cake"; then
-        health_score=$((health_score - 20))
-        issues="${issues}上传CAKE队列未启用\n"
-    fi
-
-    if ! ip link show dev "$IFB_DEVICE" >/dev/null 2>&1; then
-        health_score=$((health_score - 10))
-        issues="${issues}IFB设备不存在\n"
-    elif ! tc qdisc show dev "$IFB_DEVICE" root 2>/dev/null | grep -q "cake"; then
-        health_score=$((health_score - 20))
-        issues="${issues}下载CAKE队列未启用\n"
-    fi
-
-    if ! tc qdisc show dev "$qos_interface" ingress 2>/dev/null; then
-        health_score=$((health_score - 10))
-        issues="${issues}入口重定向未配置\n"
-    fi
-
-    echo -e "\n健康检查结果:"
-    echo "  健康分数: $health_score/100"
-
-    if [ -z "$issues" ]; then
-        echo "  ✅ 所有检查通过"
-    else
-        echo "  ⚠️ 发现的问题:"
-        printf "%b" "$issues" | while IFS= read -r line; do
-            [ -n "$line" ] && echo "    - $line"
-        done
-    fi
-
-    return $((health_score >= 70 ? 0 : 1))
-}
-
-# ========== 状态显示 ==========
-show_cake_status() {
-    echo "===== CAKE QoS状态报告 ====="
-    echo "时间: $(date)"
-    echo "网络接口: ${qos_interface:-未知}"
-
-    load_cake_config
-
-    if [ -f "$RUNTIME_PARAMS_FILE" ]; then
-        . "$RUNTIME_PARAMS_FILE"
-        qos_log "DEBUG" "使用运行时参数: RTT=$CAKE_RTT, MEM=$CAKE_MEMORY_LIMIT"
-    else
-        qos_log "DEBUG" "无运行时参数文件，使用UCI配置"
-    fi
-
-    if ! tc qdisc show dev "${qos_interface}" 2>/dev/null | grep -q "qdisc cake"; then
-        echo "警告: QoS未在接口 ${qos_interface} 上激活"
-        return 1
-    fi
-
-    echo -e "\n===== 出口CAKE队列 ($qos_interface) ====="
-    if tc qdisc show dev "$qos_interface" root 2>/dev/null | grep -q "cake"; then
-        echo "状态: 已启用 ✅"
-        local egress_count=$(tc qdisc show dev "$qos_interface" 2>/dev/null | grep -c "qdisc cake")
-        if [ "$egress_count" -gt 1 ]; then
-            echo "多队列模式: 共 $egress_count 个队列"
-        else
-            echo "模式: 普通CAKE"
-        fi
-        echo "队列参数:"
-        tc qdisc show dev "$qos_interface" root 2>/dev/null | grep "qdisc cake" | sed 's/^qdisc cake //' | sed 's/^/  /'
-        echo -e "\nTC队列统计:"
-        tc -s qdisc show dev "$qos_interface" root 2>/dev/null | sed 's/^/  /'
-    else
-        echo "状态: 未启用 ❌"
-    fi
-
-    echo -e "\n===== 入口CAKE队列 ($IFB_DEVICE) ====="
-    if ip link show "$IFB_DEVICE" >/dev/null 2>&1; then
-        if tc qdisc show dev "$IFB_DEVICE" root 2>/dev/null | grep -q "cake"; then
-            echo "状态: 已启用 ✅"
-            local ingress_count=$(tc qdisc show dev "$IFB_DEVICE" 2>/dev/null | grep -c "qdisc cake")
-            if [ "$ingress_count" -gt 1 ]; then
-                echo "多队列模式: 共 $ingress_count 个队列"
-            else
-                echo "模式: 普通CAKE"
-            fi
-            echo "队列参数:"
-            tc qdisc show dev "$IFB_DEVICE" root 2>/dev/null | grep "qdisc cake" | sed 's/^qdisc cake //' | sed 's/^/  /'
-            echo -e "\nTC队列统计:"
-            tc -s qdisc show dev "$IFB_DEVICE" root 2>/dev/null | sed 's/^/  /'
-        else
-            echo "状态: IFB设备存在但无CAKE队列"
-        fi
-    else
-        echo "状态: IFB设备未创建"
-    fi
-
-    if command -v conntrack >/dev/null 2>&1; then
-        echo -e "\n===== conntrack 标记示例 (最近5条) ====="
-        conntrack -L 2>/dev/null | grep -E "mark=[1-9][0-9]*" | head -n 10 | while IFS= read -r line; do
-            proto=$(echo "$line" | awk '{print $1}')
-            src=$(echo "$line" | awk '{print $4}' | cut -d= -f2)
-            dst=$(echo "$line" | awk '{print $6}' | cut -d= -f2)
-            sport=$(echo "$line" | awk '{print $5}' | cut -d= -f2)
-            dport=$(echo "$line" | awk '{print $7}' | cut -d= -f2)
-            mark=$(echo "$line" | grep -o "mark=[0-9]\+" | cut -d= -f2)
-            dscp=$((mark & 0x3F))
-            case $dscp in
-                0) class="CS0/BE" ;;
-                8) class="CS1" ;;
-                10) class="AF11" ;;
-                12) class="AF12" ;;
-                14) class="AF13" ;;
-                16) class="CS2" ;;
-                18) class="AF21" ;;
-                20) class="AF22" ;;
-                22) class="AF23" ;;
-                24) class="CS3" ;;
-                26) class="AF31" ;;
-                28) class="AF32" ;;
-                30) class="AF33" ;;
-                32) class="CS4" ;;
-                34) class="AF41" ;;
-                36) class="AF42" ;;
-                38) class="AF43" ;;
-                40) class="CS5" ;;
-                44) class="VA" ;;
-                46) class="EF" ;;
-                48) class="CS6" ;;
-                56) class="CS7" ;;
-                *) class="Unknown" ;;
-            esac
-            printf "  %-5s %-30s:%-5s → %-30s:%-5s [mark=%-6s dscp=%2d (%s)]\n" \
-                "$proto" "${src:-N/A}" "${sport:-N/A}" "${dst:-N/A}" "${dport:-N/A}" "$mark" "$dscp" "$class"
-        done
-    else
-        echo "  conntrack 工具未安装，无法显示连接标记"
-    fi
-
-    echo -e "\n===== 入口重定向检查 ====="
-    if tc filter show dev "$qos_interface" parent ffff: 2>/dev/null | grep -q "$IFB_DEVICE"; then
-        echo "✅ 入口重定向: 已生效"
-    else
-        echo "❌ 入口重定向: 未生效"
-    fi
-    if tc qdisc show dev "$qos_interface" 2>/dev/null | grep -q "ingress"; then
-        echo "入口队列状态: 已配置"
-        tc filter show dev "$qos_interface" parent ffff: 2>/dev/null | sed 's/^/  /' || echo "  无过滤器规则"
-    else
-        echo "入口队列状态: 未配置"
-    fi
-
-    echo -e "\n===== CAKE配置参数 ====="
-    echo "DiffServ模式: $CAKE_DIFFSERV_MODE"
-    echo "流模式: ${CAKE_FLOWMODE:-未配置}"
-    echo "RTT: $CAKE_RTT"
-    echo "Overhead: $CAKE_OVERHEAD"
-    echo "MPU: $CAKE_MPU"
-    echo "Memory Limit: $CAKE_MEMORY_LIMIT"
-    echo "ACK过滤: $([ "$CAKE_ACK_FILTER" = "1" ] && echo "启用 ✅" || echo "禁用 ❌")"
-    echo "NAT支持: $([ "$CAKE_NAT" = "1" ] && echo "启用 ✅" || echo "禁用 ❌")"
-    echo "Wash: $([ "$CAKE_WASH" = "1" ] && echo "启用 ✅" || echo "禁用 ❌")"
-    echo "Split GSO: $([ "$CAKE_SPLIT_GSO" = "1" ] && echo "启用 ✅" || echo "禁用 ❌")"
-    echo "Ingress模式: $([ "$CAKE_INGRESS" = "1" ] && echo "启用 ✅" || echo "禁用 ❌")"
-    echo "AutoRate Ingress: $([ "$CAKE_AUTORATE_INGRESS" = "1" ] && echo "启用 ✅" || echo "禁用 ❌")"
-    echo "ECN: $([ -n "$CAKE_ECN" ] && echo "$CAKE_ECN" || echo "未配置")"
-    echo "自动调优: $([ "$ENABLE_AUTO_TUNE" = "1" ] && echo "启用 ✅" || echo "禁用 ❌")"
-
-    echo -e "\n===== CAKE-MQ 状态报告结束 ====="
+    qos_log "INFO" "下载方向HFSC初始化完成"
     return 0
 }
 
-# ========== 停止清理 ==========
-stop_cake_qos() {
-    qos_log "INFO" "停止CAKE QoS"
-
-    if tc qdisc show dev "$qos_interface" root 2>/dev/null | grep -q "cake"; then
-        tc qdisc del dev "$qos_interface" root 2>/dev/null && \
-            qos_log "INFO" "清理上传方向CAKE队列" || qos_log "WARN" "上传队列清理可能未完全成功"
+# ========== 主初始化函数 ==========
+init_hfsc_cake_qos() {
+    local action="${1:-start}"
+    qos_log "INFO" "开始初始化HFSC+CAKE QoS系统 (action=$action)"
+    
+    # 检查是否已在运行（由 procd 保证，但保留辅助检查）
+    if ! check_already_running; then
+        qos_log "ERROR" "HFSC+CAKE QoS 已经在运行中"
+        return 1
     fi
-
-    if ip link show dev "$IFB_DEVICE" >/dev/null 2>&1; then
-        if tc qdisc show dev "$IFB_DEVICE" root 2>/dev/null | grep -q "cake"; then
-            tc qdisc del dev "$IFB_DEVICE" root 2>/dev/null && \
-                qos_log "INFO" "清理下载方向CAKE队列 (IFB)" || qos_log "WARN" "下载队列清理可能未完全成功"
+    
+    if ! init_ruleset; then
+        qos_log "ERROR" "初始化规则集失败，QoS 无法启动"
+        rm -f "$QOS_RUNNING_FILE"
+        return 1
+    fi
+    
+    nft flush chain inet gargoyle-qos-priority filter_qos_egress 2>/dev/null
+    nft flush chain inet gargoyle-qos-priority filter_qos_ingress 2>/dev/null
+    qos_log "INFO" "已清空 nft 规则链"
+    
+    if ! check_required_commands; then
+        qos_log "ERROR" "缺少必需的命令，请安装对应软件包"
+        rm -f "$QOS_RUNNING_FILE"
+        return 1
+    fi
+    
+    if ! load_required_modules; then
+        qos_log "ERROR" "无法加载必需的内核模块"
+        rm -f "$QOS_RUNNING_FILE"
+        return 1
+    fi
+    
+    # 加载 HFSC 和 CAKE 调度器模块
+    local missing=0
+    for mod in sch_hfsc sch_cake; do
+        if ! lsmod 2>/dev/null | grep -q "^$mod"; then
+            log_info "尝试加载内核模块: $mod"
+            modprobe "$mod" 2>/dev/null || { log_error "无法加载内核模块 $mod"; missing=1; }
+            if ! lsmod 2>/dev/null | grep -q "^$mod"; then
+                log_error "内核模块 $mod 加载失败"
+                missing=1
+            fi
+        fi
+    done
+    if (( missing )); then
+        qos_log "ERROR" "HFSC/CAKE 内核模块加载失败"
+        rm -f "$QOS_RUNNING_FILE"
+        return 1
+    fi
+    
+    nft add table inet gargoyle-qos-priority 2>/dev/null || true
+    if [[ -z "$qos_interface" ]]; then
+        qos_interface=$(uci -q get ${CONFIG_FILE}.global.wan_interface 2>/dev/null)
+        if [[ -z "$qos_interface" ]] && [[ -f "/lib/functions/network.sh" ]]; then
+            . /lib/functions/network.sh
+            network_find_wan qos_interface
+        fi
+        if [[ -z "$qos_interface" ]]; then
+            qos_log "ERROR" "无法确定 WAN 接口，请检查配置"
+            rm -f "$QOS_RUNNING_FILE"
+            return 1
+        fi
+    fi
+    qos_log "INFO" "使用WAN接口: $qos_interface"
+    
+    # ========== 自动测速与带宽加载 ==========
+    # 自动测速开关处理（需要在加载带宽配置之前执行）
+    if [[ "$AUTO_SPEEDTEST" == "1" ]]; then
+        qos_log "INFO" "自动测速开关已开启，正在执行速度测试..."
+        # 非交互模式，强制覆盖现有配置
+        if ! auto_speedtest -n -f; then
+            qos_log "WARN" "自动测速失败，将使用原有带宽配置（若有）"
         fi
     fi
 
-    tc qdisc del dev "$qos_interface" ingress 2>/dev/null && qos_log "INFO" "清理入口重定向队列" || true
+    # 加载带宽配置（会设置 total_upload_bandwidth 和 total_download_bandwidth）
+    if ! load_bandwidth_from_config; then
+        qos_log "ERROR" "加载带宽配置失败"
+        rm -f "$QOS_RUNNING_FILE"
+        return 1
+    fi
+    # ====================================
+    
+    if ! load_hfsc_cake_config; then
+        qos_log "ERROR" "加载HFSC+CAKE配置失败"
+        rm -f "$QOS_RUNNING_FILE"
+        return 1
+    fi
+    
+    if [[ "$UPLOAD_MASK" == "0" ]] || [[ "$DOWNLOAD_MASK" == "0" ]]; then
+        qos_log "ERROR" "UPLOAD_MASK 或 DOWNLOAD_MASK 为 0，无法正确匹配标记"
+        rm -f "$QOS_RUNNING_FILE"
+        return 1
+    fi
 
-    if ip link show dev "$IFB_DEVICE" >/dev/null 2>&1; then
-        ip link set dev "$IFB_DEVICE" down
-        if [ "$CAKE_DELETE_IFB_ON_STOP" = "1" ]; then
-            ip link del "$IFB_DEVICE" 2>/dev/null && qos_log "INFO" "删除IFB设备: $IFB_DEVICE"
-        else
-            qos_log "INFO" "停用IFB设备: $IFB_DEVICE (保留)"
+    load_upload_class_configurations
+    load_download_class_configurations
+
+    local upload_enabled=0
+    local download_enabled=0
+
+    if [[ -n "$total_upload_bandwidth" ]] && [[ "$total_upload_bandwidth" =~ ^[0-9]+$ ]] && (( total_upload_bandwidth > 0 )); then
+        upload_enabled=1
+        qos_log "INFO" "上传带宽有效，将启用上传QoS"
+    else
+        qos_log "INFO" "上传带宽未配置或为0，禁用上传QoS"
+    fi
+
+    if [[ -n "$total_download_bandwidth" ]] && [[ "$total_download_bandwidth" =~ ^[0-9]+$ ]] && (( total_download_bandwidth > 0 )); then
+        download_enabled=1
+        qos_log "INFO" "下载带宽有效，将启用下载QoS"
+    else
+        qos_log "INFO" "下载带宽未配置或为0，禁用下载QoS"
+    fi
+
+    if (( upload_enabled == 0 )) && (( download_enabled == 0 )); then
+        qos_log "WARN" "上传和下载带宽均为0，QoS未启动任何方向"
+        check_and_handle_zero_bandwidth "$total_upload_bandwidth" "$total_download_bandwidth"
+        rm -f "$QOS_RUNNING_FILE"
+        return 0
+    fi
+
+    if (( upload_enabled == 1 )) && [[ -n "$upload_class_list" ]]; then
+        if ! allocate_class_marks "upload" "$upload_class_list"; then
+            qos_log "ERROR" "上传方向标记分配失败"
+            rm -f "$QOS_RUNNING_FILE"
+            return 1
         fi
     fi
 
-    rm -f "$RUNTIME_PARAMS_FILE"
-    rm -f "$QOS_RUNNING_FILE"
+    if (( download_enabled == 1 )) && [[ -n "$download_class_list" ]]; then
+        if ! allocate_class_marks "download" "$download_class_list"; then
+            qos_log "ERROR" "下载方向标记分配失败"
+            rm -f "$QOS_RUNNING_FILE"
+            return 1
+        fi
+    fi
 
-    cleanup_qos_state
-    cleanup_dynamic_detection
-    restore_main_config
+    if (( upload_enabled == 1 )); then
+        echo "调用上传分类规则应用..." 
+        if ! apply_all_rules "upload_rule" "$UPLOAD_MASK" "filter_qos_egress"; then
+            qos_log "ERROR" "上传规则应用失败，回滚"
+            stop_hfsc_cake_qos
+            return 1
+        fi
+    fi
 
-    qos_log "INFO" "CAKE QoS停止完成"
+    if (( download_enabled == 1 )); then
+        echo "调用下载分类规则应用..." 
+        if ! apply_all_rules "download_rule" "$DOWNLOAD_MASK" "filter_qos_ingress"; then
+            qos_log "ERROR" "下载规则应用失败，回滚"
+            stop_hfsc_cake_qos
+            return 1
+        fi
+    fi
+
+    # ========== 添加 DSCP 映射 ==========
+    if ! setup_class_mark_map; then
+        qos_log "ERROR" "class_mark 映射设置失败"
+        stop_hfsc_cake_qos
+        return 1
+    fi
+
+    qos_log "INFO" "应用自定义规则成功"
+    if (( ENABLE_RATELIMIT == 1 )); then
+        echo "应用速率限制链..." 
+        setup_ratelimit_chain
+    fi
+    
+    # 增强功能函数（ACK/TCP/UDP/动态分类）
+    apply_enhanced_features
+    
+    echo "应用ipv6特别规则..." 
+    setup_ipv6_specific_rules
+    
+    local upload_failed=0
+    local download_failed=0
+    local upload_skipped=0
+    local download_skipped=0
+
+    if (( upload_enabled == 1 )); then
+        if ! init_hfsc_cake_upload; then
+            qos_log "ERROR" "上传方向初始化失败"
+            upload_failed=1
+        fi
+    else
+        upload_skipped=1
+    fi
+
+    if (( download_enabled == 1 )); then
+        if ! init_hfsc_cake_download; then
+            qos_log "ERROR" "下载方向初始化失败"
+            download_failed=1
+        fi
+    else
+        download_skipped=1
+    fi
+
+    if (( upload_failed == 1 )) || (( download_failed == 1 )); then
+        qos_log "ERROR" "HFSC+CAKE QoS 初始化部分失败"
+        stop_hfsc_cake_qos
+        return 1
+    fi
+
+    if (( upload_skipped == 1 )) && (( download_skipped == 1 )); then
+        qos_log "WARN" "上传和下载带宽均为0，QoS未启动任何方向"
+    fi
+    
+    qos_log "INFO" "HFSC+CAKE QoS初始化完成"
+    return 0
 }
 
-# ========== 主函数 ==========
-init_cake_qos() {
-    local action="$1"
-
-    case "$action" in
-        start)
-            qos_log "INFO" "启动CAKE QoS"
-            check_dependencies || exit 1
-            init_ruleset || exit 1
-
-            if ! check_already_running; then
-                qos_log "ERROR" "CAKE QoS 已经在运行中"
-                exit 1
-            fi
-
-            RUNTIME_SPLIT_GSO=0
-            RUNTIME_INGRESS=0
-            RUNTIME_AUTORATE_INGRESS=0
-
-            load_global_config
-
-            if ! load_bandwidth_from_config; then
-                qos_log "ERROR" "加载带宽配置失败"
-                rm -f "$QOS_RUNNING_FILE"
-                exit 1
-            fi
-
-            load_cake_config
-
-            total_upload_bandwidth=$(convert_bandwidth_to_kbit "$total_upload_bandwidth") || {
-                rm -f "$QOS_RUNNING_FILE"
-                exit 1
-            }
-            total_download_bandwidth=$(convert_bandwidth_to_kbit "$total_download_bandwidth") || {
-                rm -f "$QOS_RUNNING_FILE"
-                exit 1
-            }
-
-            [ "$ENABLE_AUTO_TUNE" = "1" ] && auto_tune_cake
-            validate_cake_config || {
-                rm -f "$QOS_RUNNING_FILE"
-                exit 1
-            }
-
-            load_upload_class_configurations
-            load_download_class_configurations
-
-            # ====== 关键修复：分配标记 ======
-            if [ -n "$upload_class_list" ]; then
-                if ! allocate_class_marks "upload" "$upload_class_list"; then
-                    qos_log "ERROR" "上传方向标记分配失败"
-                    stop_cake_qos
-                    rm -f "$QOS_RUNNING_FILE"
-                    exit 1
+# ========== 停止函数 ==========
+stop_hfsc_cake_qos() {
+    qos_log "INFO" "停止HFSC+CAKE QoS"
+    rm -f "$QOS_RUNNING_FILE"
+    if [[ "$SAVE_NFT_RULES" == "1" ]]; then
+        rm -f /etc/nftables.d/qos_gargoyle_*.nft 2>/dev/null
+    fi
+    if [[ -n "$qos_interface" ]] && ip link show "$qos_interface" >/dev/null 2>&1; then
+        tc filter del dev "$qos_interface" parent 1:0 protocol all 2>/dev/null || true
+        tc qdisc del dev "$qos_interface" ingress 2>/dev/null || true
+        tc qdisc del dev "$qos_interface" root 2>/dev/null || true
+    fi
+    if [[ -n "$IFB_DEVICE" ]]; then
+        if ip link show "$IFB_DEVICE" >/dev/null 2>&1; then
+            tc filter del dev "$IFB_DEVICE" parent 1:0 protocol all 2>/dev/null || true
+            tc qdisc del dev "$IFB_DEVICE" ingress 2>/dev/null || true
+            tc qdisc del dev "$IFB_DEVICE" root 2>/dev/null || true
+            ip link set dev "$IFB_DEVICE" down
+            if [[ "${DELETE_IFB_ON_STOP:-0}" == "1" ]]; then
+                if ! tc qdisc show dev "$IFB_DEVICE" 2>/dev/null | grep -q .; then
+                    ip link del dev "$IFB_DEVICE" 2>/dev/null
+                    qos_log "INFO" "IFB设备 $IFB_DEVICE 已删除"
+                else
+                    qos_log "INFO" "IFB设备 $IFB_DEVICE 仍有队列，保留"
                 fi
+            else
+                qos_log "INFO" "IFB设备 $IFB_DEVICE 已停用（保留）"
             fi
-            if [ -n "$download_class_list" ]; then
-                if ! allocate_class_marks "download" "$download_class_list"; then
-                    qos_log "ERROR" "下载方向标记分配失败"
-                    stop_cake_qos
-                    rm -f "$QOS_RUNNING_FILE"
-                    exit 1
+        else
+            qos_log "INFO" "IFB设备 $IFB_DEVICE 不存在，跳过"
+        fi
+    fi
+    
+    # 清理动态检测相关资源
+    cleanup_dynamic_detection
+    
+    nft delete table inet gargoyle-qos-priority 2>/dev/null || true
+    clear_class_marks
+    qos_log "INFO" "HFSC+CAKE QoS停止完成"
+    
+    # 恢复配置（已在 common.sh 中增加有效性检查）
+    restore_main_config
+    
+    _QOS_TABLE_FLUSHED=0
+    _IPSET_LOADED=0
+    cleanup_qos_state
+    cleanup_temp_files
+}
+
+# ========== 状态显示函数 ==========
+show_hfsc_cake_status() {
+    # 从 UCI 获取真实 WAN 接口
+    local real_wan_if=$(uci -q get ${CONFIG_FILE}.global.wan_interface 2>/dev/null)
+    if [[ -z "$real_wan_if" ]] || [[ "$real_wan_if" == "auto" ]]; then
+        if command -v network_find_wan >/dev/null 2>&1; then
+            network_find_wan real_wan_if 2>/dev/null
+        fi
+        if [[ -z "$real_wan_if" ]]; then
+            real_wan_if=$(ip route show default 2>/dev/null | awk '/default/ {print $5}' | head -1)
+        fi
+        [[ -z "$real_wan_if" ]] && real_wan_if="未知"
+    fi
+
+    if [[ -z "$IFB_DEVICE" ]]; then
+        IFB_DEVICE=$(uci -q get ${CONFIG_FILE}.download.ifb_device 2>/dev/null)
+        [[ -z "$IFB_DEVICE" ]] && IFB_DEVICE="ifb0"
+    fi
+    local qos_ifb="$IFB_DEVICE"
+
+    echo "===== HFSC-CAKE QoS 状态报告 ====="
+    echo "时间: $(date)"
+    echo "WAN接口: ${real_wan_if}"
+
+    if [[ "$real_wan_if" == "未知" ]] || ! ip link show "$real_wan_if" >/dev/null 2>&1; then
+        echo "警告: 无法确定有效的 WAN 接口，部分信息可能无法显示。"
+    else
+        if ! tc qdisc show dev "$real_wan_if" 2>/dev/null | grep -q hfsc; then
+            echo "警告: 出口 QoS 未在接口 ${real_wan_if} 上激活"
+        fi
+    fi
+
+    if [[ -n "$qos_ifb" ]] && ip link show "$qos_ifb" >/dev/null 2>&1; then
+        if tc qdisc show dev "$qos_ifb" 2>/dev/null | grep -q "qdisc"; then
+            echo "IFB设备: 已启动且运行中 ($qos_ifb)"
+        else
+            echo "IFB设备: 已创建但无 TC 队列 ($qos_ifb)"
+        fi
+    else
+        echo "IFB设备: 未创建"
+    fi
+
+    if [[ "$real_wan_if" != "未知" ]] && ip link show "$real_wan_if" >/dev/null 2>&1; then
+        echo -e "\n======== 出口QoS ($real_wan_if) ========"
+        echo -e "\nTC队列:"
+        tc -s qdisc show dev "$real_wan_if" 2>/dev/null | while read -r line; do
+            if echo "$line" | grep -q "hfsc\|cake"; then
+                echo "  $line"
+            fi
+        done
+        if tc class show dev "$real_wan_if" >/dev/null 2>&1; then
+            echo -e "\nTC类别:"
+            tc -s class show dev "$real_wan_if" 2>/dev/null | while read -r line; do
+                if echo "$line" | grep -q "hfsc"; then
+                    echo "  $line"
                 fi
+            done
+        fi
+        echo -e "\nTC过滤器:"
+        tc -s filter show dev "$real_wan_if" 2>/dev/null | while read -r line; do
+            echo "  $line"
+        done
+    fi
+
+    echo -e "\n======== nftables 分类规则 ========"
+    if nft list table inet gargoyle-qos-priority &>/dev/null; then
+        nft list table inet gargoyle-qos-priority 2>/dev/null | sed 's/^/  /'
+    else
+        echo "  nftables 表不存在"
+    fi
+
+    echo -e "\n======== 入口QoS ($qos_ifb) ========"
+    if [[ -n "$qos_ifb" ]] && ip link show "$qos_ifb" >/dev/null 2>&1; then
+        echo -e "\nTC队列:"
+        tc -s qdisc show dev "$qos_ifb" 2>/dev/null | while read -r line; do
+            if echo "$line" | grep -q "hfsc\|cake"; then
+                echo "  $line"
             fi
-            # ====== 标记分配结束 ======
+        done
+        if tc class show dev "$qos_ifb" >/dev/null 2>&1; then
+            echo -e "\nTC类别:"
+            tc -s class show dev "$qos_ifb" 2>/dev/null | while read -r line; do
+                if echo "$line" | grep -q "hfsc"; then
+                    echo "  $line"
+                fi
+            done
+        fi
+        echo -e "\nTC过滤器:"
+        tc -s filter show dev "$qos_ifb" 2>/dev/null | while read -r line; do
+            echo "  $line"
+        done
 
-            if [ ! -s "$CLASS_MARKS_FILE" ]; then
-                qos_log "ERROR" "Class marks file $CLASS_MARKS_FILE is missing or empty"
-                stop_cake_qos
-                rm -f "$QOS_RUNNING_FILE"
-                exit 1
+        echo -e "\n入口重定向检查:"
+        if [[ "$real_wan_if" != "未知" ]] && ip link show "$real_wan_if" >/dev/null 2>&1; then
+            if tc qdisc show dev "$real_wan_if" 2>/dev/null | grep -q "ingress"; then
+                check_ingress_redirect "$real_wan_if" "$qos_ifb"
+            else
+                echo "  ✗ 入口队列未配置"
             fi
-            qos_log "INFO" "Using existing class marks file: $CLASS_MARKS_FILE"
+        else
+            echo "  ✗ 无法检查入口重定向（WAN接口无效）"
+        fi
+    else
+        echo "  IFB设备不存在，无入口配置"
+    fi
 
-            nft add table inet gargoyle-qos-priority 2>/dev/null || true
+    echo -e "\n===== QoS运行状态 ====="
+    local upload_active=0
+    local download_active=0
+    if [[ "$real_wan_if" != "未知" ]] && ip link show "$real_wan_if" >/dev/null 2>&1; then
+        tc qdisc show dev "$real_wan_if" 2>/dev/null | grep -q "hfsc" && upload_active=1
+    fi
+    [[ -n "$qos_ifb" ]] && tc qdisc show dev "$qos_ifb" 2>/dev/null | grep -q "hfsc" && download_active=1
 
-            nft add map inet gargoyle-qos-priority upload_tcp_dport_map '{ type mark : verdict; flags interval; }' 2>/dev/null || true
-            nft add map inet gargoyle-qos-priority upload_udp_dport_map '{ type mark : verdict; flags interval; }' 2>/dev/null || true
-            nft add map inet gargoyle-qos-priority download_tcp_sport_map '{ type mark : verdict; flags interval; }' 2>/dev/null || true
-            nft add map inet gargoyle-qos-priority download_udp_sport_map '{ type mark : verdict; flags interval; }' 2>/dev/null || true
+    if (( upload_active == 1 )); then
+        echo "上传QoS: 已启用 (HFSC+cake)"
+    else
+        echo "上传QoS: 未启用"
+    fi
 
-            if [ -f "$CLASS_MARKS_FILE" ]; then
-                for class_name in $(cut -d: -f2 "$CLASS_MARKS_FILE" | sort -u); do
-                    realname=$(uci -q get ${CONFIG_FILE}.${class_name}.name 2>/dev/null | tr '[:upper:]' '[:lower:]')
-                    [ -z "$realname" ] && continue
-                    nft add set inet gargoyle-qos-priority upload_${realname} '{ type ipv4_addr; flags dynamic, timeout; }' 2>/dev/null || true
-                    nft add set inet gargoyle-qos-priority upload_${realname}6 '{ type ipv6_addr; flags dynamic, timeout; }' 2>/dev/null || true
-                    nft add set inet gargoyle-qos-priority download_${realname} '{ type ipv4_addr; flags dynamic, timeout; }' 2>/dev/null || true
-                    nft add set inet gargoyle-qos-priority download_${realname}6 '{ type ipv6_addr; flags dynamic, timeout; }' 2>/dev/null || true
+    if (( download_active == 1 )); then
+        echo "下载QoS: 已启用 (HFSC+cake)"
+    else
+        echo "下载QoS: 未启用"
+    fi
+
+    if (( upload_active == 1 )) && (( download_active == 1 )); then
+        echo -e "\n✓ QoS双向流量整形已启用"
+    elif (( upload_active == 1 )) || (( download_active == 1 )); then
+        echo -e "\n⚠ 部分方向QoS已启用"
+    else
+        echo -e "\n✗ QoS未运行"
+    fi
+
+    echo -e "\n===== 详细队列统计 ====="
+    if [[ "$real_wan_if" != "未知" ]] && ip link show "$real_wan_if" >/dev/null 2>&1; then
+        echo -e "\n上传方向cake队列:"
+        tc -s qdisc show dev "$real_wan_if" 2>/dev/null | grep -A 3 "cake" | while read -r line; do
+            if echo "$line" | grep -q "parent"; then
+                echo "  $line"
+            elif echo "$line" | grep -q "Sent" || echo "$line" | grep -q "maxpacket" || \
+                 echo "$line" | grep -q "ecn_mark" || echo "$line" | grep -q "memory_used"; then
+                echo "    $line"
+            fi
+        done
+    fi
+
+    if [[ -n "$qos_ifb" ]] && ip link show "$qos_ifb" >/dev/null 2>&1; then
+        echo -e "\n下载方向cake队列:"
+        tc -s qdisc show dev "$qos_ifb" 2>/dev/null | grep -A 3 "cake" | while read -r line; do
+            if echo "$line" | grep -q "parent"; then
+                echo "  $line"
+            elif echo "$line" | grep -q "Sent" || echo "$line" | grep -q "maxpacket" || \
+                 echo "$line" | grep -q "ecn_mark" || echo "$line" | grep -q "memory_used"; then
+                echo "    $line"
+            fi
+        done
+    fi
+
+    echo -e "\n===== 增强特性状态 ====="
+    local rate_val=$(uci -q get ${CONFIG_FILE}.global.enable_ratelimit 2>/dev/null)
+    local ack_val=$(uci -q get ${CONFIG_FILE}.ack_limit.enabled 2>/dev/null)
+    local tcp_val=$(uci -q get ${CONFIG_FILE}.tcp_upgrade.enabled 2>/dev/null)
+    local udp_val=$(uci -q get ${CONFIG_FILE}.udp_limit.enabled 2>/dev/null)
+
+    case "$rate_val" in 1|yes|true|on) echo "速率限制: 已启用" ;; *) echo "速率限制: 未启用" ;; esac
+    case "$ack_val"  in 1|yes|true|on) echo "ACK 限速: 已启用" ;; *) echo "ACK 限速: 未启用" ;; esac
+    case "$tcp_val"  in 1|yes|true|on) echo "TCP 升级: 已启用" ;; *) echo "TCP 升级: 未启用" ;; esac
+    case "$udp_val"  in 1|yes|true|on) echo "UDP 限速: 已启用" ;; *) echo "UDP 限速: 未启用" ;; esac
+
+    echo -e "\n===== 健康检查 ====="
+    health_check
+
+    echo -e "\n===== 活动连接标记 ========"
+    if ! command -v conntrack >/dev/null 2>&1; then
+        echo "  conntrack 命令未安装，无法显示连接标记信息。"
+        echo "  请安装 conntrack-tools 包以获取此功能。"
+    else
+        local wan_ipv4=""
+        local wan_ipv6=""
+        if [[ "$real_wan_if" != "未知" ]] && ip link show "$real_wan_if" >/dev/null 2>&1; then
+            wan_ipv4=$(ip -4 addr show dev "$real_wan_if" 2>/dev/null | grep "inet " | awk '{print $2}' | cut -d/ -f1 | head -1)
+            [[ -z "$wan_ipv4" ]] && wan_ipv4=$(ifconfig "$real_wan_if" 2>/dev/null | grep "inet addr:" | awk '{print $2}' | cut -d: -f2)
+            wan_ipv6=$(ip -6 addr show dev "$real_wan_if" 2>/dev/null | grep "inet6 " | grep -v "fe80::" | awk '{print $2}' | cut -d/ -f1 | head -1)
+            [[ -z "$wan_ipv6" ]] && wan_ipv6=$(ifconfig "$real_wan_if" 2>/dev/null | grep "inet6 addr:" | grep -v "fe80::" | awk '{print $3}' | cut -d/ -f1)
+        fi
+        echo -e "\nIPv4 连接标记 (目标地址为 WAN):"
+        if [[ -n "$wan_ipv4" ]]; then
+            echo "WAN IPv4: $wan_ipv4"
+            local ipv4_marks=$(conntrack -L -d "$wan_ipv4" 2>/dev/null | grep -E "mark=[0-9]+" | head -n 5)
+            if [[ -n "$ipv4_marks" ]]; then
+                echo "$ipv4_marks" | while IFS= read -r line; do
+                    local src_ip=$(echo "$line" | awk '{for(i=1;i<=NF;i++) if ($i ~ /^src=/) {sub(/^src=/, "", $i); print $i; exit}}')
+                    local dst_ip=$(echo "$line" | awk '{for(i=1;i<=NF;i++) if ($i ~ /^dst=/) {sub(/^dst=/, "", $i); print $i; exit}}')
+                    local sport=$(echo "$line" | awk '{for(i=1;i<=NF;i++) if ($i ~ /^sport=/) {sub(/^sport=/, "", $i); print $i; exit}}')
+                    local dport=$(echo "$line" | awk '{for(i=1;i<=NF;i++) if ($i ~ /^dport=/) {sub(/^dport=/, "", $i); print $i; exit}}')
+                    local proto=$(echo "$line" | awk '{print $1}')
+                    local dec_mark=$(echo "$line" | grep -o "mark=[0-9]\+" | cut -d= -f2 | head -1)
+                    local mark_hex="0x$(printf '%x' "$dec_mark" 2>/dev/null || echo '0')"
+                    printf "  %-7s %-15s:%-5s → %-15s:%-5s [标记: %s]\n" \
+                        "$proto" "${src_ip:-N/A}" "${sport:-N/A}" "${dst_ip:-N/A}" "${dport:-N/A}" "$mark_hex"
                 done
+            else
+                echo "  未找到带标记的 IPv4 连接"
             fi
+        else
+            echo "  WAN IPv4 地址不可用"
+        fi
+        echo -e "\nIPv6 连接标记 (目标地址为 WAN):"
+        if [[ -n "$wan_ipv6" ]]; then
+            echo "WAN IPv6: $wan_ipv6"
+            local ipv6_marks=$(conntrack -L -d "$wan_ipv6" 2>/dev/null | grep -E "mark=[0-9]+" | head -n 5)
+            if [[ -n "$ipv6_marks" ]]; then
+                echo "$ipv6_marks" | while IFS= read -r line; do
+                    local src_ip=$(echo "$line" | awk '{for(i=1;i<=NF;i++) if ($i ~ /^src=/) {sub(/^src=/, "", $i); print $i; exit}}')
+                    local dst_ip=$(echo "$line" | awk '{for(i=1;i<=NF;i++) if ($i ~ /^dst=/) {sub(/^dst=/, "", $i); print $i; exit}}')
+                    local sport=$(echo "$line" | awk '{for(i=1;i<=NF;i++) if ($i ~ /^sport=/) {sub(/^sport=/, "", $i); print $i; exit}}')
+                    local dport=$(echo "$line" | awk '{for(i=1;i<=NF;i++) if ($i ~ /^dport=/) {sub(/^dport=/, "", $i); print $i; exit}}')
+                    local proto=$(echo "$line" | awk '{print $1}')
+                    local dec_mark=$(echo "$line" | grep -o "mark=[0-9]\+" | cut -d= -f2 | head -1)
+                    local mark_hex="0x$(printf '%x' "$dec_mark" 2>/dev/null || echo '0')"
+                    src_ip=$(echo "$src_ip" | sed 's/\(:\)[0:]*/\1/g')
+                    dst_ip=$(echo "$dst_ip" | sed 's/\(:\)[0:]*/\1/g')
+                    printf "  %-7s %-30s:%-5s → %-30s:%-5s [标记: %s]\n" \
+                        "$proto" "${src_ip:-N/A}" "${sport:-N/A}" "${dst_ip:-N/A}" "${dport:-N/A}" "$mark_hex"
+                done
+            else
+                echo "  未找到带标记的 IPv6 连接"
+            fi
+        else
+            echo "  WAN IPv6 地址不可用"
+        fi
+        echo -e "\n上传方向连接标记 (源地址为 WAN):"
+        if [[ -n "$wan_ipv4" ]]; then
+            local upload_marks=$(conntrack -L -s "$wan_ipv4" 2>/dev/null | grep -E "mark=[0-9]+" | head -n 3)
+            if [[ -n "$upload_marks" ]]; then
+                echo "$upload_marks" | while IFS= read -r line; do
+                    local src_ip=$(echo "$line" | awk '{for(i=1;i<=NF;i++) if ($i ~ /^src=/) {sub(/^src=/, "", $i); print $i; exit}}')
+                    local dst_ip=$(echo "$line" | awk '{for(i=1;i<=NF;i++) if ($i ~ /^dst=/) {sub(/^dst=/, "", $i); print $i; exit}}')
+                    local sport=$(echo "$line" | awk '{for(i=1;i<=NF;i++) if ($i ~ /^sport=/) {sub(/^sport=/, "", $i); print $i; exit}}')
+                    local dport=$(echo "$line" | awk '{for(i=1;i<=NF;i++) if ($i ~ /^dport=/) {sub(/^dport=/, "", $i); print $i; exit}}')
+                    local proto=$(echo "$line" | awk '{print $1}')
+                    local dec_mark=$(echo "$line" | grep -o "mark=[0-9]\+" | cut -d= -f2 | head -1)
+                    local mark_hex="0x$(printf '%x' "$dec_mark" 2>/dev/null || echo '0')"
+                    printf "  %-7s %-15s:%-5s → %-15s:%-5s [标记: %s]\n" \
+                        "$proto" "${src_ip:-N/A}" "${sport:-N/A}" "${dst_ip:-N/A}" "${dport:-N/A}" "$mark_hex"
+                done
+            else
+                echo "  未找到带标记的上传方向连接"
+            fi
+        fi
+    fi
 
-            if ! apply_all_rules "upload_rule" "$UPLOAD_MASK" "filter_qos_egress"; then
-                qos_log "ERROR" "上传规则应用失败"
-                stop_cake_qos
-                rm -f "$QOS_RUNNING_FILE"
+    echo -e "\n===== HFSC-CAKE 状态报告结束 ====="
+    return 0
+}
+
+# ========== 主入口 ==========
+main_hfsc_cake_qos() {
+    local action="$1"
+    case "$action" in
+        "start")
+            if ! init_hfsc_cake_qos; then
+                qos_log "ERROR" "HFSC+CAKE QoS启动失败"
                 exit 1
             fi
-            if ! apply_all_rules "download_rule" "$DOWNLOAD_MASK" "filter_qos_ingress"; then
-                qos_log "ERROR" "下载规则应用失败"
-                stop_cake_qos
-                rm -f "$QOS_RUNNING_FILE"
+            ;;
+        "stop")
+            stop_hfsc_cake_qos
+            ;;
+        "restart")
+            stop_hfsc_cake_qos
+            sleep 1
+            if ! init_hfsc_cake_qos; then
+                qos_log "ERROR" "HFSC+CAKE QoS重启失败"
                 exit 1
             fi
-
-            if ! setup_class_mark_map; then
-                qos_log "ERROR" "class_mark 映射设置失败"
-                stop_cake_qos
-                rm -f "$QOS_RUNNING_FILE"
+            ;;
+        "status")
+            show_hfsc_cake_status
+            ;;
+        "health_check")
+            health_check
+            ;;
+        "auto_speedtest")
+            if ! auto_speedtest; then
+                qos_log "ERROR" "自动速率测试失败"
                 exit 1
             fi
-
-            apply_enhanced_features
-
-            echo "应用ipv6特别规则..."
-            setup_ipv6_specific_rules
-
-            local upload_success=0 download_success=0
-            init_cake_upload || upload_success=1
-            init_cake_download || download_success=1
-
-            if [ $upload_success -eq 1 ] || [ $download_success -eq 1 ]; then
-                qos_log "ERROR" "CAKE QoS 初始化部分失败"
-                stop_cake_qos
-                rm -f "$QOS_RUNNING_FILE"
-                exit 1
-            fi
-
-            if [ "$total_download_bandwidth" -gt 0 ] 2>/dev/null; then
-                check_ingress_redirect "$qos_interface" "$IFB_DEVICE"
-            fi
-
-            {
-                echo "CAKE_RTT='$CAKE_RTT'"
-                echo "CAKE_MEMORY_LIMIT='$CAKE_MEMORY_LIMIT'"
-                echo "RUNTIME_SPLIT_GSO='$RUNTIME_SPLIT_GSO'"
-                echo "RUNTIME_INGRESS='$RUNTIME_INGRESS'"
-                echo "RUNTIME_AUTORATE_INGRESS='$RUNTIME_AUTORATE_INGRESS'"
-            } > "$RUNTIME_PARAMS_FILE"
-
-            health_check_cake
-            qos_log "INFO" "CAKE QoS 启动成功"
-            return 0
-            ;;
-
-        stop)
-            qos_log "INFO" "停止CAKE QoS"
-            stop_cake_qos || exit 1
-            ;;
-
-        restart)
-            qos_log "INFO" "重启CAKE QoS"
-            stop_cake_qos
-            sleep 2
-            init_cake_qos start
-            ;;
-
-        status|show)
-            show_cake_status
-            ;;
-
-        health)
-            health_check_cake
-            ;;
-
-        validate)
-            check_dependencies || exit 1
-            load_cake_config
-            total_upload_bandwidth=$(convert_bandwidth_to_kbit "$total_upload_bandwidth") || exit 1
-            total_download_bandwidth=$(convert_bandwidth_to_kbit "$total_download_bandwidth") || exit 1
-            validate_cake_config
-            ;;
-
-        help)
-            echo "用法: $0 {start|stop|restart|status|health|validate|help}"
+           ;;
+        *)
+            echo "用法: $0 {start|stop|restart|status|health_check}"
             echo ""
             echo "命令:"
-            echo "  start    启动CAKE QoS"
-            echo "  stop     停止CAKE QoS"
-            echo "  restart  重启CAKE QoS"
-            echo "  status   显示CAKE状态"
-            echo "  health   执行健康检查"
-            echo "  validate 验证CAKE配置"
-            echo "  help     显示此帮助信息"
-            ;;
-
-        *)
-            echo "错误: 未知操作 '$action'"
-            echo ""
-            init_cake_qos "help"
+            echo "  start        启动HFSC+CAKE QoS"
+            echo "  stop         停止HFSC+CAKE QoS"
+            echo "  restart      重启HFSC+CAKE QoS"
+            echo "  status       显示状态"
+            echo "  health_check 执行健康检查"
+            echo "  auto_speedtest   自动测速（测速或手动输入带宽）"
             exit 1
             ;;
     esac
 }
 
-if [ "$(basename "$0")" = "cake.sh" ]; then
-    if [ $# -eq 0 ]; then
-        echo "错误: 缺少参数"
-        echo ""
-        init_cake_qos "help"
-        exit 1
-    fi
-    init_cake_qos "$@"
+if [[ "$(basename "$0")" == "hfsc_cake.sh" ]] || [[ "$(basename "$0")" == "hfsc-cake.sh" ]]; then
+    main_hfsc_cake_qos "$1"
 fi
-
-qos_log "INFO" "CAKE模块加载完成"

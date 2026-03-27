@@ -7,6 +7,8 @@
  * idclass_run_cmd() utility for executing shell commands.
  */
 #include "common.h"
+#include <ctype.h>
+#include <sys/wait.h>
 
 /* Forward declarations for module interfaces (already in common.h) */
 /* All interfaces are declared in common.h, no need to repeat here. */

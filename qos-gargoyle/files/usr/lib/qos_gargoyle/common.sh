@@ -1,6 +1,6 @@
 #!/bin/bash
 # 核心库模块 (common.sh)
-# 版本: 3.4.7 - 移除未使用变量、增加 UCI 缓存刷新函数、优化错误日志
+# 版本: 3.4.7 - 增加 CAKE diffserv 模式获取、标记辅助函数、清理未使用变量
 # 提供 QoS 系统基础功能
 
 # ========== 加载 OpenWrt 标准函数库 ==========
@@ -51,7 +51,6 @@ if [[ -z "$_QOS_LIB_SH_LOADED" ]]; then
 fi
 
 # ========== 检查是否已经在运行 ==========
-# 注意：使用 procd 管理时，此函数仅用于辅助，实际单实例由 procd 保证
 check_already_running() {
     if [ -f "$QOS_RUNNING_FILE" ]; then
         local old_pid=$(cat "$QOS_RUNNING_FILE" 2>/dev/null)
@@ -75,7 +74,7 @@ strip_leading_zeros() {
     echo "$val"
 }
 
-# ========== 日志函数（优化多行输出，修复优先级大小写） ==========
+# ========== 日志函数（优化多行输出） ==========
 log_debug() { [[ "$DEBUG" == "1" ]] && log "DEBUG" "$@"; }
 log_info()  { log "INFO" "$@"; }
 log_warn()  { log "WARN" "$@"; }
@@ -116,7 +115,6 @@ cleanup_temp_files() {
     TEMP_FILES=()
 }
 
-# 设置退出时清理临时文件（改进：保留原有 trap）
 _old_trap=$(trap -p EXIT | awk '{print $3}' | sed "s/^'//;s/'$//")
 if [[ -n "$_old_trap" ]]; then
     trap "cleanup_temp_files; $_old_trap" EXIT
@@ -168,23 +166,6 @@ load_global_config() {
 
     val=$(uci -q get ${CONFIG_FILE}.global.enable_dynamic_classify 2>/dev/null)
     case "$val" in 1|yes|true|on) ENABLE_DYNAMIC_CLASSIFY=1 ;; *) ENABLE_DYNAMIC_CLASSIFY=0 ;; esac
-}
-
-# ========== UCI 缓存刷新函数 ==========
-refresh_uci_cache() {
-    log_debug "刷新 UCI 配置缓存"
-    unset UCI_CACHE 2>/dev/null
-    declare -A UCI_CACHE
-    while IFS= read -r line; do
-        [[ -z "$line" ]] && continue
-        local key="${line%%=*}"
-        local val="${line#*=}"
-        val="${val#\'}"; val="${val%\'}"
-        if [[ "$key" == "${CONFIG_FILE}."* ]]; then
-            UCI_CACHE["$key"]="$val"
-        fi
-    done < <(uci show "${CONFIG_FILE}" 2>/dev/null)
-    log_debug "UCI 缓存刷新完成，共 ${#UCI_CACHE[@]} 个选项"
 }
 
 # ========== eBPF 支持函数 ==========
@@ -641,6 +622,46 @@ get_class_mark() {
 
 clear_class_marks() {
     log_debug "标记文件持久化，停止时不删除"
+}
+
+# ========== 辅助函数：获取 CAKE diffserv 模式 ==========
+get_cake_diffserv_mode() {
+    local mode
+    mode=$(uci -q get ${CONFIG_FILE}.cake.diffserv_mode 2>/dev/null)
+    case "$mode" in
+        diffserv3|diffserv4|diffserv5|diffserv8|besteffort)
+            echo "$mode"
+            ;;
+        *)
+            echo "diffserv4"
+            ;;
+    esac
+}
+
+# ========== 辅助函数：获取已分配标记中的最小/最大值 ==========
+get_min_max_mark() {
+    local direction="$1"  # upload 或 download
+    local which="$2"      # min 或 max
+    local marks=()
+    if [[ ! -f "$CLASS_MARKS_FILE" ]]; then
+        echo "0"
+        return
+    fi
+    while IFS=: read -r dir cls mark; do
+        if [[ "$dir" == "$direction" && -n "$mark" ]]; then
+            marks+=("$mark")
+        fi
+    done < "$CLASS_MARKS_FILE"
+    if [[ ${#marks[@]} -eq 0 ]]; then
+        echo "0"
+        return
+    fi
+    local sorted=($(printf "%s\n" "${marks[@]}" | sort -n))
+    if [[ "$which" == "min" ]]; then
+        echo "${sorted[0]}"
+    else
+        echo "${sorted[-1]}"
+    fi
 }
 
 # ========== 配置加载函数 ==========
@@ -1310,7 +1331,7 @@ ensure_ifb_device() {
     return 1
 }
 
-# ========== 检查 tc connmark 支持 ==========
+# ========== 检查 tc connmark 支持（修复 dummy 设备回退） ==========
 check_tc_connmark_support() {
     modprobe sch_ingress 2>/dev/null
     modprobe act_connmark 2>/dev/null
@@ -1352,7 +1373,7 @@ check_sfo_enabled() {
     fi
 }
 
-# ========== 检查 tc ctinfo 支持 ==========
+# ========== 检查 tc ctinfo 支持（修复 dummy 设备回退） ==========
 check_tc_ctinfo_support() {
     local dummy_dev="qos_test_ctinfo_$$"
     local created=0
@@ -1445,7 +1466,7 @@ restore_main_config() {
     log_info "已清理规则集标记"
 }
 
-# ========== 内存限制计算（增强版） ==========
+# ========== 内存限制计算（增强版，支持大小写不敏感） ==========
 calculate_memory_limit() {
     local config_value="$1" result
     [[ -z "$config_value" ]] && { echo ""; return; }
@@ -1494,7 +1515,7 @@ calculate_memory_limit() {
     echo "$result"
 }
 
-# ========== 获取最高优先级的类名称 ==========
+# ========== 获取最高优先级的类名称（修复：检查 enabled） ==========
 get_highest_priority_class() {
     local direction="$1"
     local class_list=""
@@ -1522,7 +1543,7 @@ get_highest_priority_class() {
     echo "$best_class"
 }
 
-# 获取最低优先级的类
+# 获取最低优先级的类（priority 数值最大的启用类）
 get_lowest_priority_class() {
     local direction="$1"
     local class_list=""
@@ -1550,7 +1571,7 @@ get_lowest_priority_class() {
     echo "$best_class"
 }
 
-# ========== 自动测速 ==========
+# ========== 自动测速（增加交互超时，安装后验证） ==========
 auto_speedtest() {
     local noninteractive=0 force=0 gaming_ip=""
     local WAN_IF="" DOWNLOAD_SPEED="" UPLOAD_SPEED="" SPEEDTEST_CMD=""

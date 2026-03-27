@@ -57,7 +57,7 @@ static int ip_conn_fd = -1;
 static int flow_stats_fd = -1;
 static struct uloop_timeout ip_conn_timer;
 
-/* 比较函数原型声明（供 AVL_TREE 使用） */
+/* 比较函数原型（供 AVL_TREE 使用） */
 static int idclass_map_entry_cmp(const void *k1, const void *k2, void *ptr);
 
 /* Helper: compare two map data entries for AVL tree */

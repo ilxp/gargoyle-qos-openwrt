@@ -1,6 +1,6 @@
 #!/bin/bash
 # HTB_FQCODEL算法实现模块
-# 版本: 3.4.5 - 修复 DELETE_IFB_ON_STOP 未读取、类配置变量重置、HTB参数验证
+# 版本: 3.4.7 - 修复内存限制解析、CAKE带宽忽略、IFB删除控制、参数验证增强
 # 基于HTB与FQ_CODEL组合算法实现QoS流量控制。
 
 # ========== 全局配置常量 ==========
@@ -85,7 +85,6 @@ load_htb_fqcodel_config() {
     # 读取 HTB 参数
     HTB_R2Q=$(uci -q get ${CONFIG_FILE}.htb.r2q 2>/dev/null)
     [[ -z "$HTB_R2Q" ]] && HTB_R2Q=10
-    # 验证 HTB_R2Q 是否为有效数字
     if ! validate_number "$HTB_R2Q" "htb.r2q" 1 1000 2>/dev/null; then
         qos_log "WARN" "HTB R2Q 参数无效，使用默认值 10"
         HTB_R2Q=10
@@ -93,7 +92,6 @@ load_htb_fqcodel_config() {
 
     HTB_DRR_QUANTUM=$(uci -q get ${CONFIG_FILE}.htb.drr_quantum 2>/dev/null)
     [[ -z "$HTB_DRR_QUANTUM" ]] && HTB_DRR_QUANTUM="auto"
-    # 验证 drr_quantum，如果是数字且大于0，则保留；否则视为 auto
     if [[ "$HTB_DRR_QUANTUM" != "auto" ]] && ! validate_number "$HTB_DRR_QUANTUM" "htb.drr_quantum" 1 1048576 2>/dev/null; then
         qos_log "WARN" "HTB DRR quantum 无效，使用 auto"
         HTB_DRR_QUANTUM="auto"
@@ -106,6 +104,16 @@ load_htb_fqcodel_config() {
         *) DELETE_IFB_ON_STOP=0 ;;
     esac
 
+    # 强制忽略 CAKE_BANDWIDTH，防止二次整形（此处CAKE未被使用，但保留检查以兼容旧配置）
+    local cake_bw=$(uci -q get ${CONFIG_FILE}.cake.bandwidth 2>/dev/null)
+    if [[ -n "$cake_bw" ]]; then
+        qos_log "ERROR" "检测到 CAKE_BANDWIDTH 已配置 (值: $cake_bw)，这将导致CAKE二次整形，严重影响HTB调度性能。已强制忽略该配置，使用HTB主导整形。"
+        # 可选：直接退出或仅警告，这里选择忽略
+        # uci set ${CONFIG_FILE}.cake.bandwidth="" 2>/dev/null  # 不修改UCI，仅在运行时忽略
+    fi
+    # 确保 CAKE_BANDWIDTH 变量为空
+    CAKE_BANDWIDTH=""
+
     # fq_codel 参数：提供合理的默认值，并进行内核支持检测
     # 1. limit
     FQCODEL_LIMIT=$(uci -q get ${CONFIG_FILE}.fq_codel.limit 2>/dev/null)
@@ -117,7 +125,6 @@ load_htb_fqcodel_config() {
         qos_log "ERROR" "fq_codel limit 无效，使用默认值 1000"
         FQCODEL_LIMIT=1000
     fi
-    # 检测 limit 参数支持
     if ! check_fq_codel_param_support "limit $FQCODEL_LIMIT"; then
         qos_log "WARN" "内核不支持 fq_codel limit=$FQCODEL_LIMIT，将使用默认值 1000"
         FQCODEL_LIMIT=1000
@@ -234,16 +241,6 @@ load_htb_fqcodel_config() {
         FQCODEL_ECN=""
         qos_log "INFO" "fq_codel ECN: 未配置"
     fi
-
-    # 强制忽略 CAKE_BANDWIDTH，防止二次整形（此处CAKE未被使用，但保留检查以兼容旧配置）
-    local cake_bw=$(uci -q get ${CONFIG_FILE}.cake.bandwidth 2>/dev/null)
-    if [[ -n "$cake_bw" ]]; then
-        qos_log "ERROR" "检测到 CAKE_BANDWIDTH 已配置 (值: $cake_bw)，这将导致CAKE二次整形，严重影响HTB调度性能。已强制忽略该配置，使用HTB主导整形。"
-        # 可选：直接退出或仅警告，这里选择忽略
-        # uci set ${CONFIG_FILE}.cake.bandwidth="" 2>/dev/null  # 不修改UCI，仅在运行时忽略
-    fi
-    # 确保 CAKE_BANDWIDTH 变量为空
-    CAKE_BANDWIDTH=""
 
     qos_log "INFO" "HTB配置: R2Q=${HTB_R2Q}, DRR量子=${HTB_DRR_QUANTUM}"
     qos_log "INFO" "fq_codel参数: limit=${FQCODEL_LIMIT}, interval=${FQCODEL_INTERVAL}us, target=${FQCODEL_TARGET}us, flows=${FQCODEL_FLOWS}, quantum=${FQCODEL_QUANTUM}, memory_limit=${FQCODEL_MEMORY_LIMIT:-未配置}, ce_threshold=${FQCODEL_CE_THRESHOLD:-未配置}, ecn=${FQCODEL_ECN:-未配置}"

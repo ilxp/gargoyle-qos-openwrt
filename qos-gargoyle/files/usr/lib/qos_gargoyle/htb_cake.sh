@@ -1,6 +1,6 @@
 #!/bin/bash
 # HTB_CAKE算法实现模块
-# 版本: 3.4.5 - 修复 DELETE_IFB_ON_STOP 未读取、类配置变量重置、HTB参数验证
+# 版本: 3.4.7 - 修复内存限制解析、RTT验证、IFB删除控制
 # 基于 HTB 与 CAKE 组合算法实现 QoS 流量控制
 
 # ========== 全局配置常量 ==========
@@ -40,6 +40,11 @@ trap main_cleanup EXIT INT TERM HUP QUIT
 . /lib/functions/network.sh
 include /lib/network
 
+# ========== 参数消毒 ==========
+sanitize_param() {
+    echo "$1" | sed 's/[^a-zA-Z0-9_./:-]//g'
+}
+
 # ========== HTB 与 CAKE 专属配置加载 ==========
 load_htb_cake_config() {
     qos_log "INFO" "加载HTB与CAKE配置"
@@ -60,7 +65,6 @@ load_htb_cake_config() {
     # 读取 HTB 参数
     HTB_R2Q=$(uci -q get ${CONFIG_FILE}.htb.r2q 2>/dev/null)
     [[ -z "$HTB_R2Q" ]] && HTB_R2Q=10
-    # 验证 HTB_R2Q 是否为有效数字
     if ! validate_number "$HTB_R2Q" "htb.r2q" 1 1000 2>/dev/null; then
         qos_log "WARN" "HTB R2Q 参数无效，使用默认值 10"
         HTB_R2Q=10
@@ -68,7 +72,6 @@ load_htb_cake_config() {
 
     HTB_DRR_QUANTUM=$(uci -q get ${CONFIG_FILE}.htb.drr_quantum 2>/dev/null)
     [[ -z "$HTB_DRR_QUANTUM" ]] && HTB_DRR_QUANTUM="auto"
-    # 验证 drr_quantum，如果是数字且大于0，则保留；否则视为 auto
     if [[ "$HTB_DRR_QUANTUM" != "auto" ]] && ! validate_number "$HTB_DRR_QUANTUM" "htb.drr_quantum" 1 1048576 2>/dev/null; then
         qos_log "WARN" "HTB DRR quantum 无效，使用 auto"
         HTB_DRR_QUANTUM="auto"
@@ -85,13 +88,18 @@ load_htb_cake_config() {
     local cake_bw=$(uci -q get ${CONFIG_FILE}.cake.bandwidth 2>/dev/null)
     if [[ -n "$cake_bw" ]]; then
         qos_log "ERROR" "检测到 CAKE_BANDWIDTH 已配置 (值: $cake_bw)，这将导致CAKE二次整形，严重影响HTB调度性能。已强制忽略该配置，使用HTB主导整形。"
-        # 运行时忽略，不修改UCI
         CAKE_BANDWIDTH=""
     else
         CAKE_BANDWIDTH=""
     fi
 
+    # 读取 CAKE 参数
     CAKE_RTT=$(uci -q get ${CONFIG_FILE}.cake.rtt 2>/dev/null)
+    if [[ -n "$CAKE_RTT" ]] && ! echo "$CAKE_RTT" | grep -qiE '^[0-9]+(us|ms|s)$'; then
+        qos_log "WARN" "无效的 RTT 格式: $CAKE_RTT，将使用默认值 100ms"
+        CAKE_RTT="100ms"
+    fi
+
     CAKE_FLOWMODE=$(uci -q get ${CONFIG_FILE}.cake.flowmode 2>/dev/null)
     [[ -z "$CAKE_FLOWMODE" ]] && CAKE_FLOWMODE="srchost"
     CAKE_DIFFSERV=$(uci -q get ${CONFIG_FILE}.cake.diffserv_mode 2>/dev/null)
@@ -121,6 +129,7 @@ load_htb_cake_config() {
         CAKE_ECN=""
         qos_log "INFO" "CAKE ECN 未配置，使用默认禁用"
     fi
+
     qos_log "INFO" "HTB配置: R2Q=${HTB_R2Q}, DRR量子=${HTB_DRR_QUANTUM}"
     qos_log "INFO" "CAKE参数: bandwidth=${CAKE_BANDWIDTH:-未配置}, rtt=${CAKE_RTT:-未配置}, flowmode=${CAKE_FLOWMODE}, diffserv=${CAKE_DIFFSERV}, nat=${CAKE_NAT}, wash=${CAKE_WASH}, overhead=${CAKE_OVERHEAD:-未配置}, mpu=${CAKE_MPU:-未配置}, ack_filter=${CAKE_ACK_FILTER}, split_gso=${CAKE_SPLIT_GSO}, memlimit=${CAKE_MEMLIMIT:-未配置}, ecn=${CAKE_ECN}"
     return 0
@@ -208,12 +217,11 @@ calculate_htb_burst() {
     echo "${burst_kb}kb ${cburst_kb}kb"
 }
 
-# ========== CAKE 参数支持检查（修复：避免回退 lo）==========
+# ========== CAKE 参数支持检查 ==========
 check_cake_param_support() {
     local param="$1"
     local dummy_dev="qos_test_cake_$$"
     local created=0
-    # 尝试创建唯一 dummy 设备
     if ! ip link add "$dummy_dev" type dummy 2>/dev/null; then
         qos_log "DEBUG" "无法创建 dummy 设备，假定 $param 不支持"
         return 1
@@ -600,7 +608,6 @@ create_htb_download_class() {
 # ========== 上传方向初始化 ==========
 init_htb_cake_upload() {
     qos_log "INFO" "初始化上传方向HTB"
-    # 上传类别配置已在主初始化中加载，但为确保安全，可再次加载
     load_upload_class_configurations
     if [[ -z "$upload_class_list" ]]; then
         qos_log "ERROR" "未找到上传类别配置，请至少配置一个上传类"
@@ -698,7 +705,6 @@ init_htb_cake_upload() {
 # ========== 下载方向初始化 ==========
 init_htb_cake_download() {
     qos_log "INFO" "初始化下载方向HTB"
-    # 下载类别配置已在主初始化中加载，但为确保安全，可再次加载
     load_download_class_configurations
     if [[ -z "$download_class_list" ]]; then
         qos_log "ERROR" "未找到下载类别配置，请至少配置一个下载类"

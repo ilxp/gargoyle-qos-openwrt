@@ -1,6 +1,6 @@
 #!/bin/bash
 # HFSC_CAKE算法实现模块
-# 版本: 3.4.5 - 修复 DELETE_IFB_ON_STOP 未读取、类配置变量重置、参数验证
+# 版本: 3.4.7 - 修复内存限制解析、CAKE带宽忽略、IFB删除控制、RTT验证
 # 基于HFSC与CAKE组合算法实现QoS流量控制。
 
 # ========== 全局配置常量 ==========
@@ -39,6 +39,11 @@ trap main_cleanup EXIT INT TERM HUP QUIT
 . /lib/functions.sh
 . /lib/functions/network.sh
 include /lib/network
+
+# ========== 参数消毒 ==========
+sanitize_param() {
+    echo "$1" | sed 's/[^a-zA-Z0-9_./:-]//g'
+}
 
 # ========== HFSC 与 CAKE 专属配置加载 ==========
 load_hfsc_cake_config() {
@@ -86,7 +91,13 @@ load_hfsc_cake_config() {
         CAKE_BANDWIDTH=""
     fi
 
+    # 读取 CAKE 参数
     CAKE_RTT=$(uci -q get ${CONFIG_FILE}.cake.rtt 2>/dev/null)
+    if [[ -n "$CAKE_RTT" ]] && ! echo "$CAKE_RTT" | grep -qiE '^[0-9]+(us|ms|s)$'; then
+        qos_log "WARN" "无效的 RTT 格式: $CAKE_RTT，将使用默认值 100ms"
+        CAKE_RTT="100ms"
+    fi
+
     CAKE_FLOWMODE=$(uci -q get ${CONFIG_FILE}.cake.flowmode 2>/dev/null)
     [[ -z "$CAKE_FLOWMODE" ]] && CAKE_FLOWMODE="srchost"
     CAKE_DIFFSERV=$(uci -q get ${CONFIG_FILE}.cake.diffserv_mode 2>/dev/null)
