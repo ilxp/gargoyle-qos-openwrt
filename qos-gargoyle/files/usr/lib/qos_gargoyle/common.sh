@@ -1,6 +1,6 @@
 #!/bin/bash
 # 核心库模块 (common.sh)
-# 版本: 3.4.4 - 修复日志优先级大小写问题，增强规则选项验证错误提示
+# 版本: 3.4.5 - 修复带宽单位转换支持 /s 后缀，更新 qos_interface 全局变量
 # 提供 QoS 系统基础功能
 
 # ========== 加载 OpenWrt 标准函数库 ==========
@@ -1175,9 +1175,12 @@ convert_bandwidth_to_kbit() {
     [[ -z "$bw" ]] && { log_error "带宽值为空"; return 1; }
     bw=$(echo "$bw" | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]')
     if [[ "$bw" =~ ^[0-9]+$ ]]; then echo "$bw"; return 0; fi
-    if [[ "$bw" =~ ^([0-9]+(\.[0-9]+)?)([a-z]+)$ ]]; then
+    # 支持可选的 /s 后缀，如 100Mbps、100Mbit/s、100mbit/s
+    if [[ "$bw" =~ ^([0-9]+(\.[0-9]+)?)([a-z]+)(/?s?)?$ ]]; then
         num="${BASH_REMATCH[1]}"
         unit="${BASH_REMATCH[3]}"
+        # 移除可能的单位内嵌 /（如 bit/s 中的 /）
+        unit="${unit%/*}"
         case "$unit" in
             kbit|kbits|kbit/s|kbps|kb|kib) multiplier=1 ;;
             mbit|mbits|mbit/s|mbps|mb|mib) multiplier=1000 ;;
@@ -1253,6 +1256,11 @@ load_bandwidth_from_config() {
         else
             log_info "下载总带宽: ${total_download_bandwidth}kbit/s"
         fi
+    fi
+    # 将检测到的 WAN 接口赋值给全局变量 qos_interface
+    if [[ -n "$wan_if" ]]; then
+        qos_interface="$wan_if"
+        log_info "已设置 WAN 接口: $qos_interface"
     fi
     return 0
 }

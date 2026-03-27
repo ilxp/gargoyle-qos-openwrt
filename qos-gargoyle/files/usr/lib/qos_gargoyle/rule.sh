@@ -1,6 +1,6 @@
 #!/bin/bash
 # 规则辅助模块 (rule.sh)
-# 版本: 3.4.7 - 修复动态分类标记值错误，增强参数验证
+# 版本: 3.4.9 - 完整修复：动态分类回退使用实际类标记、UDP/ACK参数验证、WAN接口检查
 # 完全移除锁机制，适配 procd 管理
 
 # 加载核心库（已修复）
@@ -30,8 +30,7 @@ get_wan_interface() {
 
 # ========== 辅助函数：调整协议以适应地址族 ==========
 adjust_proto_for_family() {
-    local proto="$1"
-    local family="$2"
+    local proto="$1" family="$2"
     local adjusted="$proto"
     [[ -z "$proto" || "$proto" == "all" ]] && { echo "$proto"; return 0; }
     case "$family" in
@@ -625,7 +624,7 @@ EOF
         echo "add element inet gargoyle-qos-priority class_mark { $elements }" >> "$tmp_nft_file"
     fi
 
-    # 3. 添加使用 map 的规则（使用 insert 确保在分类规则之前执行？但分类规则已经在 filter_qos_egress 链中，而 DSCP 映射应在分类之后执行，所以使用 add rule）
+    # 3. 添加使用 map 的规则（使用 add rule，确保在分类之后执行）
     cat << EOF >> "$tmp_nft_file"
 # DSCP mapping rules: apply after classification (use add rule)
 add rule inet gargoyle-qos-priority filter_qos_egress ct mark != 0 ip dscp set @class_mark[ct mark]
@@ -957,6 +956,13 @@ generate_udp_limit_rules() {
     [[ -z "$udp_action" ]] && udp_action="mark"
     [[ -z "$udp_mark_class" ]] && udp_mark_class="bulk"
 
+    # 获取 WAN 接口
+    local wan_if="${qos_interface:-$(uci -q get ${CONFIG_FILE}.global.wan_interface 2>/dev/null)}"
+    if [[ -z "$wan_if" ]]; then
+        qos_log "WARN" "无法确定 WAN 接口，UDP 速率限制规则将被跳过"
+        return
+    fi
+
     local upload_mark="" download_mark=""
     if [[ "$udp_action" == "mark" ]]; then
         if [[ -z "$upload_class_list" ]]; then
@@ -983,12 +989,6 @@ generate_udp_limit_rules() {
             qos_log "WARN" "UDP 速率限制目标类 '$udp_mark_class' 未同时存在于上传/下载类中，将回退到丢弃动作"
             udp_action="drop"
         fi
-    fi
-
-    local wan_if="${qos_interface:-$(uci -q get ${CONFIG_FILE}.global.wan_interface 2>/dev/null)}"
-    if [[ -z "$wan_if" ]]; then
-        qos_log "WARN" "无法确定 WAN 接口，UDP 速率限制规则将被跳过"
-        return
     fi
 
     local rules=""
@@ -1066,7 +1066,7 @@ create_bulk_client_rules() {
     [ "$min_bytes" -le 0 ] && min_bytes=10000
     [ "$min_connections" -le 1 ] && min_connections=10
     
-    # 获取完整的类标记值，而不是 DSCP
+    # 获取完整的类标记值
     local class_mark=""
     if [[ -n "$uci_class" ]]; then
         class_mark=$(get_class_mark "upload" "$uci_class" 2>/dev/null)
@@ -1086,8 +1086,8 @@ create_bulk_client_rules() {
         if [ -n "$lowest_class" ]; then
             class_mark=$(get_class_mark "upload" "$lowest_class" 2>/dev/null)
             if [ -z "$class_mark" ] || [ "$class_mark" -eq 0 ]; then
-                class_mark=8  # 回退标记值，对应 bulk 类（实际标记值通常为 8 或更高）
-                qos_log "警告" "批量客户端检测: 最低优先级类 '$lowest_class' 标记无效，使用回退标记 $class_mark"
+                qos_log "警告" "批量客户端检测: 最低优先级类 '$lowest_class' 标记无效，使用回退标记 8"
+                class_mark=8
             else
                 qos_log "信息" "批量客户端检测: 自动使用最低优先级类 '$lowest_class' (标记=$class_mark)"
             fi
@@ -1184,8 +1184,8 @@ create_high_throughput_service_rules() {
         if [ -n "$highest_class" ]; then
             class_mark=$(get_class_mark "upload" "$highest_class" 2>/dev/null)
             if [ -z "$class_mark" ] || [ "$class_mark" -eq 0 ]; then
-                class_mark=1  # 回退标记值，对应最高优先级类（通常标记值为 1）
-                qos_log "警告" "高吞吐服务检测: 最高优先级类 '$highest_class' 标记无效，使用回退标记 $class_mark"
+                qos_log "警告" "高吞吐服务检测: 最高优先级类 '$highest_class' 标记无效，使用回退标记 1"
+                class_mark=1
             else
                 qos_log "信息" "高吞吐服务检测: 自动使用最高优先级类 '$highest_class' (标记=$class_mark)"
             fi
@@ -1362,7 +1362,7 @@ apply_all_rules() {
     return 0
 }
 
-# 应用增强功能（ACK限速、TCP升级、UDP限速,动态分类） 修复：同时设置 meta mark 和 ct mark，并确保 UDP 规则插入链首
+# 应用增强功能（ACK限速、TCP升级、UDP限速,动态分类）
 apply_enhanced_features() {
     if [[ $ENABLE_ACK_LIMIT -eq 1 ]]; then
         qos_log "INFO" "ACK 限速已启用，生成规则..."
@@ -1397,8 +1397,7 @@ apply_enhanced_features() {
             register_temp_file "$tcp_file"
             echo "$tcp_upgrade_rules" | while IFS= read -r rule; do
                 [[ -z "$rule" ]] && continue
-                # 修复：同时设置 meta mark 和 ct mark，使用 insert 确保优先执行
-                # 注意：规则中已经包含 meta mark set 和 ct mark set，无需再次 sed
+                # 使用 insert 确保优先执行
                 echo "${rule/add rule/insert rule}" >> "$tcp_file"
             done
             qos_log "INFO" "TCP 升级规则文件内容:"
