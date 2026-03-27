@@ -1,9 +1,9 @@
 #!/bin/bash
 # 规则辅助模块 (rule.sh)
-# 版本: 3.4.9 - 完整修复：动态分类回退使用实际类标记、UDP/ACK参数验证、WAN接口检查
+# 版本: 3.4.10 - 修复 DSCP 映射统一、UDP 限速条件优化、移除未使用参数
 # 完全移除锁机制，适配 procd 管理
 
-# 加载核心库（已修复）
+# 加载核心库
 if [[ -f "/usr/lib/qos_gargoyle/common.sh" ]]; then
     . /usr/lib/qos_gargoyle/common.sh
 else
@@ -97,12 +97,12 @@ flags_to_mask() {
     printf "0x%x" "$mask"
 }
 
-# ========== 通用规则构建函数 ==========
+# ========== 通用规则构建函数（移除未使用的 mask 参数） ==========
 build_nft_rule_generic() {
-    local rule_name="$1" chain="$2" class_mark="$3" mask="$4" family="$5" proto="$6"
-    local srcport="$7" dstport="$8" connbytes_kb="$9" state="${10}" src_ip="${11}" dest_ip="${12}"
-    local packet_len="${13}" tcp_flags="${14}" iif="${15}" oif="${16}" udp_length="${17}"
-    local dscp="${18}" ttl="${19}" icmp_type="${20}"
+    local rule_name="$1" chain="$2" class_mark="$3" family="$4" proto="$5"
+    local srcport="$6" dstport="$7" connbytes_kb="$8" state="$9" src_ip="${10}" dest_ip="${11}"
+    local packet_len="${12}" tcp_flags="${13}" iif="${14}" oif="${15}" udp_length="${16}"
+    local dscp="${17}" ttl="${18}" icmp_type="${19}"
     
     local proto_v4=$(adjust_proto_for_family "$proto" "ipv4")
     local proto_v6=$(adjust_proto_for_family "$proto" "ipv6")
@@ -175,10 +175,8 @@ build_nft_rule_generic() {
             fi
         done
         if [[ -n "$set_flags" && -z "$unset_flags" ]]; then
-            # 只有正标志：使用集合形式（更直观，且不要求其他位为零）
             tcp_flag_expr="tcp flags { ${set_flags//,/ } }"
         elif [[ -n "$set_flags" || -n "$unset_flags" ]]; then
-            # 包含否定标志：使用掩码形式
             local mask_set=0
             local mask_unset=0
             if [[ -n "$set_flags" ]]; then
@@ -189,7 +187,6 @@ build_nft_rule_generic() {
             fi
             local total_mask=$((mask_set | mask_unset))
             if [[ $total_mask -ne 0 ]]; then
-                # 要求总掩码位中，set_flags 对应位必须为1，unset_flags 对应位必须为0
                 tcp_flag_expr="tcp flags & 0x$(printf '%x' "$total_mask") == 0x$(printf '%x' "$mask_set")"
             fi
         fi
@@ -459,7 +456,7 @@ build_nft_rule_generic() {
     done
 }
 
-# 辅助函数：构建 ICMP 条件（修复否定组合：使用 and 而非 or）
+# 辅助函数：构建 ICMP 条件
 build_icmp_cond() {
     local icmp_val="$1"
     local cond=""
@@ -468,7 +465,6 @@ build_icmp_cond() {
     if [[ "$icmp_val" == */* ]]; then
         local type="${icmp_val%/*}" code="${icmp_val#*/}"
         if [[ -n "$neg" ]]; then
-            # 否定组合：要求 type != type 且 code != code（即排除精确匹配）
             cond="(icmp type != $type) and (icmp code != $code)"
         else
             cond="icmp type $type icmp code $code"
@@ -479,98 +475,38 @@ build_icmp_cond() {
     echo "$cond"
 }
 
-# ========== class_mark 映射设置（直接规则，支持 priority 自动映射，适配 diffserv8） ==========
-setup_class_mark_map22() {
-    qos_log "信息" "设置 class_mark 映射（直接规则）..."
-    local tmp_nft_file=$(mktemp)
-    register_temp_file "$tmp_nft_file"
-
-    # 收集所有需要映射的标记和对应的 DSCP 值
-    declare -A mark_to_dscp
-
-    config_load "$CONFIG_FILE"
-
-    # 根据 priority 映射到标准 DSCP（适配 CAKE diffserv8）
-    map_priority_to_dscp() {
-        local priority="$1"
-        # 将 priority 映射到 diffserv8 的队列（1=最高，8=最低）
-        # 队列 1: EF (46)         - 语音/游戏
-        # 队列 2: AF41 (34)       - 视频会议
-        # 队列 3: AF31 (26)       - 高优先级数据
-        # 队列 4: AF21 (18)       - 中优先级数据
-        # 队列 5: AF11 (10)       - 低优先级数据 (CS1)
-        # 队列 6-8: CS0 (0)       - Best Effort
-        case "$priority" in
-            1) echo 46 ;;   # EF
-            2) echo 34 ;;   # AF41
-            3) echo 26 ;;   # AF31
-            4) echo 18 ;;   # AF21
-            5) echo 10 ;;   # AF11
-            *) echo 0 ;;    # 其他优先级默认 Best Effort (CS0)
-        esac
-    }
-
-    while IFS=: read -r dir cls mark_raw; do
-        [ -z "$dir" ] || [ -z "$cls" ] && continue
-        local cls_clean=$(echo "$cls" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' | tr -d '\r')
-        local mark="${mark_raw%%#*}"
-        mark=$(echo "$mark" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
-        [ -z "$mark" ] && continue
-
-        # 获取该类的 DSCP 值（优先使用用户配置的 dscp，否则根据 priority 自动映射）
-        local dscp_raw=$(uci -q get "${CONFIG_FILE}.${cls_clean}.dscp" 2>/dev/null)
-        local dscp=$(echo "$dscp_raw" | tr -d '\r' | tr -d '[:space:]')
-        if [ -z "$dscp" ]; then
-            # 未配置 dscp，根据 priority 自动映射
-            local priority=$(uci -q get "${CONFIG_FILE}.${cls_clean}.priority" 2>/dev/null)
-            # 如果 priority 未配置或无效，默认为 6（Best Effort）
-            if ! echo "$priority" | grep -qE '^[0-9]+$' || [ "$priority" -lt 1 ] 2>/dev/null; then
-                priority=6
-            fi
-            dscp=$(map_priority_to_dscp "$priority")
-            qos_log "调试" "类别 $cls_clean 未配置 DSCP，根据优先级 $priority 自动映射为 $dscp"
-        else
-            if ! [ "$dscp" -ge 0 ] 2>/dev/null || ! [ "$dscp" -le 63 ] 2>/dev/null; then
-                dscp=0
-            fi
-        fi
-
-        mark_to_dscp["$mark"]="$dscp"
-        qos_log "调试" "收集映射: 标记 $mark -> DSCP $dscp (类 $cls_clean)"
-    done < "$CLASS_MARKS_FILE"
-
-    # 生成直接设置 DSCP 的规则（使用 ct mark）
-    cat << EOF >> "$tmp_nft_file"
-# DSCP mapping rules: apply after classification (use add rule, not insert)
-EOF
-
-    for mark in "${!mark_to_dscp[@]}"; do
-        dscp="${mark_to_dscp[$mark]}"
-        cat << EOF >> "$tmp_nft_file"
-add rule inet gargoyle-qos-priority filter_qos_egress ct mark $mark ip dscp set $dscp
-add rule inet gargoyle-qos-priority filter_qos_egress ct mark $mark ip6 dscp set $dscp
-add rule inet gargoyle-qos-priority filter_qos_ingress ct mark $mark ip dscp set $dscp
-add rule inet gargoyle-qos-priority filter_qos_ingress ct mark $mark ip6 dscp set $dscp
-add rule inet gargoyle-qos-priority filter_qos_egress ct state established,related ct mark $mark ip dscp set $dscp
-add rule inet gargoyle-qos-priority filter_qos_egress ct state established,related ct mark $mark ip6 dscp set $dscp
-add rule inet gargoyle-qos-priority filter_qos_ingress ct state established,related ct mark $mark ip dscp set $dscp
-add rule inet gargoyle-qos-priority filter_qos_ingress ct state established,related ct mark $mark ip6 dscp set $dscp
-EOF
-    done
-
-    if nft -f "$tmp_nft_file" 2>&1 | logger -t qos_gargoyle; then
-        qos_log "信息" "class_mark 直接规则加载成功"
-        rm -f "$tmp_nft_file"
-        return 0
-    else
-        qos_log "错误" "加载 class_mark 直接规则失败"
-        cat "$tmp_nft_file" | logger -t qos_gargoyle
-        rm -f "$tmp_nft_file"
-        return 1
-    fi
+# ========== DSCP 映射函数（根据 diffserv 模式） ==========
+map_priority_to_dscp() {
+    local priority="$1"
+    local mode="${2:-diffserv4}"   # diffserv4 或 diffserv8，默认 diffserv4
+    case "$mode" in
+        diffserv8)
+            # diffserv8 映射：1=EF(46), 2=AF41(34), 3=AF31(26), 4=AF21(18), 5=AF11(10), 6=CS0(0), 7=CS1(8), 8=CS2(16)
+            case "$priority" in
+                1) echo 46 ;;
+                2) echo 34 ;;
+                3) echo 26 ;;
+                4) echo 18 ;;
+                5) echo 10 ;;
+                6) echo 0  ;;
+                7) echo 8  ;;
+                8) echo 16 ;;
+                *) echo 0 ;;
+            esac
+            ;;
+        diffserv4|*)
+            # diffserv4 映射：1=EF(46), 2=BE(0), 3=CS1(8), 其他=0
+            case "$priority" in
+                1) echo 46 ;;
+                2) echo 0  ;;
+                3) echo 8  ;;
+                *) echo 0 ;;
+            esac
+            ;;
+    esac
 }
 
-# ========== class_mark 映射设置（使用 map，性能最优） ==========
+# ========== class_mark 映射设置（使用 map，支持 diffserv 模式） ==========
 setup_class_mark_map() {
     qos_log "信息" "设置 class_mark 映射（map 方式）..."
     local tmp_nft_file=$(mktemp)
@@ -584,6 +520,10 @@ EOF
 
     config_load "$CONFIG_FILE"
 
+    # 获取 CAKE diffserv 模式（用于自动映射）
+    local diffserv_mode=$(uci -q get ${CONFIG_FILE}.cake.diffserv_mode 2>/dev/null)
+    [[ -z "$diffserv_mode" ]] && diffserv_mode="diffserv4"
+
     # 2. 从 class_marks 文件读取标记，并收集 map 元素
     local elements=""
     while IFS=: read -r dir cls mark_raw; do
@@ -593,21 +533,16 @@ EOF
         mark=$(echo "$mark" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
         [ -z "$mark" ] && continue
 
-        # 获取 DSCP（优先使用用户配置的 dscp，否则根据 priority 映射）
+        # 获取 DSCP（优先使用用户配置的 dscp，否则根据 priority 和 diffserv 模式自动映射）
         local dscp_raw=$(uci -q get "${CONFIG_FILE}.${cls_clean}.dscp" 2>/dev/null)
         local dscp=$(echo "$dscp_raw" | tr -d '\r' | tr -d '[:space:]')
         if [ -z "$dscp" ]; then
             local priority=$(uci -q get "${CONFIG_FILE}.${cls_clean}.priority" 2>/dev/null)
             if ! echo "$priority" | grep -qE '^[0-9]+$' || [ "$priority" -lt 1 ] 2>/dev/null; then
-                priority=2
+                priority=2   # 默认中等优先级
             fi
-            # 根据 priority 映射到 diffserv4 标准 DSCP
-            case "$priority" in
-                1) dscp=46 ;;  # Voice (EF)
-                2) dscp=0 ;;   # Best Effort (CS0)
-                3) dscp=8 ;;   # Bulk (CS1)
-                *) dscp=0 ;;
-            esac
+            dscp=$(map_priority_to_dscp "$priority" "$diffserv_mode")
+            qos_log "调试" "类别 $cls_clean 未配置 DSCP，根据优先级 $priority 自动映射为 $dscp (模式 $diffserv_mode)"
         else
             if ! [ "$dscp" -ge 0 ] 2>/dev/null || ! [ "$dscp" -le 63 ] 2>/dev/null; then
                 dscp=0
@@ -646,7 +581,6 @@ EOF
         qos_log "错误" "加载 class_mark map 规则失败"
         cat "$tmp_nft_file" | logger -t qos_gargoyle
         rm -f "$tmp_nft_file"
-        # 可选：回退到直接规则（如果需要，可在这里调用直接规则函数）
         return 1
     fi
 }
@@ -793,7 +727,7 @@ apply_enhanced_direction_rules() {
             for dstp in "${dstport_list[@]}"; do
                 for srcip in "${src_ip_list[@]}"; do
                     for dstip in "${dest_ip_list[@]}"; do
-                        build_nft_rule_generic "$rule_name" "$chain" "$class_mark" "$mask" "$tmp_family" "$tmp_proto" \
+                        build_nft_rule_generic "$rule_name" "$chain" "$class_mark" "$tmp_family" "$tmp_proto" \
                             "$srcp" "$dstp" "$tmp_connbytes_kb" "$tmp_state" "$srcip" "$dstip" \
                             "$tmp_packet_len" "$tmp_tcp_flags" "$tmp_iif" "$tmp_oif" "$tmp_udp_length" \
                             "$tmp_dscp" "$tmp_ttl" "$tmp_icmp_type" >> "$nft_batch_file"
@@ -875,13 +809,11 @@ generate_ack_limit_rules() {
     local ack_enabled=$(uci -q get ${CONFIG_FILE}.ack_limit.enabled 2>/dev/null)
     case "$ack_enabled" in 1|yes|true|on) ;; *) return ;; esac
 
-    # 读取配置并验证数值
     local slow_rate=$(uci -q get ${CONFIG_FILE}.ack_limit.slow_rate 2>/dev/null)
     local med_rate=$(uci -q get ${CONFIG_FILE}.ack_limit.med_rate 2>/dev/null)
     local fast_rate=$(uci -q get ${CONFIG_FILE}.ack_limit.fast_rate 2>/dev/null)
     local xfast_rate=$(uci -q get ${CONFIG_FILE}.ack_limit.xfast_rate 2>/dev/null)
 
-    # 验证并设置默认值
     if ! validate_number "$slow_rate" "ack_limit.slow_rate" 1 100000 2>/dev/null; then
         slow_rate=50
         qos_log "WARN" "ACK slow_rate 无效，使用默认值 50"
@@ -910,11 +842,9 @@ EOF
 
 # ========== TCP 升级规则 ==========
 generate_tcp_upgrade_rules() {
-    # 从 UCI 读取启用状态（独立节）
     local tcp_enabled=$(uci -q get ${CONFIG_FILE}.tcp_upgrade.enabled 2>/dev/null)
     case "$tcp_enabled" in 1|yes|true|on) ;; *) return ;; esac
 
-    # 获取上传方向优先级最高的启用的类
     local highest_class=$(get_highest_priority_class "upload")
     if [[ -z "$highest_class" ]]; then
         log_warn "TCP升级：未找到任何启用的上传类，将禁用此功能"
@@ -934,7 +864,7 @@ add rule inet gargoyle-qos-priority filter_qos_egress meta l4proto tcp ct state 
 EOF
 }
 
-# ========== UDP 限速规则 ==========
+# ========== UDP 限速规则（添加 ct mark == 0 条件） ==========
 generate_udp_limit_rules() {
     local udp_enable=$(uci -q get ${CONFIG_FILE}.udp_limit.enabled 2>/dev/null)
     local udp_rate=$(uci -q get ${CONFIG_FILE}.udp_limit.rate 2>/dev/null)
@@ -947,7 +877,6 @@ generate_udp_limit_rules() {
         return
     fi
 
-    # 验证速率值
     if ! validate_number "$udp_rate" "udp_limit.rate" 1 1000000 2>/dev/null; then
         qos_log "WARN" "UDP 速率值无效，使用默认 450"
         udp_rate=450
@@ -956,7 +885,6 @@ generate_udp_limit_rules() {
     [[ -z "$udp_action" ]] && udp_action="mark"
     [[ -z "$udp_mark_class" ]] && udp_mark_class="bulk"
 
-    # 获取 WAN 接口
     local wan_if="${qos_interface:-$(uci -q get ${CONFIG_FILE}.global.wan_interface 2>/dev/null)}"
     if [[ -z "$wan_if" ]]; then
         qos_log "WARN" "无法确定 WAN 接口，UDP 速率限制规则将被跳过"
@@ -993,14 +921,16 @@ generate_udp_limit_rules() {
 
     local rules=""
     if [[ "$udp_action" == "mark" ]] && [[ -n "$upload_mark" ]] && [[ -n "$download_mark" ]]; then
+        # 添加条件 ct mark & 0x3f == 0，避免覆盖已分类的流量
         rules="${rules}
-# Global UDP rate limit - upload direction (mark)
-add rule inet gargoyle-qos-priority filter_qos_egress oifname \"$wan_if\" meta l4proto udp limit rate over ${udp_rate}/second counter meta mark set $upload_mark ct mark set $upload_mark
-# Global UDP rate limit - download direction (mark)
-add rule inet gargoyle-qos-priority filter_qos_ingress iifname \"$wan_if\" meta l4proto udp limit rate over ${udp_rate}/second counter meta mark set $download_mark ct mark set $download_mark"
+# Global UDP rate limit - upload direction (mark) - only for unclassified flows
+add rule inet gargoyle-qos-priority filter_qos_egress oifname \"$wan_if\" meta l4proto udp ct mark & 0x3f == 0 limit rate over ${udp_rate}/second counter meta mark set $upload_mark ct mark set $upload_mark
+# Global UDP rate limit - download direction (mark) - only for unclassified flows
+add rule inet gargoyle-qos-priority filter_qos_ingress iifname \"$wan_if\" meta l4proto udp ct mark & 0x3f == 0 limit rate over ${udp_rate}/second counter meta mark set $download_mark ct mark set $download_mark"
     elif [[ "$udp_action" == "drop" ]]; then
+        # 丢弃规则也应避免覆盖已分类的流量，但丢弃无影响，可以不设条件
         rules="${rules}
-# Global UDP rate limit - drop
+# Global UDP rate limit - drop (applies to all UDP)
 add rule inet gargoyle-qos-priority filter_qos_egress meta l4proto udp limit rate over ${udp_rate}/second counter drop
 add rule inet gargoyle-qos-priority filter_qos_ingress meta l4proto udp limit rate over ${udp_rate}/second counter drop"
     fi
@@ -1012,7 +942,6 @@ add rule inet gargoyle-qos-priority filter_qos_ingress meta l4proto udp limit ra
 check_meter_support() {
     local test_file=$(mktemp)
     register_temp_file "$test_file"
-    # 使用与动态分类相同的 meter 结构进行测试
     cat > "$test_file" <<EOF
 add table inet qos_meter_test
 add set inet qos_meter_test test_set { type ipv4_addr . inet_service . inet_proto; flags timeout; }
@@ -1066,7 +995,6 @@ create_bulk_client_rules() {
     [ "$min_bytes" -le 0 ] && min_bytes=10000
     [ "$min_connections" -le 1 ] && min_connections=10
     
-    # 获取完整的类标记值
     local class_mark=""
     if [[ -n "$uci_class" ]]; then
         class_mark=$(get_class_mark "upload" "$uci_class" 2>/dev/null)
@@ -1080,7 +1008,6 @@ create_bulk_client_rules() {
             qos_log "信息" "批量客户端检测: 使用用户指定的类 '$uci_class' (标记=$class_mark)"
         fi
     fi
-    # 如果用户未配置类或配置无效，则自动选择最低优先级类
     if [ -z "$class_mark" ]; then
         local lowest_class=$(get_lowest_priority_class "upload")
         if [ -n "$lowest_class" ]; then
@@ -1111,7 +1038,6 @@ create_bulk_client_rules() {
         return 0
     fi
 
-    # meter 规则（已修复语法）
     nft add rule inet gargoyle-qos-priority qos_established_connection \
         meter qos_bulk_detect '{ ip daddr . th dport . meta l4proto timeout 5s limit rate over '"$((min_connections - 1))"'/minute }' \
         add @qos_bulk_clients '{ ip daddr . th dport . meta l4proto timeout 30s }' 2>/dev/null || true
@@ -1206,7 +1132,6 @@ create_high_throughput_service_rules() {
     nft add chain inet gargoyle-qos-priority qos_high_throughput_service 2>/dev/null || true
     nft add chain inet gargoyle-qos-priority qos_high_throughput_service_reply 2>/dev/null || true
 
-    # meter 规则（已修复语法）
     nft add rule inet gargoyle-qos-priority qos_established_connection \
         meter qos_htp_detect '{ ip daddr . ip saddr and 255.255.255.0 . th sport . meta l4proto timeout 5s limit rate over '"$((min_connections - 1))"'/minute }' \
         add @qos_high_throughput_services '{ ip daddr . ip saddr and 255.255.255.0 . th sport . meta l4proto timeout 30s }' 2>/dev/null || true
@@ -1239,12 +1164,10 @@ setup_dynamic_classification() {
     nft add chain inet gargoyle-qos-priority qos_dynamic_classify 2>/dev/null || true
     nft add chain inet gargoyle-qos-priority qos_dynamic_classify_reply 2>/dev/null || true
 
-    # 为已建立的连接添加检测（动态分类的核心，必须插入）
     nft insert rule inet gargoyle-qos-priority filter_forward ct state established jump qos_established_connection 2>/dev/null || true
     nft insert rule inet gargoyle-qos-priority filter_input ct state established jump qos_established_connection 2>/dev/null || true
     nft insert rule inet gargoyle-qos-priority filter_output ct state established jump qos_established_connection 2>/dev/null || true
 
-    # 动态分类跳转（仅当 ct mark 为 0 时，确保在静态分类之前执行）
     nft insert rule inet gargoyle-qos-priority filter_input "ct mark & 0x3f == 0" jump qos_dynamic_classify 2>/dev/null || true
     nft insert rule inet gargoyle-qos-priority filter_output "ct mark & 0x3f == 0" jump qos_dynamic_classify 2>/dev/null || true
     nft insert rule inet gargoyle-qos-priority filter_forward "ct mark & 0x3f == 0" jump qos_dynamic_classify 2>/dev/null || true
@@ -1420,7 +1343,7 @@ apply_enhanced_features() {
         if [[ -n "$udp_limit_rules" ]]; then
             local udp_file=$(mktemp)
             register_temp_file "$udp_file"
-            # 规则已经直接包含 meta mark set 和 ct mark set，直接使用 insert
+            # 规则已经包含条件，使用 insert 确保在分类之前执行
             udp_limit_rules=$(echo "$udp_limit_rules" | sed 's/^add rule/insert rule/')
             echo "$udp_limit_rules" > "$udp_file"
             qos_log "INFO" "UDP 限速规则文件内容:"
