@@ -1,6 +1,6 @@
 #!/bin/bash
 # HFSC_CAKE算法实现模块
-# 版本: 3.4.4 - 修复 CAKE 带宽指定，修复 check_cake_param_support 回退 lo
+# 版本: 3.4.5 - 修复 DELETE_IFB_ON_STOP 未读取、类配置变量重置、参数验证
 # 基于HFSC与CAKE组合算法实现QoS流量控制。
 
 # ========== 全局配置常量 ==========
@@ -57,11 +57,25 @@ load_hfsc_cake_config() {
         qos_log "WARN" "IFB设备未通过环境变量传递，从 UCI 读取: $IFB_DEVICE"
     fi
 
+    # 读取 HFSC 参数
     HFSC_LATENCY_MODE=$(uci -q get ${CONFIG_FILE}.hfsc.latency_mode 2>/dev/null)
     HFSC_MINRTT_ENABLED=$(uci -q get ${CONFIG_FILE}.hfsc.minrtt_enabled 2>/dev/null)
     [[ -z "$HFSC_MINRTT_ENABLED" ]] && HFSC_MINRTT_ENABLED=0
     HFSC_MINRTT_DELAY=$(uci -q get ${CONFIG_FILE}.hfsc.minrtt_delay 2>/dev/null)
     [[ -z "$HFSC_MINRTT_DELAY" ]] && HFSC_MINRTT_DELAY="1000us"
+
+    # 验证 MINRTT_DELAY 格式
+    if [[ -n "$HFSC_MINRTT_DELAY" ]] && ! echo "$HFSC_MINRTT_DELAY" | grep -qiE '^[0-9]+(us|ms|s)$'; then
+        qos_log "WARN" "无效的 minrtt_delay 格式 '$HFSC_MINRTT_DELAY'，使用默认值 1000us"
+        HFSC_MINRTT_DELAY="1000us"
+    fi
+
+    # 读取 DELETE_IFB_ON_STOP 配置
+    local delete_ifb=$(uci -q get ${CONFIG_FILE}.cake.delete_ifb_on_stop 2>/dev/null)
+    case "$delete_ifb" in
+        1|yes|true|on) DELETE_IFB_ON_STOP=1 ;;
+        *) DELETE_IFB_ON_STOP=0 ;;
+    esac
 
     # 强制忽略 CAKE_BANDWIDTH，防止二次整形
     local cake_bw=$(uci -q get ${CONFIG_FILE}.cake.bandwidth 2>/dev/null)
@@ -108,10 +122,16 @@ load_hfsc_cake_config() {
     return 0
 }
 
-# 加载HFSC类别配置（使用全局变量传递）
+# 加载HFSC类别配置（使用全局变量传递，并在函数开头重置）
 load_hfsc_class_config() {
     local class_name="$1"
-    local percent_bandwidth per_min_bandwidth per_max_bandwidth minRTT priority name
+    # 重置全局变量，避免前一个类的配置残留
+    HFSC_CLASS_PERCENT=""
+    HFSC_CLASS_MIN=""
+    HFSC_CLASS_MAX=""
+    HFSC_CLASS_MINRTT=""
+    HFSC_CLASS_NAME=""
+
     qos_log "INFO" "加载HFSC类别配置: $class_name"
     percent_bandwidth=$(uci -q get ${CONFIG_FILE}.$class_name.percent_bandwidth 2>/dev/null)
     per_min_bandwidth=$(uci -q get ${CONFIG_FILE}.$class_name.per_min_bandwidth 2>/dev/null)
