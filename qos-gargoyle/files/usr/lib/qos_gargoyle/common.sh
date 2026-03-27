@@ -1,6 +1,6 @@
 #!/bin/bash
 # 核心库模块 (common.sh)
-# 版本: 3.4.6 - 修复内存限制大小写、清理未使用变量、增强带宽转换、PID检查优化
+# 版本: 3.4.7 - 移除未使用变量、增加 UCI 缓存刷新函数、优化错误日志
 # 提供 QoS 系统基础功能
 
 # ========== 加载 OpenWrt 标准函数库 ==========
@@ -34,7 +34,6 @@ if [[ -z "$_QOS_LIB_SH_LOADED" ]]; then
     ENABLE_ACK_LIMIT=0
     ENABLE_TCP_UPGRADE=0
     SAVE_NFT_RULES=0
-    # 移除未使用的 ACK_* 变量，具体速率由 UCI 配置
     UDP_RATE_LIMIT_ENABLE=0
     UDP_RATE_LIMIT_RATE=450
     UDP_RATE_LIMIT_ACTION="mark"
@@ -44,8 +43,6 @@ if [[ -z "$_QOS_LIB_SH_LOADED" ]]; then
     _QOS_TABLE_FLUSHED=0
     _IPSET_LOADED=0
     _HOOKS_SETUP=0
-    _UCI_CONFIG_CACHED=0
-    _UCI_CACHE_FILE=""
     _EBPF_LOADED=0
 
     declare -A UCI_CACHE
@@ -58,7 +55,6 @@ fi
 check_already_running() {
     if [ -f "$QOS_RUNNING_FILE" ]; then
         local old_pid=$(cat "$QOS_RUNNING_FILE" 2>/dev/null)
-        # 验证 PID 是否为数字且进程存在
         if [[ "$old_pid" =~ ^[0-9]+$ ]] && kill -0 "$old_pid" 2>/dev/null; then
             return 1
         else
@@ -172,6 +168,23 @@ load_global_config() {
 
     val=$(uci -q get ${CONFIG_FILE}.global.enable_dynamic_classify 2>/dev/null)
     case "$val" in 1|yes|true|on) ENABLE_DYNAMIC_CLASSIFY=1 ;; *) ENABLE_DYNAMIC_CLASSIFY=0 ;; esac
+}
+
+# ========== UCI 缓存刷新函数 ==========
+refresh_uci_cache() {
+    log_debug "刷新 UCI 配置缓存"
+    unset UCI_CACHE 2>/dev/null
+    declare -A UCI_CACHE
+    while IFS= read -r line; do
+        [[ -z "$line" ]] && continue
+        local key="${line%%=*}"
+        local val="${line#*=}"
+        val="${val#\'}"; val="${val%\'}"
+        if [[ "$key" == "${CONFIG_FILE}."* ]]; then
+            UCI_CACHE["$key"]="$val"
+        fi
+    done < <(uci show "${CONFIG_FILE}" 2>/dev/null)
+    log_debug "UCI 缓存刷新完成，共 ${#UCI_CACHE[@]} 个选项"
 }
 
 # ========== eBPF 支持函数 ==========
@@ -1159,11 +1172,9 @@ convert_bandwidth_to_kbit() {
     [[ -z "$bw" ]] && { log_error "带宽值为空"; return 1; }
     bw=$(echo "$bw" | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]')
     if [[ "$bw" =~ ^[0-9]+$ ]]; then echo "$bw"; return 0; fi
-    # 支持可选的 /s 后缀，如 100Mbps、100Mbit/s、100mbit/s
     if [[ "$bw" =~ ^([0-9]+(\.[0-9]+)?)([a-z]+)(/?s?)?$ ]]; then
         num="${BASH_REMATCH[1]}"
         unit="${BASH_REMATCH[3]}"
-        # 移除可能的单位内嵌 /（如 bit/s 中的 /）
         unit="${unit%/*}"
         case "$unit" in
             kbit|kbits|kbit/s|kbps|kb|kib) multiplier=1 ;;
@@ -1174,7 +1185,6 @@ convert_bandwidth_to_kbit() {
             g|gb|gib) multiplier=8000000 ;;
             *) log_error "未知带宽单位: $unit"; return 1 ;;
         esac
-        # 使用 bc 或 awk 计算，确保精度
         if command -v bc >/dev/null 2>&1; then
             result=$(echo "$num * $multiplier" | bc | awk '{printf "%.0f", $1}')
         else
@@ -1300,7 +1310,7 @@ ensure_ifb_device() {
     return 1
 }
 
-# ========== 检查 tc connmark 支持（修复 dummy 设备回退） ==========
+# ========== 检查 tc connmark 支持 ==========
 check_tc_connmark_support() {
     modprobe sch_ingress 2>/dev/null
     modprobe act_connmark 2>/dev/null
@@ -1342,7 +1352,7 @@ check_sfo_enabled() {
     fi
 }
 
-# ========== 检查 tc ctinfo 支持（修复 dummy 设备回退） ==========
+# ========== 检查 tc ctinfo 支持 ==========
 check_tc_ctinfo_support() {
     local dummy_dev="qos_test_ctinfo_$$"
     local created=0
@@ -1435,11 +1445,10 @@ restore_main_config() {
     log_info "已清理规则集标记"
 }
 
-# ========== 内存限制计算（增强版，支持大小写不敏感） ==========
+# ========== 内存限制计算（增强版） ==========
 calculate_memory_limit() {
     local config_value="$1" result
     [[ -z "$config_value" ]] && { echo ""; return; }
-    # 转为小写，便于匹配
     local lower_val=$(echo "$config_value" | tr '[:upper:]' '[:lower:]')
     if [[ "$lower_val" == "auto" ]]; then
         local total_mem_mb=0
@@ -1475,9 +1484,8 @@ calculate_memory_limit() {
             log_warn "无法读取内存信息，使用默认值 16Mb"; result="16Mb"
         fi
     else
-        # 大小写不敏感匹配：支持 "32mb", "32Mb", "32MB", "32mB"
         if [[ "$lower_val" =~ ^[0-9]+mb$ ]]; then
-            result="$config_value"  # 保留用户原始大小写
+            result="$config_value"
             log_info "使用用户配置的 memlimit: ${result}"
         else
             log_warn "无效的 memlimit 格式 '$config_value'，使用默认值 16Mb"; result="16Mb"
@@ -1486,7 +1494,7 @@ calculate_memory_limit() {
     echo "$result"
 }
 
-# ========== 获取最高优先级的类名称（修复：检查 enabled） ==========
+# ========== 获取最高优先级的类名称 ==========
 get_highest_priority_class() {
     local direction="$1"
     local class_list=""
@@ -1514,7 +1522,7 @@ get_highest_priority_class() {
     echo "$best_class"
 }
 
-# 获取最低优先级的类（priority 数值最大的启用类）
+# 获取最低优先级的类
 get_lowest_priority_class() {
     local direction="$1"
     local class_list=""
@@ -1542,7 +1550,7 @@ get_lowest_priority_class() {
     echo "$best_class"
 }
 
-# ========== 自动测速（增加交互超时，安装后验证） ==========
+# ========== 自动测速 ==========
 auto_speedtest() {
     local noninteractive=0 force=0 gaming_ip=""
     local WAN_IF="" DOWNLOAD_SPEED="" UPLOAD_SPEED="" SPEEDTEST_CMD=""
