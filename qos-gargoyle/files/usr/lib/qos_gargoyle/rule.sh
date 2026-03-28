@@ -1,6 +1,6 @@
 #!/bin/bash
 # 规则辅助模块 (rule.sh)
-# 版本: 3.5.6 - ack tcp udp 新语法
+# 版本: 3.5.7 - ack tcp udp 新语法
 # 完全移除锁机制，适配 procd 管理
 
 # 加载核心库
@@ -1127,36 +1127,33 @@ cleanup_dynamic_detection() {
     nft delete set inet ${NFT_TABLE} qos_high_throughput_services6 2>/dev/null || true
 }
 
-# ========== 批量客户端检测（修复 meter 语法，增加支持检测） ==========
+# ========== 批量客户端检测（基于源 IP 连接建立速率） ==========
 create_bulk_client_rules() {
-    local enabled=1 min_bytes=10000 min_connections=10 class="bulk"
-    local bulk_section="bulk_detect"  # 先定义变量
-    
-    # 检查 meter 支持
-    if ! check_meter_support; then
-        qos_log "WARN" "内核不支持 nftables meter 关键字，动态分类 '$bulk_section' 功能已禁用"
-        return 0
+    # 检查 WAN 接口
+    if [[ -z "$qos_interface" ]]; then
+        qos_log "WARN" "无法确定 WAN 接口，批量客户端检测功能将被禁用"
+        return 1
     fi
+
+    local enabled=1 min_connections=10 class="bulk"
+    local bulk_section="bulk_detect"
     
+    # 读取用户配置
     local uci_enabled=$(uci -q get ${CONFIG_FILE}.${bulk_section}.enabled 2>/dev/null)
     [ -n "$uci_enabled" ] && enabled="$uci_enabled"
-    local uci_min_bytes=$(uci -q get ${CONFIG_FILE}.${bulk_section}.min_bytes 2>/dev/null)
-    [ -n "$uci_min_bytes" ] && min_bytes="$uci_min_bytes"
     local uci_min_connections=$(uci -q get ${CONFIG_FILE}.${bulk_section}.min_connections 2>/dev/null)
     [ -n "$uci_min_connections" ] && min_connections="$uci_min_connections"
     local uci_class=$(uci -q get ${CONFIG_FILE}.${bulk_section}.class 2>/dev/null)
     [ -n "$uci_class" ] && class="$uci_class"
 
     [ "$enabled" != "1" ] && return 0
-    if ! validate_number "$min_bytes" "bulk_detect.min_bytes" 1 1000000000 2>/dev/null; then
-        qos_log "WARN" "min_bytes 无效，使用默认值 10000"
-        min_bytes=10000
-    fi
+
     if ! validate_number "$min_connections" "bulk_detect.min_connections" 1 10000 2>/dev/null; then
         qos_log "WARN" "min_connections 无效，使用默认值 10"
         min_connections=10
     fi
-    
+
+    # 获取最低优先级类的标记
     local upload_mark="" download_mark=""
     if [[ -n "$uci_class" ]]; then
         upload_mark=$(get_class_mark "upload" "$uci_class" 2>/dev/null)
@@ -1190,62 +1187,61 @@ create_bulk_client_rules() {
         fi
     fi
 
-    nft add set inet ${NFT_TABLE} qos_bulk_clients '{ type ipv4_addr . inet_service . inet_proto; flags timeout; }' 2>/dev/null || true
-    nft add set inet ${NFT_TABLE} qos_bulk_clients6 '{ type ipv6_addr . inet_service . inet_proto; flags timeout; }' 2>/dev/null || true
+    # 创建用于记录被限速客户端的动态集合
+    nft add set inet ${NFT_TABLE} qos_bulk_clients4 '{ typeof ip saddr; flags dynamic, timeout; timeout 30s; }' 2>/dev/null || {
+        qos_log "ERROR" "无法创建 IPv4 批量客户端集合"
+        return 1
+    }
+    nft add set inet ${NFT_TABLE} qos_bulk_clients6 '{ typeof ip6 saddr; flags dynamic, timeout; timeout 30s; }' 2>/dev/null || {
+        qos_log "ERROR" "无法创建 IPv6 批量客户端集合"
+        return 1
+    }
 
-    nft add chain inet ${NFT_TABLE} qos_established_connection 2>/dev/null || true
-    nft add chain inet ${NFT_TABLE} qos_dynamic_classify 2>/dev/null || true
-    nft add chain inet ${NFT_TABLE} qos_dynamic_classify_reply 2>/dev/null || true
-    nft add chain inet ${NFT_TABLE} qos_bulk_client 2>/dev/null || true
-    nft add chain inet ${NFT_TABLE} qos_bulk_client_reply 2>/dev/null || true
+    # 创建新连接检测链
+    nft add chain inet ${NFT_TABLE} qos_new_connection 2>/dev/null || true
+    nft flush chain inet ${NFT_TABLE} qos_new_connection 2>/dev/null || true
 
-    # 建立连接检测（上行）：将源 IP+源端口加入集合（修复 meter 语法）
-    nft add rule inet ${NFT_TABLE} qos_established_connection \
-        meter qos_bulk_detect { ip saddr . th sport . meta l4proto timeout 5s } \
-        limit rate over $((min_connections - 1))/minute \
-        add @qos_bulk_clients { ip saddr . th sport . meta l4proto timeout 30s } 2>/dev/null || true
+    # 在 filter_forward 中插入规则：当 ct state new 且未标记时，跳转到 qos_new_connection（追加到末尾）
+    nft add rule inet ${NFT_TABLE} filter_forward "ct state new ct mark == 0 jump qos_new_connection" 2>/dev/null || true
 
-    nft add rule inet ${NFT_TABLE} qos_established_connection \
-        meter qos_bulk_detect6 { ip6 saddr . th sport . meta l4proto timeout 5s } \
-        limit rate over $((min_connections - 1))/minute \
-        add @qos_bulk_clients6 { ip6 saddr . th sport . meta l4proto timeout 30s } 2>/dev/null || true
+    # 在新连接链中，对每个源 IP 进行限速检测，仅将超限 IP 加入集合，不设置标记
+    nft add rule inet ${NFT_TABLE} qos_new_connection meta nfproto ipv4 \
+        ip saddr limit rate over ${min_connections}/minute \
+        update @qos_bulk_clients4 { ip saddr } counter 2>/dev/null || true
 
-    # 上行流量：匹配后设置上传标记
-    nft add rule inet ${NFT_TABLE} qos_bulk_client \
-        ip saddr . th sport . meta l4proto @qos_bulk_clients \
-        meta mark set $upload_mark ct mark set $upload_mark return 2>/dev/null || true
+    nft add rule inet ${NFT_TABLE} qos_new_connection meta nfproto ipv6 \
+        ip6 saddr limit rate over ${min_connections}/minute \
+        update @qos_bulk_clients6 { ip6 saddr } counter 2>/dev/null || true
 
-    nft add rule inet ${NFT_TABLE} qos_bulk_client \
-        ip6 saddr . th sport . meta l4proto @qos_bulk_clients6 \
-        meta mark set $upload_mark ct mark set $upload_mark return 2>/dev/null || true
+    # 上行规则：源 IP 在集合中且未标记时，设置上传标记
+    nft add rule inet ${NFT_TABLE} filter_forward oifname "$qos_interface" ct mark == 0 \
+        ip saddr @qos_bulk_clients4 meta mark set $upload_mark ct mark set $upload_mark 2>/dev/null || true
+    nft add rule inet ${NFT_TABLE} filter_forward oifname "$qos_interface" ct mark == 0 \
+        ip6 saddr @qos_bulk_clients6 meta mark set $upload_mark ct mark set $upload_mark 2>/dev/null || true
 
-    # 下行流量：匹配后设置下载标记
-    nft add rule inet ${NFT_TABLE} qos_bulk_client_reply \
-        ip daddr . th dport . meta l4proto @qos_bulk_clients \
-        meta mark set $download_mark ct mark set $download_mark return 2>/dev/null || true
+    # 下行规则：目的 IP 在集合中，且当前未标记或已标记为上传标记时，设置下载标记
+    nft add rule inet ${NFT_TABLE} filter_forward iifname "$qos_interface" \
+        ct mark == 0 ip daddr @qos_bulk_clients4 meta mark set $download_mark ct mark set $download_mark 2>/dev/null || true
+    nft add rule inet ${NFT_TABLE} filter_forward iifname "$qos_interface" \
+        ct mark == $upload_mark ip daddr @qos_bulk_clients4 meta mark set $download_mark ct mark set $download_mark 2>/dev/null || true
+    nft add rule inet ${NFT_TABLE} filter_forward iifname "$qos_interface" \
+        ct mark == 0 ip6 daddr @qos_bulk_clients6 meta mark set $download_mark ct mark set $download_mark 2>/dev/null || true
+    nft add rule inet ${NFT_TABLE} filter_forward iifname "$qos_interface" \
+        ct mark == $upload_mark ip6 daddr @qos_bulk_clients6 meta mark set $download_mark ct mark set $download_mark 2>/dev/null || true
 
-    nft add rule inet ${NFT_TABLE} qos_bulk_client_reply \
-        ip6 daddr . th dport . meta l4proto @qos_bulk_clients6 \
-        meta mark set $download_mark ct mark set $download_mark return 2>/dev/null || true
-
-    # 挂载规则到动态分类链
-    nft add rule inet ${NFT_TABLE} qos_dynamic_classify "ct mark == 0" ip saddr . th sport . meta l4proto @qos_bulk_clients goto qos_bulk_client 2>/dev/null || true
-    nft add rule inet ${NFT_TABLE} qos_dynamic_classify "ct mark == 0" ip6 saddr . th sport . meta l4proto @qos_bulk_clients6 goto qos_bulk_client 2>/dev/null || true
-    nft add rule inet ${NFT_TABLE} qos_dynamic_classify_reply "ct mark == 0" ip daddr . th dport . meta l4proto @qos_bulk_clients goto qos_bulk_client_reply 2>/dev/null || true
-    nft add rule inet ${NFT_TABLE} qos_dynamic_classify_reply "ct mark == 0" ip6 daddr . th dport . meta l4proto @qos_bulk_clients6 goto qos_bulk_client_reply 2>/dev/null || true
-
-    qos_log "信息" "批量客户端检测已启用: 最小连接数=$min_connections, 最小字节数=$min_bytes 字节/秒, 上传标记=$upload_mark, 下载标记=$download_mark"
+    qos_log "信息" "批量客户端检测已启用: 最小连接数=${min_connections}/分钟, 上传标记=$upload_mark, 下载标记=$download_mark"
+    return 0
 }
 
-# ========== 高吞吐服务检测（修复 meter 语法，增加支持检测） ==========
 create_high_throughput_service_rules() {
-    local enabled=1 min_bytes=1000000 min_connections=3 class="realtime"
-    local htp_section="htp_detect"  # 先定义变量
-    
-    if ! check_meter_support; then
-        qos_log "WARN" "内核不支持 nftables meter 关键字，动态分类 '$htp_section' 功能已禁用"
-        return 0
+    # 检查 WAN 接口
+    if [[ -z "$qos_interface" ]]; then
+        qos_log "WARN" "无法确定 WAN 接口，高吞吐服务检测功能将被禁用"
+        return 1
     fi
+
+    local enabled=1 min_bytes=1000000 min_connections=3 class="realtime"
+    local htp_section="htp_detect"
     
     local uci_enabled=$(uci -q get ${CONFIG_FILE}.${htp_section}.enabled 2>/dev/null)
     [ -n "$uci_enabled" ] && enabled="$uci_enabled"
@@ -1257,6 +1253,7 @@ create_high_throughput_service_rules() {
     [ -n "$uci_class" ] && class="$uci_class"
 
     [ "$enabled" != "1" ] && return 0
+
     if ! validate_number "$min_bytes" "htp_detect.min_bytes" 1 1000000000 2>/dev/null; then
         qos_log "WARN" "min_bytes 无效，使用默认值 1000000"
         min_bytes=1000000
@@ -1266,6 +1263,7 @@ create_high_throughput_service_rules() {
         min_connections=3
     fi
 
+    # 获取最高优先级类的标记
     local upload_mark="" download_mark=""
     if [[ -n "$uci_class" ]]; then
         upload_mark=$(get_class_mark "upload" "$uci_class" 2>/dev/null)
@@ -1299,67 +1297,97 @@ create_high_throughput_service_rules() {
         fi
     fi
 
-    nft add set inet ${NFT_TABLE} qos_high_throughput_services '{ type ipv4_addr . inet_service . inet_proto; flags timeout; }' 2>/dev/null || true
-    nft add set inet ${NFT_TABLE} qos_high_throughput_services6 '{ type ipv6_addr . inet_service . inet_proto; flags timeout; }' 2>/dev/null || true
+    # 创建用于记录高吞吐服务的动态集合
+    nft add set inet ${NFT_TABLE} qos_high_throughput_services4 '{ typeof ip daddr . th dport . meta l4proto; flags dynamic, timeout; timeout 30s; }' 2>/dev/null || {
+        qos_log "ERROR" "无法创建 IPv4 高吞吐服务集合"
+        return 1
+    }
+    nft add set inet ${NFT_TABLE} qos_high_throughput_services6 '{ typeof ip6 daddr . th dport . meta l4proto; flags dynamic, timeout; timeout 30s; }' 2>/dev/null || {
+        qos_log "ERROR" "无法创建 IPv6 高吞吐服务集合"
+        return 1
+    }
 
-    nft add chain inet ${NFT_TABLE} qos_high_throughput_service 2>/dev/null || true
-    nft add chain inet ${NFT_TABLE} qos_high_throughput_service_reply 2>/dev/null || true
+    # 创建流量检测链（在 established 状态进行字节速率检测）
+    nft add chain inet ${NFT_TABLE} qos_throughput_detect 2>/dev/null || true
+    nft flush chain inet ${NFT_TABLE} qos_throughput_detect 2>/dev/null || true
 
-    # 建立连接检测：将目的 IP+目的端口加入集合（服务端标识）（修复 meter 语法）
-    nft add rule inet ${NFT_TABLE} qos_established_connection \
-        meter qos_htp_detect { ip daddr . th dport . meta l4proto timeout 5s } \
-        limit rate over $((min_connections - 1))/minute \
-        add @qos_high_throughput_services { ip daddr . th dport . meta l4proto timeout 30s } 2>/dev/null || true
+    # 在 filter_forward 中插入规则：当 ct state established 且未标记时，跳转到检测链（追加到末尾）
+    nft add rule inet ${NFT_TABLE} filter_forward "ct state established ct mark == 0 jump qos_throughput_detect" 2>/dev/null || true
 
-    nft add rule inet ${NFT_TABLE} qos_established_connection \
-        meter qos_htp_detect6 { ip6 daddr . th dport . meta l4proto timeout 5s } \
-        limit rate over $((min_connections - 1))/minute \
-        add @qos_high_throughput_services6 { ip6 daddr . th dport . meta l4proto timeout 30s } 2>/dev/null || true
+    # 在检测链中，对每个目的 IP+端口 进行字节速率检测，仅将超限的服务加入集合，不设置标记
+    nft add rule inet ${NFT_TABLE} qos_throughput_detect meta nfproto ipv4 \
+        ip daddr . th dport . meta l4proto limit rate over ${min_bytes} bytes/second \
+        update @qos_high_throughput_services4 { ip daddr . th dport . meta l4proto } counter 2>/dev/null || true
 
-    # 上行流量：匹配目的 IP+端口（服务端）
-    nft add rule inet ${NFT_TABLE} qos_high_throughput_service "ct bytes original < $min_bytes return" 2>/dev/null || true
-    nft add rule inet ${NFT_TABLE} qos_high_throughput_service \
-        ip daddr . th dport . meta l4proto @qos_high_throughput_services \
-        meta mark set $upload_mark ct mark set $upload_mark return 2>/dev/null || true
-    nft add rule inet ${NFT_TABLE} qos_high_throughput_service \
+    nft add rule inet ${NFT_TABLE} qos_throughput_detect meta nfproto ipv6 \
+        ip6 daddr . th dport . meta l4proto limit rate over ${min_bytes} bytes/second \
+        update @qos_high_throughput_services6 { ip6 daddr . th dport . meta l4proto } counter 2>/dev/null || true
+
+    # 上行规则：目的 IP+端口 在集合中且未标记时，设置上传标记
+    nft add rule inet ${NFT_TABLE} filter_forward oifname "$qos_interface" ct mark == 0 \
+        ip daddr . th dport . meta l4proto @qos_high_throughput_services4 \
+        meta mark set $upload_mark ct mark set $upload_mark 2>/dev/null || true
+    nft add rule inet ${NFT_TABLE} filter_forward oifname "$qos_interface" ct mark == 0 \
         ip6 daddr . th dport . meta l4proto @qos_high_throughput_services6 \
-        meta mark set $upload_mark ct mark set $upload_mark return 2>/dev/null || true
+        meta mark set $upload_mark ct mark set $upload_mark 2>/dev/null || true
 
-    # 下行流量：匹配源 IP+端口（服务端）
-    nft add rule inet ${NFT_TABLE} qos_high_throughput_service_reply "ct bytes reply < $min_bytes return" 2>/dev/null || true
-    nft add rule inet ${NFT_TABLE} qos_high_throughput_service_reply \
-        ip saddr . th sport . meta l4proto @qos_high_throughput_services \
-        meta mark set $download_mark ct mark set $download_mark return 2>/dev/null || true
-    nft add rule inet ${NFT_TABLE} qos_high_throughput_service_reply \
-        ip6 saddr . th sport . meta l4proto @qos_high_throughput_services6 \
-        meta mark set $download_mark ct mark set $download_mark return 2>/dev/null || true
+    # 下行规则：源 IP+端口 在集合中，且当前未标记或已标记为上传标记时，设置下载标记
+    nft add rule inet ${NFT_TABLE} filter_forward iifname "$qos_interface" \
+        ct mark == 0 ip saddr . th sport . meta l4proto @qos_high_throughput_services4 \
+        meta mark set $download_mark ct mark set $download_mark 2>/dev/null || true
+    nft add rule inet ${NFT_TABLE} filter_forward iifname "$qos_interface" \
+        ct mark == $upload_mark ip saddr . th sport . meta l4proto @qos_high_throughput_services4 \
+        meta mark set $download_mark ct mark set $download_mark 2>/dev/null || true
+    nft add rule inet ${NFT_TABLE} filter_forward iifname "$qos_interface" \
+        ct mark == 0 ip6 saddr . th sport . meta l4proto @qos_high_throughput_services6 \
+        meta mark set $download_mark ct mark set $download_mark 2>/dev/null || true
+    nft add rule inet ${NFT_TABLE} filter_forward iifname "$qos_interface" \
+        ct mark == $upload_mark ip6 saddr . th sport . meta l4proto @qos_high_throughput_services6 \
+        meta mark set $download_mark ct mark set $download_mark 2>/dev/null || true
 
-    # 挂载规则到动态分类链
-    nft add rule inet ${NFT_TABLE} qos_dynamic_classify "ct mark == 0" ip daddr . th dport . meta l4proto @qos_high_throughput_services goto qos_high_throughput_service 2>/dev/null || true
-    nft add rule inet ${NFT_TABLE} qos_dynamic_classify "ct mark == 0" ip6 daddr . th dport . meta l4proto @qos_high_throughput_services6 goto qos_high_throughput_service 2>/dev/null || true
-    nft add rule inet ${NFT_TABLE} qos_dynamic_classify_reply "ct mark == 0" ip saddr . th sport . meta l4proto @qos_high_throughput_services goto qos_high_throughput_service_reply 2>/dev/null || true
-    nft add rule inet ${NFT_TABLE} qos_dynamic_classify_reply "ct mark == 0" ip6 saddr . th sport . meta l4proto @qos_high_throughput_services6 goto qos_high_throughput_service_reply 2>/dev/null || true
-    
-    qos_log "信息" "高吞吐服务检测已启用: 最小连接数=$min_connections, 最小字节数=$min_bytes 字节/秒, 上传标记=$upload_mark, 下载标记=$download_mark"
+    qos_log "信息" "高吞吐服务检测已启用: 最小吞吐=${min_bytes} 字节/秒, 上传标记=$upload_mark, 下载标记=$download_mark"
+    return 0
 }
 
 setup_dynamic_classification() {
     qos_log "信息" "初始化动态分类链..."
+
+    # 创建必要的 nftables 链（如果不存在）
     nft add chain inet ${NFT_TABLE} qos_established_connection 2>/dev/null || true
     nft add chain inet ${NFT_TABLE} qos_dynamic_classify 2>/dev/null || true
     nft add chain inet ${NFT_TABLE} qos_dynamic_classify_reply 2>/dev/null || true
 
-    nft insert rule inet ${NFT_TABLE} filter_forward ct state established jump qos_established_connection 2>/dev/null || true
-    nft insert rule inet ${NFT_TABLE} filter_input ct state established jump qos_established_connection 2>/dev/null || true
-    nft insert rule inet ${NFT_TABLE} filter_output ct state established jump qos_established_connection 2>/dev/null || true
+    # 挂载钩子链（若尚未挂载）
+    # 注意：钩子挂载可能在 apply_all_rules 中已完成，但这里需要确保 filter_forward 等链存在
+    # 以下操作不会重复挂载，因为 nft add chain 若已存在则静默成功
+    nft add chain inet ${NFT_TABLE} filter_forward '{ type filter hook forward priority 0; policy accept; }' 2>/dev/null || true
+    nft add chain inet ${NFT_TABLE} filter_input  '{ type filter hook input priority 0; policy accept; }' 2>/dev/null || true
+    nft add chain inet ${NFT_TABLE} filter_output '{ type filter hook output priority 0; policy accept; }' 2>/dev/null || true
 
-    nft insert rule inet ${NFT_TABLE} filter_input "ct mark == 0" jump qos_dynamic_classify 2>/dev/null || true
-    nft insert rule inet ${NFT_TABLE} filter_output "ct mark == 0" jump qos_dynamic_classify 2>/dev/null || true
-    nft insert rule inet ${NFT_TABLE} filter_forward "ct mark == 0" jump qos_dynamic_classify 2>/dev/null || true
-    nft insert rule inet ${NFT_TABLE} filter_forward "ct mark == 0" jump qos_dynamic_classify_reply 2>/dev/null || true
+    # 插入跳转规则（确保仅插入一次，但重复插入也无妨，nft 会去重？为避免重复，可先删除再添加，但性能影响小）
+    # 注意：这些规则可能已存在，这里用 add 追加，不影响已有规则
+    nft add rule inet ${NFT_TABLE} filter_forward ct state established jump qos_established_connection 2>/dev/null || true
+    nft add rule inet ${NFT_TABLE} filter_input ct state established jump qos_established_connection 2>/dev/null || true
+    nft add rule inet ${NFT_TABLE} filter_output ct state established jump qos_established_connection 2>/dev/null || true
 
-    create_bulk_client_rules
-    create_high_throughput_service_rules
+    nft add rule inet ${NFT_TABLE} filter_input "ct mark == 0" jump qos_dynamic_classify 2>/dev/null || true
+    nft add rule inet ${NFT_TABLE} filter_output "ct mark == 0" jump qos_dynamic_classify 2>/dev/null || true
+    nft add rule inet ${NFT_TABLE} filter_forward "ct mark == 0" jump qos_dynamic_classify 2>/dev/null || true
+    nft add rule inet ${NFT_TABLE} filter_forward "ct mark == 0" jump qos_dynamic_classify_reply 2>/dev/null || true
+
+    # 调用子函数，并检查返回值
+    local bulk_ret=0
+    local htp_ret=0
+    create_bulk_client_rules || bulk_ret=1
+    create_high_throughput_service_rules || htp_ret=1
+
+    if [[ $bulk_ret -eq 1 ]] || [[ $htp_ret -eq 1 ]]; then
+        qos_log "ERROR" "动态分类子模块初始化失败，动态分类功能将被禁用"
+        return 1
+    fi
+
+    qos_log "信息" "动态分类初始化完成"
+    return 0
 }
 
 # ========== 应用所有规则 ==========
@@ -1580,7 +1608,10 @@ apply_enhanced_features() {
     # 动态分类
     if [[ $ENABLE_DYNAMIC_CLASSIFY -eq 1 ]]; then
         qos_log "INFO" "动态分类总开关已启用，初始化动态检测..."
-        setup_dynamic_classification
+        if ! setup_dynamic_classification; then
+            ENABLE_DYNAMIC_CLASSIFY=0
+            qos_log "ERROR" "动态分类初始化失败，功能已禁用"
+        fi
     else
         qos_log "INFO" "动态分类未启用"
     fi
