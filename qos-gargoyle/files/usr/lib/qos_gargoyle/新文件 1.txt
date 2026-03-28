@@ -1,0 +1,39 @@
+
+sed -i 's/\r$//' /usr/lib/qos_gargoyle/*.sh
+DEBUG=1 /etc/init.d/qos_gargoyle restart
+
+DEBUG=1 /etc/init.d/qos_gargoyle stop
+
+# 进入脚本目录
+cd /usr/lib/qos_gargoyle
+
+# 确保所有脚本 Unix 格式
+find . -name "*.sh" -exec sed -i 's/\r$//' {} \;
+
+# 手动运行 hfsc_cake.sh 并查看输出
+bash -x /usr/lib/qos_gargoyle/hfsc_cake.sh start 2>&1 | tee /tmp/hfsc_cake_debug.log
+
+
+
+# 清理旧表
+nft delete table inet test 2>/dev/null
+
+# 创建测试环境
+nft add table inet test
+nft add chain inet test filter_qos_egress
+nft add map inet test class_mark '{ type mark : verdict; }'
+
+# 创建 DSCP 设置子链
+nft add chain inet test set_dscp_46
+nft add rule inet test set_dscp_46 ip dscp set 46
+nft add rule inet test set_dscp_46 ip6 dscp set 46
+nft add rule inet test set_dscp_46 return
+
+# 添加 map 元素
+nft add element inet test class_mark { 1 : goto set_dscp_46 }
+
+# 添加主规则
+nft add rule inet test filter_qos_egress ct mark vmap @class_mark
+
+# 查看结果（应无错误）
+nft list table inet test

@@ -507,26 +507,42 @@ get_cake_diffserv_mode() {
 
 # ========== class_mark 映射设置 ==========
 setup_class_mark_map() {
-    qos_log "信息" "设置 class_mark 映射（map 方式）..."
-    
-    # ========== 检查 CAKE wash 冲突 ==========
+    qos_log "信息" "设置 class_mark 映射（verdict map 方式）..."
+
+    # 检查 CAKE wash 冲突
     local cake_wash=$(uci -q get ${CONFIG_FILE}.cake.wash 2>/dev/null)
     if [[ "$cake_wash" == "1" ]] || [[ "$cake_wash" == "yes" ]] || [[ "$cake_wash" == "true" ]]; then
         qos_log "WARN" "CAKE wash 已启用，将清除数据包中的 DSCP 字段。DSCP 映射设置的 DSCP 可能被覆盖，建议设置 cake.wash=0 或确认预期行为。"
     fi
-    
+
+    # 确保表存在
+    nft add table inet ${NFT_TABLE} 2>/dev/null || true
+    # 确保链存在
+    nft add chain inet ${NFT_TABLE} filter_qos_egress 2>/dev/null || true
+    nft add chain inet ${NFT_TABLE} filter_qos_ingress 2>/dev/null || true
+
+    # 删除可能残留的 map 和旧子链（避免冲突）
+    nft delete map inet ${NFT_TABLE} class_mark 2>/dev/null || true
+    for chain in $(nft -j list chains 2>/dev/null | jsonfilter -e "@.nftables[@.chain.table=\"${NFT_TABLE}\"].chain.name" | grep '^set_dscp_'); do
+        nft delete chain inet ${NFT_TABLE} $chain 2>/dev/null || true
+    done
+
     local tmp_nft_file=$(mktemp)
     register_temp_file "$tmp_nft_file"
-
-    cat << EOF >> "$tmp_nft_file"
-delete map inet ${NFT_TABLE} class_mark 2>/dev/null
-add map inet ${NFT_TABLE} class_mark { type mark : dscp; }
-EOF
 
     config_load "$CONFIG_FILE"
     local diffserv_mode=$(get_cake_diffserv_mode)
 
-    local elements=""
+    # 创建 verdict map
+    cat << EOF >> "$tmp_nft_file"
+# class_mark verdict map
+add map inet ${NFT_TABLE} class_mark { type mark : verdict; }
+EOF
+
+    local map_elements=""
+    declare -A dscp_chains   # 关联数组记录已创建的 DSCP 链
+
+    # 遍历 class_marks 文件
     while IFS=: read -r dir cls mark_raw; do
         [ -z "$dir" ] || [ -z "$cls" ] && continue
         local cls_clean=$(echo "$cls" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' | tr -d '\r')
@@ -534,6 +550,7 @@ EOF
         mark=$(echo "$mark" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
         [ -z "$mark" ] && continue
 
+        # 获取该类的 DSCP 值
         local dscp_raw=$(uci -q get "${CONFIG_FILE}.${cls_clean}.dscp" 2>/dev/null)
         local dscp=$(echo "$dscp_raw" | tr -d '\r' | tr -d '[:space:]')
         if [ -z "$dscp" ]; then
@@ -549,40 +566,52 @@ EOF
             fi
         fi
 
-        elements="${elements}${elements:+, }${mark} : $dscp"
-        qos_log "调试" "收集映射: 标记 $mark -> DSCP $dscp (类 $cls_clean)"
+        # 创建该 DSCP 值的设置链（若尚未创建）
+        local chain_name="set_dscp_${dscp}"
+        if [[ -z "${dscp_chains[$chain_name]}" ]]; then
+            dscp_chains[$chain_name]=1
+            cat << EOF >> "$tmp_nft_file"
+# Chain to set DSCP $dscp
+add chain inet ${NFT_TABLE} $chain_name
+add rule inet ${NFT_TABLE} $chain_name ip dscp set $dscp
+add rule inet ${NFT_TABLE} $chain_name ip6 dscp set $dscp
+add rule inet ${NFT_TABLE} $chain_name return
+EOF
+        fi
+
+        # 添加到 map 元素
+        map_elements="${map_elements}${map_elements:+, }${mark} : goto $chain_name"
+        qos_log "调试" "映射: 标记 $mark -> 跳转到链 $chain_name (DSCP $dscp)"
     done < "$CLASS_MARKS_FILE"
 
-    if [ -n "$elements" ]; then
-        echo "add element inet ${NFT_TABLE} class_mark { $elements }" >> "$tmp_nft_file"
+    # 添加 map 元素
+    if [ -n "$map_elements" ]; then
+        echo "add element inet ${NFT_TABLE} class_mark { $map_elements }" >> "$tmp_nft_file"
     fi
 
+    # 在主链中添加 verdict map 规则
     cat << EOF >> "$tmp_nft_file"
-# DSCP mapping rules
-add rule inet ${NFT_TABLE} filter_qos_egress ct mark != 0 ip dscp set @class_mark[ct mark]
-add rule inet ${NFT_TABLE} filter_qos_egress ct mark != 0 ip6 dscp set @class_mark[ct mark]
-add rule inet ${NFT_TABLE} filter_qos_ingress ct mark != 0 ip dscp set @class_mark[ct mark]
-add rule inet ${NFT_TABLE} filter_qos_ingress ct mark != 0 ip6 dscp set @class_mark[ct mark]
-add rule inet ${NFT_TABLE} filter_qos_egress ct state established,related ct mark != 0 ip dscp set @class_mark[ct mark]
-add rule inet ${NFT_TABLE} filter_qos_egress ct state established,related ct mark != 0 ip6 dscp set @class_mark[ct mark]
-add rule inet ${NFT_TABLE} filter_qos_ingress ct state established,related ct mark != 0 ip dscp set @class_mark[ct mark]
-add rule inet ${NFT_TABLE} filter_qos_ingress ct state established,related ct mark != 0 ip6 dscp set @class_mark[ct mark]
+# Main classification using verdict map
+add rule inet ${NFT_TABLE} filter_qos_egress ct mark vmap @class_mark
+add rule inet ${NFT_TABLE} filter_qos_ingress ct mark vmap @class_mark
+add rule inet ${NFT_TABLE} filter_qos_egress ct state established,related ct mark vmap @class_mark
+add rule inet ${NFT_TABLE} filter_qos_ingress ct state established,related ct mark vmap @class_mark
 EOF
 
     local nft_output
-	nft_output=$(nft -f "$tmp_nft_file" 2>&1)
-	local nft_ret=$?
-	if [[ $nft_ret -eq 0 ]]; then
-		qos_log "信息" "class_mark map 规则加载成功"
-		rm -f "$tmp_nft_file"
-		return 0
-	else
-		qos_log "错误" "加载 class_mark map 规则失败 (退出码: $nft_ret)"
-		echo "$nft_output" | logger -t qos_gargoyle
-		cat "$tmp_nft_file" | logger -t qos_gargoyle
-		rm -f "$tmp_nft_file"
-		return 1
-	fi
+    nft_output=$(nft -f "$tmp_nft_file" 2>&1)
+    local nft_ret=$?
+    if [[ $nft_ret -eq 0 ]]; then
+        qos_log "信息" "class_mark verdict map 规则加载成功"
+        rm -f "$tmp_nft_file"
+        return 0
+    else
+        qos_log "错误" "加载 class_mark verdict map 规则失败 (退出码: $nft_ret)"
+        echo "$nft_output" | logger -t qos_gargoyle
+        cat "$tmp_nft_file" | logger -t qos_gargoyle
+        rm -f "$tmp_nft_file"
+        return 1
+    fi
 }
 
 # ========== 增强规则应用（无笛卡尔积展开） ==========
@@ -624,12 +653,7 @@ apply_enhanced_direction_rules() {
         return 0
     fi
 
-    # ========== 缓存现有集合列表，避免在循环中重复执行 nft 命令 ==========
-    declare -A existing_set_map
-    while IFS= read -r setname; do
-        existing_set_map["$setname"]=1
-    done < <(get_existing_sets "inet ${NFT_TABLE}")
-    qos_log "DEBUG" "已加载 ${#existing_set_map[@]} 个现有集合到缓存"
+    # ========== 已移除集合缓存，改为循环内直接检查 ==========
 
     local nft_batch_file=$(mktemp /tmp/qos_nft_batch_XXXXXX)
     register_temp_file "$nft_batch_file"
@@ -652,7 +676,7 @@ apply_enhanced_direction_rules() {
             continue
         fi
 
-        # ========== 检查该规则引用的集合是否存在（使用缓存） ==========
+        # ========== 检查该规则引用的集合是否存在（直接使用 nft list set） ==========
         local rule_sets=""
         for field in src_ip dest_ip; do
             local var_name="tmp_${field}"
@@ -667,7 +691,7 @@ apply_enhanced_direction_rules() {
 
         local missing_set=""
         for setname in $rule_sets; do
-            if [[ -z "${existing_set_map[$setname]}" ]]; then
+            if ! nft list set inet ${NFT_TABLE} "$setname" &>/dev/null; then
                 missing_set="$setname"
                 break
             fi
@@ -687,13 +711,13 @@ apply_enhanced_direction_rules() {
         ((rule_count++))
     done
 
-    # ========== 加载统一的自定义规则文件 ==========
-	local custom_file=""
-	if [[ "$chain" == "filter_qos_egress" ]]; then
-		custom_file="${CUSTOM_EGRESS_FILE:-/etc/qos_gargoyle/egress_custom.nft}"
-	else
-		custom_file="${CUSTOM_INGRESS_FILE:-/etc/qos_gargoyle/ingress_custom.nft}"
-	fi
+    # ========== 加载自定义规则文件（按方向区分） ==========
+    local custom_file=""
+    if [[ "$chain" == "filter_qos_egress" ]]; then
+        custom_file="${CUSTOM_EGRESS_FILE:-/etc/qos_gargoyle/egress_custom.nft}"
+    else
+        custom_file="${CUSTOM_INGRESS_FILE:-/etc/qos_gargoyle/ingress_custom.nft}"
+    fi
     if [[ -s "$custom_file" ]]; then
         qos_log "INFO" "验证自定义规则: $custom_file"
         local check_file=$(mktemp)
@@ -867,6 +891,21 @@ generate_ack_limit_rules() {
         both) granularity="both" ;;
         *)    granularity="conn" ;;
     esac
+    qos_log "INFO" "ACK 限速粒度: $granularity (conn=连接, ip=源IP, both=连接+源IP复合)"
+
+    # 构建 meter 键的表达式
+    local meter_key_upload=""
+    case "$granularity" in
+        ip)
+            meter_key_upload="ip saddr"
+            ;;
+        both)
+            meter_key_upload="ip saddr . ct id . ct direction"
+            ;;
+        conn|*)
+            meter_key_upload="ct id . ct direction"
+            ;;
+    esac
 
     # 辅助函数：生成一组 ACK 限速规则（四个级别）
     generate_ack_rules_for_family() {
@@ -890,23 +929,23 @@ generate_ack_limit_rules() {
         cat <<EOF
 # ACK rate limiting - xfst (extreme fast)
 add rule inet ${NFT_TABLE} filter_qos_egress $addr_match meta length < 100 tcp flags ack \
-    $final_key limit rate over ${xfast_rate}/second \
-    update @qos_xfst_ack${set_suffix} { $final_key } counter jump drop995
+    update @qos_xfst_ack${set_suffix} { $final_key limit rate over ${xfast_rate}/second } \
+    counter jump drop995
 
 # fast
 add rule inet ${NFT_TABLE} filter_qos_egress $addr_match meta length < 100 tcp flags ack \
-    $final_key limit rate over ${fast_rate}/second \
-    update @qos_fast_ack${set_suffix} { $final_key } counter jump drop95
+    update @qos_fast_ack${set_suffix} { $final_key limit rate over ${fast_rate}/second } \
+    counter jump drop95
 
 # medium
 add rule inet ${NFT_TABLE} filter_qos_egress $addr_match meta length < 100 tcp flags ack \
-    $final_key limit rate over ${med_rate}/second \
-    update @qos_med_ack${set_suffix} { $final_key } counter jump drop50
+    update @qos_med_ack${set_suffix} { $final_key limit rate over ${med_rate}/second } \
+    counter jump drop50
 
 # slow
 add rule inet ${NFT_TABLE} filter_qos_egress $addr_match meta length < 100 tcp flags ack \
-    $final_key limit rate over ${slow_rate}/second \
-    update @qos_slow_ack${set_suffix} { $final_key } counter jump drop50
+    update @qos_slow_ack${set_suffix} { $final_key limit rate over ${slow_rate}/second } \
+    counter jump drop50
 EOF
     }
 
@@ -961,20 +1000,18 @@ generate_tcp_upgrade_rules() {
         return
     fi
 
-    cat <<EOF
+     cat <<EOF
 # TCP upgrade for connections exceeding rate (per-connection)
 add rule inet ${NFT_TABLE} filter_qos_egress meta l4proto tcp ct state established meta nfproto ipv4 \
-    ct id . ct direction limit rate over ${rate}/second burst ${burst} packets \
-    update @qos_slow_tcp { ct id . ct direction } \
+    update @qos_slow_tcp { ct id . ct direction limit rate over ${rate}/second burst ${burst} packets } \
     meta mark set $class_mark ct mark set meta mark counter
 add rule inet ${NFT_TABLE} filter_qos_egress meta l4proto tcp ct state established meta nfproto ipv6 \
-    ct id . ct direction limit rate over ${rate}/second burst ${burst} packets \
-    update @qos_slow_tcp { ct id . ct direction } \
+    update @qos_slow_tcp { ct id . ct direction limit rate over ${rate}/second burst ${burst} packets } \
     meta mark set $class_mark ct mark set meta mark counter
 EOF
 }
 
-# ========== UDP 限速规则（采用官方新语法，默认 mark，增加有效性检查） ==========
+
 # ========== UDP 限速规则（采用官方新语法，默认 mark，增加有效性检查） ==========
 generate_udp_limit_rules() {
     local udp_enable=$(uci -q get ${CONFIG_FILE}.udp_limit.enabled 2>/dev/null)
@@ -1055,24 +1092,21 @@ generate_udp_limit_rules() {
         rules="${rules}
 # UDP per-IP rate limit - upload direction (mark)
 add rule inet ${NFT_TABLE} filter_qos_egress oifname \"$wan_if\" meta l4proto udp ct mark == 0 \
-    ip saddr limit rate over ${udp_rate}/second \
-    update @udp_per_ip_upload { ip saddr } counter \
+    update @udp_per_ip_upload { ip saddr limit rate over ${udp_rate}/second } \
     meta mark set $upload_mark ct mark set $upload_mark
 add rule inet ${NFT_TABLE} filter_qos_egress oifname \"$wan_if\" meta l4proto udp ct mark == 0 \
-    ip6 saddr limit rate over ${udp_rate}/second \
-    update @udp_per_ip_upload_v6 { ip6 saddr } counter \
+    update @udp_per_ip_upload_v6 { ip6 saddr limit rate over ${udp_rate}/second } \
     meta mark set $upload_mark ct mark set $upload_mark
 
 # UDP per-IP rate limit - download direction (mark)
 add rule inet ${NFT_TABLE} filter_qos_ingress iifname \"$wan_if\" meta l4proto udp ct mark == 0 \
-    ip daddr limit rate over ${udp_rate}/second \
-    update @udp_per_ip_download { ip daddr } counter \
+    update @udp_per_ip_download { ip daddr limit rate over ${udp_rate}/second } \
     meta mark set $download_mark ct mark set $download_mark
 add rule inet ${NFT_TABLE} filter_qos_ingress iifname \"$wan_if\" meta l4proto udp ct mark == 0 \
-    ip6 daddr limit rate over ${udp_rate}/second \
-    update @udp_per_ip_download_v6 { ip6 daddr } counter \
+    update @udp_per_ip_download_v6 { ip6 daddr limit rate over ${udp_rate}/second } \
     meta mark set $download_mark ct mark set $download_mark"
     elif [[ "$udp_action" == "drop" ]]; then
+        # drop 动作
         rules="${rules}
 # UDP per-IP rate limit - drop (upload)
 add rule inet ${NFT_TABLE} filter_qos_egress oifname \"$wan_if\" meta l4proto udp ct mark == 0 \

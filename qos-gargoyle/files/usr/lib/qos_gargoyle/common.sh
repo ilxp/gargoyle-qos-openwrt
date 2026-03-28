@@ -3,6 +3,12 @@
 # 版本: 3.5.2 - 修复: eval注入风险、带宽转换精度、间接引用安全
 # 提供 QoS 系统基础功能
 
+# ========== 防止重复加载 ==========
+if [[ -n "$_QOS_COMMON_SH_LOADED" ]]; then
+    return 0
+fi
+_QOS_COMMON_SH_LOADED=1
+
 # ========== 全局常量定义 ==========
 readonly NFT_TABLE="gargoyle-qos-priority"
 readonly NFT_FAMILY="inet"
@@ -1501,6 +1507,7 @@ init_ruleset() {
         return 0
     fi
     [[ -f "$RULESET_MERGED_FLAG" ]] && return 0
+
     local ruleset ruleset_file
     ruleset=$(uci -q get ${CONFIG_FILE}.global.ruleset 2>/dev/null)
     [[ -z "$ruleset" ]] && ruleset="default.ru"
@@ -1510,17 +1517,11 @@ init_ruleset() {
         log_error "规则集文件 $ruleset_file 不存在，无法加载任何规则！"
         return 1
     fi
-    local backup_base="/etc/config/${CONFIG_FILE}.bak"
-    local backup_file="${backup_base}.$(date +%s)"
+
+    local backup_file="/etc/config/${CONFIG_FILE}.bak.$(date +%s)"
     cp "/etc/config/${CONFIG_FILE}" "$backup_file"
     log_info "已备份主配置文件到 $backup_file"
-    local backups=($(ls -t ${backup_base}.* 2>/dev/null))
-    if [[ ${#backups[@]} -gt 3 ]]; then
-        for ((i=3; i<${#backups[@]}; i++)); do
-            rm -f "${backups[$i]}" 2>/dev/null
-            log_debug "删除旧备份: ${backups[$i]}"
-        done
-    fi
+
     if grep -q "^# === RULESET_" "/etc/config/${CONFIG_FILE}"; then
         local tmp_conf=$(mktemp /tmp/qos_config_$$.tmp)
         TEMP_FILES+=("$tmp_conf")
@@ -1528,12 +1529,14 @@ init_ruleset() {
         mv "$tmp_conf" "/etc/config/${CONFIG_FILE}"
         log_info "已清理旧的规则集内容"
     fi
+
     {
         echo ""
         echo "# === RULESET_${ruleset} ==="
         cat "$ruleset_file"
         echo "# === RULESET_END ==="
     } >> "/etc/config/${CONFIG_FILE}"
+
     uci commit ${CONFIG_FILE}
     touch "$RULESET_MERGED_FLAG"
     log_info "已将规则集 $ruleset 合并到主配置文件"
@@ -1557,11 +1560,12 @@ restore_main_config() {
     log_info "已清理规则集标记"
 }
 
+
 # ========== 内存限制计算（增强版，支持大小写不敏感） ==========
 calculate_memory_limit() {
     local config_value="$1" result
     [[ -z "$config_value" ]] && { echo ""; return; }
-    local lower_val=$(echo "$config_value" | tr '[:upper:]' '[:lower:]')
+    local lower_val=$(echo "$config_value" | tr '[:upper:]' '[:lower:]' | tr -d ' ')
     if [[ "$lower_val" == "auto" ]]; then
         local total_mem_mb=0
         if [[ -f /sys/fs/cgroup/memory.max ]]; then
@@ -1585,7 +1589,7 @@ calculate_memory_limit() {
                 log_info "从 /proc/meminfo 获取内存: ${total_mem_mb}MB"
             fi
         fi
-        if (( total_mem_mb > 0 )); then
+        if (( total_mem_mb > 0 )); then	
             # 使用总内存的 6.25% (1/16)
             # 256MB -> 16MB, 512MB -> 32MB, 1GB -> 64MB, 2GB -> 128MB
             # 上限 128MB，避免过度占用
@@ -1599,7 +1603,9 @@ calculate_memory_limit() {
             log_warn "无法读取内存信息，使用默认值 16Mb"; result="16Mb"
         fi
     else
-        if [[ "$lower_val" =~ ^[0-9]+mb$ ]]; then
+        # 匹配数字+单位（kb, mb, gb），允许大小写混合
+        if [[ "$lower_val" =~ ^([0-9]+)(kb|mb|gb)$ ]]; then
+            # 保持原始格式输出
             result="$config_value"
             log_info "使用用户配置的 memlimit: ${result}"
         else
@@ -1608,7 +1614,6 @@ calculate_memory_limit() {
     fi
     echo "$result"
 }
-
 # ========== 获取最高优先级的类名称 ==========
 get_highest_priority_class() {
     local direction="$1"
