@@ -528,6 +528,13 @@ create_cake_root_qdisc() {
         qos_log "INFO" "$device 的 $direction 方向普通CAKE队列创建完成"
         echo "✅ $device 的 $direction 方向普通CAKE队列创建完成"
     fi
+	
+	# 上传方向的 ctinfo 规则（仅当方向为 upload 时）
+    if [[ "$direction" == "upload" ]]; then
+        if ! setup_egress_ctinfo "$device"; then
+            qos_log "WARN" "出口方向 ctinfo 设置失败，SFO 下 QoS 可能不完整"
+        fi
+    fi
 
     return 0
 }

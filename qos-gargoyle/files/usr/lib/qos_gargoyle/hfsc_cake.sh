@@ -661,7 +661,12 @@ init_hfsc_cake_upload() {
         qos_log "ERROR" "创建上传根队列失败"
         return 1
     fi
-
+    
+	# 创建根队列后，如果 SFO 启用，添加出口 ctinfo 规则
+    if ! setup_egress_ctinfo "$qos_interface"; then
+        qos_log "WARN" "出口方向 ctinfo 设置失败，SFO 下 QoS 可能不完整"
+    fi
+	
     # 创建各个子类
     upload_class_mark_list=""
     for class_name in $enabled_classes; do

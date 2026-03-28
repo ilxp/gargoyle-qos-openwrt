@@ -2074,6 +2074,40 @@ check_ingress_redirect() {
     return 0
 }
 
+# 兼容sfo
+setup_egress_ctinfo() {
+    local device="$1"
+    local sfo_enabled=0
+    if check_sfo_enabled; then
+        sfo_enabled=1
+        qos_log "INFO" "SFO 已启用，将在出口方向使用 ctinfo 恢复标记"
+    fi
+    if [[ $sfo_enabled -ne 1 ]]; then
+        return 0
+    fi
+    
+    local ctinfo_ok=0
+    if check_tc_ctinfo_support; then
+        ctinfo_ok=1
+        qos_log "INFO" "tc ctinfo 动作受支持"
+    else
+        qos_log "WARN" "tc ctinfo 动作不受支持，出口方向标记可能丢失"
+        return 1
+    fi
+    
+    # 删除旧规则（如果存在）
+    tc filter del dev "$device" parent 1: prio 1 protocol all 2>/dev/null || true
+    
+    # 添加 ctinfo 规则，恢复 DSCP（从 conntrack 到数据包）
+    if ! tc filter add dev "$device" parent 1: prio 1 protocol all matchall action ctinfo dscp 63 128 continue 2>&1; then
+        qos_log "ERROR" "出口方向 ctinfo 规则添加失败，SFO 下 QoS 可能失效"
+        return 1
+    fi
+    
+    qos_log "INFO" "出口方向 ctinfo 规则添加成功，SFO 兼容"
+    return 0
+}
+
 # ========== IPv6增强支持 ==========
 setup_ipv6_specific_rules() {
     qos_log "INFO" "设置IPv6特定规则（优化版）"
