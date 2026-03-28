@@ -468,11 +468,12 @@ create_cake_root_qdisc() {
         qos_log "INFO" "CAKE-MQ 已被禁用，使用普通 CAKE"
     fi
 
-    # 修复：当带宽小于队列数时强制回退到单队列模式
+    # 修复：当带宽小于队列数时强制回退到单队列模式，并明确重置变量
     if [ "$use_mq" = "1" ] && [ "$bandwidth" -lt "$queues" ] 2>/dev/null; then
         qos_log "WARN" "总带宽 ${bandwidth}kbit 小于队列数 ${queues}，强制使用单队列模式"
         use_mq=0
         queues=1
+        qos_log "INFO" "已回退至普通 CAKE 模式，队列数重置为 $queues"
     fi
 
     if [ "$use_mq" = "1" ]; then

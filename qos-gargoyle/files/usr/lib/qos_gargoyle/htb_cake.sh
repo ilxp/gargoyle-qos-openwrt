@@ -447,7 +447,7 @@ create_htb_upload_class() {
         return 1
     fi
     # 计算子类上限带宽（ul_m2 已在前面定义，例如 "5000kbit"）
-	local cake_bw="${ul_m2%kbit}"          # 去掉 "kbit" 后缀，得到纯数字
+	local cake_bw="${ceil%kbit}"               # 使用 ceil 变量
 	local cake_params=$(build_cake_params "$cake_bw" "upload")
 
 	if ! tc qdisc add dev "$qos_interface" parent 1:$class_index \
@@ -564,7 +564,8 @@ create_htb_download_class() {
         qos_log "ERROR" "创建下载类别 1:$class_index 失败"
         return 1
     fi
-    local cake_bw="${ul_m2%kbit}"
+
+	local cake_bw="${ceil%kbit}"               # 使用 ceil 变量
 	local cake_params=$(build_cake_params "$cake_bw" "download")
 
 	if ! tc qdisc add dev "$ifb_dev" parent 1:$class_index \

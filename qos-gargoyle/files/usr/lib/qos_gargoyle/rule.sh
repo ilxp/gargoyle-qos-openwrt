@@ -621,7 +621,7 @@ apply_enhanced_direction_rules() {
         for field in src_ip dest_ip; do
             local var_name="tmp_${field}"
             local val
-            eval "val=\${${var_name}}"
+			val=${!var_name}
             [[ -z "$val" ]] && continue
             [[ "$val" == "!="* ]] && val="${val#!=}"
             if [[ "$val" == @* ]]; then

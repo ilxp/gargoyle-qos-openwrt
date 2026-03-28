@@ -400,10 +400,18 @@ create_hfsc_upload_class() {
     else
         enable_minrtt="${HFSC_MINRTT_ENABLED:-0}"
     fi
+    # ========== 修复 minRTT 模式：设置 m1 与 m2 相同 ==========
     if (( enable_minrtt == 1 )); then
         d="${HFSC_MINRTT_DELAY:-1000us}"
-        qos_log "INFO" "类别 $class_name 启用最小延迟模式 (d=$d)"
+        # 将初始突发带宽 m1 设置为与保证带宽 m2 相同，避免在延迟窗口内无带宽
+        m1="$m2"
+        qos_log "INFO" "类别 $class_name 启用最小延迟模式 (d=$d, m1=$m1)"
+    else
+        # 未启用 minRTT 时，保持 m1=0bit，d=0us
+        m1="0bit"
+        d="0us"
     fi
+    # ========== 修复结束 ==========
     qos_log "INFO" "正在创建HFSC类别 1:$class_index (带宽: ls=$m2, ul=$ul_m2)"
     if ! tc class add dev "$qos_interface" parent 1:1 \
         classid 1:$class_index hfsc \
@@ -531,10 +539,18 @@ create_hfsc_download_class() {
     else
         enable_minrtt="${HFSC_MINRTT_ENABLED:-0}"
     fi
+    # ========== 修复 minRTT 模式：设置 m1 与 m2 相同 ==========
     if (( enable_minrtt == 1 )); then
         d="${HFSC_MINRTT_DELAY:-1000us}"
-        qos_log "INFO" "类别 $class_name 启用最小延迟模式 (d=$d)"
+        # 将初始突发带宽 m1 设置为与保证带宽 m2 相同，避免在延迟窗口内无带宽
+        m1="$m2"
+        qos_log "INFO" "类别 $class_name 启用最小延迟模式 (d=$d, m1=$m1)"
+    else
+        # 未启用 minRTT 时，保持 m1=0bit，d=0us
+        m1="0bit"
+        d="0us"
     fi
+    # ========== 修复结束 ==========
     qos_log "INFO" "正在创建下载HFSC类别 1:$class_index (带宽: ls=$m2, ul=$ul_m2)"
     if ! tc class add dev "$ifb_dev" parent 1:1 \
         classid 1:$class_index hfsc \

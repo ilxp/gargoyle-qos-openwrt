@@ -1,12 +1,12 @@
 #!/bin/bash
 # 核心库模块 (common.sh)
-# 版本: 3.5.1 - 修复: CAKE参数检测清理、带宽转换精度、标记冲突检测、全局常量统一
+# 版本: 3.5.2 - 修复: eval注入风险、带宽转换精度、间接引用安全
 # 提供 QoS 系统基础功能
 
 # ========== 全局常量定义 ==========
 readonly NFT_TABLE="gargoyle-qos-priority"
 readonly NFT_FAMILY="inet"
-readonly QOS_VERSION="3.5.1"
+readonly QOS_VERSION="3.5.2"
 readonly DEFAULT_IFB="ifb0"
 readonly MAX_PRIORITY_INDEX=16
 
@@ -764,10 +764,12 @@ load_download_class_configurations() {
 load_all_config_options() {
     local config_name="$1" section_id="$2" prefix="$3"
     local var_name val
+    # 清空变量（安全方式）
     for var in class order enabled proto srcport dstport connbytes_kb family state src_ip dest_ip \
           tcp_flags packet_len dscp iif oif icmp_type udp_length ttl; do
-        eval "${prefix}${var}=''"
+        printf -v "${prefix}${var}" "%s" ""
     done
+
     if [[ ${#UCI_CACHE[@]} -gt 0 ]]; then
         local key="${config_name}.${section_id}.class"
         val="${UCI_CACHE[$key]}"
@@ -775,7 +777,7 @@ load_all_config_options() {
             log_error "配置节 $section_id 缺少 class 参数，忽略此规则"
             return 1
         fi
-        eval "${prefix}class='$val'"
+        printf -v "${prefix}class" "%s" "$val"
         for opt in order enabled proto srcport dstport connbytes_kb family state src_ip dest_ip \
             tcp_flags packet_len dscp iif oif icmp_type udp_length ttl; do
             local key="${config_name}.${section_id}.${opt}"
@@ -801,10 +803,11 @@ load_all_config_options() {
                 udp_length) if ! validate_length "$val" "${section_id}.udp_length"; then continue; fi ;;
                 ttl)        if ! validate_ttl "$val" "${section_id}.ttl"; then continue; fi ;;
             esac
-            eval "${prefix}${opt}='$val'"
+            printf -v "${prefix}${opt}" "%s" "$val"
         done
         return 0
     fi
+
     log_debug "配置缓存不可用，从 UCI 直接读取规则 $section_id"
     local tmp_class
     tmp_class=$(uci -q get "${config_name}.${section_id}.class" 2>/dev/null)
@@ -812,7 +815,7 @@ load_all_config_options() {
         log_error "配置节 $section_id 缺少 class 参数，忽略此规则"
         return 1
     fi
-    eval "${prefix}class='$tmp_class'"
+    printf -v "${prefix}class" "%s" "$tmp_class"
     for opt in order enabled proto srcport dstport connbytes_kb family state src_ip dest_ip \
         tcp_flags packet_len dscp iif oif icmp_type udp_length ttl; do
         local val
@@ -838,7 +841,7 @@ load_all_config_options() {
             udp_length) if ! validate_length "$val" "${section_id}.udp_length"; then continue; fi ;;
             ttl)        if ! validate_ttl "$val" "${section_id}.ttl"; then continue; fi ;;
         esac
-        eval "${prefix}${opt}='$val'"
+        printf -v "${prefix}${opt}" "%s" "$val"
     done
     return 0
 }
@@ -1243,7 +1246,7 @@ get_physical_interface_max_bandwidth() {
     echo "$max_bandwidth"
 }
 
-# ========== 带宽单位转换（修复精度和bc依赖） ==========
+# ========== 带宽单位转换（使用整数运算，避免浮点误差） ==========
 convert_bandwidth_to_kbit() {
     local bw="$1" num unit multiplier result
     [[ -z "$bw" ]] && { log_error "带宽值为空"; return 1; }
@@ -1269,11 +1272,26 @@ convert_bandwidth_to_kbit() {
             *) log_error "未知带宽单位: $unit"; return 1 ;;
         esac
         
-        # 使用 bc 或 awk 进行浮点运算，并四舍五入
-        if command -v bc >/dev/null 2>&1; then
-            result=$(echo "scale=0; ($num * $multiplier + 0.5) / 1" | bc)
+        # 使用整数运算避免浮点误差：将 num 转换为整数（乘以 1000 保持精度）
+        # 例如 1.5mbit -> 1.5 * 1000 = 1500 kbit
+        # 使用 awk 或 bc 进行高精度整数乘法，但最终结果应为整数
+        if [[ "$num" == *"."* ]]; then
+            # 将小数转为整数：去掉小数点，计算小数点后位数
+            local int_part="${num%%.*}"
+            local frac_part="${num#*.}"
+            local frac_len=${#frac_part}
+            # 补齐到 3 位小数（以处理 kbit 单位的精度）
+            while (( ${#frac_part} < 3 )); do
+                frac_part="${frac_part}0"
+            done
+            # 将整数和小数合并为一个整数（乘以 10^frac_len）
+            local num_int="$int_part$frac_part"
+            # 计算 multiplier 时，将 multiplier 乘以 10^frac_len 后再除
+            local result_int=$((num_int * multiplier))
+            # 除以 10^frac_len 得到最终整数
+            result=$(( (result_int + (10**frac_len)/2) / (10**frac_len) ))  # 四舍五入
         else
-            result=$(awk "BEGIN {printf \"%.0f\", $num * $multiplier + 0.5}")
+            result=$((num * multiplier))
         fi
         
         # 确保结果不为空且为数字
@@ -1790,49 +1808,49 @@ auto_speedtest() {
     uci commit ${CONFIG_FILE}
 
     if [[ $noninteractive -eq 1 ]] && [[ -n "$gaming_ip" ]]; then
-		# 使用 validate_ip 函数进行完整验证
-		if validate_ip "$gaming_ip"; then
-			log_info "添加游戏设备 IP $gaming_ip 的规则"
-			load_upload_class_configurations
-			load_download_class_configurations
-			local upload_best_class=$(get_highest_priority_class "upload")
-			local download_best_class=$(get_highest_priority_class "download")
-			while true; do
-				local old_upload_rule=$(uci -q show ${CONFIG_FILE} | grep -F ".upload_rule." | grep -F ".src_ip='${gaming_ip}'" | cut -d. -f2 | head -1)
-				[[ -n "$old_upload_rule" ]] && uci -q delete ${CONFIG_FILE}.${old_upload_rule} || break
-			done
-			while true; do
-				local old_download_rule=$(uci -q show ${CONFIG_FILE} | grep -F ".download_rule." | grep -F ".dest_ip='${gaming_ip}'" | cut -d. -f2 | head -1)
-				[[ -n "$old_download_rule" ]] && uci -q delete ${CONFIG_FILE}.${old_download_rule} || break
-			done
-			if [[ -n "$upload_best_class" ]]; then
-				uci add ${CONFIG_FILE} upload_rule
-				uci set ${CONFIG_FILE}.@upload_rule[-1].name="Game_Console_Upload_${gaming_ip//[.:]/_}"
-				uci set ${CONFIG_FILE}.@upload_rule[-1].enabled=1
-				uci set ${CONFIG_FILE}.@upload_rule[-1].class="$upload_best_class"
-				uci set ${CONFIG_FILE}.@upload_rule[-1].src_ip="$gaming_ip"
-				uci set ${CONFIG_FILE}.@upload_rule[-1].proto="udp"
-				uci set ${CONFIG_FILE}.@upload_rule[-1].order=10
-				uci set ${CONFIG_FILE}.@upload_rule[-1].counter=1
-				log_info "已添加上传规则: 源IP=${gaming_ip}, 协议=UDP, 类=${upload_best_class}, order=10"
-			fi
-			if [[ -n "$download_best_class" ]]; then
-				uci add ${CONFIG_FILE} download_rule
-				uci set ${CONFIG_FILE}.@download_rule[-1].name="Game_Console_Download_${gaming_ip//[.:]/_}"
-				uci set ${CONFIG_FILE}.@download_rule[-1].enabled=1
-				uci set ${CONFIG_FILE}.@download_rule[-1].class="$download_best_class"
-				uci set ${CONFIG_FILE}.@download_rule[-1].dest_ip="$gaming_ip"
-				uci set ${CONFIG_FILE}.@download_rule[-1].proto="udp"
-				uci set ${CONFIG_FILE}.@download_rule[-1].order=10
-				uci set ${CONFIG_FILE}.@download_rule[-1].counter=1
-				log_info "已添加下载规则: 目的IP=${gaming_ip}, 协议=UDP, 类=${download_best_class}, order=10"
-			fi
-			uci commit ${CONFIG_FILE}
-		else
-			log_warn "游戏设备 IP '$gaming_ip' 格式无效，跳过规则添加"
-		fi
-	fi
-	
+        # 使用 validate_ip 函数进行完整验证
+        if validate_ip "$gaming_ip"; then
+            log_info "添加游戏设备 IP $gaming_ip 的规则"
+            load_upload_class_configurations
+            load_download_class_configurations
+            local upload_best_class=$(get_highest_priority_class "upload")
+            local download_best_class=$(get_highest_priority_class "download")
+            while true; do
+                local old_upload_rule=$(uci -q show ${CONFIG_FILE} | grep -F ".upload_rule." | grep -F ".src_ip='${gaming_ip}'" | cut -d. -f2 | head -1)
+                [[ -n "$old_upload_rule" ]] && uci -q delete ${CONFIG_FILE}.${old_upload_rule} || break
+            done
+            while true; do
+                local old_download_rule=$(uci -q show ${CONFIG_FILE} | grep -F ".download_rule." | grep -F ".dest_ip='${gaming_ip}'" | cut -d. -f2 | head -1)
+                [[ -n "$old_download_rule" ]] && uci -q delete ${CONFIG_FILE}.${old_download_rule} || break
+            done
+            if [[ -n "$upload_best_class" ]]; then
+                uci add ${CONFIG_FILE} upload_rule
+                uci set ${CONFIG_FILE}.@upload_rule[-1].name="Game_Console_Upload_${gaming_ip//[.:]/_}"
+                uci set ${CONFIG_FILE}.@upload_rule[-1].enabled=1
+                uci set ${CONFIG_FILE}.@upload_rule[-1].class="$upload_best_class"
+                uci set ${CONFIG_FILE}.@upload_rule[-1].src_ip="$gaming_ip"
+                uci set ${CONFIG_FILE}.@upload_rule[-1].proto="udp"
+                uci set ${CONFIG_FILE}.@upload_rule[-1].order=10
+                uci set ${CONFIG_FILE}.@upload_rule[-1].counter=1
+                log_info "已添加上传规则: 源IP=${gaming_ip}, 协议=UDP, 类=${upload_best_class}, order=10"
+            fi
+            if [[ -n "$download_best_class" ]]; then
+                uci add ${CONFIG_FILE} download_rule
+                uci set ${CONFIG_FILE}.@download_rule[-1].name="Game_Console_Download_${gaming_ip//[.:]/_}"
+                uci set ${CONFIG_FILE}.@download_rule[-1].enabled=1
+                uci set ${CONFIG_FILE}.@download_rule[-1].class="$download_best_class"
+                uci set ${CONFIG_FILE}.@download_rule[-1].dest_ip="$gaming_ip"
+                uci set ${CONFIG_FILE}.@download_rule[-1].proto="udp"
+                uci set ${CONFIG_FILE}.@download_rule[-1].order=10
+                uci set ${CONFIG_FILE}.@download_rule[-1].counter=1
+                log_info "已添加下载规则: 目的IP=${gaming_ip}, 协议=UDP, 类=${download_best_class}, order=10"
+            fi
+            uci commit ${CONFIG_FILE}
+        else
+            log_warn "游戏设备 IP '$gaming_ip' 格式无效，跳过规则添加"
+        fi
+    fi
+    
     log_info "自动测速完成。请重启 QoS 服务生效（/etc/init.d/qos_gargoyle restart）。"
     return 0
 }
