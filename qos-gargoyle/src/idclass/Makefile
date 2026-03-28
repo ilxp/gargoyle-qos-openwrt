@@ -1,7 +1,7 @@
 # idclass Makefile
 CC = gcc
 CFLAGS = -O2 -Wall -Wno-unused-result
-LDFLAGS = -lbpf -luci -lubox -lubus -lnl-3 -lnl-route-3 -lresolv -lpthread
+LDFLAGS = -lbpf -luci -lubox -lubus -lresolv -lpthread
 
 # 安装路径
 DESTDIR ?=
@@ -13,7 +13,7 @@ BPFDIR ?= /lib/bpf
 TARGET = idclass
 BPF_OBJ = idclass-bpf.o
 
-# 用户态源文件（根据新的模块化文件）
+# 用户态源文件
 USER_SRCS = main.c ebpf_loader.c map_manager.c config.c dns_parser.c interface.c ubus_server.c
 USER_OBJS = $(USER_SRCS:.c=.o)
 
@@ -21,8 +21,8 @@ USER_OBJS = $(USER_SRCS:.c=.o)
 LINUX_UAPI_DIR ?= $(STAGING_DIR)/usr/include
 BPF_CFLAGS = -I$(STAGING_DIR)/usr/include -I$(LINUX_UAPI_DIR)
 
-# 用户态头文件搜索路径（添加 libnl3 路径，解决 netlink/msg.h 缺失）
-INCLUDES = -I. -I$(STAGING_DIR)/usr/include/libnl3
+# 用户态头文件搜索路径
+INCLUDES = -I.
 
 # 默认目标
 all: $(TARGET) $(BPF_OBJ)
