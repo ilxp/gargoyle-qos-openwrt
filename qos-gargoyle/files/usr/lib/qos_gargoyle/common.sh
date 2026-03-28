@@ -1565,8 +1565,11 @@ restore_main_config() {
 calculate_memory_limit() {
     local config_value="$1" result
     [[ -z "$config_value" ]] && { echo ""; return; }
-    local lower_val=$(echo "$config_value" | tr '[:upper:]' '[:lower:]' | tr -d ' ')
+    # 去除可能的引号和空格
+    local cleaned=$(echo "$config_value" | sed "s/['\"]//g" | tr -d ' ')
+    local lower_val=$(echo "$cleaned" | tr "A-Z" "a-z")
     if [[ "$lower_val" == "auto" ]]; then
+        # 自动计算内存限制（此处保留原有自动计算代码，未列出）
         local total_mem_mb=0
         if [[ -f /sys/fs/cgroup/memory.max ]]; then
             local total_mem_bytes=$(cat /sys/fs/cgroup/memory.max 2>/dev/null)
@@ -1589,8 +1592,8 @@ calculate_memory_limit() {
                 log_info "从 /proc/meminfo 获取内存: ${total_mem_mb}MB"
             fi
         fi
-        if (( total_mem_mb > 0 )); then	
-            # 使用总内存的 6.25% (1/16)
+        if (( total_mem_mb > 0 )); then
+		    # 使用总内存的 6.25% (1/16)
             # 256MB -> 16MB, 512MB -> 32MB, 1GB -> 64MB, 2GB -> 128MB
             # 上限 128MB，避免过度占用
             result="$((total_mem_mb / 16))Mb"
@@ -1603,10 +1606,9 @@ calculate_memory_limit() {
             log_warn "无法读取内存信息，使用默认值 16Mb"; result="16Mb"
         fi
     else
-        # 匹配数字+单位（kb, mb, gb），允许大小写混合
-        if [[ "$lower_val" =~ ^([0-9]+)(kb|mb|gb)$ ]]; then
-            # 保持原始格式输出
-            result="$config_value"
+        # 匹配数字+单位（kb, mb, gb），不区分大小写
+        if [[ "$lower_val" =~ ^[0-9]+(kb|mb|gb)$ ]]; then
+            result="$cleaned"   # 保留原始格式（去除引号但保留大小写）
             log_info "使用用户配置的 memlimit: ${result}"
         else
             log_warn "无效的 memlimit 格式 '$config_value'，使用默认值 16Mb"; result="16Mb"
@@ -1614,6 +1616,7 @@ calculate_memory_limit() {
     fi
     echo "$result"
 }
+
 # ========== 获取最高优先级的类名称 ==========
 get_highest_priority_class() {
     local direction="$1"
