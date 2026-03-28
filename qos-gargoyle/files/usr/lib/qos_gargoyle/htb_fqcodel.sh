@@ -1,6 +1,6 @@
 #!/bin/bash
 # HTB_FQCODEL算法实现模块
-# 版本: 3.4.7 - 修复内存限制解析、CAKE带宽忽略、IFB删除控制、参数验证增强
+# 版本: 3.5.1 - 修复burst值计算、SFO检测警告、全局常量统一、参数验证增强
 # 基于HTB与FQ_CODEL组合算法实现QoS流量控制。
 
 # ========== 全局配置常量 ==========
@@ -39,6 +39,26 @@ trap main_cleanup EXIT INT TERM HUP QUIT
 . /lib/functions.sh
 . /lib/functions/network.sh
 include /lib/network
+
+# ========== 辅助函数：优化后的 HTB burst 计算 ==========
+calculate_htb_burst() {
+    local rate_kbps="$1"   # kbit/s
+    local mtu="${2:-1500}"
+    
+    # 使用 10ms 的 burst 时间窗口
+    local burst_bytes=$(( (rate_kbps * 1000 / 8) * 10 / 1000 ))
+    # 确保至少能容纳 3 个 MTU
+    local min_burst=$(( mtu * 3 ))
+    (( burst_bytes < min_burst )) && burst_bytes=$min_burst
+    # 限制最大 burst (16MB)
+    (( burst_bytes > 16777216 )) && burst_bytes=16777216
+    
+    local burst_kb=$(( (burst_bytes + 1023) / 1024 ))
+    local cburst_kb=$(( burst_kb * 2 ))
+    (( cburst_kb > 16777216 / 1024 )) && cburst_kb=$(( 16777216 / 1024 ))
+    
+    echo "${burst_kb}kb ${cburst_kb}kb"
+}
 
 # ========== 辅助函数：检测 fq_codel 参数支持 ==========
 check_fq_codel_param_support() {
@@ -191,19 +211,19 @@ load_htb_fqcodel_config() {
     fi
 
     # 6. memory_limit（可选）
-	FQCODEL_MEMORY_LIMIT=$(uci -q get ${CONFIG_FILE}.fq_codel.memory_limit 2>/dev/null)
-	if [[ -n "$FQCODEL_MEMORY_LIMIT" ]]; then
-		local original_mem="$FQCODEL_MEMORY_LIMIT"
-		# 先通过 calculate_memory_limit 转换为 "X Mb" 格式，再提取数字并转为字节
-		local mem_str=$(calculate_memory_limit "$FQCODEL_MEMORY_LIMIT")
-		local mem_num=$(echo "$mem_str" | sed 's/Mb//')
-		# 转换为字节（1 Mb = 1048576 字节）
-		FQCODEL_MEMORY_LIMIT=$((mem_num * 1048576))
-		if ! check_fq_codel_param_support "memory_limit $FQCODEL_MEMORY_LIMIT"; then
-			qos_log "WARN" "内核不支持 fq_codel memory_limit=$FQCODEL_MEMORY_LIMIT，将禁用此参数"
-			FQCODEL_MEMORY_LIMIT=""
-		fi
-	fi
+    FQCODEL_MEMORY_LIMIT=$(uci -q get ${CONFIG_FILE}.fq_codel.memory_limit 2>/dev/null)
+    if [[ -n "$FQCODEL_MEMORY_LIMIT" ]]; then
+        local original_mem="$FQCODEL_MEMORY_LIMIT"
+        # 先通过 calculate_memory_limit 转换为 "X Mb" 格式，再提取数字并转为字节
+        local mem_str=$(calculate_memory_limit "$FQCODEL_MEMORY_LIMIT")
+        local mem_num=$(echo "$mem_str" | sed 's/Mb//')
+        # 转换为字节（1 Mb = 1048576 字节）
+        FQCODEL_MEMORY_LIMIT=$((mem_num * 1048576))
+        if ! check_fq_codel_param_support "memory_limit $FQCODEL_MEMORY_LIMIT"; then
+            qos_log "WARN" "内核不支持 fq_codel memory_limit=$FQCODEL_MEMORY_LIMIT，将禁用此参数"
+            FQCODEL_MEMORY_LIMIT=""
+        fi
+    fi
 
     # 7. ce_threshold（可选）
     FQCODEL_CE_THRESHOLD=$(uci -q get ${CONFIG_FILE}.fq_codel.ce_threshold 2>/dev/null)
@@ -311,26 +331,7 @@ load_htb_class_config() {
 }
 
 # ========== HTB 辅助函数 ==========
-calculate_htb_burst() {
-    local rate="$1"  # 单位: kbit
-    local ceil="$2"  # 单位: kbit
-    local mtu="$3"   # MTU大小
-    if [[ -z "$mtu" ]]; then
-        mtu=1500
-    fi
-
-    local burst_kb=$(awk "BEGIN {printf \"%.0f\", ($rate + 7) / 8}")
-    local min_burst_kb=$((mtu * 3 / 1024))
-    (( min_burst_kb < 1 )) && min_burst_kb=1
-    (( burst_kb < min_burst_kb )) && burst_kb=$min_burst_kb
-    if (( burst_kb > 1048576 )); then
-        burst_kb=1048576
-        qos_log "WARN" "burst值超过1GB，已限制为1048576KB"
-    fi
-    local cburst_kb=$((burst_kb * 2))
-    (( cburst_kb > 1048576 )) && cburst_kb=1048576
-    echo "${burst_kb}kb ${cburst_kb}kb"
-}
+# 已使用新的 calculate_htb_burst 函数
 
 # ========== FQ_CODEL 参数构建函数 ==========
 build_fq_codel_params() {
@@ -379,7 +380,8 @@ create_htb_root_qdisc() {
         qos_log "ERROR" "无法在 $device 上创建HTB根队列"
         return 1
     fi
-    local burst_params=$(calculate_htb_burst "$bandwidth" "$bandwidth")
+    # 使用新的 burst 计算
+    local burst_params=$(calculate_htb_burst "$bandwidth")
     local burst=$(echo "$burst_params" | awk '{print $1}')
     local cburst=$(echo "$burst_params" | awk '{print $2}')
     if ! tc class add dev "$device" parent $root_handle classid $root_classid htb \
@@ -406,7 +408,7 @@ set_htb_default_class() {
         qos_log "ERROR" "无效的默认类ID: $default_classid (有效范围 2-17)"
         return 1
     fi
-    # 修复：正确使用 tc qdisc change 修改默认类
+    # 优先使用 tc qdisc change 修改默认类
     if tc qdisc change dev "$device" root htb default $default_classid 2>/dev/null; then
         qos_log "INFO" "已设置HTB根队列默认类为 $default_classid"
         return 0
@@ -493,7 +495,8 @@ create_htb_upload_class() {
         rate_value="$ceil_value"
     fi
     local mtu=$(cat /sys/class/net/$qos_interface/mtu 2>/dev/null || echo 1500)
-    local burst_params=$(calculate_htb_burst "$rate_value" "$ceil_value" "$mtu")
+    # 使用新的 burst 计算
+    local burst_params=$(calculate_htb_burst "$rate_value" "$mtu")
     local burst=$(echo "$burst_params" | awk '{print $1}')
     local cburst=$(echo "$burst_params" | awk '{print $2}')
     local prio="prio 3"
@@ -612,7 +615,8 @@ create_htb_download_class() {
         rate_value="$ceil_value"
     fi
     local mtu=$(cat /sys/class/net/$ifb_dev/mtu 2>/dev/null || echo 1500)
-    local burst_params=$(calculate_htb_burst "$rate_value" "$ceil_value" "$mtu")
+    # 使用新的 burst 计算
+    local burst_params=$(calculate_htb_burst "$rate_value" "$mtu")
     local burst=$(echo "$burst_params" | awk '{print $1}')
     local cburst=$(echo "$burst_params" | awk '{print $2}')
     local prio="prio 3"
@@ -869,6 +873,15 @@ init_htb_fqcodel_qos() {
     local action="${1:-start}"
     qos_log "INFO" "开始初始化HTB+FQ_CODEL QoS系统 (action=$action)"
     
+    # 检测 SFO 并警告
+    if check_sfo_enabled; then
+        qos_log "WARN" "检测到软件/硬件流加速已启用，QoS标记可能被绕过"
+        qos_log "WARN" "建议禁用流加速以获得完整QoS功能:"
+        qos_log "WARN" "  uci set firewall.@defaults[0].flow_offloading=0"
+        qos_log "WARN" "  uci set firewall.@defaults[0].flow_offloading_hw=0"
+        qos_log "WARN" "  uci commit firewall && /etc/init.d/firewall restart"
+    fi
+    
     # 检查是否已在运行（由 procd 保证，但保留辅助检查）
     if ! check_already_running; then
         qos_log "ERROR" "HTB+FQ_CODEL QoS 已经在运行中"
@@ -881,8 +894,8 @@ init_htb_fqcodel_qos() {
         return 1
     fi
     
-    nft flush chain inet gargoyle-qos-priority filter_qos_egress 2>/dev/null
-    nft flush chain inet gargoyle-qos-priority filter_qos_ingress 2>/dev/null
+    nft flush chain inet ${NFT_TABLE} filter_qos_egress 2>/dev/null
+    nft flush chain inet ${NFT_TABLE} filter_qos_ingress 2>/dev/null
     qos_log "INFO" "已清空 nft 规则链"
     
     if ! check_required_commands; then
@@ -915,7 +928,7 @@ init_htb_fqcodel_qos() {
         return 1
     fi
     
-    nft add table inet gargoyle-qos-priority 2>/dev/null || true
+    nft add table inet ${NFT_TABLE} 2>/dev/null || true
     if [[ -z "$qos_interface" ]]; then
         qos_interface=$(uci -q get ${CONFIG_FILE}.global.wan_interface 2>/dev/null)
         if [[ -z "$qos_interface" ]] && [[ -f "/lib/functions/network.sh" ]]; then
@@ -1119,7 +1132,7 @@ stop_htb_fqcodel_qos() {
     # 清理动态检测相关资源
     cleanup_dynamic_detection
     
-    nft delete table inet gargoyle-qos-priority 2>/dev/null || true
+    nft delete table inet ${NFT_TABLE} 2>/dev/null || true
     clear_class_marks
     qos_log "INFO" "HTB+FQ_CODEL QoS停止完成"
     
@@ -1152,7 +1165,7 @@ show_htb_fqcodel_status() {
     fi
     local qos_ifb="$IFB_DEVICE"
 
-    echo "===== HTB-FQCODEL QoS 状态报告 ====="
+    echo "===== HTB-FQCODEL QoS 状态报告（$QOS_VERSION）  ====="
     echo "时间: $(date)"
     echo "WAN接口: ${real_wan_if}"
 
@@ -1197,8 +1210,8 @@ show_htb_fqcodel_status() {
     fi
 
     echo -e "\n======== nftables 分类规则 ========"
-    if nft list table inet gargoyle-qos-priority &>/dev/null; then
-        nft list table inet gargoyle-qos-priority 2>/dev/null | sed 's/^/  /'
+    if nft list table inet ${NFT_TABLE} &>/dev/null; then
+        nft list table inet ${NFT_TABLE} 2>/dev/null | sed 's/^/  /'
     else
         echo "  nftables 表不存在"
     fi

@@ -1,6 +1,6 @@
 #!/bin/bash
 # 规则辅助模块 (rule.sh)
-# 版本: 3.4.17 - ipv6重定向缓存
+# 版本: 3.5.1 - 修复: UDP限速类名匹配、IPv6重定向缓存验证、meter检测、全局常量统一
 # 完全移除锁机制，适配 procd 管理
 
 # 加载核心库
@@ -111,7 +111,7 @@ build_nft_rule_generic() {
     local ipv6_rules=()
     
     add_ipv4_rule() {
-        local cmd="add rule inet gargoyle-qos-priority $chain meta mark == 0 meta nfproto ipv4"
+        local cmd="add rule inet ${NFT_TABLE} $chain meta mark == 0 meta nfproto ipv4"
         [ -n "$1" ] && cmd="$cmd $1"
         [ -n "$2" ] && cmd="$cmd $2"
         [ -n "$3" ] && cmd="$cmd $3"
@@ -124,7 +124,7 @@ build_nft_rule_generic() {
     }
     
     add_ipv6_rule() {
-        local cmd="add rule inet gargoyle-qos-priority $chain meta mark == 0 meta nfproto ipv6"
+        local cmd="add rule inet ${NFT_TABLE} $chain meta mark == 0 meta nfproto ipv6"
         [ -n "$1" ] && cmd="$cmd $1"
         [ -n "$2" ] && cmd="$cmd $2"
         [ -n "$3" ] && cmd="$cmd $3"
@@ -525,8 +525,8 @@ setup_class_mark_map() {
     register_temp_file "$tmp_nft_file"
 
     cat << EOF >> "$tmp_nft_file"
-delete map inet gargoyle-qos-priority class_mark 2>/dev/null
-add map inet gargoyle-qos-priority class_mark { type mark : dscp; }
+delete map inet ${NFT_TABLE} class_mark 2>/dev/null
+add map inet ${NFT_TABLE} class_mark { type mark : dscp; }
 EOF
 
     config_load "$CONFIG_FILE"
@@ -560,19 +560,19 @@ EOF
     done < "$CLASS_MARKS_FILE"
 
     if [ -n "$elements" ]; then
-        echo "add element inet gargoyle-qos-priority class_mark { $elements }" >> "$tmp_nft_file"
+        echo "add element inet ${NFT_TABLE} class_mark { $elements }" >> "$tmp_nft_file"
     fi
 
     cat << EOF >> "$tmp_nft_file"
 # DSCP mapping rules
-add rule inet gargoyle-qos-priority filter_qos_egress ct mark != 0 ip dscp set @class_mark[ct mark]
-add rule inet gargoyle-qos-priority filter_qos_egress ct mark != 0 ip6 dscp set @class_mark[ct mark]
-add rule inet gargoyle-qos-priority filter_qos_ingress ct mark != 0 ip dscp set @class_mark[ct mark]
-add rule inet gargoyle-qos-priority filter_qos_ingress ct mark != 0 ip6 dscp set @class_mark[ct mark]
-add rule inet gargoyle-qos-priority filter_qos_egress ct state established,related ct mark != 0 ip dscp set @class_mark[ct mark]
-add rule inet gargoyle-qos-priority filter_qos_egress ct state established,related ct mark != 0 ip6 dscp set @class_mark[ct mark]
-add rule inet gargoyle-qos-priority filter_qos_ingress ct state established,related ct mark != 0 ip dscp set @class_mark[ct mark]
-add rule inet gargoyle-qos-priority filter_qos_ingress ct state established,related ct mark != 0 ip6 dscp set @class_mark[ct mark]
+add rule inet ${NFT_TABLE} filter_qos_egress ct mark != 0 ip dscp set @class_mark[ct mark]
+add rule inet ${NFT_TABLE} filter_qos_egress ct mark != 0 ip6 dscp set @class_mark[ct mark]
+add rule inet ${NFT_TABLE} filter_qos_ingress ct mark != 0 ip dscp set @class_mark[ct mark]
+add rule inet ${NFT_TABLE} filter_qos_ingress ct mark != 0 ip6 dscp set @class_mark[ct mark]
+add rule inet ${NFT_TABLE} filter_qos_egress ct state established,related ct mark != 0 ip dscp set @class_mark[ct mark]
+add rule inet ${NFT_TABLE} filter_qos_egress ct state established,related ct mark != 0 ip6 dscp set @class_mark[ct mark]
+add rule inet ${NFT_TABLE} filter_qos_ingress ct state established,related ct mark != 0 ip dscp set @class_mark[ct mark]
+add rule inet ${NFT_TABLE} filter_qos_ingress ct state established,related ct mark != 0 ip6 dscp set @class_mark[ct mark]
 EOF
 
     if nft -f "$tmp_nft_file" 2>&1 | logger -t qos_gargoyle; then
@@ -591,8 +591,8 @@ EOF
 apply_enhanced_direction_rules() {
     local rule_type="$1" chain="$2" mask="$3"
     qos_log "INFO" "应用增强$rule_type规则到链: $chain, 掩码: $mask"
-    nft add chain inet gargoyle-qos-priority "$chain" 2>/dev/null || true
-    nft flush chain inet gargoyle-qos-priority "$chain" 2>/dev/null || true
+    nft add chain inet ${NFT_TABLE} "$chain" 2>/dev/null || true
+    nft flush chain inet ${NFT_TABLE} "$chain" 2>/dev/null || true
     local direction=""
     [[ "$chain" == "filter_qos_egress" ]] && direction="upload"
     [[ "$chain" == "filter_qos_ingress" ]] && direction="download"
@@ -645,7 +645,7 @@ apply_enhanced_direction_rules() {
     done
     if [[ ${#all_sets[@]} -gt 0 ]]; then
         all_sets=($(printf "%s\n" "${all_sets[@]}" | sort -u))
-        local existing_sets=$(get_existing_sets "inet gargoyle-qos-priority")
+        local existing_sets=$(get_existing_sets "inet ${NFT_TABLE}")
         local missing_sets=()
         for setname in "${all_sets[@]}"; do
             if ! echo "$existing_sets" | grep -qx "$setname"; then
@@ -760,7 +760,7 @@ apply_enhanced_direction_rules() {
                 line="${line#"${line%%[![:space:]]*}"}"
                 line="${line%"${line##*[![:space:]]}"}"
                 [[ -z "$line" || "$line" == \#* ]] && continue
-                echo "add rule inet gargoyle-qos-priority $chain $line" >> "$nft_batch_file"
+                echo "add rule inet ${NFT_TABLE} $chain $line" >> "$nft_batch_file"
                 ((rule_count++))
             done < "$custom_file"
         else
@@ -813,7 +813,7 @@ generate_ack_limit_rules() {
 
     # 检查必要的集合是否存在（由 apply_all_rules 创建）
     for set in qos_xfst_ack qos_fast_ack qos_med_ack qos_slow_ack; do
-        if ! nft list set inet gargoyle-qos-priority "$set" &>/dev/null; then
+        if ! nft list set inet ${NFT_TABLE} "$set" &>/dev/null; then
             qos_log "WARN" "ACK 限速所需集合 $set 不存在，功能已禁用"
             return
         fi
@@ -843,10 +843,10 @@ generate_ack_limit_rules() {
 
     cat <<EOF
 # ACK rate limiting using per-connection dynamic sets
-add rule inet gargoyle-qos-priority filter_qos_egress meta length < 100 tcp flags ack add @qos_xfst_ack { ct id . ct direction limit rate over ${xfast_rate}/second } counter jump drop995
-add rule inet gargoyle-qos-priority filter_qos_egress meta length < 100 tcp flags ack add @qos_fast_ack { ct id . ct direction limit rate over ${fast_rate}/second } counter jump drop95
-add rule inet gargoyle-qos-priority filter_qos_egress meta length < 100 tcp flags ack add @qos_med_ack { ct id . ct direction limit rate over ${med_rate}/second } counter jump drop50
-add rule inet gargoyle-qos-priority filter_qos_egress meta length < 100 tcp flags ack add @qos_slow_ack { ct id . ct direction limit rate over ${slow_rate}/second } counter jump drop50
+add rule inet ${NFT_TABLE} filter_qos_egress meta length < 100 tcp flags ack add @qos_xfst_ack { ct id . ct direction limit rate over ${xfast_rate}/second } counter jump drop995
+add rule inet ${NFT_TABLE} filter_qos_egress meta length < 100 tcp flags ack add @qos_fast_ack { ct id . ct direction limit rate over ${fast_rate}/second } counter jump drop95
+add rule inet ${NFT_TABLE} filter_qos_egress meta length < 100 tcp flags ack add @qos_med_ack { ct id . ct direction limit rate over ${med_rate}/second } counter jump drop50
+add rule inet ${NFT_TABLE} filter_qos_egress meta length < 100 tcp flags ack add @qos_slow_ack { ct id . ct direction limit rate over ${slow_rate}/second } counter jump drop50
 EOF
 }
 
@@ -856,7 +856,7 @@ generate_tcp_upgrade_rules() {
     case "$tcp_enabled" in 1|yes|true|on) ;; *) return ;; esac
 
     # 检查集合是否存在
-    if ! nft list set inet gargoyle-qos-priority qos_slow_tcp &>/dev/null; then
+    if ! nft list set inet ${NFT_TABLE} qos_slow_tcp &>/dev/null; then
         qos_log "WARN" "TCP 升级所需集合 qos_slow_tcp 不存在，功能已禁用"
         return
     fi
@@ -887,12 +887,12 @@ generate_tcp_upgrade_rules() {
 
     cat <<EOF
 # TCP upgrade for connections exceeding rate (per-connection)
-add rule inet gargoyle-qos-priority filter_qos_egress meta l4proto tcp ct state established meta nfproto ipv4 add @qos_slow_tcp { ct id . ct direction limit rate over ${rate}/second burst ${burst} packets } meta mark set $class_mark ct mark set meta mark counter
-add rule inet gargoyle-qos-priority filter_qos_egress meta l4proto tcp ct state established meta nfproto ipv6 add @qos_slow_tcp { ct id . ct direction limit rate over ${rate}/second burst ${burst} packets } meta mark set $class_mark ct mark set meta mark counter
+add rule inet ${NFT_TABLE} filter_qos_egress meta l4proto tcp ct state established meta nfproto ipv4 add @qos_slow_tcp { ct id . ct direction limit rate over ${rate}/second burst ${burst} packets } meta mark set $class_mark ct mark set meta mark counter
+add rule inet ${NFT_TABLE} filter_qos_egress meta l4proto tcp ct state established meta nfproto ipv6 add @qos_slow_tcp { ct id . ct direction limit rate over ${rate}/second burst ${burst} packets } meta mark set $class_mark ct mark set meta mark counter
 EOF
 }
 
-# ========== UDP 限速规则（类名大小写不敏感） ==========
+# ========== UDP 限速规则（类名大小写不敏感，改进匹配逻辑） ==========
 generate_udp_limit_rules() {
     local udp_enable=$(uci -q get ${CONFIG_FILE}.udp_limit.enabled 2>/dev/null)
     local udp_rate=$(uci -q get ${CONFIG_FILE}.udp_limit.rate 2>/dev/null)
@@ -919,7 +919,7 @@ generate_udp_limit_rules() {
         return
     fi
 
-    # 将类名转为小写进行匹配（大小写不敏感）
+    # 将类名转为小写进行匹配（大小写不敏感），同时支持节名和 name 字段
     local lower_mark_class=$(echo "$udp_mark_class" | tr '[:upper:]' '[:lower:]')
     local upload_mark="" download_mark=""
     if [[ "$udp_action" == "mark" ]]; then
@@ -929,16 +929,26 @@ generate_udp_limit_rules() {
         if [[ -z "$download_class_list" ]]; then
             load_download_class_configurations
         fi
+        # 上传方向匹配
         for class in $upload_class_list; do
-            local name=$(uci -q get ${CONFIG_FILE}.${class}.name 2>/dev/null | tr '[:upper:]' '[:lower:]')
-            if [[ "$name" == "$lower_mark_class" ]]; then
+            local class_display=$(uci -q get ${CONFIG_FILE}.${class}.name 2>/dev/null)
+            if [[ -z "$class_display" ]]; then
+                class_display="$class"
+            fi
+            class_display=$(echo "$class_display" | tr '[:upper:]' '[:lower:]')
+            if [[ "$class_display" == "$lower_mark_class" ]]; then
                 upload_mark=$(get_class_mark "upload" "$class")
                 break
             fi
         done
+        # 下载方向匹配
         for class in $download_class_list; do
-            local name=$(uci -q get ${CONFIG_FILE}.${class}.name 2>/dev/null | tr '[:upper:]' '[:lower:]')
-            if [[ "$name" == "$lower_mark_class" ]]; then
+            local class_display=$(uci -q get ${CONFIG_FILE}.${class}.name 2>/dev/null)
+            if [[ -z "$class_display" ]]; then
+                class_display="$class"
+            fi
+            class_display=$(echo "$class_display" | tr '[:upper:]' '[:lower:]')
+            if [[ "$class_display" == "$lower_mark_class" ]]; then
                 download_mark=$(get_class_mark "download" "$class")
                 break
             fi
@@ -953,14 +963,14 @@ generate_udp_limit_rules() {
     if [[ "$udp_action" == "mark" ]] && [[ -n "$upload_mark" ]] && [[ -n "$download_mark" ]]; then
         rules="${rules}
 # Global UDP rate limit - upload direction (mark) - only for unclassified flows
-add rule inet gargoyle-qos-priority filter_qos_egress oifname \"$wan_if\" meta l4proto udp ct mark == 0 limit rate over ${udp_rate}/second counter meta mark set $upload_mark ct mark set $upload_mark
+add rule inet ${NFT_TABLE} filter_qos_egress oifname \"$wan_if\" meta l4proto udp ct mark == 0 limit rate over ${udp_rate}/second counter meta mark set $upload_mark ct mark set $upload_mark
 # Global UDP rate limit - download direction (mark) - only for unclassified flows
-add rule inet gargoyle-qos-priority filter_qos_ingress iifname \"$wan_if\" meta l4proto udp ct mark == 0 limit rate over ${udp_rate}/second counter meta mark set $download_mark ct mark set $download_mark"
+add rule inet ${NFT_TABLE} filter_qos_ingress iifname \"$wan_if\" meta l4proto udp ct mark == 0 limit rate over ${udp_rate}/second counter meta mark set $download_mark ct mark set $download_mark"
     elif [[ "$udp_action" == "drop" ]]; then
         rules="${rules}
 # Global UDP rate limit - drop
-add rule inet gargoyle-qos-priority filter_qos_egress meta l4proto udp limit rate over ${udp_rate}/second counter drop
-add rule inet gargoyle-qos-priority filter_qos_ingress meta l4proto udp limit rate over ${udp_rate}/second counter drop"
+add rule inet ${NFT_TABLE} filter_qos_egress meta l4proto udp limit rate over ${udp_rate}/second counter drop
+add rule inet ${NFT_TABLE} filter_qos_ingress meta l4proto udp limit rate over ${udp_rate}/second counter drop"
     fi
 
     echo "$rules"
@@ -968,6 +978,11 @@ add rule inet gargoyle-qos-priority filter_qos_ingress meta l4proto udp limit ra
 
 # ========== 动态检测函数 ==========
 check_meter_support() {
+    # 使用缓存结果
+    if [[ $METER_SUPPORT_CHECKED -eq 1 ]]; then
+        return $METER_SUPPORT_AVAILABLE
+    fi
+    
     local test_file=$(mktemp)
     register_temp_file "$test_file"
     cat > "$test_file" <<EOF
@@ -979,6 +994,8 @@ EOF
     if nft -c -f "$test_file" 2>/dev/null; then
         nft delete table inet qos_meter_test 2>/dev/null
         rm -f "$test_file"
+        METER_SUPPORT_CHECKED=1
+        METER_SUPPORT_AVAILABLE=1
         return 0
     else
         if [[ "$DEBUG" == "1" ]]; then
@@ -987,22 +1004,24 @@ EOF
         fi
         nft delete table inet qos_meter_test 2>/dev/null
         rm -f "$test_file"
+        METER_SUPPORT_CHECKED=1
+        METER_SUPPORT_AVAILABLE=0
         return 1
     fi
 }
 
 cleanup_dynamic_detection() {
-    nft delete set inet gargoyle-qos-priority qos_bulk_clients 2>/dev/null || true
-    nft delete set inet gargoyle-qos-priority qos_bulk_clients6 2>/dev/null || true
-    nft delete chain inet gargoyle-qos-priority qos_bulk_client 2>/dev/null || true
-    nft delete chain inet gargoyle-qos-priority qos_bulk_client_reply 2>/dev/null || true
-    nft delete chain inet gargoyle-qos-priority qos_dynamic_classify 2>/dev/null || true
-    nft delete chain inet gargoyle-qos-priority qos_dynamic_classify_reply 2>/dev/null || true
-    nft delete chain inet gargoyle-qos-priority qos_established_connection 2>/dev/null || true
-    nft delete chain inet gargoyle-qos-priority qos_high_throughput_service 2>/dev/null || true
-    nft delete chain inet gargoyle-qos-priority qos_high_throughput_service_reply 2>/dev/null || true
-    nft delete set inet gargoyle-qos-priority qos_high_throughput_services 2>/dev/null || true
-    nft delete set inet gargoyle-qos-priority qos_high_throughput_services6 2>/dev/null || true
+    nft delete set inet ${NFT_TABLE} qos_bulk_clients 2>/dev/null || true
+    nft delete set inet ${NFT_TABLE} qos_bulk_clients6 2>/dev/null || true
+    nft delete chain inet ${NFT_TABLE} qos_bulk_client 2>/dev/null || true
+    nft delete chain inet ${NFT_TABLE} qos_bulk_client_reply 2>/dev/null || true
+    nft delete chain inet ${NFT_TABLE} qos_dynamic_classify 2>/dev/null || true
+    nft delete chain inet ${NFT_TABLE} qos_dynamic_classify_reply 2>/dev/null || true
+    nft delete chain inet ${NFT_TABLE} qos_established_connection 2>/dev/null || true
+    nft delete chain inet ${NFT_TABLE} qos_high_throughput_service 2>/dev/null || true
+    nft delete chain inet ${NFT_TABLE} qos_high_throughput_service_reply 2>/dev/null || true
+    nft delete set inet ${NFT_TABLE} qos_high_throughput_services 2>/dev/null || true
+    nft delete set inet ${NFT_TABLE} qos_high_throughput_services6 2>/dev/null || true
 }
 
 # ========== 批量客户端检测（方向标记正确） ==========
@@ -1062,14 +1081,14 @@ create_bulk_client_rules() {
         fi
     fi
 
-    nft add set inet gargoyle-qos-priority qos_bulk_clients '{ type ipv4_addr . inet_service . inet_proto; flags timeout; }' 2>/dev/null || true
-    nft add set inet gargoyle-qos-priority qos_bulk_clients6 '{ type ipv6_addr . inet_service . inet_proto; flags timeout; }' 2>/dev/null || true
+    nft add set inet ${NFT_TABLE} qos_bulk_clients '{ type ipv4_addr . inet_service . inet_proto; flags timeout; }' 2>/dev/null || true
+    nft add set inet ${NFT_TABLE} qos_bulk_clients6 '{ type ipv6_addr . inet_service . inet_proto; flags timeout; }' 2>/dev/null || true
 
-    nft add chain inet gargoyle-qos-priority qos_established_connection 2>/dev/null || true
-    nft add chain inet gargoyle-qos-priority qos_dynamic_classify 2>/dev/null || true
-    nft add chain inet gargoyle-qos-priority qos_dynamic_classify_reply 2>/dev/null || true
-    nft add chain inet gargoyle-qos-priority qos_bulk_client 2>/dev/null || true
-    nft add chain inet gargoyle-qos-priority qos_bulk_client_reply 2>/dev/null || true
+    nft add chain inet ${NFT_TABLE} qos_established_connection 2>/dev/null || true
+    nft add chain inet ${NFT_TABLE} qos_dynamic_classify 2>/dev/null || true
+    nft add chain inet ${NFT_TABLE} qos_dynamic_classify_reply 2>/dev/null || true
+    nft add chain inet ${NFT_TABLE} qos_bulk_client 2>/dev/null || true
+    nft add chain inet ${NFT_TABLE} qos_bulk_client_reply 2>/dev/null || true
 
     if ! check_meter_support; then
         qos_log "警告" "内核不支持 nftables meter 关键字，动态分类 bulk_client 功能将禁用"
@@ -1077,41 +1096,41 @@ create_bulk_client_rules() {
     fi
 
     # 建立连接检测（上行）
-    nft add rule inet gargoyle-qos-priority qos_established_connection \
+    nft add rule inet ${NFT_TABLE} qos_established_connection \
         meter qos_bulk_detect '{ ip daddr . th dport . meta l4proto timeout 5s limit rate over '"$((min_connections - 1))"'/minute }' \
         add @qos_bulk_clients '{ ip daddr . th dport . meta l4proto timeout 30s }' 2>/dev/null || true
 
-    nft add rule inet gargoyle-qos-priority qos_established_connection \
+    nft add rule inet ${NFT_TABLE} qos_established_connection \
         meter qos_bulk_detect6 '{ ip6 daddr . th dport . meta l4proto timeout 5s limit rate over '"$((min_connections - 1))"'/minute }' \
         add @qos_bulk_clients6 '{ ip6 daddr . th dport . meta l4proto timeout 30s }' 2>/dev/null || true
 
     # 上行流量：匹配后设置上传标记
-    nft add rule inet gargoyle-qos-priority qos_bulk_client \
+    nft add rule inet ${NFT_TABLE} qos_bulk_client \
         meter qos_bulk_orig '{ ip saddr . th sport . meta l4proto timeout 5m limit rate over '"$((min_bytes - 1))"' bytes/second }' \
         update @qos_bulk_clients '{ ip saddr . th sport . meta l4proto timeout 5m }' \
         meta mark set $upload_mark ct mark set $upload_mark return 2>/dev/null || true
 
-    nft add rule inet gargoyle-qos-priority qos_bulk_client \
+    nft add rule inet ${NFT_TABLE} qos_bulk_client \
         meter qos_bulk_orig6 '{ ip6 saddr . th sport . meta l4proto timeout 5m limit rate over '"$((min_bytes - 1))"' bytes/second }' \
         update @qos_bulk_clients6 '{ ip6 saddr . th sport . meta l4proto timeout 5m }' \
         meta mark set $upload_mark ct mark set $upload_mark return 2>/dev/null || true
 
     # 下行流量：匹配后设置下载标记
-    nft add rule inet gargoyle-qos-priority qos_bulk_client_reply \
+    nft add rule inet ${NFT_TABLE} qos_bulk_client_reply \
         meter qos_bulk_reply '{ ip daddr . th dport . meta l4proto timeout 5m limit rate over '"$((min_bytes - 1))"' bytes/second }' \
         update @qos_bulk_clients '{ ip daddr . th dport . meta l4proto timeout 5m }' \
         meta mark set $download_mark ct mark set $download_mark return 2>/dev/null || true
 
-    nft add rule inet gargoyle-qos-priority qos_bulk_client_reply \
+    nft add rule inet ${NFT_TABLE} qos_bulk_client_reply \
         meter qos_bulk_reply6 '{ ip6 daddr . th dport . meta l4proto timeout 5m limit rate over '"$((min_bytes - 1))"' bytes/second }' \
         update @qos_bulk_clients6 '{ ip6 daddr . th dport . meta l4proto timeout 5m }' \
         meta mark set $download_mark ct mark set $download_mark return 2>/dev/null || true
 
     # 挂载规则到动态分类链
-    nft add rule inet gargoyle-qos-priority qos_dynamic_classify "ct mark == 0" ip saddr . th sport . meta l4proto @qos_bulk_clients goto qos_bulk_client 2>/dev/null || true
-    nft add rule inet gargoyle-qos-priority qos_dynamic_classify "ct mark == 0" ip6 saddr . th sport . meta l4proto @qos_bulk_clients6 goto qos_bulk_client 2>/dev/null || true
-    nft add rule inet gargoyle-qos-priority qos_dynamic_classify_reply "ct mark == 0" ip daddr . th dport . meta l4proto @qos_bulk_clients goto qos_bulk_client_reply 2>/dev/null || true
-    nft add rule inet gargoyle-qos-priority qos_dynamic_classify_reply "ct mark == 0" ip6 daddr . th dport . meta l4proto @qos_bulk_clients6 goto qos_bulk_client_reply 2>/dev/null || true
+    nft add rule inet ${NFT_TABLE} qos_dynamic_classify "ct mark == 0" ip saddr . th sport . meta l4proto @qos_bulk_clients goto qos_bulk_client 2>/dev/null || true
+    nft add rule inet ${NFT_TABLE} qos_dynamic_classify "ct mark == 0" ip6 saddr . th sport . meta l4proto @qos_bulk_clients6 goto qos_bulk_client 2>/dev/null || true
+    nft add rule inet ${NFT_TABLE} qos_dynamic_classify_reply "ct mark == 0" ip daddr . th dport . meta l4proto @qos_bulk_clients goto qos_bulk_client_reply 2>/dev/null || true
+    nft add rule inet ${NFT_TABLE} qos_dynamic_classify_reply "ct mark == 0" ip6 daddr . th dport . meta l4proto @qos_bulk_clients6 goto qos_bulk_client_reply 2>/dev/null || true
 
     qos_log "信息" "批量客户端检测已启用: 最小连接数=$min_connections, 最小字节数=$min_bytes 字节/秒, 上传标记=$upload_mark, 下载标记=$download_mark"
 }
@@ -1178,55 +1197,55 @@ create_high_throughput_service_rules() {
         return 0
     fi
 
-    nft add set inet gargoyle-qos-priority qos_high_throughput_services '{ type ipv4_addr . ipv4_addr . inet_service . inet_proto; flags timeout; }' 2>/dev/null || true
-    nft add set inet gargoyle-qos-priority qos_high_throughput_services6 '{ type ipv6_addr . ipv6_addr . inet_service . inet_proto; flags timeout; }' 2>/dev/null || true
+    nft add set inet ${NFT_TABLE} qos_high_throughput_services '{ type ipv4_addr . ipv4_addr . inet_service . inet_proto; flags timeout; }' 2>/dev/null || true
+    nft add set inet ${NFT_TABLE} qos_high_throughput_services6 '{ type ipv6_addr . ipv6_addr . inet_service . inet_proto; flags timeout; }' 2>/dev/null || true
 
-    nft add chain inet gargoyle-qos-priority qos_high_throughput_service 2>/dev/null || true
-    nft add chain inet gargoyle-qos-priority qos_high_throughput_service_reply 2>/dev/null || true
+    nft add chain inet ${NFT_TABLE} qos_high_throughput_service 2>/dev/null || true
+    nft add chain inet ${NFT_TABLE} qos_high_throughput_service_reply 2>/dev/null || true
 
     # 上行方向检测
-    nft add rule inet gargoyle-qos-priority qos_established_connection \
+    nft add rule inet ${NFT_TABLE} qos_established_connection \
         meter qos_htp_detect '{ ip daddr . ip saddr and 255.255.255.0 . th sport . meta l4proto timeout 5s limit rate over '"$((min_connections - 1))"'/minute }' \
         add @qos_high_throughput_services '{ ip daddr . ip saddr and 255.255.255.0 . th sport . meta l4proto timeout 30s }' 2>/dev/null || true
 
-    nft add rule inet gargoyle-qos-priority qos_established_connection \
+    nft add rule inet ${NFT_TABLE} qos_established_connection \
         meter qos_htp_detect6 '{ ip6 daddr . ip6 saddr and ffff:ffff:ffff:: . th sport . meta l4proto timeout 5s limit rate over '"$((min_connections - 1))"'/minute }' \
         add @qos_high_throughput_services6 '{ ip6 daddr . ip6 saddr and ffff:ffff:ffff:: . th sport . meta l4proto timeout 30s }' 2>/dev/null || true
 
-    nft add rule inet gargoyle-qos-priority qos_high_throughput_service "ct bytes original < $min_bytes return" 2>/dev/null || true
-    nft add rule inet gargoyle-qos-priority qos_high_throughput_service update @qos_high_throughput_services '{ ip saddr . ip daddr and 255.255.255.0 . th dport . meta l4proto timeout 5m }' 2>/dev/null || true
-    nft add rule inet gargoyle-qos-priority qos_high_throughput_service update @qos_high_throughput_services6 '{ ip6 saddr . ip6 daddr and ffff:ffff:ffff:: . th dport . meta l4proto timeout 5m }' 2>/dev/null || true
-    nft add rule inet gargoyle-qos-priority qos_high_throughput_service meta mark set $upload_mark ct mark set $upload_mark return 2>/dev/null || true
+    nft add rule inet ${NFT_TABLE} qos_high_throughput_service "ct bytes original < $min_bytes return" 2>/dev/null || true
+    nft add rule inet ${NFT_TABLE} qos_high_throughput_service update @qos_high_throughput_services '{ ip saddr . ip daddr and 255.255.255.0 . th dport . meta l4proto timeout 5m }' 2>/dev/null || true
+    nft add rule inet ${NFT_TABLE} qos_high_throughput_service update @qos_high_throughput_services6 '{ ip6 saddr . ip6 daddr and ffff:ffff:ffff:: . th dport . meta l4proto timeout 5m }' 2>/dev/null || true
+    nft add rule inet ${NFT_TABLE} qos_high_throughput_service meta mark set $upload_mark ct mark set $upload_mark return 2>/dev/null || true
 
     # 下行方向检测
-    nft add rule inet gargoyle-qos-priority qos_high_throughput_service_reply "ct bytes reply < $min_bytes return" 2>/dev/null || true
-    nft add rule inet gargoyle-qos-priority qos_high_throughput_service_reply update @qos_high_throughput_services '{ ip daddr . ip saddr and 255.255.255.0 . th sport . meta l4proto timeout 5m }' 2>/dev/null || true
-    nft add rule inet gargoyle-qos-priority qos_high_throughput_service_reply update @qos_high_throughput_services6 '{ ip6 daddr . ip6 saddr and ffff:ffff:ffff:: . th sport . meta l4proto timeout 5m }' 2>/dev/null || true
-    nft add rule inet gargoyle-qos-priority qos_high_throughput_service_reply meta mark set $download_mark ct mark set $download_mark return 2>/dev/null || true
+    nft add rule inet ${NFT_TABLE} qos_high_throughput_service_reply "ct bytes reply < $min_bytes return" 2>/dev/null || true
+    nft add rule inet ${NFT_TABLE} qos_high_throughput_service_reply update @qos_high_throughput_services '{ ip daddr . ip saddr and 255.255.255.0 . th sport . meta l4proto timeout 5m }' 2>/dev/null || true
+    nft add rule inet ${NFT_TABLE} qos_high_throughput_service_reply update @qos_high_throughput_services6 '{ ip6 daddr . ip6 saddr and ffff:ffff:ffff:: . th sport . meta l4proto timeout 5m }' 2>/dev/null || true
+    nft add rule inet ${NFT_TABLE} qos_high_throughput_service_reply meta mark set $download_mark ct mark set $download_mark return 2>/dev/null || true
 
     # 挂载规则到动态分类链
-    nft add rule inet gargoyle-qos-priority qos_dynamic_classify "ct mark == 0" ip saddr . ip daddr and 255.255.255.0 . th dport . meta l4proto @qos_high_throughput_services goto qos_high_throughput_service 2>/dev/null || true
-    nft add rule inet gargoyle-qos-priority qos_dynamic_classify "ct mark == 0" ip6 saddr . ip6 daddr and ffff:ffff:ffff:: . th dport . meta l4proto @qos_high_throughput_services6 goto qos_high_throughput_service 2>/dev/null || true
-    nft add rule inet gargoyle-qos-priority qos_dynamic_classify_reply "ct mark == 0" ip daddr . ip saddr and 255.255.255.0 . th sport . meta l4proto @qos_high_throughput_services goto qos_high_throughput_service_reply 2>/dev/null || true
-    nft add rule inet gargoyle-qos-priority qos_dynamic_classify_reply "ct mark == 0" ip6 daddr . ip6 saddr and ffff:ffff:ffff:: . th sport . meta l4proto @qos_high_throughput_services6 goto qos_high_throughput_service_reply 2>/dev/null || true
+    nft add rule inet ${NFT_TABLE} qos_dynamic_classify "ct mark == 0" ip saddr . ip daddr and 255.255.255.0 . th dport . meta l4proto @qos_high_throughput_services goto qos_high_throughput_service 2>/dev/null || true
+    nft add rule inet ${NFT_TABLE} qos_dynamic_classify "ct mark == 0" ip6 saddr . ip6 daddr and ffff:ffff:ffff:: . th dport . meta l4proto @qos_high_throughput_services6 goto qos_high_throughput_service 2>/dev/null || true
+    nft add rule inet ${NFT_TABLE} qos_dynamic_classify_reply "ct mark == 0" ip daddr . ip saddr and 255.255.255.0 . th sport . meta l4proto @qos_high_throughput_services goto qos_high_throughput_service_reply 2>/dev/null || true
+    nft add rule inet ${NFT_TABLE} qos_dynamic_classify_reply "ct mark == 0" ip6 daddr . ip6 saddr and ffff:ffff:ffff:: . th sport . meta l4proto @qos_high_throughput_services6 goto qos_high_throughput_service_reply 2>/dev/null || true
     
     qos_log "信息" "高吞吐服务检测已启用: 最小连接数=$min_connections, 最小字节数=$min_bytes 字节/秒, 上传标记=$upload_mark, 下载标记=$download_mark"
 }
 
 setup_dynamic_classification() {
     qos_log "信息" "初始化动态分类链..."
-    nft add chain inet gargoyle-qos-priority qos_established_connection 2>/dev/null || true
-    nft add chain inet gargoyle-qos-priority qos_dynamic_classify 2>/dev/null || true
-    nft add chain inet gargoyle-qos-priority qos_dynamic_classify_reply 2>/dev/null || true
+    nft add chain inet ${NFT_TABLE} qos_established_connection 2>/dev/null || true
+    nft add chain inet ${NFT_TABLE} qos_dynamic_classify 2>/dev/null || true
+    nft add chain inet ${NFT_TABLE} qos_dynamic_classify_reply 2>/dev/null || true
 
-    nft insert rule inet gargoyle-qos-priority filter_forward ct state established jump qos_established_connection 2>/dev/null || true
-    nft insert rule inet gargoyle-qos-priority filter_input ct state established jump qos_established_connection 2>/dev/null || true
-    nft insert rule inet gargoyle-qos-priority filter_output ct state established jump qos_established_connection 2>/dev/null || true
+    nft insert rule inet ${NFT_TABLE} filter_forward ct state established jump qos_established_connection 2>/dev/null || true
+    nft insert rule inet ${NFT_TABLE} filter_input ct state established jump qos_established_connection 2>/dev/null || true
+    nft insert rule inet ${NFT_TABLE} filter_output ct state established jump qos_established_connection 2>/dev/null || true
 
-    nft insert rule inet gargoyle-qos-priority filter_input "ct mark == 0" jump qos_dynamic_classify 2>/dev/null || true
-    nft insert rule inet gargoyle-qos-priority filter_output "ct mark == 0" jump qos_dynamic_classify 2>/dev/null || true
-    nft insert rule inet gargoyle-qos-priority filter_forward "ct mark == 0" jump qos_dynamic_classify 2>/dev/null || true
-    nft insert rule inet gargoyle-qos-priority filter_forward "ct mark == 0" jump qos_dynamic_classify_reply 2>/dev/null || true
+    nft insert rule inet ${NFT_TABLE} filter_input "ct mark == 0" jump qos_dynamic_classify 2>/dev/null || true
+    nft insert rule inet ${NFT_TABLE} filter_output "ct mark == 0" jump qos_dynamic_classify 2>/dev/null || true
+    nft insert rule inet ${NFT_TABLE} filter_forward "ct mark == 0" jump qos_dynamic_classify 2>/dev/null || true
+    nft insert rule inet ${NFT_TABLE} filter_forward "ct mark == 0" jump qos_dynamic_classify_reply 2>/dev/null || true
 
     create_bulk_client_rules
     create_high_throughput_service_rules
@@ -1253,7 +1272,7 @@ apply_all_rules() {
         done < <(uci show "${CONFIG_FILE}" 2>/dev/null)
         qos_log "DEBUG" "已加载 UCI 配置缓存 (${#UCI_CACHE[@]} 个选项)"
     fi
-    if ! nft list table inet gargoyle-qos-priority &>/dev/null; then
+    if ! nft list table inet ${NFT_TABLE} &>/dev/null; then
         qos_log "INFO" "nft 表不存在，将重新初始化"
         _QOS_TABLE_FLUSHED=0
         _IPSET_LOADED=0
@@ -1262,48 +1281,47 @@ apply_all_rules() {
     fi
     if [[ $_QOS_TABLE_FLUSHED -eq 0 ]]; then
         qos_log "INFO" "初始化 nftables 表"
-        nft add table inet gargoyle-qos-priority 2>/dev/null || true
-        nft flush chain inet gargoyle-qos-priority filter_qos_egress 2>/dev/null || true
-        nft flush chain inet gargoyle-qos-priority filter_qos_ingress 2>/dev/null || true
-        nft flush chain inet gargoyle-qos-priority drop995 2>/dev/null || true
-        nft flush chain inet gargoyle-qos-priority drop95 2>/dev/null || true
-        nft flush chain inet gargoyle-qos-priority drop50 2>/dev/null || true
-        nft flush chain inet gargoyle-qos-priority $RATELIMIT_CHAIN 2>/dev/null || true
-        nft add chain inet gargoyle-qos-priority filter_qos_egress 2>/dev/null || true
-        nft add chain inet gargoyle-qos-priority filter_qos_ingress 2>/dev/null || true
+        nft add table inet ${NFT_TABLE} 2>/dev/null || true
+        nft flush chain inet ${NFT_TABLE} filter_qos_egress 2>/dev/null || true
+        nft flush chain inet ${NFT_TABLE} filter_qos_ingress 2>/dev/null || true
+        nft flush chain inet ${NFT_TABLE} drop995 2>/dev/null || true
+        nft flush chain inet ${NFT_TABLE} drop95 2>/dev/null || true
+        nft flush chain inet ${NFT_TABLE} drop50 2>/dev/null || true
+        nft flush chain inet ${NFT_TABLE} $RATELIMIT_CHAIN 2>/dev/null || true
+        nft add chain inet ${NFT_TABLE} filter_qos_egress 2>/dev/null || true
+        nft add chain inet ${NFT_TABLE} filter_qos_ingress 2>/dev/null || true
         generate_ipset_sets
         
         # 创建 ACK 限速和 TCP 升级所需的动态集合
-        # 创建 ACK 限速和 TCP 升级所需的动态集合
-	local sets_ok=1
-	for set in qos_xfst_ack qos_fast_ack qos_med_ack qos_slow_ack qos_slow_tcp; do
-		if ! nft list set inet gargoyle-qos-priority "$set" &>/dev/null; then
-			if ! nft add set inet gargoyle-qos-priority "$set" '{ typeof ct id . ct direction; flags dynamic; timeout 5m; }' 2>/dev/null; then
-				qos_log "ERROR" "无法创建动态集合 $set"
-				sets_ok=0
-			else
-				qos_log "DEBUG" "动态集合 $set 创建成功"
-			fi
-		fi
-	done
-	if [[ $sets_ok -eq 0 ]]; then
-		qos_log "ERROR" "动态集合创建失败，ACK 限速和 TCP 升级功能将被禁用"
-		ENABLE_ACK_LIMIT=0
-		ENABLE_TCP_UPGRADE=0
-	fi
+        local sets_ok=1
+        for set in qos_xfst_ack qos_fast_ack qos_med_ack qos_slow_ack qos_slow_tcp; do
+            if ! nft list set inet ${NFT_TABLE} "$set" &>/dev/null; then
+                if ! nft add set inet ${NFT_TABLE} "$set" '{ typeof ct id . ct direction; flags dynamic; timeout 5m; }' 2>/dev/null; then
+                    qos_log "ERROR" "无法创建动态集合 $set"
+                    sets_ok=0
+                else
+                    qos_log "DEBUG" "动态集合 $set 创建成功"
+                fi
+            fi
+        done
+        if [[ $sets_ok -eq 0 ]]; then
+            qos_log "ERROR" "动态集合创建失败，ACK 限速和 TCP 升级功能将被禁用"
+            ENABLE_ACK_LIMIT=0
+            ENABLE_TCP_UPGRADE=0
+        fi
         
-        nft add chain inet gargoyle-qos-priority drop995 2>/dev/null || true
-        nft add chain inet gargoyle-qos-priority drop95 2>/dev/null || true
-        nft add chain inet gargoyle-qos-priority drop50 2>/dev/null || true
-        nft flush chain inet gargoyle-qos-priority drop995 2>/dev/null || true
-        nft flush chain inet gargoyle-qos-priority drop95 2>/dev/null || true
-        nft flush chain inet gargoyle-qos-priority drop50 2>/dev/null || true
-        nft add rule inet gargoyle-qos-priority drop995 numgen random mod 1000 ge 995 return
-        nft add rule inet gargoyle-qos-priority drop995 drop
-        nft add rule inet gargoyle-qos-priority drop95 numgen random mod 1000 ge 950 return
-        nft add rule inet gargoyle-qos-priority drop95 drop
-        nft add rule inet gargoyle-qos-priority drop50 numgen random mod 1000 ge 500 return
-        nft add rule inet gargoyle-qos-priority drop50 drop
+        nft add chain inet ${NFT_TABLE} drop995 2>/dev/null || true
+        nft add chain inet ${NFT_TABLE} drop95 2>/dev/null || true
+        nft add chain inet ${NFT_TABLE} drop50 2>/dev/null || true
+        nft flush chain inet ${NFT_TABLE} drop995 2>/dev/null || true
+        nft flush chain inet ${NFT_TABLE} drop95 2>/dev/null || true
+        nft flush chain inet ${NFT_TABLE} drop50 2>/dev/null || true
+        nft add rule inet ${NFT_TABLE} drop995 numgen random mod 1000 ge 995 return
+        nft add rule inet ${NFT_TABLE} drop995 drop
+        nft add rule inet ${NFT_TABLE} drop95 numgen random mod 1000 ge 950 return
+        nft add rule inet ${NFT_TABLE} drop95 drop
+        nft add rule inet ${NFT_TABLE} drop50 numgen random mod 1000 ge 500 return
+        nft add rule inet ${NFT_TABLE} drop50 drop
         _QOS_TABLE_FLUSHED=1
     fi
     if [[ $_HOOKS_SETUP -eq 0 ]]; then
@@ -1312,22 +1330,22 @@ apply_all_rules() {
         if [[ -z "$wan_if" ]]; then
             qos_log "ERROR" "无法获取 WAN 接口，钩子链可能不完整，QoS 可能无法正确区分方向"
             qos_log "WARN" "未配置 WAN 接口，将不使用方向区分，所有转发流量同时进入上传和下载链（可能导致双重标记）"
-            nft add chain inet gargoyle-qos-priority filter_forward '{ type filter hook forward priority 0; policy accept; }' 2>/dev/null || true
-            nft flush chain inet gargoyle-qos-priority filter_forward 2>/dev/null || true
-            nft add rule inet gargoyle-qos-priority filter_forward jump filter_qos_egress 2>/dev/null || true
-            nft add rule inet gargoyle-qos-priority filter_forward jump filter_qos_ingress 2>/dev/null || true
+            nft add chain inet ${NFT_TABLE} filter_forward '{ type filter hook forward priority 0; policy accept; }' 2>/dev/null || true
+            nft flush chain inet ${NFT_TABLE} filter_forward 2>/dev/null || true
+            nft add rule inet ${NFT_TABLE} filter_forward jump filter_qos_egress 2>/dev/null || true
+            nft add rule inet ${NFT_TABLE} filter_forward jump filter_qos_ingress 2>/dev/null || true
         else
             qos_log "INFO" "使用 WAN 接口: $wan_if"
-            nft add chain inet gargoyle-qos-priority filter_output '{ type filter hook output priority 0; policy accept; }' 2>/dev/null || true
-            nft add chain inet gargoyle-qos-priority filter_input  '{ type filter hook input priority 0; policy accept; }' 2>/dev/null || true
-            nft add chain inet gargoyle-qos-priority filter_forward '{ type filter hook forward priority 0; policy accept; }' 2>/dev/null || true
-            nft flush chain inet gargoyle-qos-priority filter_output 2>/dev/null || true
-            nft flush chain inet gargoyle-qos-priority filter_input  2>/dev/null || true
-            nft flush chain inet gargoyle-qos-priority filter_forward 2>/dev/null || true
-            nft add rule inet gargoyle-qos-priority filter_output jump filter_qos_egress 2>/dev/null || true
-            nft add rule inet gargoyle-qos-priority filter_forward oifname "$wan_if" jump filter_qos_egress 2>/dev/null || true
-            nft add rule inet gargoyle-qos-priority filter_forward iifname "$wan_if" jump filter_qos_ingress 2>/dev/null || true
-            nft add rule inet gargoyle-qos-priority filter_input jump filter_qos_ingress 2>/dev/null || true
+            nft add chain inet ${NFT_TABLE} filter_output '{ type filter hook output priority 0; policy accept; }' 2>/dev/null || true
+            nft add chain inet ${NFT_TABLE} filter_input  '{ type filter hook input priority 0; policy accept; }' 2>/dev/null || true
+            nft add chain inet ${NFT_TABLE} filter_forward '{ type filter hook forward priority 0; policy accept; }' 2>/dev/null || true
+            nft flush chain inet ${NFT_TABLE} filter_output 2>/dev/null || true
+            nft flush chain inet ${NFT_TABLE} filter_input  2>/dev/null || true
+            nft flush chain inet ${NFT_TABLE} filter_forward 2>/dev/null || true
+            nft add rule inet ${NFT_TABLE} filter_output jump filter_qos_egress 2>/dev/null || true
+            nft add rule inet ${NFT_TABLE} filter_forward oifname "$wan_if" jump filter_qos_egress 2>/dev/null || true
+            nft add rule inet ${NFT_TABLE} filter_forward iifname "$wan_if" jump filter_qos_ingress 2>/dev/null || true
+            nft add rule inet ${NFT_TABLE} filter_input jump filter_qos_ingress 2>/dev/null || true
         fi
         _HOOKS_SETUP=1
         qos_log "INFO" "nftables 钩子链挂载完成"
@@ -1427,8 +1445,7 @@ apply_enhanced_features() {
     fi
 }
 
-# ========== 入口重定向 ==========
-# ========== 入口重定向（添加缓存机制） ==========
+# ========== 入口重定向（添加缓存机制，包含内核版本验证） ==========
 setup_ingress_redirect() {
     if [[ -z "$qos_interface" ]]; then
         qos_log "ERROR" "无法确定 WAN 接口"
@@ -1436,6 +1453,7 @@ setup_ingress_redirect() {
     fi
     
     local cache_file="/tmp/qos_gargoyle_ipv6_redirect_cache"
+    local kernel_version=$(uname -r)
     local sfo_enabled=0
     if check_sfo_enabled; then
         sfo_enabled=1
@@ -1512,7 +1530,7 @@ setup_ingress_redirect() {
         return 1
     fi
     
-    # IPv6 入口重定向（带缓存机制）
+    # IPv6 入口重定向（带缓存机制，包含内核版本验证）
     local ipv6_prefix=$(uci -q get ${CONFIG_FILE}.global.ipv6_redirect_prefix 2>/dev/null)
     [[ -z "$ipv6_prefix" ]] && ipv6_prefix="2000::/3"
     
@@ -1534,10 +1552,20 @@ setup_ingress_redirect() {
     local ipv6_success=false
     local cached_method=""
     
-    # 读取缓存
+    # 读取缓存并验证内核版本
     if [[ -f "$cache_file" ]]; then
-        cached_method=$(cat "$cache_file" 2>/dev/null)
-        qos_log "DEBUG" "读取 IPv6 重定向缓存: $cached_method"
+        local cached_kernel=""
+        {
+            read -r cached_method
+            read -r cached_kernel
+        } < "$cache_file" 2>/dev/null
+        if [[ "$cached_kernel" != "$kernel_version" ]]; then
+            qos_log "INFO" "内核版本已变更，忽略 IPv6 重定向缓存"
+            cached_method=""
+            rm -f "$cache_file"
+        else
+            qos_log "DEBUG" "读取 IPv6 重定向缓存: $cached_method (内核: $cached_kernel)"
+        fi
     fi
     
     # 根据缓存优先尝试成功过的方式
@@ -1714,10 +1742,13 @@ setup_ingress_redirect() {
         fi
     fi
     
-    # 保存成功的方式到缓存
+    # 保存成功的方式到缓存（包含内核版本）
     if [[ "$ipv6_success" == "true" ]] && [[ -n "$cached_method" ]]; then
-        echo "$cached_method" > "$cache_file"
-        qos_log "DEBUG" "保存 IPv6 重定向缓存: $cached_method"
+        {
+            echo "$cached_method"
+            echo "$kernel_version"
+        } > "$cache_file"
+        qos_log "DEBUG" "保存 IPv6 重定向缓存: $cached_method (内核: $kernel_version)"
     elif [[ "$ipv6_success" != "true" ]] && [[ -f "$cache_file" ]]; then
         rm -f "$cache_file"
         qos_log "DEBUG" "清除无效的 IPv6 重定向缓存"
@@ -1784,24 +1815,24 @@ check_ingress_redirect() {
 # ========== IPv6增强支持 ==========
 setup_ipv6_specific_rules() {
     qos_log "INFO" "设置IPv6特定规则（优化版）"
-    nft add chain inet gargoyle-qos-priority filter_prerouting '{ type filter hook prerouting priority 0; policy accept; }' 2>/dev/null || true
-    nft flush chain inet gargoyle-qos-priority filter_prerouting 2>/dev/null || true
+    nft add chain inet ${NFT_TABLE} filter_prerouting '{ type filter hook prerouting priority 0; policy accept; }' 2>/dev/null || true
+    nft flush chain inet ${NFT_TABLE} filter_prerouting 2>/dev/null || true
     local ICMPV6_CRITICAL_TYPES="133,134,135,136,137"
-    nft add rule inet gargoyle-qos-priority filter_prerouting \
+    nft add rule inet ${NFT_TABLE} filter_prerouting \
         meta nfproto ipv6 ip6 daddr { ff02::1:2, ff02::1:3 } meta mark set 0x80000000 counter 2>/dev/null || true
-    nft add rule inet gargoyle-qos-priority filter_prerouting \
+    nft add rule inet ${NFT_TABLE} filter_prerouting \
         meta nfproto ipv6 ip6 daddr ::1 meta mark set 0x80000000 counter 2>/dev/null || true
-    nft add rule inet gargoyle-qos-priority filter_prerouting \
+    nft add rule inet ${NFT_TABLE} filter_prerouting \
         meta nfproto ipv6 icmpv6 type { $ICMPV6_CRITICAL_TYPES } meta mark set 0x40000000 counter 2>/dev/null || true
-    nft add rule inet gargoyle-qos-priority filter_prerouting \
+    nft add rule inet ${NFT_TABLE} filter_prerouting \
         meta nfproto ipv6 udp dport { 546, 547 } meta mark set 0x40000000 counter 2>/dev/null || true
-    nft add rule inet gargoyle-qos-priority filter_prerouting \
+    nft add rule inet ${NFT_TABLE} filter_prerouting \
         meta nfproto ipv6 udp dport 53 meta mark set 0x40000000 counter 2>/dev/null || true
-    nft add rule inet gargoyle-qos-priority filter_prerouting \
+    nft add rule inet ${NFT_TABLE} filter_prerouting \
         meta nfproto ipv6 tcp dport 53 meta mark set 0x40000000 counter 2>/dev/null || true
-    nft add rule inet gargoyle-qos-priority filter_prerouting \
+    nft add rule inet ${NFT_TABLE} filter_prerouting \
         meta nfproto ipv6 tcp dport { 80, 443 } meta mark set 0x40000000 counter 2>/dev/null || true
-    nft add rule inet gargoyle-qos-priority filter_prerouting \
+    nft add rule inet ${NFT_TABLE} filter_prerouting \
         meta nfproto ipv6 udp dport 123 meta mark set 0x40000000 counter 2>/dev/null || true
     qos_log "INFO" "IPv6关键流量规则设置完成"
 }
@@ -1810,7 +1841,7 @@ setup_ipv6_specific_rules() {
 health_check() {
     local errors=0 status=""
     uci -q show ${CONFIG_FILE} >/dev/null 2>&1 && status="${status}config:ok;" || { status="${status}config:missing;"; ((errors++)); }
-    nft list table inet gargoyle-qos-priority >/dev/null 2>&1 && status="${status}nft:ok;" || { status="${status}nft:missing;"; ((errors++)); }
+    nft list table inet ${NFT_TABLE} >/dev/null 2>&1 && status="${status}nft:ok;" || { status="${status}nft:missing;"; ((errors++)); }
     local wan_if=$(uci -q get ${CONFIG_FILE}.global.wan_interface 2>/dev/null)
     if [[ -n "$wan_if" ]] && tc qdisc show dev "$wan_if" 2>/dev/null | grep -qE "htb|hfsc|cake"; then
         status="${status}tc:ok;"

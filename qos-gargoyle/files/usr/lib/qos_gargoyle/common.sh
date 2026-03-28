@@ -1,12 +1,12 @@
 #!/bin/bash
 # 核心库模块 (common.sh)
-# 版本: 3.5.0 - 修复: CAKE参数检测清理、带宽转换精度、标记冲突检测、全局常量统一
+# 版本: 3.5.1 - 修复: CAKE参数检测清理、带宽转换精度、标记冲突检测、全局常量统一
 # 提供 QoS 系统基础功能
 
 # ========== 全局常量定义 ==========
 readonly NFT_TABLE="gargoyle-qos-priority"
 readonly NFT_FAMILY="inet"
-readonly QOS_VERSION="3.5.0"
+readonly QOS_VERSION="3.5.1"
 readonly DEFAULT_IFB="ifb0"
 readonly MAX_PRIORITY_INDEX=16
 

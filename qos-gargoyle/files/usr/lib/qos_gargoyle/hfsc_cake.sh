@@ -1,6 +1,6 @@
 #!/bin/bash
 # HFSC_CAKE算法实现模块
-# 版本: 3.4.7 - 修复内存限制解析、CAKE带宽忽略、IFB删除控制、RTT验证
+# 版本: 3.5.1 - 修复burst值计算、SFO检测警告、全局常量统一、参数验证增强
 # 基于HFSC与CAKE组合算法实现QoS流量控制。
 
 # ========== 全局配置常量 ==========
@@ -218,7 +218,8 @@ create_hfsc_root_qdisc() {
         return 1
     fi
     # 修复：HFSC 根类使用 ls m2 和 ul m2，而非 ls rate 和 ul rate
-    if ! tc class add dev "$device" parent $root_handle classid $root_classid hfsc ls m2 ${bandwidth}kbit ul m2 ${bandwidth}kbit; then
+    if ! tc class add dev "$device" parent $root_handle classid $root_classid hfsc \
+        ls m2 ${bandwidth}kbit ul m2 ${bandwidth}kbit; then
         qos_log "ERROR" "无法在$device上创建HFSC根类"
         tc qdisc del dev "$device" root 2>/dev/null
         return 1
@@ -249,28 +250,6 @@ set_hfsc_default_class() {
         qos_log "ERROR" "无法设置默认类（全匹配过滤器失败）"
         return 1
     fi
-}
-
-# ========== CAKE 参数支持检查（修复：避免回退 lo）==========
-check_cake_param_support() {
-    local param="$1"
-    local dummy_dev="qos_test_cake_$$"
-    local created=0
-    if ! ip link add "$dummy_dev" type dummy 2>/dev/null; then
-        qos_log "DEBUG" "无法创建 dummy 设备，假定 $param 不支持"
-        return 1
-    fi
-    created=1
-    tc qdisc del dev "$dummy_dev" root 2>/dev/null
-    local ret=1
-    if tc qdisc add dev "$dummy_dev" root cake bandwidth 1mbit "$param" 2>/dev/null; then
-        ret=0
-        tc qdisc del dev "$dummy_dev" root 2>/dev/null
-    fi
-    if [[ $created -eq 1 ]]; then
-        ip link del "$dummy_dev" 2>/dev/null
-    fi
-    return $ret
 }
 
 # ========== 构建CAKE参数串（修复：显式指定带宽）==========
@@ -830,6 +809,15 @@ init_hfsc_cake_qos() {
     local action="${1:-start}"
     qos_log "INFO" "开始初始化HFSC+CAKE QoS系统 (action=$action)"
     
+    # 检测 SFO 并警告
+    if check_sfo_enabled; then
+        qos_log "WARN" "检测到软件/硬件流加速已启用，QoS标记可能被绕过"
+        qos_log "WARN" "建议禁用流加速以获得完整QoS功能:"
+        qos_log "WARN" "  uci set firewall.@defaults[0].flow_offloading=0"
+        qos_log "WARN" "  uci set firewall.@defaults[0].flow_offloading_hw=0"
+        qos_log "WARN" "  uci commit firewall && /etc/init.d/firewall restart"
+    fi
+    
     # 检查是否已在运行（由 procd 保证，但保留辅助检查）
     if ! check_already_running; then
         qos_log "ERROR" "HFSC+CAKE QoS 已经在运行中"
@@ -842,8 +830,8 @@ init_hfsc_cake_qos() {
         return 1
     fi
     
-    nft flush chain inet gargoyle-qos-priority filter_qos_egress 2>/dev/null
-    nft flush chain inet gargoyle-qos-priority filter_qos_ingress 2>/dev/null
+    nft flush chain inet ${NFT_TABLE} filter_qos_egress 2>/dev/null
+    nft flush chain inet ${NFT_TABLE} filter_qos_ingress 2>/dev/null
     qos_log "INFO" "已清空 nft 规则链"
     
     if ! check_required_commands; then
@@ -876,7 +864,7 @@ init_hfsc_cake_qos() {
         return 1
     fi
     
-    nft add table inet gargoyle-qos-priority 2>/dev/null || true
+    nft add table inet ${NFT_TABLE} 2>/dev/null || true
     if [[ -z "$qos_interface" ]]; then
         qos_interface=$(uci -q get ${CONFIG_FILE}.global.wan_interface 2>/dev/null)
         if [[ -z "$qos_interface" ]] && [[ -f "/lib/functions/network.sh" ]]; then
@@ -1075,7 +1063,7 @@ stop_hfsc_cake_qos() {
     # 清理动态检测相关资源
     cleanup_dynamic_detection
     
-    nft delete table inet gargoyle-qos-priority 2>/dev/null || true
+    nft delete table inet ${NFT_TABLE} 2>/dev/null || true
     clear_class_marks
     qos_log "INFO" "HFSC+CAKE QoS停止完成"
     
@@ -1108,7 +1096,7 @@ show_hfsc_cake_status() {
     fi
     local qos_ifb="$IFB_DEVICE"
 
-    echo "===== HFSC-CAKE QoS 状态报告 ====="
+    echo "===== HFSC-CAKE QoS 状态报告（$QOS_VERSION） ====="
     echo "时间: $(date)"
     echo "WAN接口: ${real_wan_if}"
 
@@ -1153,8 +1141,8 @@ show_hfsc_cake_status() {
     fi
 
     echo -e "\n======== nftables 分类规则 ========"
-    if nft list table inet gargoyle-qos-priority &>/dev/null; then
-        nft list table inet gargoyle-qos-priority 2>/dev/null | sed 's/^/  /'
+    if nft list table inet ${NFT_TABLE} &>/dev/null; then
+        nft list table inet ${NFT_TABLE} 2>/dev/null | sed 's/^/  /'
     else
         echo "  nftables 表不存在"
     fi

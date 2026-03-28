@@ -1,6 +1,6 @@
 #!/bin/bash
 # HTB_CAKE算法实现模块
-# 版本: 3.4.7 - 修复内存限制解析、RTT验证、IFB删除控制
+# 版本: 3.5.1 - 修复burst值计算、SFO检测警告、全局常量统一、参数验证增强
 # 基于 HTB 与 CAKE 组合算法实现 QoS 流量控制
 
 # ========== 全局配置常量 ==========
@@ -43,6 +43,26 @@ include /lib/network
 # ========== 参数消毒 ==========
 sanitize_param() {
     echo "$1" | sed 's/[^a-zA-Z0-9_./:-]//g'
+}
+
+# ========== 辅助函数：优化后的 HTB burst 计算 ==========
+calculate_htb_burst() {
+    local rate_kbps="$1"   # kbit/s
+    local mtu="${2:-1500}"
+    
+    # 使用 10ms 的 burst 时间窗口
+    local burst_bytes=$(( (rate_kbps * 1000 / 8) * 10 / 1000 ))
+    # 确保至少能容纳 3 个 MTU
+    local min_burst=$(( mtu * 3 ))
+    (( burst_bytes < min_burst )) && burst_bytes=$min_burst
+    # 限制最大 burst (16MB)
+    (( burst_bytes > 16777216 )) && burst_bytes=16777216
+    
+    local burst_kb=$(( (burst_bytes + 1023) / 1024 ))
+    local cburst_kb=$(( burst_kb * 2 ))
+    (( cburst_kb > 16777216 / 1024 )) && cburst_kb=$(( 16777216 / 1024 ))
+    
+    echo "${burst_kb}kb ${cburst_kb}kb"
 }
 
 # ========== HTB 与 CAKE 专属配置加载 ==========
@@ -195,50 +215,6 @@ load_htb_class_config() {
     return 0
 }
 
-# ========== HTB 辅助函数 ==========
-calculate_htb_burst() {
-    local rate="$1"  # 单位: kbit
-    local ceil="$2"  # 单位: kbit
-    local mtu="$3"   # MTU大小
-    if [[ -z "$mtu" ]]; then
-        mtu=1500
-    fi
-
-    local burst_kb=$(awk "BEGIN {printf \"%.0f\", ($rate + 7) / 8}")
-    local min_burst_kb=$((mtu * 3 / 1024))
-    (( min_burst_kb < 1 )) && min_burst_kb=1
-    (( burst_kb < min_burst_kb )) && burst_kb=$min_burst_kb
-    if (( burst_kb > 1048576 )); then
-        burst_kb=1048576
-        qos_log "WARN" "burst值超过1GB，已限制为1048576KB"
-    fi
-    local cburst_kb=$((burst_kb * 2))
-    (( cburst_kb > 1048576 )) && cburst_kb=1048576
-    echo "${burst_kb}kb ${cburst_kb}kb"
-}
-
-# ========== CAKE 参数支持检查 ==========
-check_cake_param_support() {
-    local param="$1"
-    local dummy_dev="qos_test_cake_$$"
-    local created=0
-    if ! ip link add "$dummy_dev" type dummy 2>/dev/null; then
-        qos_log "DEBUG" "无法创建 dummy 设备，假定 $param 不支持"
-        return 1
-    fi
-    created=1
-    tc qdisc del dev "$dummy_dev" root 2>/dev/null
-    local ret=1
-    if tc qdisc add dev "$dummy_dev" root cake bandwidth 1mbit "$param" 2>/dev/null; then
-        ret=0
-        tc qdisc del dev "$dummy_dev" root 2>/dev/null
-    fi
-    if [[ $created -eq 1 ]]; then
-        ip link del "$dummy_dev" 2>/dev/null
-    fi
-    return $ret
-}
-
 # ========== 构建CAKE参数串（修复：显式指定带宽）==========
 build_cake_params() {
     local direction="$1"   # upload 或 download
@@ -334,9 +310,12 @@ create_htb_root_qdisc() {
         qos_log "ERROR" "无法在 $device 上创建HTB根队列"
         return 1
     fi
-    local burst_params=$(calculate_htb_burst "$bandwidth" "$bandwidth")
+    
+    # 使用新的 burst 计算
+    local burst_params=$(calculate_htb_burst "$bandwidth")
     local burst=$(echo "$burst_params" | awk '{print $1}')
     local cburst=$(echo "$burst_params" | awk '{print $2}')
+    
     if ! tc class add dev "$device" parent $root_handle classid $root_classid htb \
         rate ${bandwidth}kbit ceil ${bandwidth}kbit burst $burst cburst $cburst; then
         qos_log "ERROR" "无法在$device上创建HTB根类"
@@ -347,7 +326,7 @@ create_htb_root_qdisc() {
     return 0
 }
 
-# 设置根队列的默认类（优先 change，失败则使用全匹配过滤器）
+# 设置根队列的默认类（改进：优先 change，失败则使用全匹配过滤器）
 set_htb_default_class() {
     local device="$1"
     local default_classid="$2"
@@ -356,7 +335,7 @@ set_htb_default_class() {
 		qos_log "ERROR" "默认类 1:$default_classid 不存在"
 		return 1
 	fi
-
+	
     if ! validate_number "$default_classid" "default_classid" 2 17; then
         qos_log "ERROR" "无效的默认类ID: $default_classid (有效范围 2-17)"
         return 1
@@ -448,7 +427,8 @@ create_htb_upload_class() {
         rate_value="$ceil_value"
     fi
     local mtu=$(cat /sys/class/net/$qos_interface/mtu 2>/dev/null || echo 1500)
-    local burst_params=$(calculate_htb_burst "$rate_value" "$ceil_value" "$mtu")
+    # 使用新的 burst 计算
+    local burst_params=$(calculate_htb_burst "$rate_value" "$mtu")
     local burst=$(echo "$burst_params" | awk '{print $1}')
     local cburst=$(echo "$burst_params" | awk '{print $2}')
     local prio="prio 3"
@@ -567,7 +547,8 @@ create_htb_download_class() {
         rate_value="$ceil_value"
     fi
     local mtu=$(cat /sys/class/net/$ifb_dev/mtu 2>/dev/null || echo 1500)
-    local burst_params=$(calculate_htb_burst "$rate_value" "$ceil_value" "$mtu")
+    # 使用新的 burst 计算
+    local burst_params=$(calculate_htb_burst "$rate_value" "$mtu")
     local burst=$(echo "$burst_params" | awk '{print $1}')
     local cburst=$(echo "$burst_params" | awk '{print $2}')
     local prio="prio 3"
@@ -824,6 +805,15 @@ init_htb_cake_qos() {
     local action="${1:-start}"
     qos_log "INFO" "开始初始化HTB+CAKE QoS系统 (action=$action)"
     
+    # 检测 SFO 并警告
+    if check_sfo_enabled; then
+        qos_log "WARN" "检测到软件/硬件流加速已启用，QoS标记可能被绕过"
+        qos_log "WARN" "建议禁用流加速以获得完整QoS功能:"
+        qos_log "WARN" "  uci set firewall.@defaults[0].flow_offloading=0"
+        qos_log "WARN" "  uci set firewall.@defaults[0].flow_offloading_hw=0"
+        qos_log "WARN" "  uci commit firewall && /etc/init.d/firewall restart"
+    fi
+    
     # 检查是否已在运行（由 procd 保证，但保留辅助检查）
     if ! check_already_running; then
         qos_log "ERROR" "HTB+CAKE QoS 已经在运行中"
@@ -836,8 +826,8 @@ init_htb_cake_qos() {
         return 1
     fi
     
-    nft flush chain inet gargoyle-qos-priority filter_qos_egress 2>/dev/null
-    nft flush chain inet gargoyle-qos-priority filter_qos_ingress 2>/dev/null
+    nft flush chain inet ${NFT_TABLE} filter_qos_egress 2>/dev/null
+    nft flush chain inet ${NFT_TABLE} filter_qos_ingress 2>/dev/null
     qos_log "INFO" "已清空 nft 规则链"
     
     if ! check_required_commands; then
@@ -870,7 +860,7 @@ init_htb_cake_qos() {
         return 1
     fi
     
-    nft add table inet gargoyle-qos-priority 2>/dev/null || true
+    nft add table inet ${NFT_TABLE} 2>/dev/null || true
     if [[ -z "$qos_interface" ]]; then
         qos_interface=$(uci -q get ${CONFIG_FILE}.global.wan_interface 2>/dev/null)
         if [[ -z "$qos_interface" ]] && [[ -f "/lib/functions/network.sh" ]]; then
@@ -1074,7 +1064,7 @@ stop_htb_cake_qos() {
     # 清理动态检测相关资源
     cleanup_dynamic_detection
     
-    nft delete table inet gargoyle-qos-priority 2>/dev/null || true
+    nft delete table inet ${NFT_TABLE} 2>/dev/null || true
     clear_class_marks
     qos_log "INFO" "HTB+CAKE QoS停止完成"
     
@@ -1107,7 +1097,7 @@ show_htb_cake_status() {
     fi
     local qos_ifb="$IFB_DEVICE"
 
-    echo "===== HTB-CAKE QoS 状态报告 ====="
+    echo "===== HTB-CAKE QoS 状态报告（$QOS_VERSION）====="
     echo "时间: $(date)"
     echo "WAN接口: ${real_wan_if}"
 
@@ -1152,8 +1142,8 @@ show_htb_cake_status() {
     fi
 
     echo -e "\n======== nftables 分类规则 ========"
-    if nft list table inet gargoyle-qos-priority &>/dev/null; then
-        nft list table inet gargoyle-qos-priority 2>/dev/null | sed 's/^/  /'
+    if nft list table inet ${NFT_TABLE} &>/dev/null; then
+        nft list table inet ${NFT_TABLE} 2>/dev/null | sed 's/^/  /'
     else
         echo "  nftables 表不存在"
     fi

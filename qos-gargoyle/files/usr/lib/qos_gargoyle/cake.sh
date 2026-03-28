@@ -1,6 +1,6 @@
 #!/bin/bash
 # CAKE算法实现模块 - 多队列增强版
-# 版本: 3.4.5 - 修复函数导出，优化内存计算
+# 版本: 3.5.1 - 修复多队列带宽分配、CAKE参数检测清理、SFO检测警告、全局常量统一
 # 支持与 idclass 集成，通过 DSCP 进行分类（diffserv4 模式）
 # 必要工具：tc, nft, conntrack, ethtool, sysctl
 # 内核模块：sch_cake
@@ -9,14 +9,6 @@
 : ${IFB_DEVICE:=ifb0}
 : ${qos_interface:=$(uci -q get qos_gargoyle.global.wan_interface 2>/dev/null)}
 : ${qos_interface:=pppoe-wan}
-
-# 加载核心库（必须在最前面）
-if [ -f "/usr/lib/qos_gargoyle/common.sh" ]; then
-    . /usr/lib/qos_gargoyle/common.sh
-else
-    echo "错误: 核心库 /usr/lib/qos_gargoyle/common.sh 未找到" >&2
-    exit 1
-fi
 
 # 加载规则辅助模块（必须）
 if [ -f "/usr/lib/qos_gargoyle/rule.sh" ]; then
@@ -38,7 +30,7 @@ RUNTIME_PARAMS_FILE="${RUNTIME_PARAMS_FILE:-/tmp/cake_runtime_params}"
 UPLOAD_MASK=0xFFFF
 DOWNLOAD_MASK=0xFFFF0000
 
-echo "CAKE 模块初始化完成 (v3.4.5)"
+echo "CAKE 模块初始化完成"
 echo "  网络接口: $qos_interface"
 echo "  IFB 设备: $IFB_DEVICE"
 echo "  上传带宽: ${total_upload_bandwidth:-未配置}kbit/s"
@@ -213,33 +205,6 @@ get_tx_queues() {
     fi
 
     echo "$queues"
-}
-
-# ========== 检测内核是否支持特定 CAKE 参数 ==========
-check_cake_param_support() {
-    local param="$1"
-    local dummy_dev="cake_test_$$"
-    local created=0
-
-    if ! ip link show "$dummy_dev" >/dev/null 2>&1; then
-        if ! ip link add "$dummy_dev" type dummy 2>/dev/null; then
-            qos_log "DEBUG" "无法创建 dummy 设备，假定 $param 不支持"
-            return 1
-        fi
-        created=1
-    fi
-
-    tc qdisc del dev "$dummy_dev" root 2>/dev/null
-    local ret=1
-    if tc qdisc add dev "$dummy_dev" root cake bandwidth 1mbit "$param" 2>/dev/null; then
-        ret=0
-        tc qdisc del dev "$dummy_dev" root 2>/dev/null
-    fi
-
-    if [ $created -eq 1 ]; then
-        ip link del "$dummy_dev" 2>/dev/null
-    fi
-    return $ret
 }
 
 # ========== 配置加载 ==========
@@ -472,7 +437,7 @@ build_cake_params() {
     echo "$params"
 }
 
-# ========== 创建CAKE队列（支持多队列）==========
+# ========== 创建CAKE队列（支持多队列，修复带宽分配） ==========
 create_cake_root_qdisc() {
     local device="$1"
     local direction="$2"
@@ -503,8 +468,9 @@ create_cake_root_qdisc() {
         qos_log "INFO" "CAKE-MQ 已被禁用，使用普通 CAKE"
     fi
 
+    # 修复：当带宽小于队列数时强制回退到单队列模式
     if [ "$use_mq" = "1" ] && [ "$bandwidth" -lt "$queues" ] 2>/dev/null; then
-        qos_log "WARN" "总带宽 ${bandwidth}kbit 小于队列数 $queues，多队列可能导致部分队列带宽为0，已自动回退到单队列模式。"
+        qos_log "WARN" "总带宽 ${bandwidth}kbit 小于队列数 ${queues}，强制使用单队列模式"
         use_mq=0
         queues=1
     fi
@@ -698,7 +664,7 @@ health_check_cake() {
 
 # ========== 状态显示 ==========
 show_cake_status() {
-    echo "===== CAKE QoS状态报告 (v3.4.5) ====="
+    echo "===== CAKE QoS状态报告 （$QOS_VERSION） ====="
     echo "时间: $(date)"
     echo "网络接口: ${qos_interface:-未知}"
 
@@ -873,6 +839,16 @@ init_cake_qos() {
     case "$action" in
         start)
             qos_log "INFO" "启动CAKE QoS"
+            
+            # 检测 SFO 并警告（修复10）
+            if check_sfo_enabled; then
+                qos_log "WARN" "检测到软件/硬件流加速已启用，QoS标记可能被绕过"
+                qos_log "WARN" "建议禁用流加速以获得完整QoS功能:"
+                qos_log "WARN" "  uci set firewall.@defaults[0].flow_offloading=0"
+                qos_log "WARN" "  uci set firewall.@defaults[0].flow_offloading_hw=0"
+                qos_log "WARN" "  uci commit firewall && /etc/init.d/firewall restart"
+            fi
+            
             check_dependencies || exit 1
             init_ruleset || exit 1
 
@@ -940,21 +916,21 @@ init_cake_qos() {
             fi
             qos_log "INFO" "Using existing class marks file: $CLASS_MARKS_FILE"
 
-            nft add table inet gargoyle-qos-priority 2>/dev/null || true
+            nft add table inet ${NFT_TABLE} 2>/dev/null || true
 
-            nft add map inet gargoyle-qos-priority upload_tcp_dport_map '{ type mark : verdict; flags interval; }' 2>/dev/null || true
-            nft add map inet gargoyle-qos-priority upload_udp_dport_map '{ type mark : verdict; flags interval; }' 2>/dev/null || true
-            nft add map inet gargoyle-qos-priority download_tcp_sport_map '{ type mark : verdict; flags interval; }' 2>/dev/null || true
-            nft add map inet gargoyle-qos-priority download_udp_sport_map '{ type mark : verdict; flags interval; }' 2>/dev/null || true
+            nft add map inet ${NFT_TABLE} upload_tcp_dport_map '{ type mark : verdict; flags interval; }' 2>/dev/null || true
+            nft add map inet ${NFT_TABLE} upload_udp_dport_map '{ type mark : verdict; flags interval; }' 2>/dev/null || true
+            nft add map inet ${NFT_TABLE} download_tcp_sport_map '{ type mark : verdict; flags interval; }' 2>/dev/null || true
+            nft add map inet ${NFT_TABLE} download_udp_sport_map '{ type mark : verdict; flags interval; }' 2>/dev/null || true
 
             if [ -f "$CLASS_MARKS_FILE" ]; then
                 for class_name in $(cut -d: -f2 "$CLASS_MARKS_FILE" | sort -u); do
                     realname=$(uci -q get ${CONFIG_FILE}.${class_name}.name 2>/dev/null | tr '[:upper:]' '[:lower:]')
                     [ -z "$realname" ] && continue
-                    nft add set inet gargoyle-qos-priority upload_${realname} '{ type ipv4_addr; flags dynamic, timeout; }' 2>/dev/null || true
-                    nft add set inet gargoyle-qos-priority upload_${realname}6 '{ type ipv6_addr; flags dynamic, timeout; }' 2>/dev/null || true
-                    nft add set inet gargoyle-qos-priority download_${realname} '{ type ipv4_addr; flags dynamic, timeout; }' 2>/dev/null || true
-                    nft add set inet gargoyle-qos-priority download_${realname}6 '{ type ipv6_addr; flags dynamic, timeout; }' 2>/dev/null || true
+                    nft add set inet ${NFT_TABLE} upload_${realname} '{ type ipv4_addr; flags dynamic, timeout; }' 2>/dev/null || true
+                    nft add set inet ${NFT_TABLE} upload_${realname}6 '{ type ipv6_addr; flags dynamic, timeout; }' 2>/dev/null || true
+                    nft add set inet ${NFT_TABLE} download_${realname} '{ type ipv4_addr; flags dynamic, timeout; }' 2>/dev/null || true
+                    nft add set inet ${NFT_TABLE} download_${realname}6 '{ type ipv6_addr; flags dynamic, timeout; }' 2>/dev/null || true
                 done
             fi
 
