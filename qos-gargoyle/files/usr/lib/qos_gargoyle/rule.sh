@@ -1,6 +1,6 @@
 #!/bin/bash
 # 规则辅助模块 (rule.sh)
-# 版本: 3.5.1 - 修复: UDP限速类名匹配、IPv6重定向缓存验证、meter检测、全局常量统一
+# 版本: 3.5.1 - 修复: UDP按IP限速、动态分类键匹配、nft预验证
 # 完全移除锁机制，适配 procd 管理
 
 # 加载核心库
@@ -892,7 +892,7 @@ add rule inet ${NFT_TABLE} filter_qos_egress meta l4proto tcp ct state establish
 EOF
 }
 
-# ========== UDP 限速规则（类名大小写不敏感，改进匹配逻辑） ==========
+# ========== UDP 限速规则（按 IP 限速） ==========
 generate_udp_limit_rules() {
     local udp_enable=$(uci -q get ${CONFIG_FILE}.udp_limit.enabled 2>/dev/null)
     local udp_rate=$(uci -q get ${CONFIG_FILE}.udp_limit.rate 2>/dev/null)
@@ -962,15 +962,34 @@ generate_udp_limit_rules() {
     local rules=""
     if [[ "$udp_action" == "mark" ]] && [[ -n "$upload_mark" ]] && [[ -n "$download_mark" ]]; then
         rules="${rules}
-# Global UDP rate limit - upload direction (mark) - only for unclassified flows
-add rule inet ${NFT_TABLE} filter_qos_egress oifname \"$wan_if\" meta l4proto udp ct mark == 0 limit rate over ${udp_rate}/second counter meta mark set $upload_mark ct mark set $upload_mark
-# Global UDP rate limit - download direction (mark) - only for unclassified flows
-add rule inet ${NFT_TABLE} filter_qos_ingress iifname \"$wan_if\" meta l4proto udp ct mark == 0 limit rate over ${udp_rate}/second counter meta mark set $download_mark ct mark set $download_mark"
+# UDP per-IP rate limit - upload direction (mark)
+add rule inet ${NFT_TABLE} filter_qos_egress oifname \"$wan_if\" meta l4proto udp ct mark == 0 \\
+    meter udp_per_ip_upload { ip saddr limit rate over ${udp_rate}/second } \\
+    meta mark set $upload_mark ct mark set $upload_mark
+add rule inet ${NFT_TABLE} filter_qos_egress oifname \"$wan_if\" meta l4proto udp ct mark == 0 \\
+    meter udp_per_ip_upload_v6 { ip6 saddr limit rate over ${udp_rate}/second } \\
+    meta mark set $upload_mark ct mark set $upload_mark
+
+# UDP per-IP rate limit - download direction (mark)
+add rule inet ${NFT_TABLE} filter_qos_ingress iifname \"$wan_if\" meta l4proto udp ct mark == 0 \\
+    meter udp_per_ip_download { ip daddr limit rate over ${udp_rate}/second } \\
+    meta mark set $download_mark ct mark set $download_mark
+add rule inet ${NFT_TABLE} filter_qos_ingress iifname \"$wan_if\" meta l4proto udp ct mark == 0 \\
+    meter udp_per_ip_download_v6 { ip6 daddr limit rate over ${udp_rate}/second } \\
+    meta mark set $download_mark ct mark set $download_mark"
     elif [[ "$udp_action" == "drop" ]]; then
         rules="${rules}
-# Global UDP rate limit - drop
-add rule inet ${NFT_TABLE} filter_qos_egress meta l4proto udp limit rate over ${udp_rate}/second counter drop
-add rule inet ${NFT_TABLE} filter_qos_ingress meta l4proto udp limit rate over ${udp_rate}/second counter drop"
+# UDP per-IP rate limit - drop (upload)
+add rule inet ${NFT_TABLE} filter_qos_egress oifname \"$wan_if\" meta l4proto udp ct mark == 0 \\
+    meter udp_per_ip_drop_upload { ip saddr limit rate over ${udp_rate}/second } drop
+add rule inet ${NFT_TABLE} filter_qos_egress oifname \"$wan_if\" meta l4proto udp ct mark == 0 \\
+    meter udp_per_ip_drop_upload_v6 { ip6 saddr limit rate over ${udp_rate}/second } drop
+
+# UDP per-IP rate limit - drop (download)
+add rule inet ${NFT_TABLE} filter_qos_ingress iifname \"$wan_if\" meta l4proto udp ct mark == 0 \\
+    meter udp_per_ip_drop_download { ip daddr limit rate over ${udp_rate}/second } drop
+add rule inet ${NFT_TABLE} filter_qos_ingress iifname \"$wan_if\" meta l4proto udp ct mark == 0 \\
+    meter udp_per_ip_drop_download_v6 { ip6 daddr limit rate over ${udp_rate}/second } drop"
     fi
 
     echo "$rules"
@@ -1095,35 +1114,31 @@ create_bulk_client_rules() {
         return 0
     fi
 
-    # 建立连接检测（上行）
+    # 建立连接检测（上行）：将源 IP+源端口加入集合
     nft add rule inet ${NFT_TABLE} qos_established_connection \
-        meter qos_bulk_detect '{ ip daddr . th dport . meta l4proto timeout 5s limit rate over '"$((min_connections - 1))"'/minute }' \
-        add @qos_bulk_clients '{ ip daddr . th dport . meta l4proto timeout 30s }' 2>/dev/null || true
+        meter qos_bulk_detect '{ ip saddr . th sport . meta l4proto timeout 5s limit rate over '"$((min_connections - 1))"'/minute }' \
+        add @qos_bulk_clients '{ ip saddr . th sport . meta l4proto timeout 30s }' 2>/dev/null || true
 
     nft add rule inet ${NFT_TABLE} qos_established_connection \
-        meter qos_bulk_detect6 '{ ip6 daddr . th dport . meta l4proto timeout 5s limit rate over '"$((min_connections - 1))"'/minute }' \
-        add @qos_bulk_clients6 '{ ip6 daddr . th dport . meta l4proto timeout 30s }' 2>/dev/null || true
+        meter qos_bulk_detect6 '{ ip6 saddr . th sport . meta l4proto timeout 5s limit rate over '"$((min_connections - 1))"'/minute }' \
+        add @qos_bulk_clients6 '{ ip6 saddr . th sport . meta l4proto timeout 30s }' 2>/dev/null || true
 
     # 上行流量：匹配后设置上传标记
     nft add rule inet ${NFT_TABLE} qos_bulk_client \
-        meter qos_bulk_orig '{ ip saddr . th sport . meta l4proto timeout 5m limit rate over '"$((min_bytes - 1))"' bytes/second }' \
-        update @qos_bulk_clients '{ ip saddr . th sport . meta l4proto timeout 5m }' \
+        ip saddr . th sport . meta l4proto @qos_bulk_clients \
         meta mark set $upload_mark ct mark set $upload_mark return 2>/dev/null || true
 
     nft add rule inet ${NFT_TABLE} qos_bulk_client \
-        meter qos_bulk_orig6 '{ ip6 saddr . th sport . meta l4proto timeout 5m limit rate over '"$((min_bytes - 1))"' bytes/second }' \
-        update @qos_bulk_clients6 '{ ip6 saddr . th sport . meta l4proto timeout 5m }' \
+        ip6 saddr . th sport . meta l4proto @qos_bulk_clients6 \
         meta mark set $upload_mark ct mark set $upload_mark return 2>/dev/null || true
 
     # 下行流量：匹配后设置下载标记
     nft add rule inet ${NFT_TABLE} qos_bulk_client_reply \
-        meter qos_bulk_reply '{ ip daddr . th dport . meta l4proto timeout 5m limit rate over '"$((min_bytes - 1))"' bytes/second }' \
-        update @qos_bulk_clients '{ ip daddr . th dport . meta l4proto timeout 5m }' \
+        ip daddr . th dport . meta l4proto @qos_bulk_clients \
         meta mark set $download_mark ct mark set $download_mark return 2>/dev/null || true
 
     nft add rule inet ${NFT_TABLE} qos_bulk_client_reply \
-        meter qos_bulk_reply6 '{ ip6 daddr . th dport . meta l4proto timeout 5m limit rate over '"$((min_bytes - 1))"' bytes/second }' \
-        update @qos_bulk_clients6 '{ ip6 daddr . th dport . meta l4proto timeout 5m }' \
+        ip6 daddr . th dport . meta l4proto @qos_bulk_clients6 \
         meta mark set $download_mark ct mark set $download_mark return 2>/dev/null || true
 
     # 挂载规则到动态分类链
@@ -1197,37 +1212,44 @@ create_high_throughput_service_rules() {
         return 0
     fi
 
-    nft add set inet ${NFT_TABLE} qos_high_throughput_services '{ type ipv4_addr . ipv4_addr . inet_service . inet_proto; flags timeout; }' 2>/dev/null || true
-    nft add set inet ${NFT_TABLE} qos_high_throughput_services6 '{ type ipv6_addr . ipv6_addr . inet_service . inet_proto; flags timeout; }' 2>/dev/null || true
+    nft add set inet ${NFT_TABLE} qos_high_throughput_services '{ type ipv4_addr . inet_service . inet_proto; flags timeout; }' 2>/dev/null || true
+    nft add set inet ${NFT_TABLE} qos_high_throughput_services6 '{ type ipv6_addr . inet_service . inet_proto; flags timeout; }' 2>/dev/null || true
 
     nft add chain inet ${NFT_TABLE} qos_high_throughput_service 2>/dev/null || true
     nft add chain inet ${NFT_TABLE} qos_high_throughput_service_reply 2>/dev/null || true
 
-    # 上行方向检测
+    # 建立连接检测：将目的 IP+目的端口加入集合（服务端标识）
     nft add rule inet ${NFT_TABLE} qos_established_connection \
-        meter qos_htp_detect '{ ip daddr . ip saddr and 255.255.255.0 . th sport . meta l4proto timeout 5s limit rate over '"$((min_connections - 1))"'/minute }' \
-        add @qos_high_throughput_services '{ ip daddr . ip saddr and 255.255.255.0 . th sport . meta l4proto timeout 30s }' 2>/dev/null || true
+        meter qos_htp_detect '{ ip daddr . th dport . meta l4proto timeout 5s limit rate over '"$((min_connections - 1))"'/minute }' \
+        add @qos_high_throughput_services '{ ip daddr . th dport . meta l4proto timeout 30s }' 2>/dev/null || true
 
     nft add rule inet ${NFT_TABLE} qos_established_connection \
-        meter qos_htp_detect6 '{ ip6 daddr . ip6 saddr and ffff:ffff:ffff:: . th sport . meta l4proto timeout 5s limit rate over '"$((min_connections - 1))"'/minute }' \
-        add @qos_high_throughput_services6 '{ ip6 daddr . ip6 saddr and ffff:ffff:ffff:: . th sport . meta l4proto timeout 30s }' 2>/dev/null || true
+        meter qos_htp_detect6 '{ ip6 daddr . th dport . meta l4proto timeout 5s limit rate over '"$((min_connections - 1))"'/minute }' \
+        add @qos_high_throughput_services6 '{ ip6 daddr . th dport . meta l4proto timeout 30s }' 2>/dev/null || true
 
+    # 上行流量：匹配目的 IP+端口（服务端）
     nft add rule inet ${NFT_TABLE} qos_high_throughput_service "ct bytes original < $min_bytes return" 2>/dev/null || true
-    nft add rule inet ${NFT_TABLE} qos_high_throughput_service update @qos_high_throughput_services '{ ip saddr . ip daddr and 255.255.255.0 . th dport . meta l4proto timeout 5m }' 2>/dev/null || true
-    nft add rule inet ${NFT_TABLE} qos_high_throughput_service update @qos_high_throughput_services6 '{ ip6 saddr . ip6 daddr and ffff:ffff:ffff:: . th dport . meta l4proto timeout 5m }' 2>/dev/null || true
-    nft add rule inet ${NFT_TABLE} qos_high_throughput_service meta mark set $upload_mark ct mark set $upload_mark return 2>/dev/null || true
+    nft add rule inet ${NFT_TABLE} qos_high_throughput_service \
+        ip daddr . th dport . meta l4proto @qos_high_throughput_services \
+        meta mark set $upload_mark ct mark set $upload_mark return 2>/dev/null || true
+    nft add rule inet ${NFT_TABLE} qos_high_throughput_service \
+        ip6 daddr . th dport . meta l4proto @qos_high_throughput_services6 \
+        meta mark set $upload_mark ct mark set $upload_mark return 2>/dev/null || true
 
-    # 下行方向检测
+    # 下行流量：匹配源 IP+端口（服务端）
     nft add rule inet ${NFT_TABLE} qos_high_throughput_service_reply "ct bytes reply < $min_bytes return" 2>/dev/null || true
-    nft add rule inet ${NFT_TABLE} qos_high_throughput_service_reply update @qos_high_throughput_services '{ ip daddr . ip saddr and 255.255.255.0 . th sport . meta l4proto timeout 5m }' 2>/dev/null || true
-    nft add rule inet ${NFT_TABLE} qos_high_throughput_service_reply update @qos_high_throughput_services6 '{ ip6 daddr . ip6 saddr and ffff:ffff:ffff:: . th sport . meta l4proto timeout 5m }' 2>/dev/null || true
-    nft add rule inet ${NFT_TABLE} qos_high_throughput_service_reply meta mark set $download_mark ct mark set $download_mark return 2>/dev/null || true
+    nft add rule inet ${NFT_TABLE} qos_high_throughput_service_reply \
+        ip saddr . th sport . meta l4proto @qos_high_throughput_services \
+        meta mark set $download_mark ct mark set $download_mark return 2>/dev/null || true
+    nft add rule inet ${NFT_TABLE} qos_high_throughput_service_reply \
+        ip6 saddr . th sport . meta l4proto @qos_high_throughput_services6 \
+        meta mark set $download_mark ct mark set $download_mark return 2>/dev/null || true
 
     # 挂载规则到动态分类链
-    nft add rule inet ${NFT_TABLE} qos_dynamic_classify "ct mark == 0" ip saddr . ip daddr and 255.255.255.0 . th dport . meta l4proto @qos_high_throughput_services goto qos_high_throughput_service 2>/dev/null || true
-    nft add rule inet ${NFT_TABLE} qos_dynamic_classify "ct mark == 0" ip6 saddr . ip6 daddr and ffff:ffff:ffff:: . th dport . meta l4proto @qos_high_throughput_services6 goto qos_high_throughput_service 2>/dev/null || true
-    nft add rule inet ${NFT_TABLE} qos_dynamic_classify_reply "ct mark == 0" ip daddr . ip saddr and 255.255.255.0 . th sport . meta l4proto @qos_high_throughput_services goto qos_high_throughput_service_reply 2>/dev/null || true
-    nft add rule inet ${NFT_TABLE} qos_dynamic_classify_reply "ct mark == 0" ip6 daddr . ip6 saddr and ffff:ffff:ffff:: . th sport . meta l4proto @qos_high_throughput_services6 goto qos_high_throughput_service_reply 2>/dev/null || true
+    nft add rule inet ${NFT_TABLE} qos_dynamic_classify "ct mark == 0" ip daddr . th dport . meta l4proto @qos_high_throughput_services goto qos_high_throughput_service 2>/dev/null || true
+    nft add rule inet ${NFT_TABLE} qos_dynamic_classify "ct mark == 0" ip6 daddr . th dport . meta l4proto @qos_high_throughput_services6 goto qos_high_throughput_service 2>/dev/null || true
+    nft add rule inet ${NFT_TABLE} qos_dynamic_classify_reply "ct mark == 0" ip saddr . th sport . meta l4proto @qos_high_throughput_services goto qos_high_throughput_service_reply 2>/dev/null || true
+    nft add rule inet ${NFT_TABLE} qos_dynamic_classify_reply "ct mark == 0" ip6 saddr . th sport . meta l4proto @qos_high_throughput_services6 goto qos_high_throughput_service_reply 2>/dev/null || true
     
     qos_log "信息" "高吞吐服务检测已启用: 最小连接数=$min_connections, 最小字节数=$min_bytes 字节/秒, 上传标记=$upload_mark, 下载标记=$download_mark"
 }

@@ -252,58 +252,52 @@ set_hfsc_default_class() {
     fi
 }
 
-# ========== 构建CAKE参数串（修复：显式指定带宽）==========
+# 构建 CAKE 参数串，带宽由调用者传入（单位为 kbit）
+# 参数：
+#   $1 - bandwidth (integer, kbit)
+#   $2 - direction (可选，upload/download，用于日志)
 build_cake_params() {
-    local direction="$1"   # upload 或 download
+    local bandwidth="$1"   # 必须：子类带宽数值（kbit）
+    local direction="$2"   # 可选：方向标识，用于日志
     local params=""
-    local bandwidth=""
-    
-    # 根据方向选择对应的总带宽
-    if [[ "$direction" == "upload" ]]; then
-        bandwidth="$total_upload_bandwidth"
-    elif [[ "$direction" == "download" ]]; then
-        bandwidth="$total_download_bandwidth"
-    else
-        qos_log "ERROR" "build_cake_params: 未知方向 $direction"
-        return 1
-    fi
-    
-    # 如果用户显式配置了 CAKE_BANDWIDTH，则优先使用，否则使用 HFSC 总带宽（避免二次整形）
-    if [[ -n "$CAKE_BANDWIDTH" ]]; then
-        params="$params bandwidth $CAKE_BANDWIDTH"
-        qos_log "INFO" "用户显式配置了CAKE bandwidth: $CAKE_BANDWIDTH，CAKE将进行二次整形（可能影响HFSC调度）"
-    else
-        # 默认使用 HFSC 该方向的总带宽，使 CAKE 只作为队列调度而不做速率整形
-        params="$params bandwidth ${bandwidth}kbit"
-        qos_log "DEBUG" "CAKE 使用 HFSC 总带宽 ${bandwidth}kbit，避免二次整形"
-    fi
-    
+
+    # 强制使用传入的带宽，不再依赖总带宽或 CAKE_BANDWIDTH
+    params="bandwidth ${bandwidth}kbit"
+
+    # 以下参数来自全局配置
     [[ -n "$CAKE_RTT" ]] && params="$params rtt $CAKE_RTT"
     [[ -n "$CAKE_FLOWMODE" ]] && params="$params $CAKE_FLOWMODE"
     [[ -n "$CAKE_DIFFSERV" ]] && params="$params $CAKE_DIFFSERV"
+    
     if [[ "$CAKE_NAT" == "1" ]] || [[ "$CAKE_NAT" == "yes" ]] || [[ "$CAKE_NAT" == "true" ]]; then
         params="$params nat"
     else
         params="$params nonat"
     fi
+    
     if [[ "$CAKE_WASH" == "1" ]] || [[ "$CAKE_WASH" == "yes" ]] || [[ "$CAKE_WASH" == "true" ]]; then
         params="$params wash"
     else
         params="$params nowash"
     fi
+    
     [[ -n "$CAKE_OVERHEAD" ]] && params="$params overhead $CAKE_OVERHEAD"
     [[ -n "$CAKE_MPU" ]] && params="$params mpu $CAKE_MPU"
+    
     if [[ "$CAKE_ACK_FILTER" == "1" ]] || [[ "$CAKE_ACK_FILTER" == "yes" ]] || [[ "$CAKE_ACK_FILTER" == "true" ]]; then
         params="$params ack-filter"
     else
         params="$params noack-filter"
     fi
+    
     if [[ "$CAKE_SPLIT_GSO" == "1" ]] || [[ "$CAKE_SPLIT_GSO" == "yes" ]] || [[ "$CAKE_SPLIT_GSO" == "true" ]]; then
         params="$params split-gso"
     else
         params="$params no-split-gso"
     fi
+    
     [[ -n "$CAKE_MEMLIMIT" ]] && params="$params memlimit $CAKE_MEMLIMIT"
+    
     if [[ -n "$CAKE_ECN" ]]; then
         if check_cake_param_support "$CAKE_ECN"; then
             params="$params $CAKE_ECN"
@@ -311,6 +305,12 @@ build_cake_params() {
             logger -t "qos_gargoyle" "CAKE警告: 内核不支持 $CAKE_ECN 参数，已忽略 ECN 设置"
         fi
     fi
+
+    # 可选：添加方向日志（便于调试）
+    if [[ -n "$direction" ]]; then
+        qos_log "DEBUG" "CAKE 参数 ($direction): $params"
+    fi
+    
     echo "$params"
 }
 
@@ -318,6 +318,10 @@ build_cake_params() {
 create_hfsc_upload_class() {
     local class_name="$1"
     local class_index="$2"
+    local percent_bandwidth per_min_bandwidth per_max_bandwidth minRTT name class_mark
+    local m1 d m2 ul_m2 class_total_bw ul_m2_value m2_value enable_minrtt
+    local cake_bw cake_params
+
     qos_log "INFO" "创建上传类别: $class_name, ID: 1:$class_index"
     if ! load_hfsc_class_config "$class_name"; then
         qos_log "ERROR" "加载HFSC配置失败: $class_name"
@@ -408,14 +412,15 @@ create_hfsc_upload_class() {
         qos_log "ERROR" "创建上传类别 1:$class_index 失败"
         return 1
     fi
-    local cake_params=$(build_cake_params "upload")
-    qos_log "INFO" "添加上传CAKE队列参数: $cake_params"
-    if ! tc qdisc add dev "$qos_interface" parent 1:$class_index \
-        handle ${class_index}:1 cake $cake_params; then
-        qos_log "ERROR" "添加上传CAKE队列失败"
-        tc class del dev "$qos_interface" classid 1:$class_index 2>/dev/null
-        return 1
-    fi
+    local cake_bw="${ul_m2%kbit}"
+	local cake_params=$(build_cake_params "$cake_bw" "upload")
+
+	if ! tc qdisc add dev "$qos_interface" parent 1:$class_index \
+		handle ${class_index}:1 cake $cake_params; then
+		qos_log "ERROR" "添加上传CAKE队列失败"
+		tc class del dev "$qos_interface" classid 1:$class_index 2>/dev/null
+		return 1
+	fi
     if [[ "$class_mark" != "0x0" ]]; then
         if ! tc filter add dev "$qos_interface" parent 1:0 protocol ip \
             prio $class_index handle ${class_mark}/$UPLOAD_MASK fw classid 1:$class_index 2>/dev/null; then
@@ -444,6 +449,10 @@ create_hfsc_download_class() {
     local class_index="$2"
     local filter_prio="$3"
     local ifb_dev="$IFB_DEVICE"
+    local percent_bandwidth per_min_bandwidth per_max_bandwidth minRTT name class_mark
+    local m1 d m2 ul_m2 class_total_bw ul_m2_value m2_value enable_minrtt
+    local cake_bw cake_params
+
     qos_log "INFO" "创建下载类别: $class_name, ID: 1:$class_index, 过滤器优先级: $filter_prio"
     if ! ip link show dev "$ifb_dev" >/dev/null 2>&1; then
         qos_log "ERROR" "IFB设备 $ifb_dev 不存在，无法创建下载类"
@@ -534,14 +543,15 @@ create_hfsc_download_class() {
         qos_log "ERROR" "创建下载类别 1:$class_index 失败"
         return 1
     fi
-    local cake_params=$(build_cake_params "download")
-    qos_log "INFO" "添加下载CAKE队列参数: $cake_params"
-    if ! tc qdisc add dev "$ifb_dev" parent 1:$class_index \
-        handle ${class_index}:1 cake $cake_params; then
-        qos_log "ERROR" "添加下载CAKE队列失败"
-        tc class del dev "$ifb_dev" classid 1:$class_index 2>/dev/null
-        return 1
-    fi
+    local cake_bw="${ul_m2%kbit}"
+	local cake_params=$(build_cake_params "$cake_bw" "download")
+
+	if ! tc qdisc add dev "$ifb_dev" parent 1:$class_index \
+		handle ${class_index}:1 cake $cake_params; then
+		qos_log "ERROR" "添加下载CAKE队列失败"
+		tc class del dev "$ifb_dev" classid 1:$class_index 2>/dev/null
+		return 1
+	fi
     if [[ "$class_mark" != "0x0" ]]; then
         if ! tc filter add dev "$ifb_dev" parent 1:0 protocol ip \
             prio $filter_prio handle ${class_mark}/$DOWNLOAD_MASK fw classid 1:$class_index 2>/dev/null; then
