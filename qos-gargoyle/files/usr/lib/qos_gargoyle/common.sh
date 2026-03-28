@@ -1,7 +1,14 @@
 #!/bin/bash
 # 核心库模块 (common.sh)
-# 版本: 3.4.9 - 最终修复：清理冗余变量，优化动态分类阈值单位，移除未使用参数
+# 版本: 3.5.0 - 修复: CAKE参数检测清理、带宽转换精度、标记冲突检测、全局常量统一
 # 提供 QoS 系统基础功能
+
+# ========== 全局常量定义 ==========
+readonly NFT_TABLE="gargoyle-qos-priority"
+readonly NFT_FAMILY="inet"
+readonly QOS_VERSION="3.5.0"
+readonly DEFAULT_IFB="ifb0"
+readonly MAX_PRIORITY_INDEX=16
 
 # ========== 加载 OpenWrt 标准函数库 ==========
 . /lib/functions.sh 2>/dev/null || true
@@ -44,6 +51,8 @@ if [[ -z "$_QOS_LIB_SH_LOADED" ]]; then
     _IPSET_LOADED=0
     _HOOKS_SETUP=0
     _EBPF_LOADED=0
+    METER_SUPPORT_CHECKED=0
+    METER_SUPPORT_AVAILABLE=0
 
     declare -A UCI_CACHE
     declare -A _SET_FAMILY_CACHE
@@ -130,6 +139,8 @@ cleanup_qos_state() {
     _QOS_TABLE_FLUSHED=0
     _IPSET_LOADED=0
     _HOOKS_SETUP=0
+    METER_SUPPORT_CHECKED=0
+    METER_SUPPORT_AVAILABLE=0
     _SET_FAMILY_CACHE=()
     log_debug "已重置全局状态标志"
 }
@@ -203,7 +214,7 @@ load_ebpf_program() {
         fi
     fi
     [[ ! -f "$pin_path" ]] && { log_error "eBPF 程序 pin 文件不存在: $pin_path"; return 1; }
-    local bpf_rule="insert rule inet gargoyle-qos-priority $target_chain meta mark == 0 bpf obj $pin_path counter"
+    local bpf_rule="insert rule inet ${NFT_TABLE} $target_chain meta mark == 0 bpf obj $pin_path counter"
     log_info "添加 eBPF 跳转规则: $bpf_rule"
     nft "$bpf_rule" 2>/dev/null || { log_warn "挂载 eBPF 程序失败"; return 1; }
     return 0
@@ -213,8 +224,8 @@ load_ebpf_programs() {
     [[ "$ENABLE_EBPF" != "1" ]] && return 0
     [[ $_EBPF_LOADED -eq 1 ]] && return 0
     log_info "开始加载 eBPF 程序..."
-    nft add chain inet gargoyle-qos-priority filter_qos_egress 2>/dev/null || true
-    nft add chain inet gargoyle-qos-priority filter_qos_ingress 2>/dev/null || true
+    nft add chain inet ${NFT_TABLE} filter_qos_egress 2>/dev/null || true
+    nft add chain inet ${NFT_TABLE} filter_qos_ingress 2>/dev/null || true
     local ret=0
     load_ebpf_program "egress" "filter_qos_egress" || ret=1
     load_ebpf_program "ingress" "filter_qos_ingress" || ret=1
@@ -544,6 +555,28 @@ init_class_marks_file() {
     mkdir -p "$(dirname "$CLASS_MARKS_FILE")" 2>/dev/null
 }
 
+# 从标记值反推索引
+get_index_from_mark() {
+    local mark="$1" direction="$2"
+    local base_value
+    if [[ "$direction" == "upload" ]]; then
+        base_value=1
+    else
+        base_value=65536
+    fi
+    local idx=1
+    local tmp=$((mark / base_value))
+    while [[ $((tmp & 1)) -eq 0 ]] && [[ $idx -le $MAX_PRIORITY_INDEX ]]; do
+        tmp=$((tmp >> 1))
+        idx=$((idx + 1))
+    done
+    if [[ $idx -le $MAX_PRIORITY_INDEX ]]; then
+        echo "$idx"
+    else
+        echo ""
+    fi
+}
+
 allocate_class_marks() {
     local direction="$1" class_list="$2"
     local base_value i=1 mark mark_index
@@ -551,21 +584,42 @@ allocate_class_marks() {
     local temp_file=$(mktemp /tmp/qos_marks_XXXXXX)
     register_temp_file "$temp_file"
     init_class_marks_file
+    
     if [[ "$direction" == "upload" ]]; then
         base_value=1
     else
         base_value=65536
     fi
 
+    # 从现有标记文件读取已使用的索引
     if [[ -f "$CLASS_MARKS_FILE" ]]; then
+        while IFS=: read -r dir cls mark; do
+            if [[ "$dir" == "$direction" ]] && [[ -n "$mark" ]]; then
+                local idx=$(get_index_from_mark "$mark" "$direction")
+                if [[ -n "$idx" ]] && [[ ! " ${used_indexes[*]} " == *" $idx "* ]]; then
+                    used_indexes+=("$idx")
+                fi
+            fi
+        done < "$CLASS_MARKS_FILE"
+        # 保留其他方向的标记，但移除当前方向的旧条目
         grep -v "^$direction:" "$CLASS_MARKS_FILE" > "${temp_file}.clean" 2>/dev/null || true
         mv "${temp_file}.clean" "$CLASS_MARKS_FILE" 2>/dev/null
     fi
 
+    # 收集启用的类
+    local enabled_classes=""
     for class in $class_list; do
+        local enabled=$(uci -q get "${CONFIG_FILE}.${class}.enabled" 2>/dev/null)
+        if [[ "$enabled" != "0" ]]; then
+            enabled_classes="$enabled_classes $class"
+        fi
+    done
+
+    # 收集用户指定的索引
+    for class in $enabled_classes; do
         mark_index=$(uci -q get "${CONFIG_FILE}.${class}.mark_index" 2>/dev/null)
         if [[ -n "$mark_index" ]]; then
-            if ! validate_number "$mark_index" "$class.mark_index" 1 16; then
+            if ! validate_number "$mark_index" "$class.mark_index" 1 $MAX_PRIORITY_INDEX; then
                 rm -f "$temp_file"
                 return 1
             fi
@@ -577,18 +631,20 @@ allocate_class_marks() {
             used_indexes+=("$mark_index")
         fi
     done
+    
+    # 自动分配未指定索引的类
     local next_auto=1
-    for class in $class_list; do
+    for class in $enabled_classes; do
         mark_index=$(uci -q get "${CONFIG_FILE}.${class}.mark_index" 2>/dev/null)
-        if [[ -z "$mark_index" || ! "$mark_index" =~ ^[0-9]+$ ]] || ! validate_number "$mark_index" "$class.mark_index" 1 16 2>/dev/null; then
+        if [[ -z "$mark_index" || ! "$mark_index" =~ ^[0-9]+$ ]] || ! validate_number "$mark_index" "$class.mark_index" 1 $MAX_PRIORITY_INDEX 2>/dev/null; then
             while [[ " ${used_indexes[*]} " == *" $next_auto "* ]]; do
                 ((next_auto++))
+                if (( next_auto > $MAX_PRIORITY_INDEX )); then
+                    log_error "没有可用的标记索引 (已用: ${used_indexes[*]})，无法为类别 $class 分配标记"
+                    rm -f "$temp_file"
+                    return 1
+                fi
             done
-            if (( next_auto > 16 )); then
-                log_error "没有可用的标记索引，无法为类别 $class 分配标记"
-                rm -f "$temp_file"
-                return 1
-            fi
             mark_index=$next_auto
             used_indexes+=("$mark_index")
             ((next_auto++))
@@ -597,6 +653,7 @@ allocate_class_marks() {
         echo "$direction:$class:$mark" >> "$temp_file"
         log_info "类别 $class 分配标记索引 $mark_index (值: $mark / 0x$(printf '%X' $mark))"
     done
+    
     if [[ -s "$temp_file" ]]; then
         cat "$temp_file" >> "$CLASS_MARKS_FILE"
         chmod 644 "$CLASS_MARKS_FILE"
@@ -811,7 +868,7 @@ process_ipset_section() {
     fi
     echo "$name $family" >> "$SET_FAMILIES_FILE"
     if [[ "$mode" == "dynamic" ]]; then
-        echo "add set inet gargoyle-qos-priority $name { type ${family}_addr; flags dynamic, timeout; timeout $timeout; }" >> "$IPSET_TEMP_FILE"
+        echo "add set inet ${NFT_TABLE} $name { type ${family}_addr; flags dynamic, timeout; timeout $timeout; }" >> "$IPSET_TEMP_FILE"
     else
         if [[ "$family" == "ipv6" ]]; then
             [[ -n "$ip6_list" ]] && elements=$(echo "$ip6_list" | tr '\n' ' ' | tr -s ' ' ',' | sed 's/^,//;s/,$//')
@@ -819,9 +876,9 @@ process_ipset_section() {
             [[ -n "$ip4_list" ]] && elements=$(echo "$ip4_list" | tr '\n' ' ' | tr -s ' ' ',' | sed 's/^,//;s/,$//')
         fi
         if [[ -n "$elements" ]]; then
-            echo "add set inet gargoyle-qos-priority $name { type ${family}_addr; flags interval; elements = { $elements }; }" >> "$IPSET_TEMP_FILE"
+            echo "add set inet ${NFT_TABLE} $name { type ${family}_addr; flags interval; elements = { $elements }; }" >> "$IPSET_TEMP_FILE"
         else
-            echo "add set inet gargoyle-qos-priority $name { type ${family}_addr; flags interval; }" >> "$IPSET_TEMP_FILE"
+            echo "add set inet ${NFT_TABLE} $name { type ${family}_addr; flags interval; }" >> "$IPSET_TEMP_FILE"
         fi
     fi
     log_info "已生成 ipset: $name ($family, mode=$mode)"
@@ -829,7 +886,7 @@ process_ipset_section() {
 
 generate_ipset_sets() {
     [[ $_IPSET_LOADED -eq 1 ]] && return 0
-    nft add table inet gargoyle-qos-priority 2>/dev/null || true
+    nft add table inet ${NFT_TABLE} 2>/dev/null || true
     if ! type config_load >/dev/null 2>&1; then
         . /lib/functions.sh
     fi
@@ -942,7 +999,7 @@ process_ratelimit_section() {
                 set_family=$(awk -v set="$setname" '$1 == set {print $2}' "$SET_FAMILIES_FILE" 2>/dev/null)
             fi
             if [[ -z "$set_family" ]]; then
-                set_family=$(nft list set inet gargoyle-qos-priority "$setname" 2>/dev/null | grep -o 'type [a-z0-9_]*' | head -1 | awk '{print $2}')
+                set_family=$(nft list set inet ${NFT_TABLE} "$setname" 2>/dev/null | grep -o 'type [a-z0-9_]*' | head -1 | awk '{print $2}')
                 set_family=${set_family%_addr}
             fi
             [[ -z "$set_family" ]] && set_family="ipv4"
@@ -971,12 +1028,12 @@ process_ratelimit_section() {
     set_name_dl6="${prefix_set}${name}_dl6"
     set_name_ul6="${prefix_set}${name}_ul6"
     if [[ $download_limit -gt 0 ]]; then
-        echo "create set inet gargoyle-qos-priority ${set_name_dl4} { type ipv4_addr; flags dynamic, timeout; timeout ${timeout}; }" >> "$RATELIMIT_TEMP_FILE"
-        echo "create set inet gargoyle-qos-priority ${set_name_dl6} { type ipv6_addr; flags dynamic, timeout; timeout ${timeout}; }" >> "$RATELIMIT_TEMP_FILE"
+        echo "create set inet ${NFT_TABLE} ${set_name_dl4} { type ipv4_addr; flags dynamic, timeout; timeout ${timeout}; }" >> "$RATELIMIT_TEMP_FILE"
+        echo "create set inet ${NFT_TABLE} ${set_name_dl6} { type ipv6_addr; flags dynamic, timeout; timeout ${timeout}; }" >> "$RATELIMIT_TEMP_FILE"
     fi
     if [[ $upload_limit -gt 0 ]]; then
-        echo "create set inet gargoyle-qos-priority ${set_name_ul4} { type ipv4_addr; flags dynamic, timeout; timeout ${timeout}; }" >> "$RATELIMIT_TEMP_FILE"
-        echo "create set inet gargoyle-qos-priority ${set_name_ul6} { type ipv6_addr; flags dynamic, timeout; timeout ${timeout}; }" >> "$RATELIMIT_TEMP_FILE"
+        echo "create set inet ${NFT_TABLE} ${set_name_ul4} { type ipv4_addr; flags dynamic, timeout; timeout ${timeout}; }" >> "$RATELIMIT_TEMP_FILE"
+        echo "create set inet ${NFT_TABLE} ${set_name_ul6} { type ipv6_addr; flags dynamic, timeout; timeout ${timeout}; }" >> "$RATELIMIT_TEMP_FILE"
     fi
     if [[ $download_limit -gt 0 ]]; then
         for grp in "pos:$ips_pos_v4" "neg:$ips_neg_v4"; do
@@ -1089,19 +1146,19 @@ setup_ratelimit_chain() {
     [[ $ENABLE_RATELIMIT != 1 ]] && return 0
     local rules=$(generate_ratelimit_rules)
     if [[ -n "$rules" ]]; then
-        local old_sets=$(nft list set inet gargoyle-qos-priority 2>/dev/null | sed -n 's/^[[:space:]]*set \([a-zA-Z0-9_]\+\).*/\1/p' | grep '^rl_')
+        local old_sets=$(nft list set inet ${NFT_TABLE} 2>/dev/null | sed -n 's/^[[:space:]]*set \([a-zA-Z0-9_]\+\).*/\1/p' | grep '^rl_')
         for set in $old_sets; do
-            nft delete set inet gargoyle-qos-priority "$set" 2>/dev/null || true
+            nft delete set inet ${NFT_TABLE} "$set" 2>/dev/null || true
         done
 
         local temp_ratelimit_file=$(mktemp /tmp/qos_ratelimit_XXXXXX)
         register_temp_file "$temp_ratelimit_file"
-        echo "create chain inet gargoyle-qos-priority $RATELIMIT_CHAIN '{ type filter hook forward priority -10; policy accept; }'" > "$temp_ratelimit_file"
-        echo "flush chain inet gargoyle-qos-priority $RATELIMIT_CHAIN" >> "$temp_ratelimit_file"
+        echo "create chain inet ${NFT_TABLE} $RATELIMIT_CHAIN '{ type filter hook forward priority -10; policy accept; }'" > "$temp_ratelimit_file"
+        echo "flush chain inet ${NFT_TABLE} $RATELIMIT_CHAIN" >> "$temp_ratelimit_file"
         echo "$rules" | while IFS= read -r rule; do
             [[ -z "$rule" ]] && continue
             [[ "${rule#\#}" != "$rule" ]] && continue
-            echo "add rule inet gargoyle-qos-priority $RATELIMIT_CHAIN $rule" >> "$temp_ratelimit_file"
+            echo "add rule inet ${NFT_TABLE} $RATELIMIT_CHAIN $rule" >> "$temp_ratelimit_file"
         done
         nft -f "$temp_ratelimit_file" 2>/dev/null || { log_error "无法创建速率限制链"; return 1; }
         log_info "速率限制链已创建并填充规则"
@@ -1121,7 +1178,7 @@ get_set_family() {
         family=$(awk -v set="$setname" '$1 == set {print $2}' "$SET_FAMILIES_FILE" 2>/dev/null)
     fi
     if [[ -z "$family" ]]; then
-        family=$(nft list set inet gargoyle-qos-priority "$setname" 2>/dev/null | grep -o 'type [a-z0-9_]*' | head -1 | awk '{print $2}')
+        family=$(nft list set inet ${NFT_TABLE} "$setname" 2>/dev/null | grep -o 'type [a-z0-9_]*' | head -1 | awk '{print $2}')
         family=${family%_addr}
     fi
     [[ -z "$family" ]] && family="ipv4"
@@ -1186,16 +1243,22 @@ get_physical_interface_max_bandwidth() {
     echo "$max_bandwidth"
 }
 
-# ========== 带宽单位转换 ==========
+# ========== 带宽单位转换（修复精度和bc依赖） ==========
 convert_bandwidth_to_kbit() {
     local bw="$1" num unit multiplier result
     [[ -z "$bw" ]] && { log_error "带宽值为空"; return 1; }
     bw=$(echo "$bw" | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]')
-    if [[ "$bw" =~ ^[0-9]+$ ]]; then echo "$bw"; return 0; fi
+    
+    if [[ "$bw" =~ ^[0-9]+$ ]]; then 
+        echo "$bw"
+        return 0
+    fi
+    
     if [[ "$bw" =~ ^([0-9]+(\.[0-9]+)?)([a-z]+)(/?s?)?$ ]]; then
         num="${BASH_REMATCH[1]}"
         unit="${BASH_REMATCH[3]}"
         unit="${unit%/*}"
+        
         case "$unit" in
             kbit|kbits|kbit/s|kbps|kb|kib) multiplier=1 ;;
             mbit|mbits|mbit/s|mbps|mb|mib) multiplier=1000 ;;
@@ -1205,13 +1268,22 @@ convert_bandwidth_to_kbit() {
             g|gb|gib) multiplier=8000000 ;;
             *) log_error "未知带宽单位: $unit"; return 1 ;;
         esac
+        
+        # 使用 bc 或 awk 进行浮点运算，并四舍五入
         if command -v bc >/dev/null 2>&1; then
-            result=$(echo "$num * $multiplier" | bc | awk '{printf "%.0f", $1}')
+            result=$(echo "scale=0; ($num * $multiplier + 0.5) / 1" | bc)
         else
-            result=$(awk "BEGIN {printf \"%.0f\", $num * $multiplier}")
+            result=$(awk "BEGIN {printf \"%.0f\", $num * $multiplier + 0.5}")
         fi
-        [[ -z "$result" || ! "$result" =~ ^[0-9]+$ || $result -lt 0 ]] && result=0
-        echo "$result"; return 0
+        
+        # 确保结果不为空且为数字
+        if [[ -z "$result" || ! "$result" =~ ^[0-9]+$ ]]; then
+            log_error "带宽转换失败: $bw"
+            return 1
+        fi
+        
+        echo "$result"
+        return 0
     else
         log_error "无效带宽格式: $bw (应为数字或数字+单位，例如 100mbit、10MB)"
         return 1
@@ -1763,6 +1835,32 @@ auto_speedtest() {
 	
     log_info "自动测速完成。请重启 QoS 服务生效（/etc/init.d/qos_gargoyle restart）。"
     return 0
+}
+
+# ========== CAKE 参数支持检查（修复：确保 dummy 设备清理） ==========
+check_cake_param_support() {
+    local param="$1"
+    local dummy_dev="cake_test_$$"
+    
+    # 使用 trap 确保清理
+    cleanup() {
+        ip link del "$dummy_dev" 2>/dev/null
+    }
+    
+    if ! ip link add "$dummy_dev" type dummy 2>/dev/null; then
+        qos_log "DEBUG" "无法创建 dummy 设备，假定 $param 不支持"
+        return 1
+    fi
+    trap cleanup RETURN INT TERM
+    
+    tc qdisc del dev "$dummy_dev" root 2>/dev/null
+    local ret=1
+    if tc qdisc add dev "$dummy_dev" root cake bandwidth 1mbit "$param" 2>/dev/null; then
+        ret=0
+        tc qdisc del dev "$dummy_dev" root 2>/dev/null
+    fi
+    
+    return $ret
 }
 
 # ========== 自动加载全局配置 ==========
