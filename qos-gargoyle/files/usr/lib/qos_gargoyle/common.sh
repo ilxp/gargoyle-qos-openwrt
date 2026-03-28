@@ -1,6 +1,6 @@
 #!/bin/bash
 # 核心库模块 (common.sh)
-# 版本: 3.4.8 - 最终修复：清理冗余变量，优化动态分类阈值单位，移除未使用参数
+# 版本: 3.4.9 - 最终修复：清理冗余变量，优化动态分类阈值单位，移除未使用参数
 # 提供 QoS 系统基础功能
 
 # ========== 加载 OpenWrt 标准函数库 ==========
@@ -310,14 +310,14 @@ validate_connbytes() {
     value=$(echo "$value" | tr -d '[:space:]')
     if [[ "$value" =~ ^[0-9]+-[0-9]+$ ]]; then
         local min=${value%-*} max=${value#*-}
-        validate_number "$min" "$param_name" 0 1048576 &&
-        validate_number "$max" "$param_name" 0 1048576 &&
+        validate_number "$min" "$param_name" 0 10485760 &&
+        validate_number "$max" "$param_name" 0 10485760 &&
         (( min <= max ))
     elif [[ "$value" =~ ^([<>]=?|!=)[0-9]+$ ]]; then
         local num=$(echo "$value" | grep -o '[0-9]\+')
-        validate_number "$num" "$param_name" 0 1048576
+        validate_number "$num" "$param_name" 0 10485760
     elif [[ "$value" =~ ^[0-9]+$ ]]; then
-        validate_number "$value" "$param_name" 0 1048576
+        validate_number "$value" "$param_name" 0 10485760
     else
         log_error "$param_name 无效格式 '$value'"
         return 1
@@ -1494,12 +1494,15 @@ calculate_memory_limit() {
             fi
         fi
         if (( total_mem_mb > 0 )); then
-            result="$(((total_mem_mb + 63) / 64))Mb"
-            local min_limit=8 max_limit=32
+            # 使用总内存的 6.25% (1/16)
+            # 256MB -> 16MB, 512MB -> 32MB, 1GB -> 64MB, 2GB -> 128MB
+            # 上限 128MB，避免过度占用
+            result="$((total_mem_mb / 16))Mb"
+            local min_limit=8 max_limit=128
             local result_value=${result%Mb}
             if (( result_value < min_limit )); then result="${min_limit}Mb"
             elif (( result_value > max_limit )); then result="${max_limit}Mb"; fi
-            log_info "系统内存 ${total_mem_mb}MB，自动计算 memlimit=${result}"
+            log_info "系统内存 ${total_mem_mb}MB，自动计算 memlimit=${result} (总内存的 6.25%)"
         else
             log_warn "无法读取内存信息，使用默认值 16Mb"; result="16Mb"
         fi
@@ -1714,45 +1717,50 @@ auto_speedtest() {
     uci set ${CONFIG_FILE}.download.total_bandwidth="${DOWNRATE}kbit"
     uci commit ${CONFIG_FILE}
 
-    if [[ $noninteractive -eq 1 ]] && [[ -n "$gaming_ip" ]] && [[ "$gaming_ip" =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$ || "$gaming_ip" =~ : ]]; then
-        log_info "添加游戏设备 IP $gaming_ip 的规则"
-        load_upload_class_configurations
-        load_download_class_configurations
-        local upload_best_class=$(get_highest_priority_class "upload")
-        local download_best_class=$(get_highest_priority_class "download")
-        while true; do
-            local old_upload_rule=$(uci -q show ${CONFIG_FILE} | grep -F ".upload_rule." | grep -F ".src_ip='${gaming_ip}'" | cut -d. -f2 | head -1)
-            [[ -n "$old_upload_rule" ]] && uci -q delete ${CONFIG_FILE}.${old_upload_rule} || break
-        done
-        while true; do
-            local old_download_rule=$(uci -q show ${CONFIG_FILE} | grep -F ".download_rule." | grep -F ".dest_ip='${gaming_ip}'" | cut -d. -f2 | head -1)
-            [[ -n "$old_download_rule" ]] && uci -q delete ${CONFIG_FILE}.${old_download_rule} || break
-        done
-        if [[ -n "$upload_best_class" ]]; then
-            uci add ${CONFIG_FILE} upload_rule
-            uci set ${CONFIG_FILE}.@upload_rule[-1].name="Game_Console_Upload_${gaming_ip//[.:]/_}"
-            uci set ${CONFIG_FILE}.@upload_rule[-1].enabled=1
-            uci set ${CONFIG_FILE}.@upload_rule[-1].class="$upload_best_class"
-            uci set ${CONFIG_FILE}.@upload_rule[-1].src_ip="$gaming_ip"
-            uci set ${CONFIG_FILE}.@upload_rule[-1].proto="udp"
-            uci set ${CONFIG_FILE}.@upload_rule[-1].order=10
-            uci set ${CONFIG_FILE}.@upload_rule[-1].counter=1
-            log_info "已添加上传规则: 源IP=${gaming_ip}, 协议=UDP, 类=${upload_best_class}, order=10"
-        fi
-        if [[ -n "$download_best_class" ]]; then
-            uci add ${CONFIG_FILE} download_rule
-            uci set ${CONFIG_FILE}.@download_rule[-1].name="Game_Console_Download_${gaming_ip//[.:]/_}"
-            uci set ${CONFIG_FILE}.@download_rule[-1].enabled=1
-            uci set ${CONFIG_FILE}.@download_rule[-1].class="$download_best_class"
-            uci set ${CONFIG_FILE}.@download_rule[-1].dest_ip="$gaming_ip"
-            uci set ${CONFIG_FILE}.@download_rule[-1].proto="udp"
-            uci set ${CONFIG_FILE}.@download_rule[-1].order=10
-            uci set ${CONFIG_FILE}.@download_rule[-1].counter=1
-            log_info "已添加下载规则: 目的IP=${gaming_ip}, 协议=UDP, 类=${download_best_class}, order=10"
-        fi
-        uci commit ${CONFIG_FILE}
-    fi
-
+    if [[ $noninteractive -eq 1 ]] && [[ -n "$gaming_ip" ]]; then
+		# 使用 validate_ip 函数进行完整验证
+		if validate_ip "$gaming_ip"; then
+			log_info "添加游戏设备 IP $gaming_ip 的规则"
+			load_upload_class_configurations
+			load_download_class_configurations
+			local upload_best_class=$(get_highest_priority_class "upload")
+			local download_best_class=$(get_highest_priority_class "download")
+			while true; do
+				local old_upload_rule=$(uci -q show ${CONFIG_FILE} | grep -F ".upload_rule." | grep -F ".src_ip='${gaming_ip}'" | cut -d. -f2 | head -1)
+				[[ -n "$old_upload_rule" ]] && uci -q delete ${CONFIG_FILE}.${old_upload_rule} || break
+			done
+			while true; do
+				local old_download_rule=$(uci -q show ${CONFIG_FILE} | grep -F ".download_rule." | grep -F ".dest_ip='${gaming_ip}'" | cut -d. -f2 | head -1)
+				[[ -n "$old_download_rule" ]] && uci -q delete ${CONFIG_FILE}.${old_download_rule} || break
+			done
+			if [[ -n "$upload_best_class" ]]; then
+				uci add ${CONFIG_FILE} upload_rule
+				uci set ${CONFIG_FILE}.@upload_rule[-1].name="Game_Console_Upload_${gaming_ip//[.:]/_}"
+				uci set ${CONFIG_FILE}.@upload_rule[-1].enabled=1
+				uci set ${CONFIG_FILE}.@upload_rule[-1].class="$upload_best_class"
+				uci set ${CONFIG_FILE}.@upload_rule[-1].src_ip="$gaming_ip"
+				uci set ${CONFIG_FILE}.@upload_rule[-1].proto="udp"
+				uci set ${CONFIG_FILE}.@upload_rule[-1].order=10
+				uci set ${CONFIG_FILE}.@upload_rule[-1].counter=1
+				log_info "已添加上传规则: 源IP=${gaming_ip}, 协议=UDP, 类=${upload_best_class}, order=10"
+			fi
+			if [[ -n "$download_best_class" ]]; then
+				uci add ${CONFIG_FILE} download_rule
+				uci set ${CONFIG_FILE}.@download_rule[-1].name="Game_Console_Download_${gaming_ip//[.:]/_}"
+				uci set ${CONFIG_FILE}.@download_rule[-1].enabled=1
+				uci set ${CONFIG_FILE}.@download_rule[-1].class="$download_best_class"
+				uci set ${CONFIG_FILE}.@download_rule[-1].dest_ip="$gaming_ip"
+				uci set ${CONFIG_FILE}.@download_rule[-1].proto="udp"
+				uci set ${CONFIG_FILE}.@download_rule[-1].order=10
+				uci set ${CONFIG_FILE}.@download_rule[-1].counter=1
+				log_info "已添加下载规则: 目的IP=${gaming_ip}, 协议=UDP, 类=${download_best_class}, order=10"
+			fi
+			uci commit ${CONFIG_FILE}
+		else
+			log_warn "游戏设备 IP '$gaming_ip' 格式无效，跳过规则添加"
+		fi
+	fi
+	
     log_info "自动测速完成。请重启 QoS 服务生效（/etc/init.d/qos_gargoyle restart）。"
     return 0
 }

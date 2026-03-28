@@ -1,6 +1,6 @@
 #!/bin/bash
 # 规则辅助模块 (rule.sh)
-# 版本: 3.4.16 - 恢复 ACK 和 TCP 升级的集合限速，实现每个连接的精细控制
+# 版本: 3.4.17 - ipv6重定向缓存
 # 完全移除锁机制，适配 procd 管理
 
 # 加载核心库
@@ -972,9 +972,9 @@ check_meter_support() {
     register_temp_file "$test_file"
     cat > "$test_file" <<EOF
 add table inet qos_meter_test
-add set inet qos_meter_test test_set { type ipv4_addr . inet_service . inet_proto; flags timeout; }
-add chain inet qos_meter_test test
-add rule inet qos_meter_test test meter test_meter { ip daddr . th dport . meta l4proto timeout 5s limit rate over 1/minute } add @test_set { ip daddr . th dport . meta l4proto timeout 30s }
+add set inet qos_meter_test meter_test_set { type ipv4_addr . inet_service . inet_proto; flags timeout; }
+add chain inet qos_meter_test meter_test_chain
+add rule inet qos_meter_test meter_test_chain meter meter_test { ip daddr . th dport . meta l4proto timeout 5s limit rate over 1/minute } add @meter_test_set { ip daddr . th dport . meta l4proto timeout 30s }
 EOF
     if nft -c -f "$test_file" 2>/dev/null; then
         nft delete table inet qos_meter_test 2>/dev/null
@@ -1108,10 +1108,10 @@ create_bulk_client_rules() {
         meta mark set $download_mark ct mark set $download_mark return 2>/dev/null || true
 
     # 挂载规则到动态分类链
-    nft add rule inet gargoyle-qos-priority qos_dynamic_classify "ct mark & 0x3f == 0" ip saddr . th sport . meta l4proto @qos_bulk_clients goto qos_bulk_client 2>/dev/null || true
-    nft add rule inet gargoyle-qos-priority qos_dynamic_classify "ct mark & 0x3f == 0" ip6 saddr . th sport . meta l4proto @qos_bulk_clients6 goto qos_bulk_client 2>/dev/null || true
-    nft add rule inet gargoyle-qos-priority qos_dynamic_classify_reply "ct mark & 0x3f == 0" ip daddr . th dport . meta l4proto @qos_bulk_clients goto qos_bulk_client_reply 2>/dev/null || true
-    nft add rule inet gargoyle-qos-priority qos_dynamic_classify_reply "ct mark & 0x3f == 0" ip6 daddr . th dport . meta l4proto @qos_bulk_clients6 goto qos_bulk_client_reply 2>/dev/null || true
+    nft add rule inet gargoyle-qos-priority qos_dynamic_classify "ct mark == 0" ip saddr . th sport . meta l4proto @qos_bulk_clients goto qos_bulk_client 2>/dev/null || true
+    nft add rule inet gargoyle-qos-priority qos_dynamic_classify "ct mark == 0" ip6 saddr . th sport . meta l4proto @qos_bulk_clients6 goto qos_bulk_client 2>/dev/null || true
+    nft add rule inet gargoyle-qos-priority qos_dynamic_classify_reply "ct mark == 0" ip daddr . th dport . meta l4proto @qos_bulk_clients goto qos_bulk_client_reply 2>/dev/null || true
+    nft add rule inet gargoyle-qos-priority qos_dynamic_classify_reply "ct mark == 0" ip6 daddr . th dport . meta l4proto @qos_bulk_clients6 goto qos_bulk_client_reply 2>/dev/null || true
 
     qos_log "信息" "批量客户端检测已启用: 最小连接数=$min_connections, 最小字节数=$min_bytes 字节/秒, 上传标记=$upload_mark, 下载标记=$download_mark"
 }
@@ -1205,11 +1205,11 @@ create_high_throughput_service_rules() {
     nft add rule inet gargoyle-qos-priority qos_high_throughput_service_reply meta mark set $download_mark ct mark set $download_mark return 2>/dev/null || true
 
     # 挂载规则到动态分类链
-    nft add rule inet gargoyle-qos-priority qos_dynamic_classify "ct mark & 0x3f == 0" ip saddr . ip daddr and 255.255.255.0 . th dport . meta l4proto @qos_high_throughput_services goto qos_high_throughput_service 2>/dev/null || true
-    nft add rule inet gargoyle-qos-priority qos_dynamic_classify "ct mark & 0x3f == 0" ip6 saddr . ip6 daddr and ffff:ffff:ffff:: . th dport . meta l4proto @qos_high_throughput_services6 goto qos_high_throughput_service 2>/dev/null || true
-    nft add rule inet gargoyle-qos-priority qos_dynamic_classify_reply "ct mark & 0x3f == 0" ip daddr . ip saddr and 255.255.255.0 . th sport . meta l4proto @qos_high_throughput_services goto qos_high_throughput_service_reply 2>/dev/null || true
-    nft add rule inet gargoyle-qos-priority qos_dynamic_classify_reply "ct mark & 0x3f == 0" ip6 daddr . ip6 saddr and ffff:ffff:ffff:: . th sport . meta l4proto @qos_high_throughput_services6 goto qos_high_throughput_service_reply 2>/dev/null || true
-
+    nft add rule inet gargoyle-qos-priority qos_dynamic_classify "ct mark == 0" ip saddr . ip daddr and 255.255.255.0 . th dport . meta l4proto @qos_high_throughput_services goto qos_high_throughput_service 2>/dev/null || true
+    nft add rule inet gargoyle-qos-priority qos_dynamic_classify "ct mark == 0" ip6 saddr . ip6 daddr and ffff:ffff:ffff:: . th dport . meta l4proto @qos_high_throughput_services6 goto qos_high_throughput_service 2>/dev/null || true
+    nft add rule inet gargoyle-qos-priority qos_dynamic_classify_reply "ct mark == 0" ip daddr . ip saddr and 255.255.255.0 . th sport . meta l4proto @qos_high_throughput_services goto qos_high_throughput_service_reply 2>/dev/null || true
+    nft add rule inet gargoyle-qos-priority qos_dynamic_classify_reply "ct mark == 0" ip6 daddr . ip6 saddr and ffff:ffff:ffff:: . th sport . meta l4proto @qos_high_throughput_services6 goto qos_high_throughput_service_reply 2>/dev/null || true
+    
     qos_log "信息" "高吞吐服务检测已启用: 最小连接数=$min_connections, 最小字节数=$min_bytes 字节/秒, 上传标记=$upload_mark, 下载标记=$download_mark"
 }
 
@@ -1223,10 +1223,10 @@ setup_dynamic_classification() {
     nft insert rule inet gargoyle-qos-priority filter_input ct state established jump qos_established_connection 2>/dev/null || true
     nft insert rule inet gargoyle-qos-priority filter_output ct state established jump qos_established_connection 2>/dev/null || true
 
-    nft insert rule inet gargoyle-qos-priority filter_input "ct mark & 0x3f == 0" jump qos_dynamic_classify 2>/dev/null || true
-    nft insert rule inet gargoyle-qos-priority filter_output "ct mark & 0x3f == 0" jump qos_dynamic_classify 2>/dev/null || true
-    nft insert rule inet gargoyle-qos-priority filter_forward "ct mark & 0x3f == 0" jump qos_dynamic_classify 2>/dev/null || true
-    nft insert rule inet gargoyle-qos-priority filter_forward "ct mark & 0x3f == 0" jump qos_dynamic_classify_reply 2>/dev/null || true
+    nft insert rule inet gargoyle-qos-priority filter_input "ct mark == 0" jump qos_dynamic_classify 2>/dev/null || true
+    nft insert rule inet gargoyle-qos-priority filter_output "ct mark == 0" jump qos_dynamic_classify 2>/dev/null || true
+    nft insert rule inet gargoyle-qos-priority filter_forward "ct mark == 0" jump qos_dynamic_classify 2>/dev/null || true
+    nft insert rule inet gargoyle-qos-priority filter_forward "ct mark == 0" jump qos_dynamic_classify_reply 2>/dev/null || true
 
     create_bulk_client_rules
     create_high_throughput_service_rules
@@ -1274,19 +1274,23 @@ apply_all_rules() {
         generate_ipset_sets
         
         # 创建 ACK 限速和 TCP 升级所需的动态集合
-        local sets_ok=1
-        for set in qos_xfst_ack qos_fast_ack qos_med_ack qos_slow_ack qos_slow_tcp; do
-            if ! nft list set inet gargoyle-qos-priority "$set" &>/dev/null; then
-                if ! nft add set inet gargoyle-qos-priority "$set" '{ typeof ct id . ct direction; flags dynamic; timeout 5m; }' 2>/dev/null; then
-                    sets_ok=0
-                fi
-            fi
-        done
-        if [[ $sets_ok -eq 0 ]]; then
-            qos_log "ERROR" "动态集合创建失败，ACK 限速和 TCP 升级功能将被禁用"
-            ENABLE_ACK_LIMIT=0
-            ENABLE_TCP_UPGRADE=0
-        fi
+        # 创建 ACK 限速和 TCP 升级所需的动态集合
+	local sets_ok=1
+	for set in qos_xfst_ack qos_fast_ack qos_med_ack qos_slow_ack qos_slow_tcp; do
+		if ! nft list set inet gargoyle-qos-priority "$set" &>/dev/null; then
+			if ! nft add set inet gargoyle-qos-priority "$set" '{ typeof ct id . ct direction; flags dynamic; timeout 5m; }' 2>/dev/null; then
+				qos_log "ERROR" "无法创建动态集合 $set"
+				sets_ok=0
+			else
+				qos_log "DEBUG" "动态集合 $set 创建成功"
+			fi
+		fi
+	done
+	if [[ $sets_ok -eq 0 ]]; then
+		qos_log "ERROR" "动态集合创建失败，ACK 限速和 TCP 升级功能将被禁用"
+		ENABLE_ACK_LIMIT=0
+		ENABLE_TCP_UPGRADE=0
+	fi
         
         nft add chain inet gargoyle-qos-priority drop995 2>/dev/null || true
         nft add chain inet gargoyle-qos-priority drop95 2>/dev/null || true
@@ -1424,16 +1428,20 @@ apply_enhanced_features() {
 }
 
 # ========== 入口重定向 ==========
+# ========== 入口重定向（添加缓存机制） ==========
 setup_ingress_redirect() {
     if [[ -z "$qos_interface" ]]; then
         qos_log "ERROR" "无法确定 WAN 接口"
         return 1
     fi
+    
+    local cache_file="/tmp/qos_gargoyle_ipv6_redirect_cache"
     local sfo_enabled=0
     if check_sfo_enabled; then
         sfo_enabled=1
         qos_log "INFO" "SFO 已启用，将使用 ctinfo 恢复标记"
     fi
+    
     local connmark_ok=0
     if check_tc_connmark_support; then
         connmark_ok=1
@@ -1441,6 +1449,7 @@ setup_ingress_redirect() {
     else
         qos_log "WARN" "tc connmark 动作不受支持"
     fi
+    
     local ctinfo_ok=0
     if (( sfo_enabled )); then
         if check_tc_ctinfo_support; then
@@ -1450,6 +1459,7 @@ setup_ingress_redirect() {
             qos_log "WARN" "tc ctinfo 动作不受支持，将回退到 connmark"
         fi
     fi
+    
     qos_log "INFO" "设置入口重定向: $qos_interface -> $IFB_DEVICE"
     tc qdisc del dev "$qos_interface" ingress 2>/dev/null || true
     if ! tc qdisc add dev "$qos_interface" handle ffff: ingress; then
@@ -1457,6 +1467,8 @@ setup_ingress_redirect() {
         return 1
     fi
     tc filter del dev "$qos_interface" parent ffff: 2>/dev/null || true
+    
+    # IPv4 入口重定向（始终执行，无缓存）
     local ipv4_success=false
     if (( sfo_enabled && ctinfo_ok )); then
         if ! tc filter add dev "$qos_interface" parent ffff: protocol ip \
@@ -1494,12 +1506,16 @@ setup_ingress_redirect() {
             qos_log "WARN" "IPv4入口重定向规则添加成功（未使用标记，标记将丢失）"
         fi
     fi
+    
     if [[ "$ipv4_success" != "true" ]]; then
         qos_log "ERROR" "IPv4入口重定向配置失败"
         return 1
     fi
+    
+    # IPv6 入口重定向（带缓存机制）
     local ipv6_prefix=$(uci -q get ${CONFIG_FILE}.global.ipv6_redirect_prefix 2>/dev/null)
     [[ -z "$ipv6_prefix" ]] && ipv6_prefix="2000::/3"
+    
     local has_ipv6_global=0
     if ip -6 addr show dev "$qos_interface" scope global 2>/dev/null | grep -q "inet6"; then
         has_ipv6_global=1
@@ -1507,85 +1523,207 @@ setup_ingress_redirect() {
     else
         qos_log "INFO" "接口 $qos_interface 无全局 IPv6 地址，IPv6 重定向失败仅警告"
     fi
-
+    
     local ipv6_action=""
     if (( sfo_enabled && ctinfo_ok )); then
         ipv6_action="action ctinfo mark 0xffffffff 0xffffffff"
     elif (( connmark_ok )); then
         ipv6_action="action connmark"
     fi
-
+    
     local ipv6_success=false
-    if [[ -n "$ipv6_action" ]]; then
-        if tc filter add dev "$qos_interface" parent ffff: protocol ipv6 \
-            flower dst_ip "$ipv6_prefix" \
-            $ipv6_action \
-            action mirred egress redirect dev "$IFB_DEVICE" 2>&1; then
-            ipv6_success=true
-            qos_log "INFO" "IPv6入口重定向规则（flower 前缀 $ipv6_prefix，带标记）添加成功"
-        else
-            qos_log "WARN" "flower 带标记规则失败，尝试无标记 flower"
-        fi
+    local cached_method=""
+    
+    # 读取缓存
+    if [[ -f "$cache_file" ]]; then
+        cached_method=$(cat "$cache_file" 2>/dev/null)
+        qos_log "DEBUG" "读取 IPv6 重定向缓存: $cached_method"
     fi
-    if [[ "$ipv6_success" != "true" ]]; then
-        if tc filter add dev "$qos_interface" parent ffff: protocol ipv6 \
-            flower dst_ip "$ipv6_prefix" \
-            action mirred egress redirect dev "$IFB_DEVICE" 2>&1; then
-            ipv6_success=true
-            qos_log "INFO" "IPv6入口重定向规则（flower 前缀 $ipv6_prefix，无标记）添加成功"
-        else
-            qos_log "WARN" "flower 无标记规则失败"
-        fi
-    fi
-
-    if [[ "$ipv6_success" != "true" ]] && [[ "$ipv6_prefix" == "2000::/3" ]]; then
-        if [[ -n "$ipv6_action" ]]; then
+    
+    # 根据缓存优先尝试成功过的方式
+    case "$cached_method" in
+        "flower_mark")
+            qos_log "INFO" "使用缓存的方式: flower 带标记"
+            if [[ -n "$ipv6_action" ]]; then
+                if tc filter add dev "$qos_interface" parent ffff: protocol ipv6 \
+                    flower dst_ip "$ipv6_prefix" \
+                    $ipv6_action \
+                    action mirred egress redirect dev "$IFB_DEVICE" 2>&1; then
+                    ipv6_success=true
+                    qos_log "INFO" "IPv6入口重定向规则（flower 前缀 $ipv6_prefix，带标记）添加成功"
+                else
+                    qos_log "WARN" "缓存的方式失败，尝试其他方式"
+                    cached_method=""
+                fi
+            fi
+            ;;
+        "flower")
+            qos_log "INFO" "使用缓存的方式: flower 无标记"
             if tc filter add dev "$qos_interface" parent ffff: protocol ipv6 \
-                u32 match u32 0x20000000 0xe0000000 at 24 \
-                $ipv6_action \
+                flower dst_ip "$ipv6_prefix" \
                 action mirred egress redirect dev "$IFB_DEVICE" 2>&1; then
                 ipv6_success=true
-                qos_log "INFO" "IPv6入口重定向规则（u32 全球单播，带标记）添加成功"
+                qos_log "INFO" "IPv6入口重定向规则（flower 前缀 $ipv6_prefix，无标记）添加成功"
             else
-                qos_log "WARN" "u32 全球单播带标记规则失败"
+                qos_log "WARN" "缓存的方式失败，尝试其他方式"
+                cached_method=""
             fi
-        fi
-        if [[ "$ipv6_success" != "true" ]]; then
+            ;;
+        "u32_mark")
+            qos_log "INFO" "使用缓存的方式: u32 全球单播带标记"
+            if [[ -n "$ipv6_action" ]]; then
+                if tc filter add dev "$qos_interface" parent ffff: protocol ipv6 \
+                    u32 match u32 0x20000000 0xe0000000 at 24 \
+                    $ipv6_action \
+                    action mirred egress redirect dev "$IFB_DEVICE" 2>&1; then
+                    ipv6_success=true
+                    qos_log "INFO" "IPv6入口重定向规则（u32 全球单播，带标记）添加成功"
+                else
+                    qos_log "WARN" "缓存的方式失败，尝试其他方式"
+                    cached_method=""
+                fi
+            fi
+            ;;
+        "u32")
+            qos_log "INFO" "使用缓存的方式: u32 全球单播无标记"
             if tc filter add dev "$qos_interface" parent ffff: protocol ipv6 \
                 u32 match u32 0x20000000 0xe0000000 at 24 \
                 action mirred egress redirect dev "$IFB_DEVICE" 2>&1; then
                 ipv6_success=true
                 qos_log "INFO" "IPv6入口重定向规则（u32 全球单播，无标记）添加成功"
             else
-                qos_log "WARN" "u32 全球单播无标记规则失败"
+                qos_log "WARN" "缓存的方式失败，尝试其他方式"
+                cached_method=""
             fi
-        fi
-    fi
-
-    if [[ "$ipv6_success" != "true" ]]; then
-        if [[ -n "$ipv6_action" ]]; then
-            if tc filter add dev "$qos_interface" parent ffff: protocol ipv6 \
-                u32 match u32 0 0 \
-                $ipv6_action \
-                action mirred egress redirect dev "$IFB_DEVICE" 2>&1; then
-                ipv6_success=true
-                qos_log "INFO" "IPv6入口重定向规则（u32 全匹配，带标记）添加成功"
-            else
-                qos_log "WARN" "u32 全匹配带标记规则失败"
+            ;;
+        "full_mark")
+            qos_log "INFO" "使用缓存的方式: u32 全匹配带标记"
+            if [[ -n "$ipv6_action" ]]; then
+                if tc filter add dev "$qos_interface" parent ffff: protocol ipv6 \
+                    u32 match u32 0 0 \
+                    $ipv6_action \
+                    action mirred egress redirect dev "$IFB_DEVICE" 2>&1; then
+                    ipv6_success=true
+                    qos_log "INFO" "IPv6入口重定向规则（u32 全匹配，带标记）添加成功"
+                else
+                    qos_log "WARN" "缓存的方式失败，尝试其他方式"
+                    cached_method=""
+                fi
             fi
-        fi
-        if [[ "$ipv6_success" != "true" ]]; then
+            ;;
+        "full")
+            qos_log "INFO" "使用缓存的方式: u32 全匹配无标记"
             if tc filter add dev "$qos_interface" parent ffff: protocol ipv6 \
                 u32 match u32 0 0 \
                 action mirred egress redirect dev "$IFB_DEVICE" 2>&1; then
                 ipv6_success=true
                 qos_log "INFO" "IPv6入口重定向规则（u32 全匹配，无标记）添加成功"
             else
-                qos_log "WARN" "IPv6全匹配回退规则添加失败"
+                qos_log "WARN" "缓存的方式失败，尝试其他方式"
+                cached_method=""
+            fi
+            ;;
+        *)
+            # 无有效缓存，执行完整探测
+            ;;
+    esac
+    
+    # 如果缓存方式失败或没有缓存，执行完整探测
+    if [[ "$ipv6_success" != "true" ]]; then
+        qos_log "INFO" "执行 IPv6 重定向完整探测..."
+        
+        # 尝试 flower 带标记
+        if [[ -n "$ipv6_action" ]] && [[ "$ipv6_success" != "true" ]]; then
+            if tc filter add dev "$qos_interface" parent ffff: protocol ipv6 \
+                flower dst_ip "$ipv6_prefix" \
+                $ipv6_action \
+                action mirred egress redirect dev "$IFB_DEVICE" 2>&1; then
+                ipv6_success=true
+                cached_method="flower_mark"
+                qos_log "INFO" "IPv6入口重定向规则（flower 前缀 $ipv6_prefix，带标记）添加成功"
+            else
+                qos_log "WARN" "flower 带标记规则失败，尝试无标记 flower"
+            fi
+        fi
+        
+        # 尝试 flower 无标记
+        if [[ "$ipv6_success" != "true" ]]; then
+            if tc filter add dev "$qos_interface" parent ffff: protocol ipv6 \
+                flower dst_ip "$ipv6_prefix" \
+                action mirred egress redirect dev "$IFB_DEVICE" 2>&1; then
+                ipv6_success=true
+                cached_method="flower"
+                qos_log "INFO" "IPv6入口重定向规则（flower 前缀 $ipv6_prefix，无标记）添加成功"
+            else
+                qos_log "WARN" "flower 无标记规则失败"
+            fi
+        fi
+        
+        # 尝试 u32 全球单播（仅当使用默认前缀时）
+        if [[ "$ipv6_success" != "true" ]] && [[ "$ipv6_prefix" == "2000::/3" ]]; then
+            if [[ -n "$ipv6_action" ]]; then
+                if tc filter add dev "$qos_interface" parent ffff: protocol ipv6 \
+                    u32 match u32 0x20000000 0xe0000000 at 24 \
+                    $ipv6_action \
+                    action mirred egress redirect dev "$IFB_DEVICE" 2>&1; then
+                    ipv6_success=true
+                    cached_method="u32_mark"
+                    qos_log "INFO" "IPv6入口重定向规则（u32 全球单播，带标记）添加成功"
+                else
+                    qos_log "WARN" "u32 全球单播带标记规则失败"
+                fi
+            fi
+            if [[ "$ipv6_success" != "true" ]]; then
+                if tc filter add dev "$qos_interface" parent ffff: protocol ipv6 \
+                    u32 match u32 0x20000000 0xe0000000 at 24 \
+                    action mirred egress redirect dev "$IFB_DEVICE" 2>&1; then
+                    ipv6_success=true
+                    cached_method="u32"
+                    qos_log "INFO" "IPv6入口重定向规则（u32 全球单播，无标记）添加成功"
+                else
+                    qos_log "WARN" "u32 全球单播无标记规则失败"
+                fi
+            fi
+        fi
+        
+        # 最后尝试全匹配
+        if [[ "$ipv6_success" != "true" ]]; then
+            if [[ -n "$ipv6_action" ]]; then
+                if tc filter add dev "$qos_interface" parent ffff: protocol ipv6 \
+                    u32 match u32 0 0 \
+                    $ipv6_action \
+                    action mirred egress redirect dev "$IFB_DEVICE" 2>&1; then
+                    ipv6_success=true
+                    cached_method="full_mark"
+                    qos_log "INFO" "IPv6入口重定向规则（u32 全匹配，带标记）添加成功"
+                else
+                    qos_log "WARN" "u32 全匹配带标记规则失败"
+                fi
+            fi
+            if [[ "$ipv6_success" != "true" ]]; then
+                if tc filter add dev "$qos_interface" parent ffff: protocol ipv6 \
+                    u32 match u32 0 0 \
+                    action mirred egress redirect dev "$IFB_DEVICE" 2>&1; then
+                    ipv6_success=true
+                    cached_method="full"
+                    qos_log "INFO" "IPv6入口重定向规则（u32 全匹配，无标记）添加成功"
+                else
+                    qos_log "WARN" "IPv6全匹配回退规则添加失败"
+                fi
             fi
         fi
     fi
-
+    
+    # 保存成功的方式到缓存
+    if [[ "$ipv6_success" == "true" ]] && [[ -n "$cached_method" ]]; then
+        echo "$cached_method" > "$cache_file"
+        qos_log "DEBUG" "保存 IPv6 重定向缓存: $cached_method"
+    elif [[ "$ipv6_success" != "true" ]] && [[ -f "$cache_file" ]]; then
+        rm -f "$cache_file"
+        qos_log "DEBUG" "清除无效的 IPv6 重定向缓存"
+    fi
+    
+    # 结果报告
     if (( has_ipv6_global == 1 )); then
         if [[ "$ipv6_success" != "true" ]]; then
             qos_log "WARN" "接口存在全局 IPv6 地址，但所有 IPv6 入口重定向配置失败，IPv6 流量可能不受 QoS 控制，但 IPv4 QoS 将继续工作"
@@ -1599,7 +1737,7 @@ setup_ingress_redirect() {
             qos_log "WARN" "IPv6 入口重定向失败，但因接口无全局 IPv6 地址，继续启动"
         fi
     fi
-
+    
     local ipv4_rule_count=$(tc filter show dev "$qos_interface" parent ffff: protocol ip 2>/dev/null | grep -c "mirred.*Redirect to device $IFB_DEVICE")
     local ipv6_rule_count=$(tc filter show dev "$qos_interface" parent ffff: protocol ipv6 2>/dev/null | grep -c "mirred.*Redirect to device $IFB_DEVICE")
     if (( ipv4_rule_count >= 1 )) && (( ipv6_rule_count >= 1 )); then

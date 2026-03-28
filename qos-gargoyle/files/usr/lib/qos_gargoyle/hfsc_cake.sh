@@ -231,6 +231,12 @@ create_hfsc_root_qdisc() {
 set_hfsc_default_class() {
     local device="$1"
     local default_classid="$2"
+	
+	if ! tc class show dev "$device" classid 1:$default_classid >/dev/null 2>&1; then
+		qos_log "ERROR" "默认类 1:$default_classid 不存在"
+		return 1
+	fi
+	
     if ! validate_number "$default_classid" "default_classid" 2 17; then
         qos_log "ERROR" "无效的默认类ID: $default_classid (有效范围 2-17)"
         return 1
@@ -1051,15 +1057,16 @@ stop_hfsc_cake_qos() {
             tc qdisc del dev "$IFB_DEVICE" root 2>/dev/null || true
             ip link set dev "$IFB_DEVICE" down
             if [[ "${DELETE_IFB_ON_STOP:-0}" == "1" ]]; then
-                if ! tc qdisc show dev "$IFB_DEVICE" 2>/dev/null | grep -q .; then
-                    ip link del dev "$IFB_DEVICE" 2>/dev/null
-                    qos_log "INFO" "IFB设备 $IFB_DEVICE 已删除"
-                else
-                    qos_log "INFO" "IFB设备 $IFB_DEVICE 仍有队列，保留"
-                fi
-            else
-                qos_log "INFO" "IFB设备 $IFB_DEVICE 已停用（保留）"
-            fi
+			# 检查是否存在具体队列（hfsc/htb/cake），而非仅判断有无输出
+				if ! tc qdisc show dev "$IFB_DEVICE" 2>/dev/null | grep -qE "htb|hfsc|cake|fq_codel"; then
+					ip link del dev "$IFB_DEVICE" 2>/dev/null
+					qos_log "INFO" "IFB设备 $IFB_DEVICE 已删除"
+				else
+					qos_log "INFO" "IFB设备 $IFB_DEVICE 仍有队列，保留"
+				fi
+			else
+				qos_log "INFO" "IFB设备 $IFB_DEVICE 已停用（保留）"
+			fi
         else
             qos_log "INFO" "IFB设备 $IFB_DEVICE 不存在，跳过"
         fi

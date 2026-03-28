@@ -191,16 +191,19 @@ load_htb_fqcodel_config() {
     fi
 
     # 6. memory_limit（可选）
-    FQCODEL_MEMORY_LIMIT=$(uci -q get ${CONFIG_FILE}.fq_codel.memory_limit 2>/dev/null)
-    if [[ -n "$FQCODEL_MEMORY_LIMIT" ]]; then
-        local original_mem="$FQCODEL_MEMORY_LIMIT"
-        FQCODEL_MEMORY_LIMIT=$(calculate_memory_limit "$FQCODEL_MEMORY_LIMIT")
-        FQCODEL_MEMORY_LIMIT=$(echo "$FQCODEL_MEMORY_LIMIT" | tr 'A-Z' 'a-z')
-        if ! check_fq_codel_param_support "memory_limit $FQCODEL_MEMORY_LIMIT"; then
-            qos_log "WARN" "内核不支持 fq_codel memory_limit=$FQCODEL_MEMORY_LIMIT，将禁用此参数"
-            FQCODEL_MEMORY_LIMIT=""
-        fi
-    fi
+	FQCODEL_MEMORY_LIMIT=$(uci -q get ${CONFIG_FILE}.fq_codel.memory_limit 2>/dev/null)
+	if [[ -n "$FQCODEL_MEMORY_LIMIT" ]]; then
+		local original_mem="$FQCODEL_MEMORY_LIMIT"
+		# 先通过 calculate_memory_limit 转换为 "X Mb" 格式，再提取数字并转为字节
+		local mem_str=$(calculate_memory_limit "$FQCODEL_MEMORY_LIMIT")
+		local mem_num=$(echo "$mem_str" | sed 's/Mb//')
+		# 转换为字节（1 Mb = 1048576 字节）
+		FQCODEL_MEMORY_LIMIT=$((mem_num * 1048576))
+		if ! check_fq_codel_param_support "memory_limit $FQCODEL_MEMORY_LIMIT"; then
+			qos_log "WARN" "内核不支持 fq_codel memory_limit=$FQCODEL_MEMORY_LIMIT，将禁用此参数"
+			FQCODEL_MEMORY_LIMIT=""
+		fi
+	fi
 
     # 7. ce_threshold（可选）
     FQCODEL_CE_THRESHOLD=$(uci -q get ${CONFIG_FILE}.fq_codel.ce_threshold 2>/dev/null)
@@ -393,6 +396,12 @@ create_htb_root_qdisc() {
 set_htb_default_class() {
     local device="$1"
     local default_classid="$2"
+	
+	if ! tc class show dev "$device" classid 1:$default_classid >/dev/null 2>&1; then
+		qos_log "ERROR" "默认类 1:$default_classid 不存在"
+		return 1
+	fi
+	
     if ! validate_number "$default_classid" "default_classid" 2 17; then
         qos_log "ERROR" "无效的默认类ID: $default_classid (有效范围 2-17)"
         return 1
@@ -1092,15 +1101,16 @@ stop_htb_fqcodel_qos() {
             tc qdisc del dev "$IFB_DEVICE" root 2>/dev/null || true
             ip link set dev "$IFB_DEVICE" down
             if [[ "${DELETE_IFB_ON_STOP:-0}" == "1" ]]; then
-                if ! tc qdisc show dev "$IFB_DEVICE" 2>/dev/null | grep -q .; then
-                    ip link del dev "$IFB_DEVICE" 2>/dev/null
-                    qos_log "INFO" "IFB设备 $IFB_DEVICE 已删除"
-                else
-                    qos_log "INFO" "IFB设备 $IFB_DEVICE 仍有队列，保留"
-                fi
-            else
-                qos_log "INFO" "IFB设备 $IFB_DEVICE 已停用（保留）"
-            fi
+			# 检查是否存在具体队列（hfsc/htb/cake），而非仅判断有无输出
+				if ! tc qdisc show dev "$IFB_DEVICE" 2>/dev/null | grep -qE "htb|hfsc|cake|fq_codel"; then
+					ip link del dev "$IFB_DEVICE" 2>/dev/null
+					qos_log "INFO" "IFB设备 $IFB_DEVICE 已删除"
+				else
+					qos_log "INFO" "IFB设备 $IFB_DEVICE 仍有队列，保留"
+				fi
+			else
+				qos_log "INFO" "IFB设备 $IFB_DEVICE 已停用（保留）"
+			fi
         else
             qos_log "INFO" "IFB设备 $IFB_DEVICE 不存在，跳过"
         fi

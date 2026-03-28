@@ -141,19 +141,18 @@ stop_qos() {
 start_service() {
     echo "Starting QoS Gargoyle service..."
     
-    # 清理 Windows 换行符
-    if [ -d "$QOS_MODULES_DIR" ]; then
-        echo "Removing Windows line endings from scripts..."
-        for f in "$QOS_MODULES_DIR"/*.sh; do
-            [ -f "$f" ] && sed 's/\r$//' "$f" > "$f.tmp" && mv "$f.tmp" "$f" 2>/dev/null
-        done
-    fi
-    if [ -f "/etc/config/$CONFIG_FILE" ]; then
-        echo "Cleaning Windows line endings from UCI config..."
-        sed 's/\r$//' "/etc/config/$CONFIG_FILE" > "/etc/config/$CONFIG_FILE.tmp" && \
-            mv "/etc/config/$CONFIG_FILE.tmp" "/etc/config/$CONFIG_FILE" 2>/dev/null
-        uci commit "$CONFIG_FILE" 2>/dev/null
-    fi
+    # 清理 Windows 换行符（保持权限）
+if [ -d "$QOS_MODULES_DIR" ]; then
+    echo "Removing Windows line endings from scripts..."
+    for f in "$QOS_MODULES_DIR"/*.sh; do
+        if [ -f "$f" ]; then
+            # 保存原权限
+            orig_perm=$(stat -c %a "$f" 2>/dev/null || echo "755")
+            sed 's/\r$//' "$f" > "$f.tmp" && mv "$f.tmp" "$f"
+            chmod "$orig_perm" "$f"
+        fi
+    done
+fi
     
     load_common_libraries
     
