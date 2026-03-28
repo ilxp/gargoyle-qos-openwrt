@@ -1135,7 +1135,7 @@ create_bulk_client_rules() {
         return 1
     fi
 
-    local enabled=1 min_connections=10 class="bulk"
+    local enabled=1 min_connections=10 min_bytes=10000 class="bulk"
     local bulk_section="bulk_detect"
     
     # 读取用户配置
@@ -1143,6 +1143,8 @@ create_bulk_client_rules() {
     [ -n "$uci_enabled" ] && enabled="$uci_enabled"
     local uci_min_connections=$(uci -q get ${CONFIG_FILE}.${bulk_section}.min_connections 2>/dev/null)
     [ -n "$uci_min_connections" ] && min_connections="$uci_min_connections"
+    local uci_min_bytes=$(uci -q get ${CONFIG_FILE}.${bulk_section}.min_bytes 2>/dev/null)
+    [ -n "$uci_min_bytes" ] && min_bytes="$uci_min_bytes"
     local uci_class=$(uci -q get ${CONFIG_FILE}.${bulk_section}.class 2>/dev/null)
     [ -n "$uci_class" ] && class="$uci_class"
 
@@ -1152,6 +1154,12 @@ create_bulk_client_rules() {
         qos_log "WARN" "min_connections 无效，使用默认值 10"
         min_connections=10
     fi
+    if ! validate_number "$min_bytes" "bulk_detect.min_bytes" 1 1000000000 2>/dev/null; then
+        qos_log "WARN" "min_bytes 无效，使用默认值 10000"
+        min_bytes=10000
+    fi
+
+    qos_log "INFO" "批量客户端检测参数: 最小连接数=${min_connections}/分钟, 最小字节速率=${min_bytes} 字节/秒"
 
     # 获取最低优先级类的标记
     local upload_mark="" download_mark=""
@@ -1187,7 +1195,7 @@ create_bulk_client_rules() {
         fi
     fi
 
-    # 创建用于记录被限速客户端的动态集合
+    # 创建用于记录被限速客户端的动态集合（基于 IP）
     nft add set inet ${NFT_TABLE} qos_bulk_clients4 '{ typeof ip saddr; flags dynamic, timeout; timeout 30s; }' 2>/dev/null || {
         qos_log "ERROR" "无法创建 IPv4 批量客户端集合"
         return 1
@@ -1197,29 +1205,45 @@ create_bulk_client_rules() {
         return 1
     }
 
+    # ========== 第一阶段：新连接速率检测（基于连接数） ==========
     # 创建新连接检测链
-    nft add chain inet ${NFT_TABLE} qos_new_connection 2>/dev/null || true
-    nft flush chain inet ${NFT_TABLE} qos_new_connection 2>/dev/null || true
+    nft add chain inet ${NFT_TABLE} qos_bulk_new_conn 2>/dev/null || true
+    nft flush chain inet ${NFT_TABLE} qos_bulk_new_conn 2>/dev/null || true
 
-    # 在 filter_forward 中插入规则：当 ct state new 且未标记时，跳转到 qos_new_connection（追加到末尾）
-    nft add rule inet ${NFT_TABLE} filter_forward "ct state new ct mark == 0 jump qos_new_connection" 2>/dev/null || true
+    # 在 filter_forward 中插入规则：ct state new 且未标记时跳转
+    nft add rule inet ${NFT_TABLE} filter_forward "ct state new ct mark == 0 jump qos_bulk_new_conn" 2>/dev/null || true
 
-    # 在新连接链中，对每个源 IP 进行限速检测，仅将超限 IP 加入集合，不设置标记
-    nft add rule inet ${NFT_TABLE} qos_new_connection meta nfproto ipv4 \
+    # 新连接链：对每个源 IP 限制连接建立速率，超过阈值则将源 IP 加入集合
+    nft add rule inet ${NFT_TABLE} qos_bulk_new_conn meta nfproto ipv4 \
         ip saddr limit rate over ${min_connections}/minute \
         update @qos_bulk_clients4 { ip saddr } counter 2>/dev/null || true
-
-    nft add rule inet ${NFT_TABLE} qos_new_connection meta nfproto ipv6 \
+    nft add rule inet ${NFT_TABLE} qos_bulk_new_conn meta nfproto ipv6 \
         ip6 saddr limit rate over ${min_connections}/minute \
         update @qos_bulk_clients6 { ip6 saddr } counter 2>/dev/null || true
 
-    # 上行规则：源 IP 在集合中且未标记时，设置上传标记
+    # ========== 第二阶段：已建立连接字节速率检测 ==========
+    # 创建字节速率检测链
+    nft add chain inet ${NFT_TABLE} qos_bulk_byte_detect 2>/dev/null || true
+    nft flush chain inet ${NFT_TABLE} qos_bulk_byte_detect 2>/dev/null || true
+
+    # 在 filter_forward 中插入规则：ct state established 且未标记时跳转
+    nft add rule inet ${NFT_TABLE} filter_forward "ct state established ct mark == 0 jump qos_bulk_byte_detect" 2>/dev/null || true
+
+    # 字节速率检测：对源 IP 进行字节速率检测，超过阈值则将源 IP 加入集合
+    nft add rule inet ${NFT_TABLE} qos_bulk_byte_detect meta nfproto ipv4 \
+        ip saddr limit rate over ${min_bytes} bytes/second \
+        update @qos_bulk_clients4 { ip saddr } counter 2>/dev/null || true
+    nft add rule inet ${NFT_TABLE} qos_bulk_byte_detect meta nfproto ipv6 \
+        ip6 saddr limit rate over ${min_bytes} bytes/second \
+        update @qos_bulk_clients6 { ip6 saddr } counter 2>/dev/null || true
+
+    # ========== 上行规则：源 IP 在集合中且未标记时，设置上传标记 ==========
     nft add rule inet ${NFT_TABLE} filter_forward oifname "$qos_interface" ct mark == 0 \
         ip saddr @qos_bulk_clients4 meta mark set $upload_mark ct mark set $upload_mark 2>/dev/null || true
     nft add rule inet ${NFT_TABLE} filter_forward oifname "$qos_interface" ct mark == 0 \
         ip6 saddr @qos_bulk_clients6 meta mark set $upload_mark ct mark set $upload_mark 2>/dev/null || true
 
-    # 下行规则：目的 IP 在集合中，且当前未标记或已标记为上传标记时，设置下载标记
+    # ========== 下行规则：目的 IP 在集合中，且当前未标记或已标记为上传标记时，设置下载标记 ==========
     nft add rule inet ${NFT_TABLE} filter_forward iifname "$qos_interface" \
         ct mark == 0 ip daddr @qos_bulk_clients4 meta mark set $download_mark ct mark set $download_mark 2>/dev/null || true
     nft add rule inet ${NFT_TABLE} filter_forward iifname "$qos_interface" \
@@ -1229,7 +1253,7 @@ create_bulk_client_rules() {
     nft add rule inet ${NFT_TABLE} filter_forward iifname "$qos_interface" \
         ct mark == $upload_mark ip6 daddr @qos_bulk_clients6 meta mark set $download_mark ct mark set $download_mark 2>/dev/null || true
 
-    qos_log "信息" "批量客户端检测已启用: 最小连接数=${min_connections}/分钟, 上传标记=$upload_mark, 下载标记=$download_mark"
+    qos_log "信息" "批量客户端检测已启用: 最小连接数=${min_connections}/分钟, 最小吞吐=${min_bytes} 字节/秒, 上传标记=$upload_mark, 下载标记=$download_mark"
     return 0
 }
 
@@ -1243,6 +1267,7 @@ create_high_throughput_service_rules() {
     local enabled=1 min_bytes=1000000 min_connections=3 class="realtime"
     local htp_section="htp_detect"
     
+    # 读取用户配置
     local uci_enabled=$(uci -q get ${CONFIG_FILE}.${htp_section}.enabled 2>/dev/null)
     [ -n "$uci_enabled" ] && enabled="$uci_enabled"
     local uci_min_bytes=$(uci -q get ${CONFIG_FILE}.${htp_section}.min_bytes 2>/dev/null)
@@ -1262,6 +1287,8 @@ create_high_throughput_service_rules() {
         qos_log "WARN" "min_connections 无效，使用默认值 3"
         min_connections=3
     fi
+
+    qos_log "INFO" "高吞吐服务检测参数: 最小连接数=${min_connections}/分钟, 最小字节速率=${min_bytes} 字节/秒"
 
     # 获取最高优先级类的标记
     local upload_mark="" download_mark=""
@@ -1297,7 +1324,7 @@ create_high_throughput_service_rules() {
         fi
     fi
 
-    # 创建用于记录高吞吐服务的动态集合
+    # 创建用于记录高吞吐服务的动态集合（服务标识）
     nft add set inet ${NFT_TABLE} qos_high_throughput_services4 '{ typeof ip daddr . th dport . meta l4proto; flags dynamic, timeout; timeout 30s; }' 2>/dev/null || {
         qos_log "ERROR" "无法创建 IPv4 高吞吐服务集合"
         return 1
@@ -1307,31 +1334,37 @@ create_high_throughput_service_rules() {
         return 1
     }
 
-    # 创建流量检测链（在 established 状态进行字节速率检测）
+    # 第一阶段：新连接检测（连接建立速率）
+    nft add chain inet ${NFT_TABLE} qos_htp_new_conn 2>/dev/null || true
+    nft flush chain inet ${NFT_TABLE} qos_htp_new_conn 2>/dev/null || true
+
+    nft add rule inet ${NFT_TABLE} filter_forward "ct state new ct mark == 0 jump qos_htp_new_conn" 2>/dev/null || true
+
+    # 新连接链：对每个目的 IP+端口，限制连接建立速率，超过阈值则加入服务集合
+    nft add rule inet ${NFT_TABLE} qos_htp_new_conn meta nfproto ipv4 \
+        ip daddr . th dport . meta l4proto limit rate over ${min_connections}/minute \
+        update @qos_high_throughput_services4 { ip daddr . th dport . meta l4proto } counter 2>/dev/null || true
+    nft add rule inet ${NFT_TABLE} qos_htp_new_conn meta nfproto ipv6 \
+        ip6 daddr . th dport . meta l4proto limit rate over ${min_connections}/minute \
+        update @qos_high_throughput_services6 { ip6 daddr . th dport . meta l4proto } counter 2>/dev/null || true
+
+    # 第二阶段：已建立连接检测（字节速率）
     nft add chain inet ${NFT_TABLE} qos_throughput_detect 2>/dev/null || true
     nft flush chain inet ${NFT_TABLE} qos_throughput_detect 2>/dev/null || true
 
-    # 在 filter_forward 中插入规则：当 ct state established 且未标记时，跳转到检测链（追加到末尾）
     nft add rule inet ${NFT_TABLE} filter_forward "ct state established ct mark == 0 jump qos_throughput_detect" 2>/dev/null || true
 
-    # 在检测链中，对每个目的 IP+端口 进行字节速率检测，仅将超限的服务加入集合，不设置标记
+    # 字节速率检测链：对已经在服务集合中的目的 IP+端口，检查字节速率，满足则标记上传
     nft add rule inet ${NFT_TABLE} qos_throughput_detect meta nfproto ipv4 \
-        ip daddr . th dport . meta l4proto limit rate over ${min_bytes} bytes/second \
-        update @qos_high_throughput_services4 { ip daddr . th dport . meta l4proto } counter 2>/dev/null || true
-
-    nft add rule inet ${NFT_TABLE} qos_throughput_detect meta nfproto ipv6 \
-        ip6 daddr . th dport . meta l4proto limit rate over ${min_bytes} bytes/second \
-        update @qos_high_throughput_services6 { ip6 daddr . th dport . meta l4proto } counter 2>/dev/null || true
-
-    # 上行规则：目的 IP+端口 在集合中且未标记时，设置上传标记
-    nft add rule inet ${NFT_TABLE} filter_forward oifname "$qos_interface" ct mark == 0 \
         ip daddr . th dport . meta l4proto @qos_high_throughput_services4 \
+        ip daddr . th dport . meta l4proto limit rate over ${min_bytes} bytes/second \
         meta mark set $upload_mark ct mark set $upload_mark 2>/dev/null || true
-    nft add rule inet ${NFT_TABLE} filter_forward oifname "$qos_interface" ct mark == 0 \
+    nft add rule inet ${NFT_TABLE} qos_throughput_detect meta nfproto ipv6 \
         ip6 daddr . th dport . meta l4proto @qos_high_throughput_services6 \
+        ip6 daddr . th dport . meta l4proto limit rate over ${min_bytes} bytes/second \
         meta mark set $upload_mark ct mark set $upload_mark 2>/dev/null || true
 
-    # 下行规则：源 IP+端口 在集合中，且当前未标记或已标记为上传标记时，设置下载标记
+    # 下行方向：源 IP+端口 在服务集合中，且当前未标记或已标记为上传标记时，设置下载标记
     nft add rule inet ${NFT_TABLE} filter_forward iifname "$qos_interface" \
         ct mark == 0 ip saddr . th sport . meta l4proto @qos_high_throughput_services4 \
         meta mark set $download_mark ct mark set $download_mark 2>/dev/null || true
@@ -1345,7 +1378,7 @@ create_high_throughput_service_rules() {
         ct mark == $upload_mark ip6 saddr . th sport . meta l4proto @qos_high_throughput_services6 \
         meta mark set $download_mark ct mark set $download_mark 2>/dev/null || true
 
-    qos_log "信息" "高吞吐服务检测已启用: 最小吞吐=${min_bytes} 字节/秒, 上传标记=$upload_mark, 下载标记=$download_mark"
+    qos_log "信息" "高吞吐服务检测已启用: 最小连接数=${min_connections}/分钟, 最小吞吐=${min_bytes} 字节/秒, 上传标记=$upload_mark, 下载标记=$download_mark"
     return 0
 }
 
