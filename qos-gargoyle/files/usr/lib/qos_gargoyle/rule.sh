@@ -1756,7 +1756,7 @@ setup_ingress_redirect() {
     fi
     tc filter del dev "$qos_interface" parent ffff: 2>/dev/null || true
     
-    # IPv4 入口重定向（始终执行，无缓存）
+    # IPv4 入口重定向（已有 ctinfo 支持，保持不变）
     local ipv4_success=false
     if (( sfo_enabled && ctinfo_ok )); then
         if ! tc filter add dev "$qos_interface" parent ffff: protocol ip \
@@ -1800,7 +1800,7 @@ setup_ingress_redirect() {
         return 1
     fi
     
-    # IPv6 入口重定向（带缓存清除机制）
+    # IPv6 入口重定向（增加 ctinfo 支持）
     local ipv6_prefix=$(uci -q get ${CONFIG_FILE}.global.ipv6_redirect_prefix 2>/dev/null)
     [[ -z "$ipv6_prefix" ]] && ipv6_prefix="2000::/3"
     
@@ -1812,17 +1812,18 @@ setup_ingress_redirect() {
         qos_log "INFO" "接口 $qos_interface 无全局 IPv6 地址，IPv6 重定向失败仅警告"
     fi
     
-    local ipv6_action=""
+    # 构建 IPv6 重定向动作（优先使用 ctinfo）
+    local ipv6_action="action mirred egress redirect dev $IFB_DEVICE"
     if (( sfo_enabled && ctinfo_ok )); then
-        ipv6_action="action ctinfo mark 0xffffffff 0xffffffff"
+        ipv6_action="action ctinfo mark 0xffffffff 0xffffffff $ipv6_action"
     elif (( connmark_ok )); then
-        ipv6_action="action connmark"
+        ipv6_action="action connmark $ipv6_action"
     fi
     
     local ipv6_success=false
     local cached_method=""
     
-    # 检查接口是否变化（简单判断：若接口 up 但之前缓存的接口索引不同，则清除缓存）
+    # 检查接口是否变化（清除缓存）
     local ifindex=$(ip link show "$qos_interface" 2>/dev/null | awk '{print $1}' | tr -d ':')
     if [[ -f "$cache_file" ]]; then
         local cached_kernel cached_ifindex
@@ -1844,17 +1845,14 @@ setup_ingress_redirect() {
     case "$cached_method" in
         "flower_mark")
             qos_log "INFO" "使用缓存的方式: flower 带标记"
-            if [[ -n "$ipv6_action" ]]; then
-                if tc filter add dev "$qos_interface" parent ffff: protocol ipv6 \
-                    flower dst_ip "$ipv6_prefix" \
-                    $ipv6_action \
-                    action mirred egress redirect dev "$IFB_DEVICE" 2>&1; then
-                    ipv6_success=true
-                    qos_log "INFO" "IPv6入口重定向规则（flower 前缀 $ipv6_prefix，带标记）添加成功"
-                else
-                    qos_log "WARN" "缓存的方式失败，尝试其他方式"
-                    cached_method=""
-                fi
+            if tc filter add dev "$qos_interface" parent ffff: protocol ipv6 \
+                flower dst_ip "$ipv6_prefix" \
+                $ipv6_action 2>&1; then
+                ipv6_success=true
+                qos_log "INFO" "IPv6入口重定向规则（flower 前缀 $ipv6_prefix，带标记）添加成功"
+            else
+                qos_log "WARN" "缓存的方式失败，尝试其他方式"
+                cached_method=""
             fi
             ;;
         "flower")
@@ -1871,17 +1869,14 @@ setup_ingress_redirect() {
             ;;
         "u32_mark")
             qos_log "INFO" "使用缓存的方式: u32 全球单播带标记"
-            if [[ -n "$ipv6_action" ]]; then
-                if tc filter add dev "$qos_interface" parent ffff: protocol ipv6 \
-                    u32 match u32 0x20000000 0xe0000000 at 24 \
-                    $ipv6_action \
-                    action mirred egress redirect dev "$IFB_DEVICE" 2>&1; then
-                    ipv6_success=true
-                    qos_log "INFO" "IPv6入口重定向规则（u32 全球单播，带标记）添加成功"
-                else
-                    qos_log "WARN" "缓存的方式失败，尝试其他方式"
-                    cached_method=""
-                fi
+            if tc filter add dev "$qos_interface" parent ffff: protocol ipv6 \
+                u32 match u32 0x20000000 0xe0000000 at 24 \
+                $ipv6_action 2>&1; then
+                ipv6_success=true
+                qos_log "INFO" "IPv6入口重定向规则（u32 全球单播，带标记）添加成功"
+            else
+                qos_log "WARN" "缓存的方式失败，尝试其他方式"
+                cached_method=""
             fi
             ;;
         "u32")
@@ -1898,17 +1893,14 @@ setup_ingress_redirect() {
             ;;
         "full_mark")
             qos_log "INFO" "使用缓存的方式: u32 全匹配带标记"
-            if [[ -n "$ipv6_action" ]]; then
-                if tc filter add dev "$qos_interface" parent ffff: protocol ipv6 \
-                    u32 match u32 0 0 \
-                    $ipv6_action \
-                    action mirred egress redirect dev "$IFB_DEVICE" 2>&1; then
-                    ipv6_success=true
-                    qos_log "INFO" "IPv6入口重定向规则（u32 全匹配，带标记）添加成功"
-                else
-                    qos_log "WARN" "缓存的方式失败，尝试其他方式"
-                    cached_method=""
-                fi
+            if tc filter add dev "$qos_interface" parent ffff: protocol ipv6 \
+                u32 match u32 0 0 \
+                $ipv6_action 2>&1; then
+                ipv6_success=true
+                qos_log "INFO" "IPv6入口重定向规则（u32 全匹配，带标记）添加成功"
+            else
+                qos_log "WARN" "缓存的方式失败，尝试其他方式"
+                cached_method=""
             fi
             ;;
         "full")
@@ -1933,11 +1925,10 @@ setup_ingress_redirect() {
         qos_log "INFO" "执行 IPv6 重定向完整探测..."
         
         # 尝试 flower 带标记
-        if [[ -n "$ipv6_action" ]] && [[ "$ipv6_success" != "true" ]]; then
+        if [[ "$ipv6_success" != "true" ]]; then
             if tc filter add dev "$qos_interface" parent ffff: protocol ipv6 \
                 flower dst_ip "$ipv6_prefix" \
-                $ipv6_action \
-                action mirred egress redirect dev "$IFB_DEVICE" 2>&1; then
+                $ipv6_action 2>&1; then
                 ipv6_success=true
                 cached_method="flower_mark"
                 qos_log "INFO" "IPv6入口重定向规则（flower 前缀 $ipv6_prefix，带标记）添加成功"
@@ -1961,11 +1952,10 @@ setup_ingress_redirect() {
         
         # 尝试 u32 全球单播（仅当使用默认前缀时）
         if [[ "$ipv6_success" != "true" ]] && [[ "$ipv6_prefix" == "2000::/3" ]]; then
-            if [[ -n "$ipv6_action" ]]; then
+            if [[ "$ipv6_success" != "true" ]]; then
                 if tc filter add dev "$qos_interface" parent ffff: protocol ipv6 \
                     u32 match u32 0x20000000 0xe0000000 at 24 \
-                    $ipv6_action \
-                    action mirred egress redirect dev "$IFB_DEVICE" 2>&1; then
+                    $ipv6_action 2>&1; then
                     ipv6_success=true
                     cached_method="u32_mark"
                     qos_log "INFO" "IPv6入口重定向规则（u32 全球单播，带标记）添加成功"
@@ -1988,11 +1978,10 @@ setup_ingress_redirect() {
         
         # 最后尝试全匹配
         if [[ "$ipv6_success" != "true" ]]; then
-            if [[ -n "$ipv6_action" ]]; then
+            if [[ "$ipv6_success" != "true" ]]; then
                 if tc filter add dev "$qos_interface" parent ffff: protocol ipv6 \
                     u32 match u32 0 0 \
-                    $ipv6_action \
-                    action mirred egress redirect dev "$IFB_DEVICE" 2>&1; then
+                    $ipv6_action 2>&1; then
                     ipv6_success=true
                     cached_method="full_mark"
                     qos_log "INFO" "IPv6入口重定向规则（u32 全匹配，带标记）添加成功"
