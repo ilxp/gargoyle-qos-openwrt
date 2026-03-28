@@ -7,17 +7,15 @@
  * for chained lookups.
  */
 #include "common.h"
-#include <netinet/if_ether.h>
-#include <netinet/ip.h>
-#include <netinet/ip6.h>
-#include <netinet/udp.h>
-#include <netpacket/packet.h>
 #include <net/if.h>
 #include <sys/socket.h>
 #include <errno.h>
 #include <resolv.h>
 #include <libubox/uloop.h>
 #include <libubox/avl-cmp.h>
+
+/* 不再需要 netinet/if_ether.h, netinet/ip.h, netinet/ip6.h, netinet/udp.h */
+/* 因为它们与 linux/if_ether.h 等冲突，而 common.h 已经包含了正确的内核头文件 */
 
 #define FLAG_RESPONSE  0x8000
 #define FLAG_OPCODE    0x7800
