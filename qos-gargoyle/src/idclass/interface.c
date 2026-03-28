@@ -7,8 +7,6 @@
  * and logical interfaces (like lan) that may be bridged.
  */
 #include "common.h"
-#include "ebpf_loader.h"
-#include "ubus_server.h"
 
 #include <sys/ioctl.h>
 #include <net/if_arp.h>
