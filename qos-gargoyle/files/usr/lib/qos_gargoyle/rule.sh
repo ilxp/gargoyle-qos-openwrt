@@ -1,6 +1,6 @@
 #!/bin/bash
 # 规则辅助模块 (rule.sh)
-# 版本: 3.5.7 - ack tcp udp 新语法
+# 版本: 3.5.8 - ack tcp udp 新语法
 # 完全移除锁机制，适配 procd 管理
 
 # 加载核心库
@@ -509,7 +509,7 @@ get_cake_diffserv_mode() {
 setup_class_mark_map() {
     qos_log "信息" "设置 class_mark 映射（map 方式）..."
     
-    # ========== 新增：检查 CAKE wash 冲突 ==========
+    # ========== 检查 CAKE wash 冲突 ==========
     local cake_wash=$(uci -q get ${CONFIG_FILE}.cake.wash 2>/dev/null)
     if [[ "$cake_wash" == "1" ]] || [[ "$cake_wash" == "yes" ]] || [[ "$cake_wash" == "true" ]]; then
         qos_log "WARN" "CAKE wash 已启用，将清除数据包中的 DSCP 字段。DSCP 映射设置的 DSCP 可能被覆盖，建议设置 cake.wash=0 或确认预期行为。"
@@ -569,16 +569,20 @@ add rule inet ${NFT_TABLE} filter_qos_ingress ct state established,related ct ma
 add rule inet ${NFT_TABLE} filter_qos_ingress ct state established,related ct mark != 0 ip6 dscp set @class_mark[ct mark]
 EOF
 
-    if nft -f "$tmp_nft_file" 2>&1 | logger -t qos_gargoyle; then
-        qos_log "信息" "class_mark map 规则加载成功"
-        rm -f "$tmp_nft_file"
-        return 0
-    else
-        qos_log "错误" "加载 class_mark map 规则失败"
-        cat "$tmp_nft_file" | logger -t qos_gargoyle
-        rm -f "$tmp_nft_file"
-        return 1
-    fi
+    local nft_output
+	nft_output=$(nft -f "$tmp_nft_file" 2>&1)
+	local nft_ret=$?
+	if [[ $nft_ret -eq 0 ]]; then
+		qos_log "信息" "class_mark map 规则加载成功"
+		rm -f "$tmp_nft_file"
+		return 0
+	else
+		qos_log "错误" "加载 class_mark map 规则失败 (退出码: $nft_ret)"
+		echo "$nft_output" | logger -t qos_gargoyle
+		cat "$tmp_nft_file" | logger -t qos_gargoyle
+		rm -f "$tmp_nft_file"
+		return 1
+	fi
 }
 
 # ========== 增强规则应用（无笛卡尔积展开） ==========
@@ -620,7 +624,13 @@ apply_enhanced_direction_rules() {
         return 0
     fi
 
-    # ========== 移除全局集合检查，改为在生成规则时逐条检查 ==========
+    # ========== 缓存现有集合列表，避免在循环中重复执行 nft 命令 ==========
+    declare -A existing_set_map
+    while IFS= read -r setname; do
+        existing_set_map["$setname"]=1
+    done < <(get_existing_sets "inet ${NFT_TABLE}")
+    qos_log "DEBUG" "已加载 ${#existing_set_map[@]} 个现有集合到缓存"
+
     local nft_batch_file=$(mktemp /tmp/qos_nft_batch_XXXXXX)
     register_temp_file "$nft_batch_file"
     qos_log "INFO" "按优先级顺序生成nft规则（使用集合，避免展开）..."
@@ -642,7 +652,7 @@ apply_enhanced_direction_rules() {
             continue
         fi
 
-        # ========== 新增：检查该规则引用的集合是否存在 ==========
+        # ========== 检查该规则引用的集合是否存在（使用缓存） ==========
         local rule_sets=""
         for field in src_ip dest_ip; do
             local var_name="tmp_${field}"
@@ -657,7 +667,7 @@ apply_enhanced_direction_rules() {
 
         local missing_set=""
         for setname in $rule_sets; do
-            if ! nft list set inet ${NFT_TABLE} "$setname" &>/dev/null; then
+            if [[ -z "${existing_set_map[$setname]}" ]]; then
                 missing_set="$setname"
                 break
             fi
@@ -677,12 +687,13 @@ apply_enhanced_direction_rules() {
         ((rule_count++))
     done
 
-    local custom_file=""
-    if [[ "$chain" == "filter_qos_egress" ]]; then
-        custom_file="/etc/qos_gargoyle/egress_custom.nft"
-    else
-        custom_file="/etc/qos_gargoyle/ingress_custom.nft"
-    fi
+    # ========== 加载统一的自定义规则文件 ==========
+	local custom_file=""
+	if [[ "$chain" == "filter_qos_egress" ]]; then
+		custom_file="${CUSTOM_EGRESS_FILE:-/etc/qos_gargoyle/egress_custom.nft}"
+	else
+		custom_file="${CUSTOM_INGRESS_FILE:-/etc/qos_gargoyle/ingress_custom.nft}"
+	fi
     if [[ -s "$custom_file" ]]; then
         qos_log "INFO" "验证自定义规则: $custom_file"
         local check_file=$(mktemp)
@@ -1586,11 +1597,15 @@ apply_enhanced_features() {
             done
             qos_log "INFO" "ACK 规则文件内容:"
             cat "$ack_file" | logger -t qos_gargoyle
-            if nft -f "$ack_file" 2>&1 | logger -t qos_gargoyle; then
-                qos_log "INFO" "ACK 限速规则添加成功"
-            else
-                qos_log "ERROR" "ACK 限速规则添加失败，功能不可用"
-            fi
+            local nft_output
+			nft_output=$(nft -f "$ack_file" 2>&1)
+			local nft_ret=$?
+			if [[ $nft_ret -eq 0 ]]; then
+				qos_log "INFO" "ACK 限速规则添加成功"
+			else
+				qos_log "ERROR" "ACK 限速规则添加失败，功能不可用 (退出码: $nft_ret)"
+				echo "$nft_output" | logger -t qos_gargoyle
+			fi
         else
             qos_log "WARN" "ACK 限速规则生成失败（返回空）"
         fi
@@ -1611,11 +1626,15 @@ apply_enhanced_features() {
             done
             qos_log "INFO" "TCP 升级规则文件内容:"
             cat "$tcp_file" | logger -t qos_gargoyle
-            if nft -f "$tcp_file" 2>&1 | logger -t qos_gargoyle; then
-                qos_log "INFO" "TCP 升级规则添加成功"
-            else
-                qos_log "ERROR" "TCP 升级规则添加失败，功能不可用"
-            fi
+            local nft_output
+			nft_output=$(nft -f "$tcp_file" 2>&1)
+			local nft_ret=$?
+			if [[ $nft_ret -eq 0 ]]; then
+				qos_log "INFO" "TCP 升级规则添加成功"
+			else
+				qos_log "ERROR" "TCP 升级规则添加失败，功能不可用 (退出码: $nft_ret)"
+				echo "$nft_output" | logger -t qos_gargoyle
+			fi
         else
             qos_log "WARN" "TCP 升级规则生成失败（返回空）"
         fi
@@ -1634,11 +1653,15 @@ apply_enhanced_features() {
             echo "$udp_limit_rules" > "$udp_file"
             qos_log "INFO" "UDP 限速规则文件内容:"
             cat "$udp_file" | logger -t qos_gargoyle
-            if nft -f "$udp_file" 2>&1 | logger -t qos_gargoyle; then
-                qos_log "INFO" "UDP 限速规则添加成功"
-            else
-                qos_log "ERROR" "UDP 限速规则添加失败，功能不可用"
-            fi
+            local nft_output
+			nft_output=$(nft -f "$udp_file" 2>&1)
+			local nft_ret=$?
+			if [[ $nft_ret -eq 0 ]]; then
+				qos_log "INFO" "UDP 限速规则添加成功"
+			else
+				qos_log "ERROR" "UDP 限速规则添加失败，功能不可用 (退出码: $nft_ret)"
+				echo "$nft_output" | logger -t qos_gargoyle
+			fi
         else
             qos_log "WARN" "UDP 限速规则生成失败（返回空）"
         fi

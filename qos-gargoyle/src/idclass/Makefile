@@ -21,8 +21,8 @@ USER_OBJS = $(USER_SRCS:.c=.o)
 LINUX_UAPI_DIR ?= $(STAGING_DIR)/usr/include
 BPF_CFLAGS = -I$(STAGING_DIR)/usr/include -I$(LINUX_UAPI_DIR)
 
-# 用户态头文件搜索路径（根据项目结构，当前目录包含 common.h 和 idclass-bpf.h）
-INCLUDES = -I.
+# 用户态头文件搜索路径（添加 libnl3 路径，解决 netlink/msg.h 缺失）
+INCLUDES = -I. -I$(STAGING_DIR)/usr/include/libnl3
 
 # 默认目标
 all: $(TARGET) $(BPF_OBJ)
