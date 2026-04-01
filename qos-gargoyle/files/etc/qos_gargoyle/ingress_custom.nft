@@ -1,0 +1,25 @@
+# ====================================================================
+# qos_gargoyle - 入口方向（下载）内联规则
+# ====================================================================
+# 用途: 嵌入到 filter_qos_ingress 链中，位于 UCI 规则之后、ACK 限速之前
+#       用于补充或覆盖 UCI 规则，实现基于连接状态、字节数、包大小等复杂分类。
+# 语法: 只包含 nftables 语句，不能出现 table、chain 等顶层关键字。
+#       规则会自动插入到主链中，注意执行顺序：UCI 规则 -> 本文件规则 -> ACK 限速
+# 生效: 修改后需重启服务: /etc/init.d/qos_gargoyle restart 
+# 调试: 查看规则是否生效: nft list chain inet gargoyle-qos-priority filter_qos_ingress
+# ====================================================================
+
+# ICMP 实时（使用标记 0x1）
+#meta mark 0 meta l4proto icmp meta nfproto { ipv4, ipv6 } meta mark set 0x00000001 counter
+
+# DNS 响应实时（使用标记 0x1）
+#meta mark 0 meta l4proto { tcp, udp } th sport 53 meta nfproto { ipv4, ipv6 } meta mark set 0x00000001 counter
+
+# Web 小文件普通（标记 0x4）——基于连接总字节数
+#meta mark 0 meta l4proto tcp th sport { 80, 443 } ct bytes < 1048576 meta nfproto { ipv4, ipv6 } meta mark set 0x00000004 counter
+
+# Web 大文件降级 bulk（标记 0x8）
+#meta mark 0 meta l4proto tcp th sport { 80, 443 } ct bytes > 20971520 meta nfproto { ipv4, ipv6 } meta mark set 0x00000008 counter
+
+# ACK 小包实时（可选，下行 ACK 包通常影响较小，但保留示例）
+#meta mark 0 meta l4proto tcp meta length < 100 tcp flags { ack } meta nfproto { ipv4, ipv6 } meta mark set 0x00000001 counter

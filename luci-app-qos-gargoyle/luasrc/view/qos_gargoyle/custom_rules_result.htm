@@ -1,0 +1,17 @@
+<%+header%>
+
+<h2><%:Custom nftables Rules%></h2>
+
+<% if success then %>
+    <div class="alert-message success">
+        <p><%=message%></p>
+    </div>
+<% else %>
+    <div class="alert-message error">
+        <p><%:An error occurred while saving the rules.%></p>
+    </div>
+<% end %>
+
+<p><a href="<%=url('admin/qos/qos_gargoyle/custom_rules')%>"><%:Back to Custom Rules%></a></p>
+
+<%+footer%>

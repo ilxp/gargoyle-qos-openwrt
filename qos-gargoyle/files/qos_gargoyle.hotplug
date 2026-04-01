@@ -1,0 +1,27 @@
+#!/bin/sh
+
+# 日誌記錄
+logger -t "qos_hotplug" "事件: INTERFACE=$INTERFACE, ACTION=$ACTION"
+
+# 只處理 wan 相關接口
+case "$INTERFACE" in
+    wan|pppoe-wan)
+        logger -t "qos_hotplug" "處理 $INTERFACE 接口事件"
+        ;;
+    *)
+        # 不是 wan 接口，忽略
+        exit 0
+        ;;
+esac
+
+# 根據動作處理
+case "$ACTION" in
+    ifup)
+        logger -t "qos_hotplug" "啟動 QoS"
+        /etc/init.d/qos_gargoyle start
+        ;;
+    ifdown)
+        logger -t "qos_hotplug" "停止 QoS"
+        /etc/init.d/qos_gargoyle stop
+        ;;
+esac

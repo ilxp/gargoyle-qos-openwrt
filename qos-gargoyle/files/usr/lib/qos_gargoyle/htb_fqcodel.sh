@@ -1,0 +1,1488 @@
+#!/bin/bash
+# HTB_FQCODEL算法实现模块
+# 版本: 3.5.11
+# 基于HTB与FQ_CODEL组合算法实现QoS流量控制。
+
+# ========== 全局配置常量 ==========
+: ${CONFIG_FILE:=qos_gargoyle}
+: ${MAX_PHYSICAL_BANDWIDTH:=10000000}
+: ${UPLOAD_MASK:=0xFFFF}
+: ${DOWNLOAD_MASK:=0xFFFF0000}
+: ${DELETE_IFB_ON_STOP:=0}
+: ${DEBUG:=0}
+
+# 全局变量
+upload_class_list=""
+download_class_list=""
+upload_class_mark_list=""
+download_class_mark_list=""
+qos_interface=""
+IFB_DEVICE=""
+
+CLASS_MARKS_FILE="/etc/qos_gargoyle/class_marks"
+
+# 加载规则辅助模块（必须）
+if [[ -f "/usr/lib/qos_gargoyle/rule.sh" ]]; then
+    . /usr/lib/qos_gargoyle/rule.sh
+    qos_log() { log "$@"; }
+else
+    echo "错误: 规则辅助模块 /usr/lib/qos_gargoyle/rule.sh 未找到" >&2
+    exit 1
+fi
+
+# 清理函数：仅清理临时文件（锁已由 procd 管理）
+main_cleanup() {
+    cleanup_temp_files 2>/dev/null
+}
+trap main_cleanup EXIT INT TERM HUP QUIT
+
+. /lib/functions.sh
+. /lib/functions/network.sh
+include /lib/network
+
+# ========== 辅助函数：优化后的 HTB burst 计算 ==========
+calculate_htb_burst() {
+    local rate_kbps="$1"   # kbit/s
+    local mtu="${2:-1500}"
+    
+    # 使用 10ms 的 burst 时间窗口
+    local burst_bytes=$(( (rate_kbps * 1000 / 8) * 10 / 1000 ))
+    # 确保至少能容纳 3 个 MTU
+    local min_burst=$(( mtu * 3 ))
+    (( burst_bytes < min_burst )) && burst_bytes=$min_burst
+    # 限制最大 burst (16MB)
+    (( burst_bytes > 16777216 )) && burst_bytes=16777216
+    
+    local burst_kb=$(( (burst_bytes + 1023) / 1024 ))
+    local cburst_kb=$(( burst_kb * 2 ))
+    (( cburst_kb > 16777216 / 1024 )) && cburst_kb=$(( 16777216 / 1024 ))
+    
+    echo "${burst_kb}kb ${cburst_kb}kb"
+}
+
+# ========== # 辅助函数：检测 fq_codel 参数支持（使用 lo 接口） ==========
+check_fq_codel_param_support() {
+    local param_string="$1"
+    local ret=1
+    local old_qdisc
+
+    # 保存当前 lo 的 root qdisc
+    old_qdisc=$(tc qdisc show dev lo 2>/dev/null | grep -E "^qdisc" | head -1 | awk '{print $2}')
+
+    # 尝试添加带参数的 fq_codel qdisc
+    if tc qdisc add dev lo root fq_codel $param_string 2>/dev/null; then
+        ret=0
+        tc qdisc del dev lo root 2>/dev/null
+    fi
+
+    # 恢复原来的 qdisc（如果之前存在且不是 noqueue/pfifo_fast）
+    if [[ -n "$old_qdisc" && "$old_qdisc" != "noqueue" && "$old_qdisc" != "pfifo_fast" ]]; then
+        tc qdisc add dev lo root $old_qdisc 2>/dev/null || true
+    fi
+
+    return $ret
+}
+
+# ========== HTB 与 FQ_CODEL 专属配置加载（增加参数检测） ==========
+load_htb_fqcodel_config() {
+    qos_log "INFO" "加载HTB与fq_codel配置"
+    if [[ -z "$total_upload_bandwidth" ]] || [[ -z "$total_download_bandwidth" ]]; then
+        qos_log "ERROR" "带宽环境变量未设置，请确保主脚本已正确加载带宽配置"
+        return 1
+    fi
+    qos_log "INFO" "使用主脚本提供的带宽: 上传=${total_upload_bandwidth}kbit, 下载=${total_download_bandwidth}kbit"
+
+    if [[ -n "$IFB_DEVICE" ]]; then
+        qos_log "INFO" "使用环境变量 IFB_DEVICE=$IFB_DEVICE"
+    else
+        IFB_DEVICE=$(uci -q get ${CONFIG_FILE}.download.ifb_device 2>/dev/null)
+        [[ -z "$IFB_DEVICE" ]] && IFB_DEVICE="ifb0"
+        qos_log "WARN" "IFB设备未通过环境变量传递，从 UCI 读取: $IFB_DEVICE"
+    fi
+
+    # 读取 HTB 参数
+    HTB_R2Q=$(uci -q get ${CONFIG_FILE}.htb.r2q 2>/dev/null)
+    [[ -z "$HTB_R2Q" ]] && HTB_R2Q=10
+    if ! validate_number "$HTB_R2Q" "htb.r2q" 1 1000 2>/dev/null; then
+        qos_log "WARN" "HTB R2Q 参数无效，使用默认值 10"
+        HTB_R2Q=10
+    fi
+
+    HTB_DRR_QUANTUM=$(uci -q get ${CONFIG_FILE}.htb.drr_quantum 2>/dev/null)
+    [[ -z "$HTB_DRR_QUANTUM" ]] && HTB_DRR_QUANTUM="auto"
+    if [[ "$HTB_DRR_QUANTUM" != "auto" ]] && ! validate_number "$HTB_DRR_QUANTUM" "htb.drr_quantum" 1 1048576 2>/dev/null; then
+        qos_log "WARN" "HTB DRR quantum 无效，使用 auto"
+        HTB_DRR_QUANTUM="auto"
+    fi
+
+    # 读取 DELETE_IFB_ON_STOP 配置
+    local delete_ifb=$(uci -q get ${CONFIG_FILE}.cake.delete_ifb_on_stop 2>/dev/null)
+    case "$delete_ifb" in
+        1|yes|true|on) DELETE_IFB_ON_STOP=1 ;;
+        *) DELETE_IFB_ON_STOP=0 ;;
+    esac
+
+    # 强制忽略 CAKE_BANDWIDTH，防止二次整形（此处CAKE未被使用，但保留检查以兼容旧配置）
+    local cake_bw=$(uci -q get ${CONFIG_FILE}.cake.bandwidth 2>/dev/null)
+    if [[ -n "$cake_bw" ]]; then
+        qos_log "ERROR" "检测到 CAKE_BANDWIDTH 已配置 (值: $cake_bw)，这将导致CAKE二次整形，严重影响HTB调度性能。已强制忽略该配置，使用HTB主导整形。"
+        # 可选：直接退出或仅警告，这里选择忽略
+        # uci set ${CONFIG_FILE}.cake.bandwidth="" 2>/dev/null  # 不修改UCI，仅在运行时忽略
+    fi
+    # 确保 CAKE_BANDWIDTH 变量为空
+    CAKE_BANDWIDTH=""
+
+    # fq_codel 参数：提供合理的默认值，并进行内核支持检测
+    # 1. limit
+    FQCODEL_LIMIT=$(uci -q get ${CONFIG_FILE}.fq_codel.limit 2>/dev/null)
+    if [[ -z "$FQCODEL_LIMIT" ]]; then
+        FQCODEL_LIMIT=1000
+        qos_log "WARN" "fq_codel limit 未配置，使用默认值: $FQCODEL_LIMIT"
+    fi
+    if ! validate_number "$FQCODEL_LIMIT" "fq_codel.limit" 1 65535; then
+        qos_log "ERROR" "fq_codel limit 无效，使用默认值 1000"
+        FQCODEL_LIMIT=1000
+    fi
+    if ! check_fq_codel_param_support "limit $FQCODEL_LIMIT"; then
+        qos_log "WARN" "内核不支持 fq_codel limit=$FQCODEL_LIMIT，已回退到默认值 1000"
+        FQCODEL_LIMIT=1000
+    fi
+
+    # 2. interval
+    FQCODEL_INTERVAL=$(uci -q get ${CONFIG_FILE}.fq_codel.interval 2>/dev/null)
+    if [[ -z "$FQCODEL_INTERVAL" ]]; then
+        FQCODEL_INTERVAL=100
+        qos_log "WARN" "fq_codel interval 未配置，使用默认值: ${FQCODEL_INTERVAL}us"
+    fi
+    if ! validate_number "$FQCODEL_INTERVAL" "fq_codel.interval" 1 1000000; then
+        qos_log "ERROR" "fq_codel interval 无效，使用默认值 100"
+        FQCODEL_INTERVAL=100
+    fi
+    if ! check_fq_codel_param_support "interval ${FQCODEL_INTERVAL}us"; then
+        qos_log "WARN" "内核不支持 fq_codel interval=${FQCODEL_INTERVAL}us，已回退到默认值 100us"
+        FQCODEL_INTERVAL=100
+    fi
+
+    # 3. target
+    FQCODEL_TARGET=$(uci -q get ${CONFIG_FILE}.fq_codel.target 2>/dev/null)
+    if [[ -z "$FQCODEL_TARGET" ]]; then
+        FQCODEL_TARGET=5
+        qos_log "WARN" "fq_codel target 未配置，使用默认值: ${FQCODEL_TARGET}us"
+    fi
+    if ! validate_number "$FQCODEL_TARGET" "fq_codel.target" 1 1000000; then
+        qos_log "ERROR" "fq_codel target 无效，使用默认值 5"
+        FQCODEL_TARGET=5
+    fi
+    if ! check_fq_codel_param_support "target ${FQCODEL_TARGET}us"; then
+        qos_log "WARN" "内核不支持 fq_codel target=${FQCODEL_TARGET}us，已回退到默认值 5us"
+        FQCODEL_TARGET=5
+    fi
+
+    # 4. flows
+    FQCODEL_FLOWS=$(uci -q get ${CONFIG_FILE}.fq_codel.flows 2>/dev/null)
+    if [[ -z "$FQCODEL_FLOWS" ]]; then
+        FQCODEL_FLOWS=1024
+        qos_log "WARN" "fq_codel flows 未配置，使用默认值: $FQCODEL_FLOWS"
+    fi
+    if ! validate_number "$FQCODEL_FLOWS" "fq_codel.flows" 1 65535; then
+        qos_log "ERROR" "fq_codel flows 无效，使用默认值 1024"
+        FQCODEL_FLOWS=1024
+    fi
+    if ! check_fq_codel_param_support "flows $FQCODEL_FLOWS"; then
+        qos_log "WARN" "内核不支持 fq_codel flows=$FQCODEL_FLOWS，已回退到默认值 1024"
+        FQCODEL_FLOWS=1024
+    fi
+
+    # 5. quantum
+    FQCODEL_QUANTUM=$(uci -q get ${CONFIG_FILE}.fq_codel.quantum 2>/dev/null)
+    if [[ -z "$FQCODEL_QUANTUM" ]]; then
+        FQCODEL_QUANTUM=300
+        qos_log "WARN" "fq_codel quantum 未配置，使用默认值: $FQCODEL_QUANTUM"
+    fi
+    if ! validate_number "$FQCODEL_QUANTUM" "fq_codel.quantum" 1 10000; then
+        qos_log "ERROR" "fq_codel quantum 无效，使用默认值 300"
+        FQCODEL_QUANTUM=300
+    fi
+    if ! check_fq_codel_param_support "quantum $FQCODEL_QUANTUM"; then
+        qos_log "WARN" "内核不支持 fq_codel quantum=$FQCODEL_QUANTUM，已回退到默认值 300"
+        FQCODEL_QUANTUM=300
+    fi
+
+    # 6. memory_limit（可选）
+    FQCODEL_MEMORY_LIMIT=$(uci -q get ${CONFIG_FILE}.fq_codel.memory_limit 2>/dev/null)
+    if [[ -n "$FQCODEL_MEMORY_LIMIT" ]]; then
+        local original_mem="$FQCODEL_MEMORY_LIMIT"
+        # 先通过 calculate_memory_limit 转换为 "X Mb" 格式，再提取数字并转为字节
+        local mem_str=$(calculate_memory_limit "$FQCODEL_MEMORY_LIMIT")
+        local mem_num=$(echo "$mem_str" | sed 's/Mb//')
+        # 转换为字节（1 Mb = 1048576 字节）
+        FQCODEL_MEMORY_LIMIT=$((mem_num * 1048576))
+        if ! check_fq_codel_param_support "memory_limit $FQCODEL_MEMORY_LIMIT"; then
+            qos_log "WARN" "内核不支持 fq_codel memory_limit=$FQCODEL_MEMORY_LIMIT，将禁用此参数"
+            FQCODEL_MEMORY_LIMIT=""
+        fi
+    fi
+
+    # 7. ce_threshold（可选）
+    FQCODEL_CE_THRESHOLD=$(uci -q get ${CONFIG_FILE}.fq_codel.ce_threshold 2>/dev/null)
+    if [[ -n "$FQCODEL_CE_THRESHOLD" ]]; then
+        if ! echo "$FQCODEL_CE_THRESHOLD" | grep -qiE '^0$|^[0-9]+(\.[0-9]+)?(us|ms)?$'; then
+            qos_log "WARN" "无效的 ce_threshold 格式 '$FQCODEL_CE_THRESHOLD'，将忽略此设置"
+            FQCODEL_CE_THRESHOLD=""
+        else
+            if ! check_fq_codel_param_support "ce_threshold $FQCODEL_CE_THRESHOLD"; then
+                qos_log "WARN" "内核不支持 fq_codel ce_threshold=$FQCODEL_CE_THRESHOLD，将禁用此参数"
+                FQCODEL_CE_THRESHOLD=""
+            fi
+        fi
+    fi
+
+    # 8. ecn（可选）
+    FQCODEL_ECN=$(uci -q get ${CONFIG_FILE}.fq_codel.ecn 2>/dev/null)
+    if [[ -n "$FQCODEL_ECN" ]]; then
+        local ecn_val=""
+        case "$FQCODEL_ECN" in
+            yes|1|enable|on|true) ecn_val="ecn" ;;
+            no|0|disable|off|false) ecn_val="noecn" ;;
+            ecn|noecn) ecn_val="$FQCODEL_ECN" ;;
+            *) qos_log "WARN" "无效的ECN配置值 '$FQCODEL_ECN'，将不使用ECN"; FQCODEL_ECN="" ;;
+        esac
+        if [[ -n "$ecn_val" ]]; then
+            if ! check_fq_codel_param_support "$ecn_val"; then
+                qos_log "WARN" "内核不支持 fq_codel $ecn_val，将禁用 ECN"
+                FQCODEL_ECN=""
+            else
+                FQCODEL_ECN="$ecn_val"
+                qos_log "INFO" "fq_codel ECN: 使用 $FQCODEL_ECN"
+            fi
+        else
+            FQCODEL_ECN=""
+        fi
+    else
+        FQCODEL_ECN=""
+        qos_log "INFO" "fq_codel ECN: 未配置"
+    fi
+
+    qos_log "INFO" "HTB配置: R2Q=${HTB_R2Q}, DRR量子=${HTB_DRR_QUANTUM}"
+    qos_log "INFO" "fq_codel参数: limit=${FQCODEL_LIMIT}, interval=${FQCODEL_INTERVAL}us, target=${FQCODEL_TARGET}us, flows=${FQCODEL_FLOWS}, quantum=${FQCODEL_QUANTUM}, memory_limit=${FQCODEL_MEMORY_LIMIT:-未配置}, ce_threshold=${FQCODEL_CE_THRESHOLD:-未配置}, ecn=${FQCODEL_ECN:-未配置}"
+    return 0
+}
+
+# 加载HTB类别配置（使用全局变量传递，并在函数开头重置）
+load_htb_class_config() {
+    local class_name="$1"
+    # 重置全局变量，避免前一个类的配置残留
+    HTB_CLASS_PERCENT=""
+    HTB_CLASS_MIN=""
+    HTB_CLASS_MAX=""
+    HTB_CLASS_PRIO=""
+    HTB_CLASS_NAME=""
+
+    qos_log "INFO" "加载HTB类别配置: $class_name"
+    percent_bandwidth=$(uci -q get ${CONFIG_FILE}.$class_name.percent_bandwidth 2>/dev/null)
+    per_min_bandwidth=$(uci -q get ${CONFIG_FILE}.$class_name.per_min_bandwidth 2>/dev/null)
+    per_max_bandwidth=$(uci -q get ${CONFIG_FILE}.$class_name.per_max_bandwidth 2>/dev/null)
+    priority=$(uci -q get ${CONFIG_FILE}.$class_name.priority 2>/dev/null)
+    name=$(uci -q get ${CONFIG_FILE}.$class_name.name 2>/dev/null)
+
+    if [[ -n "$percent_bandwidth" ]]; then
+        if validate_number "$percent_bandwidth" "$class_name.percent_bandwidth" 0 100; then
+            percent_bandwidth=$(strip_leading_zeros "$percent_bandwidth")
+        else
+            percent_bandwidth=""
+        fi
+    fi
+    if [[ -n "$per_min_bandwidth" ]]; then
+        if validate_number "$per_min_bandwidth" "$class_name.per_min_bandwidth" 0 100; then
+            per_min_bandwidth=$(strip_leading_zeros "$per_min_bandwidth")
+        else
+            per_min_bandwidth=""
+        fi
+    fi
+    if [[ -n "$per_max_bandwidth" ]]; then
+        if validate_number "$per_max_bandwidth" "$class_name.per_max_bandwidth" 0 1000; then
+            per_max_bandwidth=$(strip_leading_zeros "$per_max_bandwidth")
+        else
+            per_max_bandwidth=""
+        fi
+    fi
+    if [[ -n "$priority" ]]; then
+        if validate_number "$priority" "$class_name.priority" 0 7; then
+            priority=$(strip_leading_zeros "$priority")
+        else
+            priority=""
+        fi
+    fi
+
+    qos_log "DEBUG" "HTB配置: $class_name -> percent=$percent_bandwidth, min=$per_min_bandwidth, max=$per_max_bandwidth, priority=$priority"
+    if [[ -z "$percent_bandwidth" ]] && [[ -z "$per_min_bandwidth" ]] && [[ -z "$per_max_bandwidth" ]]; then
+        qos_log "WARN" "未找到 $class_name 的带宽参数"
+        return 1
+    fi
+    # 使用全局变量传递
+    HTB_CLASS_PERCENT="$percent_bandwidth"
+    HTB_CLASS_MIN="$per_min_bandwidth"
+    HTB_CLASS_MAX="$per_max_bandwidth"
+    HTB_CLASS_PRIO="$priority"
+    HTB_CLASS_NAME="$name"
+    return 0
+}
+
+# ========== HTB 辅助函数 ==========
+# 已使用新的 calculate_htb_burst 函数
+
+# ========== FQ_CODEL 参数构建函数 ==========
+build_fq_codel_params() {
+    local params=""
+    [[ -n "$FQCODEL_LIMIT" ]] && params="$params limit $FQCODEL_LIMIT"
+    [[ -n "$FQCODEL_INTERVAL" ]] && params="$params interval ${FQCODEL_INTERVAL}us"
+    [[ -n "$FQCODEL_TARGET" ]] && params="$params target ${FQCODEL_TARGET}us"
+    [[ -n "$FQCODEL_FLOWS" ]] && params="$params flows $FQCODEL_FLOWS"
+    [[ -n "$FQCODEL_QUANTUM" ]] && params="$params quantum $FQCODEL_QUANTUM"
+    [[ -n "$FQCODEL_MEMORY_LIMIT" ]] && params="$params memory_limit $FQCODEL_MEMORY_LIMIT"
+    [[ -n "$FQCODEL_CE_THRESHOLD" ]] && params="$params ce_threshold $FQCODEL_CE_THRESHOLD"
+    [[ -n "$FQCODEL_ECN" ]] && params="$params $FQCODEL_ECN"
+    echo "$params"
+}
+
+# ========== HTB 核心队列函数 ==========
+# 先创建根队列（不带 default），创建子类后最后设置 default
+create_htb_root_qdisc() {
+    local device="$1"
+    local direction="$2"
+    local root_handle="$3"
+    local root_classid="$4"
+    local bandwidth=""
+    if [[ "$direction" == "upload" ]]; then
+        bandwidth="$total_upload_bandwidth"
+    elif [[ "$direction" == "download" ]]; then
+        bandwidth="$total_download_bandwidth"
+    else
+        qos_log "ERROR" "未知方向: $direction"
+        return 1
+    fi
+    if (( bandwidth <= 0 )); then
+        qos_log "ERROR" "方向 $direction 带宽无效或为0，无法创建根队列"
+        return 1
+    fi
+    if ! validate_number "$bandwidth" "bandwidth" 1 "$MAX_PHYSICAL_BANDWIDTH"; then
+        qos_log "ERROR" "无效的带宽值: $bandwidth"
+        return 1
+    fi
+    qos_log "INFO" "为$device创建$direction方向HTB根队列 (带宽: ${bandwidth}kbit)"
+    tc qdisc del dev "$device" ingress 2>/dev/null || true
+    tc qdisc del dev "$device" root 2>/dev/null || true
+
+    # 先不带 default 参数创建根队列
+    if ! tc qdisc add dev "$device" root handle $root_handle htb r2q $HTB_R2Q; then
+        qos_log "ERROR" "无法在 $device 上创建HTB根队列"
+        return 1
+    fi
+    # 使用新的 burst 计算
+    local burst_params=$(calculate_htb_burst "$bandwidth")
+    local burst=$(echo "$burst_params" | awk '{print $1}')
+    local cburst=$(echo "$burst_params" | awk '{print $2}')
+    if ! tc class add dev "$device" parent $root_handle classid $root_classid htb \
+        rate ${bandwidth}kbit ceil ${bandwidth}kbit burst $burst cburst $cburst; then
+        qos_log "ERROR" "无法在$device上创建HTB根类"
+        tc qdisc del dev "$device" root 2>/dev/null
+        return 1
+    fi
+    qos_log "INFO" "$device的$direction方向HTB根队列创建完成（默认类待后续设置）"
+    return 0
+}
+
+# 设置根队列的默认类（改进：优先 change，失败则使用全匹配过滤器）
+set_htb_default_class() {
+    local device="$1"
+    local default_classid="$2"
+	
+	if ! tc class show dev "$device" classid 1:$default_classid >/dev/null 2>&1; then
+		qos_log "ERROR" "默认类 1:$default_classid 不存在"
+		return 1
+	fi
+	
+    if ! validate_number "$default_classid" "default_classid" 2 17; then
+        qos_log "ERROR" "无效的默认类ID: $default_classid (有效范围 2-17)"
+        return 1
+    fi
+    # 优先使用 tc qdisc change 修改默认类
+    if tc qdisc change dev "$device" root htb default $default_classid 2>/dev/null; then
+        qos_log "INFO" "已设置HTB根队列默认类为 $default_classid"
+        return 0
+    else
+        qos_log "WARN" "无法使用 change 设置默认类，尝试添加全匹配过滤器作为替代"
+        # 添加全匹配过滤器作为默认类（优先级 999，确保最后匹配）
+        if tc filter add dev "$device" parent 1:0 protocol all prio 999 u32 match u32 0 0 flowid 1:$default_classid 2>/dev/null; then
+            qos_log "INFO" "已通过全匹配过滤器设置默认类 1:$default_classid"
+            return 0
+        else
+            qos_log "ERROR" "无法设置默认类（change 和过滤器均失败）"
+            return 1
+        fi
+    fi
+}
+
+# 创建单个上传类
+create_htb_upload_class() {
+    local class_name="$1"
+    local class_index="$2"
+    qos_log "INFO" "创建上传类别: $class_name, ID: 1:$class_index"
+    if ! load_htb_class_config "$class_name"; then
+        qos_log "ERROR" "加载HTB配置失败: $class_name"
+        return 1
+    fi
+    local percent_bandwidth="$HTB_CLASS_PERCENT"
+    local per_min_bandwidth="$HTB_CLASS_MIN"
+    local per_max_bandwidth="$HTB_CLASS_MAX"
+    local priority="$HTB_CLASS_PRIO"
+    local name="$HTB_CLASS_NAME"
+    
+    local class_mark
+    class_mark=$(get_class_mark "upload" "$class_name")
+    if [[ -z "$class_mark" ]]; then
+        qos_log "ERROR" "无法获取类别 $class_name 的标记"
+        return 1
+    fi
+    qos_log "INFO" "类别 $class_name 使用的标记: 0x$(printf '%X' $class_mark)"
+    local rate=""
+    local ceil=""
+    local rate_value=0
+    local class_total_bw=0
+    if [[ -z "$percent_bandwidth" ]] || (( percent_bandwidth <= 0 )); then
+        qos_log "ERROR" "类别 $class_name 未配置有效的 percent_bandwidth (>0)"
+        return 1
+    fi
+    if [[ -n "$total_upload_bandwidth" ]] && (( total_upload_bandwidth > 0 )); then
+        class_total_bw=$((total_upload_bandwidth * percent_bandwidth / 100))
+        qos_log "INFO" "类别 $class_name 总带宽: ${class_total_bw}kbit (${percent_bandwidth}% of ${total_upload_bandwidth}kbit)"
+    else
+        qos_log "ERROR" "total_upload_bandwidth无效"
+        return 1
+    fi
+    if [[ -n "$per_min_bandwidth" ]] && (( per_min_bandwidth >= 0 )); then
+        if (( per_min_bandwidth == 0 )); then
+            rate="1kbit"
+            rate_value=1
+            qos_log "INFO" "类别 $class_name 设置最小保证带宽: $rate (per_min_bandwidth=0)"
+        else
+            rate_value=$((class_total_bw * per_min_bandwidth / 100))
+            (( rate_value < 1 )) && rate_value=1
+            rate="${rate_value}kbit"
+            qos_log "INFO" "类别 $class_name 使用百分比计算保证带宽: $rate (${per_min_bandwidth}% of ${class_total_bw}kbit)"
+        fi
+    else
+        rate_value=$((class_total_bw * 50 / 100))
+        (( rate_value < 1 )) && rate_value=1
+        rate="${rate_value}kbit"
+        qos_log "INFO" "类别 $class_name 使用默认保证带宽: $rate (50% of ${class_total_bw}kbit)"
+    fi
+    if [[ -n "$per_max_bandwidth" ]] && (( per_max_bandwidth > 0 )); then
+        ceil="$((class_total_bw * per_max_bandwidth / 100))kbit"
+        qos_log "INFO" "类别 $class_name 使用百分比计算上限带宽: $ceil (${per_max_bandwidth}% of ${class_total_bw}kbit)"
+    else
+        ceil="${class_total_bw}kbit"
+        qos_log "INFO" "类别 $class_name 使用类别总带宽作为上限带宽: $ceil"
+    fi
+    local ceil_value=$(echo "$ceil" | sed 's/kbit//')
+    # 确保 ceil 至少为 1kbit
+    (( ceil_value < 1 )) && { ceil="1kbit"; ceil_value=1; qos_log "WARN" "上限带宽为0，调整为1kbit"; }
+    if (( rate_value > ceil_value )); then
+        qos_log "WARN" "类别 $class_name 保证带宽($rate)超过上限带宽($ceil)，调整为上限带宽"
+        rate="$ceil"
+        rate_value="$ceil_value"
+    fi
+    local mtu=$(cat /sys/class/net/$qos_interface/mtu 2>/dev/null || echo 1500)
+    # 使用新的 burst 计算
+    local burst_params=$(calculate_htb_burst "$rate_value" "$mtu")
+    local burst=$(echo "$burst_params" | awk '{print $1}')
+    local cburst=$(echo "$burst_params" | awk '{print $2}')
+    local prio="prio 3"
+    if [[ -n "$priority" ]] && (( priority >= 0 && priority <= 7 )); then
+        prio="prio $priority"
+    fi
+    qos_log "INFO" "正在创建HTB类别 1:$class_index (rate=$rate, ceil=$ceil, burst=$burst, cburst=$cburst, $prio)"
+    if ! tc class add dev "$qos_interface" parent 1:1 \
+        classid 1:$class_index htb \
+        rate $rate ceil $ceil burst $burst cburst $cburst $prio; then
+        qos_log "ERROR" "创建上传类别 1:$class_index 失败"
+        return 1
+    fi
+    local fq_codel_params=$(build_fq_codel_params)
+    qos_log "INFO" "添加上传fq_codel队列参数: $fq_codel_params"
+    if ! tc qdisc add dev "$qos_interface" parent 1:$class_index \
+        handle ${class_index}:1 fq_codel $fq_codel_params; then
+        qos_log "ERROR" "添加上传fq_codel队列失败"
+        tc class del dev "$qos_interface" classid 1:$class_index 2>/dev/null
+        return 1
+    fi
+    if [[ "$class_mark" != "0x0" ]]; then
+        # IPv4 过滤器（优先级直接用 class_index，确保在默认类之前）
+        if ! tc filter add dev "$qos_interface" parent 1:0 protocol ip \
+            prio $class_index handle ${class_mark}/$UPLOAD_MASK fw classid 1:$class_index 2>/dev/null; then
+            qos_log "WARN" "添加上传IPv4过滤器失败 (标记:$class_mark -> 类别:1:$class_index)"
+        else
+            qos_log "INFO" "添加上传IPv4过滤器: 标记:$class_mark -> 类别:1:$class_index (优先级:$class_index)"
+        fi
+
+        # IPv6 过滤器（使用偏移优先级，避免与 IPv4 冲突）
+        local base_prio=100
+        local ipv6_priority=$((base_prio + class_index))
+        if ! tc filter add dev "$qos_interface" parent 1:0 protocol ipv6 \
+            prio $ipv6_priority handle ${class_mark}/$UPLOAD_MASK fw classid 1:$class_index 2>/dev/null; then
+            qos_log "WARN" "添加上传IPv6过滤器失败 (标记:$class_mark -> 类别:1:$class_index, 优先级:$ipv6_priority)"
+        else
+            qos_log "INFO" "添加上传IPv6过滤器: 标记:$class_mark -> 类别:1:$class_index (优先级:$ipv6_priority)"
+        fi
+    fi
+    qos_log "INFO" "上传类别创建成功: $class_name -> 1:$class_index (标记: $class_mark, 带宽: rate=$rate, ceil=$ceil)"
+    return 0
+}
+
+# 创建单个下载类
+create_htb_download_class() {
+    local class_name="$1"
+    local class_index="$2"
+    local filter_prio="$3"
+    local ifb_dev="$IFB_DEVICE"
+    qos_log "INFO" "创建下载类别: $class_name, ID: 1:$class_index, 过滤器优先级: $filter_prio"
+    if ! ip link show dev "$ifb_dev" >/dev/null 2>&1; then
+        qos_log "ERROR" "IFB设备 $ifb_dev 不存在，无法创建下载类"
+        return 1
+    fi
+    if ! load_htb_class_config "$class_name"; then
+        qos_log "ERROR" "加载HTB配置失败: $class_name"
+        return 1
+    fi
+    local percent_bandwidth="$HTB_CLASS_PERCENT"
+    local per_min_bandwidth="$HTB_CLASS_MIN"
+    local per_max_bandwidth="$HTB_CLASS_MAX"
+    local priority="$HTB_CLASS_PRIO"
+    local name="$HTB_CLASS_NAME"
+    
+    local class_mark
+    class_mark=$(get_class_mark "download" "$class_name")
+    if [[ -z "$class_mark" ]]; then
+        qos_log "ERROR" "无法获取类别 $class_name 的标记"
+        return 1
+    fi
+    qos_log "INFO" "类别 $class_name 使用的标记: 0x$(printf '%X' $class_mark)"
+    local rate=""
+    local ceil=""
+    local rate_value=0
+    local class_total_bw=0
+    if [[ -z "$percent_bandwidth" ]] || (( percent_bandwidth <= 0 )); then
+        qos_log "ERROR" "类别 $class_name 未配置有效的 percent_bandwidth (>0)"
+        return 1
+    fi
+    if [[ -n "$total_download_bandwidth" ]] && (( total_download_bandwidth > 0 )); then
+        class_total_bw=$((total_download_bandwidth * percent_bandwidth / 100))
+        qos_log "INFO" "类别 $class_name 总带宽: ${class_total_bw}kbit (${percent_bandwidth}% of ${total_download_bandwidth}kbit)"
+    else
+        qos_log "ERROR" "total_download_bandwidth无效"
+        return 1
+    fi
+    if [[ -n "$per_min_bandwidth" ]] && (( per_min_bandwidth >= 0 )); then
+        if (( per_min_bandwidth == 0 )); then
+            rate="1kbit"
+            rate_value=1
+            qos_log "INFO" "类别 $class_name 设置最小保证带宽: $rate (per_min_bandwidth=0)"
+        else
+            rate_value=$((class_total_bw * per_min_bandwidth / 100))
+            (( rate_value < 1 )) && rate_value=1
+            rate="${rate_value}kbit"
+            qos_log "INFO" "类别 $class_name 使用百分比计算保证带宽: $rate (${per_min_bandwidth}% of ${class_total_bw}kbit)"
+        fi
+    else
+        rate_value=$((class_total_bw * 50 / 100))
+        (( rate_value < 1 )) && rate_value=1
+        rate="${rate_value}kbit"
+        qos_log "INFO" "类别 $class_name 使用默认保证带宽: $rate (50% of ${class_total_bw}kbit)"
+    fi
+    if [[ -n "$per_max_bandwidth" ]] && (( per_max_bandwidth > 0 )); then
+        ceil="$((class_total_bw * per_max_bandwidth / 100))kbit"
+        qos_log "INFO" "类别 $class_name 使用百分比计算上限带宽: $ceil (${per_max_bandwidth}% of ${class_total_bw}kbit)"
+    else
+        ceil="${class_total_bw}kbit"
+        qos_log "INFO" "类别 $class_name 使用类别总带宽作为上限带宽: $ceil"
+    fi
+    local ceil_value=$(echo "$ceil" | sed 's/kbit//')
+    (( ceil_value < 1 )) && { ceil="1kbit"; ceil_value=1; qos_log "WARN" "上限带宽为0，调整为1kbit"; }
+    if (( rate_value > ceil_value )); then
+        qos_log "WARN" "类别 $class_name 保证带宽($rate)超过上限带宽($ceil)，调整为上限带宽"
+        rate="$ceil"
+        rate_value="$ceil_value"
+    fi
+    local mtu=$(cat /sys/class/net/$ifb_dev/mtu 2>/dev/null || echo 1500)
+    # 使用新的 burst 计算
+    local burst_params=$(calculate_htb_burst "$rate_value" "$mtu")
+    local burst=$(echo "$burst_params" | awk '{print $1}')
+    local cburst=$(echo "$burst_params" | awk '{print $2}')
+    local prio="prio 3"
+    if [[ -n "$priority" ]] && (( priority >= 0 && priority <= 7 )); then
+        prio="prio $priority"
+    fi
+    qos_log "INFO" "正在创建下载HTB类别 1:$class_index (rate=$rate, ceil=$ceil, burst=$burst, cburst=$cburst, $prio)"
+    if ! tc class add dev "$ifb_dev" parent 1:1 \
+        classid 1:$class_index htb \
+        rate $rate ceil $ceil burst $burst cburst $cburst $prio; then
+        qos_log "ERROR" "创建下载类别 1:$class_index 失败"
+        return 1
+    fi
+    local fq_codel_params=$(build_fq_codel_params)
+    qos_log "INFO" "添加下载fq_codel队列参数: $fq_codel_params"
+    if ! tc qdisc add dev "$ifb_dev" parent 1:$class_index \
+        handle ${class_index}:1 fq_codel $fq_codel_params; then
+        qos_log "ERROR" "添加下载fq_codel队列失败"
+        tc class del dev "$ifb_dev" classid 1:$class_index 2>/dev/null
+        return 1
+    fi
+    if [[ "$class_mark" != "0x0" ]]; then
+        # IPv4 过滤器（使用传入的 filter_prio，已在函数参数中定义）
+        if ! tc filter add dev "$ifb_dev" parent 1:0 protocol ip \
+            prio $filter_prio handle ${class_mark}/$DOWNLOAD_MASK fw classid 1:$class_index 2>/dev/null; then
+            qos_log "WARN" "添加下载IPv4过滤器失败 (标记:$class_mark -> 类别:1:$class_index, 优先级:$filter_prio)"
+        else
+            qos_log "INFO" "添加下载IPv4过滤器: 标记:$class_mark -> 类别:1:$class_index (优先级:$filter_prio)"
+        fi
+
+        # IPv6 过滤器（使用偏移优先级）
+        local base_prio=100
+        local ipv6_priority=$((base_prio + filter_prio))
+        if ! tc filter add dev "$ifb_dev" parent 1:0 protocol ipv6 \
+            prio $ipv6_priority handle ${class_mark}/$DOWNLOAD_MASK fw classid 1:$class_index 2>/dev/null; then
+            qos_log "WARN" "添加下载IPv6过滤器失败 (标记:$class_mark -> 类别:1:$class_index, 优先级:$ipv6_priority)"
+        else
+            qos_log "INFO" "添加下载IPv6过滤器: 标记:$class_mark -> 类别:1:$class_index (优先级:$ipv6_priority)"
+        fi
+    fi
+    qos_log "INFO" "下载类别创建成功: $class_name -> 1:$class_index (标记: $class_mark, 带宽: rate=$rate, ceil=$ceil)"
+    return 0
+}
+
+# ========== 上传方向初始化 ==========
+init_htb_fqcodel_upload() {
+    qos_log "INFO" "初始化上传方向HTB"
+    load_upload_class_configurations
+    if [[ -z "$upload_class_list" ]]; then
+        qos_log "ERROR" "未找到上传类别配置，请至少配置一个上传类"
+        return 1
+    fi
+
+    # 统计启用的类数量，而不是所有类
+    local enabled_class_count=0
+    local class_list="$upload_class_list"
+    for class in $class_list; do
+        local enabled=$(uci -q get ${CONFIG_FILE}.${class}.enabled 2>/dev/null)
+        if [[ "$enabled" == "1" ]] || [[ -z "$enabled" ]]; then
+            ((enabled_class_count++))
+        fi
+    done
+    if (( enabled_class_count > 16 )); then
+        qos_log "ERROR" "上传方向启用的类别数量为 $enabled_class_count，超过16个，将导致标记冲突，启动中止！"
+        return 1
+    fi
+
+    local enabled_classes=""
+    local class_index=2
+    local default_class_index=""
+    local default_class_name=""
+    local first_enabled_class=""
+
+    declare -A class_index_map
+    default_class_name=$(uci -q get ${CONFIG_FILE}.upload.default_class 2>/dev/null)
+
+    for class in $upload_class_list; do
+        local enabled=$(uci -q get ${CONFIG_FILE}.${class}.enabled 2>/dev/null)
+        if [[ "$enabled" == "1" ]] || [[ -z "$enabled" ]]; then
+            enabled_classes="$enabled_classes $class"
+            [[ -z "$first_enabled_class" ]] && first_enabled_class="$class"
+            class_index_map["$class"]=$class_index
+            if [[ -n "$default_class_name" ]] && [[ "$class" == "$default_class_name" ]]; then
+                default_class_index=$class_index
+            fi
+            ((class_index++))
+        fi
+    done
+    enabled_classes=$(echo "$enabled_classes" | xargs)
+
+    if [[ -z "$enabled_classes" ]]; then
+        qos_log "ERROR" "没有启用的上传类，请至少启用一个上传类"
+        return 1
+    fi
+    
+	# 创建根队列前，计算百分比总和
+	local total_percent=0
+	for class_name in $upload_class_list; do
+		local enabled=$(uci -q get ${CONFIG_FILE}.${class_name}.enabled 2>/dev/null)
+		if [[ "$enabled" == "1" ]] || [[ -z "$enabled" ]]; then
+			local percent=$(uci -q get ${CONFIG_FILE}.${class_name}.percent_bandwidth 2>/dev/null)
+			if validate_number "$percent" "$class_name.percent_bandwidth" 0 100 2>/dev/null; then
+				total_percent=$((total_percent + percent))
+			fi
+		fi
+	done
+	if (( total_percent > 100 )); then
+		qos_log "WARN" "上传方向启用的子类百分比总和为 ${total_percent}%，超过100%，可能导致带宽保证无法实现"
+	fi
+	
+    if [[ -z "$default_class_index" ]]; then
+        if [[ -n "$default_class_name" ]]; then
+            qos_log "WARN" "未找到上传默认类别 '$default_class_name' 或该类未启用，将使用第一个启用的类别"
+        fi
+        if [[ -n "$first_enabled_class" ]]; then
+            default_class_index=${class_index_map["$first_enabled_class"]}
+            qos_log "INFO" "自动选择第一个启用的类别: $first_enabled_class (ID: 1:$default_class_index)"
+        else
+            qos_log "ERROR" "没有启用的上传类，无法设置默认类"
+            return 1
+        fi
+    else
+        qos_log "INFO" "上传默认类别: $default_class_name (ID: 1:$default_class_index)"
+    fi
+
+    # 先创建根队列（不带 default）
+    if ! create_htb_root_qdisc "$qos_interface" "upload" "1:0" "1:1"; then
+        qos_log "ERROR" "创建上传根队列失败"
+        return 1
+    fi
+    
+	# 创建根队列后，如果 SFO 启用，添加出口 ctinfo 规则
+    if ! setup_egress_ctinfo "$qos_interface"; then
+        qos_log "WARN" "出口方向 ctinfo 设置失败，SFO 下 QoS 可能不完整"
+    fi
+	
+    # 创建各个子类
+    upload_class_mark_list=""
+    for class_name in $enabled_classes; do
+        local idx=${class_index_map["$class_name"]}
+        if create_htb_upload_class "$class_name" "$idx"; then
+            local class_mark_hex=$(get_class_mark "upload" "$class_name")
+            upload_class_mark_list="$upload_class_mark_list$class_name:0x$(printf '%X' $class_mark_hex) "
+        else
+            qos_log "ERROR" "创建上传类别 $class_name 失败，停止初始化"
+            tc qdisc del dev "$qos_interface" root 2>/dev/null
+            return 1
+        fi
+    done
+
+    # 最后设置默认类
+    if ! set_htb_default_class "$qos_interface" "$default_class_index"; then
+        qos_log "ERROR" "设置上传默认类失败"
+        tc qdisc del dev "$qos_interface" root 2>/dev/null
+        return 1
+    fi
+
+    qos_log "INFO" "上传方向HTB初始化完成"
+    return 0
+}
+
+# ========== 下载方向初始化 ==========
+init_htb_fqcodel_download() {
+    qos_log "INFO" "初始化下载方向HTB"
+    load_download_class_configurations
+    if [[ -z "$download_class_list" ]]; then
+        qos_log "ERROR" "未找到下载类别配置，请至少配置一个下载类"
+        return 1
+    fi
+
+    # 统计启用的类数量，而不是所有类
+    local enabled_class_count=0
+    local class_list="$download_class_list"
+    for class in $class_list; do
+        local enabled=$(uci -q get ${CONFIG_FILE}.${class}.enabled 2>/dev/null)
+        if [[ "$enabled" == "1" ]] || [[ -z "$enabled" ]]; then
+            ((enabled_class_count++))
+        fi
+    done
+    if (( enabled_class_count > 16 )); then
+        qos_log "ERROR" "下载方向启用的类别数量为 $enabled_class_count，超过16个，将导致标记冲突，启动中止！"
+        return 1
+    fi
+
+    local enabled_classes=""
+    local class_index=2
+    local default_class_index=""
+    local default_class_name=""
+    local first_enabled_class=""
+
+    declare -A class_index_map
+    default_class_name=$(uci -q get ${CONFIG_FILE}.download.default_class 2>/dev/null)
+
+    for class in $download_class_list; do
+        local enabled=$(uci -q get ${CONFIG_FILE}.${class}.enabled 2>/dev/null)
+        if [[ "$enabled" == "1" ]] || [[ -z "$enabled" ]]; then
+            enabled_classes="$enabled_classes $class"
+            [[ -z "$first_enabled_class" ]] && first_enabled_class="$class"
+            class_index_map["$class"]=$class_index
+            if [[ -n "$default_class_name" ]] && [[ "$class" == "$default_class_name" ]]; then
+                default_class_index=$class_index
+            fi
+            ((class_index++))
+        fi
+    done
+    enabled_classes=$(echo "$enabled_classes" | xargs)
+
+    if [[ -z "$enabled_classes" ]]; then
+        qos_log "ERROR" "没有启用的下载类，请至少启用一个下载类"
+        return 1
+    fi
+    
+	# 创建根队列前，计算百分比总和
+	local total_percent=0
+	for class_name in $download_class_list; do
+		local enabled=$(uci -q get ${CONFIG_FILE}.${class_name}.enabled 2>/dev/null)
+		if [[ "$enabled" == "1" ]] || [[ -z "$enabled" ]]; then
+			local percent=$(uci -q get ${CONFIG_FILE}.${class_name}.percent_bandwidth 2>/dev/null)
+			if validate_number "$percent" "$class_name.percent_bandwidth" 0 100 2>/dev/null; then
+				total_percent=$((total_percent + percent))
+			fi
+		fi
+	done
+	if (( total_percent > 100 )); then
+		qos_log "WARN" "下载方向启用的子类百分比总和为 ${total_percent}%，超过100%，可能导致带宽保证无法实现"
+	fi
+	
+    if [[ -z "$default_class_index" ]]; then
+        if [[ -n "$default_class_name" ]]; then
+            qos_log "WARN" "未找到下载默认类别 '$default_class_name' 或该类未启用，将使用第一个启用的类别"
+        fi
+        if [[ -n "$first_enabled_class" ]]; then
+            default_class_index=${class_index_map["$first_enabled_class"]}
+            qos_log "INFO" "自动选择第一个启用的类别: $first_enabled_class (ID: 1:$default_class_index)"
+        else
+            qos_log "ERROR" "没有启用的下载类，无法设置默认类"
+            return 1
+        fi
+    else
+        qos_log "INFO" "下载默认类别: $default_class_name (ID: 1:$default_class_index)"
+    fi
+
+    if ! ip link show dev "$IFB_DEVICE" >/dev/null 2>&1; then
+        qos_log "ERROR" "IFB设备 $IFB_DEVICE 不存在"
+        return 1
+    fi
+    if ! ip link set dev "$IFB_DEVICE" up; then
+        qos_log "ERROR" "无法启动IFB设备 $IFB_DEVICE"
+        return 1
+    fi
+    # 先创建根队列（不带 default）
+    if ! create_htb_root_qdisc "$IFB_DEVICE" "download" "1:0" "1:1"; then
+        qos_log "ERROR" "创建下载根队列失败"
+        return 1
+    fi
+
+    local filter_prio=3
+    download_class_mark_list=""
+    for class_name in $enabled_classes; do
+        local idx=${class_index_map["$class_name"]}
+        if create_htb_download_class "$class_name" "$idx" "$filter_prio"; then
+            local class_mark_hex=$(get_class_mark "download" "$class_name")
+            download_class_mark_list="$download_class_mark_list$class_name:0x$(printf '%X' $class_mark_hex) "
+        else
+            qos_log "ERROR" "创建下载类别 $class_name 失败，停止初始化"
+            tc qdisc del dev "$IFB_DEVICE" root 2>/dev/null
+            return 1
+        fi
+        filter_prio=$((filter_prio + 2))
+    done
+
+    # 最后设置默认类
+    if ! set_htb_default_class "$IFB_DEVICE" "$default_class_index"; then
+        qos_log "ERROR" "设置下载默认类失败"
+        tc qdisc del dev "$IFB_DEVICE" root 2>/dev/null
+        return 1
+    fi
+
+    # 调用 rule.sh 中的入口重定向函数
+    if ! setup_ingress_redirect; then
+        qos_log "ERROR" "设置入口重定向失败"
+        return 1
+    fi
+    qos_log "INFO" "下载方向HTB初始化完成"
+    return 0
+}
+
+# ========== 主初始化函数 ==========
+init_htb_fqcodel_qos() {
+    local action="${1:-start}"
+    qos_log "INFO" "开始初始化HTB+FQ_CODEL QoS系统 (action=$action)"
+    
+    # 检测 SFO 并警告
+    if check_sfo_enabled; then
+        qos_log "WARN" "检测到软件/硬件流加速已启用，QoS标记可能被绕过"
+        qos_log "WARN" "建议禁用流加速以获得完整QoS功能:"
+        qos_log "WARN" "  uci set firewall.@defaults[0].flow_offloading=0"
+        qos_log "WARN" "  uci set firewall.@defaults[0].flow_offloading_hw=0"
+        qos_log "WARN" "  uci commit firewall && /etc/init.d/firewall restart"
+    fi
+    
+    # 检查是否已在运行（由 procd 保证，但保留辅助检查）
+    if ! check_already_running; then
+        qos_log "ERROR" "HTB+FQ_CODEL QoS 已经在运行中"
+        return 1
+    fi
+    
+    if ! init_ruleset; then
+        qos_log "ERROR" "初始化规则集失败，QoS 无法启动"
+        rm -f "$QOS_RUNNING_FILE"
+        return 1
+    fi
+    
+    nft flush chain inet ${NFT_TABLE} filter_qos_egress 2>/dev/null
+    nft flush chain inet ${NFT_TABLE} filter_qos_ingress 2>/dev/null
+    qos_log "INFO" "已清空 nft 规则链"
+    
+    if ! check_required_commands; then
+        qos_log "ERROR" "缺少必需的命令，请安装对应软件包"
+        rm -f "$QOS_RUNNING_FILE"
+        return 1
+    fi
+    
+    if ! load_required_modules; then
+        qos_log "ERROR" "无法加载必需的内核模块"
+        rm -f "$QOS_RUNNING_FILE"
+        return 1
+    fi
+    
+    # 加载 HTB 和 fq_codel 调度器模块
+    local missing=0
+    for mod in sch_htb sch_fq; do
+        if ! lsmod 2>/dev/null | grep -q "^$mod"; then
+            log_info "尝试加载内核模块: $mod"
+            modprobe "$mod" 2>/dev/null || { log_error "无法加载内核模块 $mod"; missing=1; }
+            if ! lsmod 2>/dev/null | grep -q "^$mod"; then
+                log_error "内核模块 $mod 加载失败"
+                missing=1
+            fi
+        fi
+    done
+    if (( missing )); then
+        qos_log "ERROR" "HTB/FQ_CODEL 内核模块加载失败"
+        rm -f "$QOS_RUNNING_FILE"
+        return 1
+    fi
+    
+    nft add table inet ${NFT_TABLE} 2>/dev/null || true
+    if [[ -z "$qos_interface" ]]; then
+        qos_interface=$(uci -q get ${CONFIG_FILE}.global.wan_interface 2>/dev/null)
+        if [[ -z "$qos_interface" ]] && [[ -f "/lib/functions/network.sh" ]]; then
+            . /lib/functions/network.sh
+            network_find_wan qos_interface
+        fi
+        if [[ -z "$qos_interface" ]]; then
+            qos_log "ERROR" "无法确定 WAN 接口，请检查配置"
+            rm -f "$QOS_RUNNING_FILE"
+            return 1
+        fi
+    fi
+    qos_log "INFO" "使用WAN接口: $qos_interface"
+    
+    # ========== 自动测速与带宽加载 ==========
+    # 自动测速开关处理（需要在加载带宽配置之前执行）
+    if [[ "$AUTO_SPEEDTEST" == "1" ]]; then
+        qos_log "INFO" "自动测速开关已开启，正在执行速度测试..."
+        # 非交互模式，强制覆盖现有配置
+        if ! auto_speedtest -n -f; then
+            qos_log "WARN" "自动测速失败，将使用原有带宽配置（若有）"
+        fi
+    fi
+
+    # 加载带宽配置（会设置 total_upload_bandwidth 和 total_download_bandwidth）
+    if ! load_bandwidth_from_config; then
+        qos_log "ERROR" "加载带宽配置失败"
+        rm -f "$QOS_RUNNING_FILE"
+        return 1
+    fi
+    # ====================================
+    
+    if ! load_htb_fqcodel_config; then
+        qos_log "ERROR" "加载HTB+FQ_CODEL配置失败"
+        rm -f "$QOS_RUNNING_FILE"
+        return 1
+    fi
+    if ! ensure_ifb_device "$IFB_DEVICE"; then
+        qos_log "ERROR" "IFB设备 $IFB_DEVICE 无法使用，请检查配置或启动IFB管理脚本"
+        rm -f "$QOS_RUNNING_FILE"
+        return 1
+    fi
+
+    if [[ "$UPLOAD_MASK" == "0" ]] || [[ "$DOWNLOAD_MASK" == "0" ]]; then
+        qos_log "ERROR" "UPLOAD_MASK 或 DOWNLOAD_MASK 为 0，无法正确匹配标记"
+        rm -f "$QOS_RUNNING_FILE"
+        return 1
+    fi
+
+    load_upload_class_configurations
+    load_download_class_configurations
+
+    local upload_enabled=0
+    local download_enabled=0
+
+    if [[ -n "$total_upload_bandwidth" ]] && [[ "$total_upload_bandwidth" =~ ^[0-9]+$ ]] && (( total_upload_bandwidth > 0 )); then
+        upload_enabled=1
+        qos_log "INFO" "上传带宽有效，将启用上传QoS"
+    else
+        qos_log "INFO" "上传带宽未配置或为0，禁用上传QoS"
+    fi
+
+    if [[ -n "$total_download_bandwidth" ]] && [[ "$total_download_bandwidth" =~ ^[0-9]+$ ]] && (( total_download_bandwidth > 0 )); then
+        download_enabled=1
+        qos_log "INFO" "下载带宽有效，将启用下载QoS"
+    else
+        qos_log "INFO" "下载带宽未配置或为0，禁用下载QoS"
+    fi
+
+    if (( upload_enabled == 0 )) && (( download_enabled == 0 )); then
+        qos_log "WARN" "上传和下载带宽均为0，QoS未启动任何方向"
+        check_and_handle_zero_bandwidth "$total_upload_bandwidth" "$total_download_bandwidth"
+        rm -f "$QOS_RUNNING_FILE"
+        return 0
+    fi
+
+    if (( upload_enabled == 1 )) && [[ -n "$upload_class_list" ]]; then
+        if ! allocate_class_marks "upload" "$upload_class_list"; then
+            qos_log "ERROR" "上传方向标记分配失败"
+            rm -f "$QOS_RUNNING_FILE"
+            return 1
+        fi
+    fi
+
+    if (( download_enabled == 1 )) && [[ -n "$download_class_list" ]]; then
+        if ! allocate_class_marks "download" "$download_class_list"; then
+            qos_log "ERROR" "下载方向标记分配失败"
+            rm -f "$QOS_RUNNING_FILE"
+            return 1
+        fi
+    fi
+
+    if (( upload_enabled == 1 )); then
+        echo "调用上传分类规则应用..." 
+        if ! apply_all_rules "upload_rule" "$UPLOAD_MASK" "filter_qos_egress"; then
+            qos_log "ERROR" "上传规则应用失败，回滚"
+            stop_htb_fqcodel_qos
+            return 1
+        fi
+    fi
+
+    if (( download_enabled == 1 )); then
+        echo "调用下载分类规则应用..." 
+        if ! apply_all_rules "download_rule" "$DOWNLOAD_MASK" "filter_qos_ingress"; then
+            qos_log "ERROR" "下载规则应用失败，回滚"
+            stop_htb_fqcodel_qos
+            return 1
+        fi
+    fi
+
+    # ========== 添加 DSCP 映射 ==========
+    if ! setup_class_mark_map; then
+        qos_log "ERROR" "class_mark 映射设置失败"
+        stop_htb_fqcodel_qos
+        return 1
+    fi
+
+    qos_log "INFO" "应用自定义规则成功"
+    if (( ENABLE_RATELIMIT == 1 )); then
+        echo "应用速率限制链..." 
+        setup_ratelimit_chain
+    fi
+    
+    # 增强功能函数（ACK/TCP/UDP）
+    apply_enhanced_features
+    
+    echo "应用ipv6特别规则..." 
+    setup_ipv6_specific_rules
+    
+    local upload_failed=0
+    local download_failed=0
+    local upload_skipped=0
+    local download_skipped=0
+
+    if (( upload_enabled == 1 )); then
+        if ! init_htb_fqcodel_upload; then
+            qos_log "ERROR" "上传方向初始化失败"
+            upload_failed=1
+        fi
+    else
+        upload_skipped=1
+    fi
+
+    if (( download_enabled == 1 )); then
+        if ! init_htb_fqcodel_download; then
+            qos_log "ERROR" "下载方向初始化失败"
+            download_failed=1
+        fi
+    else
+        download_skipped=1
+    fi
+
+    if (( upload_failed == 1 )) || (( download_failed == 1 )); then
+        qos_log "ERROR" "HTB+FQ_CODEL QoS 初始化部分失败"
+        stop_htb_fqcodel_qos
+        return 1
+    fi
+
+    if (( upload_skipped == 1 )) && (( download_skipped == 1 )); then
+        qos_log "WARN" "上传和下载带宽均为0，QoS未启动任何方向"
+    fi
+    
+    qos_log "INFO" "HTB+FQ_CODEL QoS初始化完成"
+    return 0
+}
+
+# ========== 停止函数 ==========
+stop_htb_fqcodel_qos() {
+    qos_log "INFO" "停止HTB+FQ_CODEL QoS"
+    rm -f "$QOS_RUNNING_FILE"
+    if [[ "$SAVE_NFT_RULES" == "1" ]]; then
+        rm -f /etc/nftables.d/qos_gargoyle_*.nft 2>/dev/null
+    fi
+    if [[ -n "$qos_interface" ]] && ip link show "$qos_interface" >/dev/null 2>&1; then
+        tc filter del dev "$qos_interface" parent 1:0 protocol all 2>/dev/null || true
+        tc qdisc del dev "$qos_interface" ingress 2>/dev/null || true
+        tc qdisc del dev "$qos_interface" root 2>/dev/null || true
+    fi
+    if [[ -n "$IFB_DEVICE" ]]; then
+		if ip link show "$IFB_DEVICE" >/dev/null 2>&1; then
+			# 总是清理队列（无论是否删除设备）
+			tc filter del dev "$IFB_DEVICE" parent 1:0 protocol all 2>/dev/null || true
+			tc qdisc del dev "$IFB_DEVICE" ingress 2>/dev/null || true
+			tc qdisc del dev "$IFB_DEVICE" root 2>/dev/null || true
+			ip link set dev "$IFB_DEVICE" down
+
+			if [[ "${DELETE_IFB_ON_STOP:-0}" == "1" ]]; then
+				# 用户要求删除 IFB 设备，直接删除（队列已经清空）
+				ip link del dev "$IFB_DEVICE" 2>/dev/null
+				qos_log "INFO" "IFB设备 $IFB_DEVICE 已删除"
+			else
+				qos_log "INFO" "IFB设备 $IFB_DEVICE 已停用（保留）"
+			fi
+		else
+			qos_log "INFO" "IFB设备 $IFB_DEVICE 不存在，跳过"
+		fi
+	fi
+    
+    # 清理动态检测相关资源
+    cleanup_dynamic_detection
+    
+    nft delete table inet ${NFT_TABLE} 2>/dev/null || true
+    clear_class_marks
+    qos_log "INFO" "HTB+FQ_CODEL QoS停止完成"
+    
+    # 恢复配置（已在 common.sh 中增加有效性检查）
+    restore_main_config
+    
+    _QOS_TABLE_FLUSHED=0
+    _IPSET_LOADED=0
+    cleanup_qos_state
+    cleanup_temp_files
+}
+
+# ========== 状态显示函数 ==========
+show_htb_fqcodel_status() {
+    # 从 UCI 获取真实 WAN 接口
+    local real_wan_if=$(uci -q get ${CONFIG_FILE}.global.wan_interface 2>/dev/null)
+    if [[ -z "$real_wan_if" ]] || [[ "$real_wan_if" == "auto" ]]; then
+        if command -v network_find_wan >/dev/null 2>&1; then
+            network_find_wan real_wan_if 2>/dev/null
+        fi
+        if [[ -z "$real_wan_if" ]]; then
+            real_wan_if=$(ip route show default 2>/dev/null | awk '/default/ {print $5}' | head -1)
+        fi
+        [[ -z "$real_wan_if" ]] && real_wan_if="未知"
+    fi
+
+    if [[ -z "$IFB_DEVICE" ]]; then
+        IFB_DEVICE=$(uci -q get ${CONFIG_FILE}.download.ifb_device 2>/dev/null)
+        [[ -z "$IFB_DEVICE" ]] && IFB_DEVICE="ifb0"
+    fi
+    local qos_ifb="$IFB_DEVICE"
+
+    echo "===== HTB-FQCODEL QoS 状态报告（$QOS_VERSION）  ====="
+    echo "时间: $(date)"
+    echo "WAN接口: ${real_wan_if}"
+
+    if [[ "$real_wan_if" == "未知" ]] || ! ip link show "$real_wan_if" >/dev/null 2>&1; then
+        echo "警告: 无法确定有效的 WAN 接口，部分信息可能无法显示。"
+    else
+        if ! tc qdisc show dev "$real_wan_if" 2>/dev/null | grep -q htb; then
+            echo "警告: 出口 QoS 未在接口 ${real_wan_if} 上激活"
+        fi
+    fi
+
+    if [[ -n "$qos_ifb" ]] && ip link show "$qos_ifb" >/dev/null 2>&1; then
+        if tc qdisc show dev "$qos_ifb" 2>/dev/null | grep -q "qdisc"; then
+            echo "IFB设备: 已启动且运行中 ($qos_ifb)"
+        else
+            echo "IFB设备: 已创建但无 TC 队列 ($qos_ifb)"
+        fi
+    else
+        echo "IFB设备: 未创建"
+    fi
+
+    if [[ "$real_wan_if" != "未知" ]] && ip link show "$real_wan_if" >/dev/null 2>&1; then
+        echo -e "\n======== 出口QoS ($real_wan_if) ========"
+        echo -e "\nTC队列:"
+        tc -s qdisc show dev "$real_wan_if" 2>/dev/null | while read -r line; do
+            if echo "$line" | grep -q "htb\|fq_codel"; then
+                echo "  $line"
+            fi
+        done
+        if tc class show dev "$real_wan_if" >/dev/null 2>&1; then
+            echo -e "\nTC类别:"
+            tc -s class show dev "$real_wan_if" 2>/dev/null | while read -r line; do
+                if echo "$line" | grep -q "htb"; then
+                    echo "  $line"
+                fi
+            done
+        fi
+        echo -e "\nTC过滤器:"
+        tc -s filter show dev "$real_wan_if" 2>/dev/null | while read -r line; do
+            echo "  $line"
+        done
+    fi
+
+    echo -e "\n======== nftables 分类规则 ========"
+    if nft list table inet ${NFT_TABLE} &>/dev/null; then
+        nft list table inet ${NFT_TABLE} 2>/dev/null | sed 's/^/  /'
+    else
+        echo "  nftables 表不存在"
+    fi
+
+    echo -e "\n======== 入口QoS ($qos_ifb) ========"
+    if [[ -n "$qos_ifb" ]] && ip link show "$qos_ifb" >/dev/null 2>&1; then
+        echo -e "\nTC队列:"
+        tc -s qdisc show dev "$qos_ifb" 2>/dev/null | while read -r line; do
+            if echo "$line" | grep -q "htb\|fq_codel"; then
+                echo "  $line"
+            fi
+        done
+        if tc class show dev "$qos_ifb" >/dev/null 2>&1; then
+            echo -e "\nTC类别:"
+            tc -s class show dev "$qos_ifb" 2>/dev/null | while read -r line; do
+                if echo "$line" | grep -q "htb"; then
+                    echo "  $line"
+                fi
+            done
+        fi
+        echo -e "\nTC过滤器:"
+        tc -s filter show dev "$qos_ifb" 2>/dev/null | while read -r line; do
+            echo "  $line"
+        done
+
+        echo -e "\n入口重定向检查:"
+        if [[ "$real_wan_if" != "未知" ]] && ip link show "$real_wan_if" >/dev/null 2>&1; then
+            if tc qdisc show dev "$real_wan_if" 2>/dev/null | grep -q "ingress"; then
+                check_ingress_redirect "$real_wan_if" "$qos_ifb"
+            else
+                echo "  ✗ 入口队列未配置"
+            fi
+        else
+            echo "  ✗ 无法检查入口重定向（WAN接口无效）"
+        fi
+    else
+        echo "  IFB设备不存在，无入口配置"
+    fi
+
+    echo -e "\n===== QoS运行状态 ====="
+    local upload_active=0
+    local download_active=0
+    if [[ "$real_wan_if" != "未知" ]] && ip link show "$real_wan_if" >/dev/null 2>&1; then
+        tc qdisc show dev "$real_wan_if" 2>/dev/null | grep -q "htb" && upload_active=1
+    fi
+    [[ -n "$qos_ifb" ]] && tc qdisc show dev "$qos_ifb" 2>/dev/null | grep -q "htb" && download_active=1
+
+    if (( upload_active == 1 )); then
+        echo "上传QoS: 已启用 (HTB+fqcodel)"
+    else
+        echo "上传QoS: 未启用"
+    fi
+
+    if (( download_active == 1 )); then
+        echo "下载QoS: 已启用 (HTB+fqcodel)"
+    else
+        echo "下载QoS: 未启用"
+    fi
+
+    if (( upload_active == 1 )) && (( download_active == 1 )); then
+        echo -e "\n✓ QoS双向流量整形已启用"
+    elif (( upload_active == 1 )) || (( download_active == 1 )); then
+        echo -e "\n⚠ 部分方向QoS已启用"
+    else
+        echo -e "\n✗ QoS未运行"
+    fi
+
+    echo -e "\n===== 详细队列统计 ====="
+    if [[ "$real_wan_if" != "未知" ]] && ip link show "$real_wan_if" >/dev/null 2>&1; then
+        echo -e "\n上传方向fq_codel队列:"
+        tc -s qdisc show dev "$real_wan_if" 2>/dev/null | grep -A 3 "fq_codel" | while read -r line; do
+            if echo "$line" | grep -q "parent"; then
+                echo "  $line"
+            elif echo "$line" | grep -q "Sent" || echo "$line" | grep -q "maxpacket" || \
+                 echo "$line" | grep -q "ecn_mark" || echo "$line" | grep -q "memory_used"; then
+                echo "    $line"
+            fi
+        done
+    fi
+
+    if [[ -n "$qos_ifb" ]] && ip link show "$qos_ifb" >/dev/null 2>&1; then
+        echo -e "\n下载方向fq_codel队列:"
+        tc -s qdisc show dev "$qos_ifb" 2>/dev/null | grep -A 3 "fq_codel" | while read -r line; do
+            if echo "$line" | grep -q "parent"; then
+                echo "  $line"
+            elif echo "$line" | grep -q "Sent" || echo "$line" | grep -q "maxpacket" || \
+                 echo "$line" | grep -q "ecn_mark" || echo "$line" | grep -q "memory_used"; then
+                echo "    $line"
+            fi
+        done
+    fi
+
+    echo -e "\n===== 增强特性状态 ====="
+    local rate_val=$(uci -q get ${CONFIG_FILE}.global.enable_ratelimit 2>/dev/null)
+    local ack_val=$(uci -q get ${CONFIG_FILE}.global.enable_ack_limit 2>/dev/null)
+    local tcp_val=$(uci -q get ${CONFIG_FILE}.global.enable_tcp_upgrade 2>/dev/null)
+    local udp_val=$(uci -q get ${CONFIG_FILE}.global.enable_udp_limit 2>/dev/null)
+
+    case "$rate_val" in 1|yes|true|on) echo "速率限制: 已启用" ;; *) echo "速率限制: 未启用" ;; esac
+    case "$ack_val"  in 1|yes|true|on) echo "ACK 限速: 已启用" ;; *) echo "ACK 限速: 未启用" ;; esac
+    case "$tcp_val"  in 1|yes|true|on) echo "TCP 升级: 已启用" ;; *) echo "TCP 升级: 未启用" ;; esac
+    case "$udp_val"  in 1|yes|true|on) echo "UDP 限速: 已启用" ;; *) echo "UDP 限速: 未启用" ;; esac
+
+    echo -e "\n===== 健康检查 ====="
+    health_check
+
+    echo -e "\n===== 活动连接标记 ========"
+    if ! command -v conntrack >/dev/null 2>&1; then
+        echo "  conntrack 命令未安装，无法显示连接标记信息。"
+        echo "  请安装 conntrack-tools 包以获取此功能。"
+    else
+        local wan_ipv4=""
+        local wan_ipv6=""
+        if [[ "$real_wan_if" != "未知" ]] && ip link show "$real_wan_if" >/dev/null 2>&1; then
+            wan_ipv4=$(ip -4 addr show dev "$real_wan_if" 2>/dev/null | grep "inet " | awk '{print $2}' | cut -d/ -f1 | head -1)
+            [[ -z "$wan_ipv4" ]] && wan_ipv4=$(ifconfig "$real_wan_if" 2>/dev/null | grep "inet addr:" | awk '{print $2}' | cut -d: -f2)
+            wan_ipv6=$(ip -6 addr show dev "$real_wan_if" 2>/dev/null | grep "inet6 " | grep -v "fe80::" | awk '{print $2}' | cut -d/ -f1 | head -1)
+            [[ -z "$wan_ipv6" ]] && wan_ipv6=$(ifconfig "$real_wan_if" 2>/dev/null | grep "inet6 addr:" | grep -v "fe80::" | awk '{print $3}' | cut -d/ -f1)
+        fi
+        echo -e "\nIPv4 连接标记 (目标地址为 WAN):"
+        if [[ -n "$wan_ipv4" ]]; then
+            echo "WAN IPv4: $wan_ipv4"
+            local ipv4_marks=$(conntrack -L -d "$wan_ipv4" 2>/dev/null | grep -E "mark=[0-9]+" | head -n 5)
+            if [[ -n "$ipv4_marks" ]]; then
+                echo "$ipv4_marks" | while IFS= read -r line; do
+                    local src_ip=$(echo "$line" | awk '{for(i=1;i<=NF;i++) if ($i ~ /^src=/) {sub(/^src=/, "", $i); print $i; exit}}')
+                    local dst_ip=$(echo "$line" | awk '{for(i=1;i<=NF;i++) if ($i ~ /^dst=/) {sub(/^dst=/, "", $i); print $i; exit}}')
+                    local sport=$(echo "$line" | awk '{for(i=1;i<=NF;i++) if ($i ~ /^sport=/) {sub(/^sport=/, "", $i); print $i; exit}}')
+                    local dport=$(echo "$line" | awk '{for(i=1;i<=NF;i++) if ($i ~ /^dport=/) {sub(/^dport=/, "", $i); print $i; exit}}')
+                    local proto=$(echo "$line" | awk '{print $1}')
+                    local dec_mark=$(echo "$line" | grep -o "mark=[0-9]\+" | cut -d= -f2 | head -1)
+                    local mark_hex="0x$(printf '%x' "$dec_mark" 2>/dev/null || echo '0')"
+                    printf "  %-7s %-15s:%-5s → %-15s:%-5s [标记: %s]\n" \
+                        "$proto" "${src_ip:-N/A}" "${sport:-N/A}" "${dst_ip:-N/A}" "${dport:-N/A}" "$mark_hex"
+                done
+            else
+                echo "  未找到带标记的 IPv4 连接"
+            fi
+        else
+            echo "  WAN IPv4 地址不可用"
+        fi
+        echo -e "\nIPv6 连接标记 (目标地址为 WAN):"
+        if [[ -n "$wan_ipv6" ]]; then
+            echo "WAN IPv6: $wan_ipv6"
+            local ipv6_marks=$(conntrack -L -d "$wan_ipv6" 2>/dev/null | grep -E "mark=[0-9]+" | head -n 5)
+            if [[ -n "$ipv6_marks" ]]; then
+                echo "$ipv6_marks" | while IFS= read -r line; do
+                    local src_ip=$(echo "$line" | awk '{for(i=1;i<=NF;i++) if ($i ~ /^src=/) {sub(/^src=/, "", $i); print $i; exit}}')
+                    local dst_ip=$(echo "$line" | awk '{for(i=1;i<=NF;i++) if ($i ~ /^dst=/) {sub(/^dst=/, "", $i); print $i; exit}}')
+                    local sport=$(echo "$line" | awk '{for(i=1;i<=NF;i++) if ($i ~ /^sport=/) {sub(/^sport=/, "", $i); print $i; exit}}')
+                    local dport=$(echo "$line" | awk '{for(i=1;i<=NF;i++) if ($i ~ /^dport=/) {sub(/^dport=/, "", $i); print $i; exit}}')
+                    local proto=$(echo "$line" | awk '{print $1}')
+                    local dec_mark=$(echo "$line" | grep -o "mark=[0-9]\+" | cut -d= -f2 | head -1)
+                    local mark_hex="0x$(printf '%x' "$dec_mark" 2>/dev/null || echo '0')"
+                    src_ip=$(echo "$src_ip" | sed 's/\(:\)[0:]*/\1/g')
+                    dst_ip=$(echo "$dst_ip" | sed 's/\(:\)[0:]*/\1/g')
+                    printf "  %-7s %-30s:%-5s → %-30s:%-5s [标记: %s]\n" \
+                        "$proto" "${src_ip:-N/A}" "${sport:-N/A}" "${dst_ip:-N/A}" "${dport:-N/A}" "$mark_hex"
+                done
+            else
+                echo "  未找到带标记的 IPv6 连接"
+            fi
+        else
+            echo "  WAN IPv6 地址不可用"
+        fi
+        echo -e "\n上传方向连接标记 (源地址为 WAN):"
+        if [[ -n "$wan_ipv4" ]]; then
+            local upload_marks=$(conntrack -L -s "$wan_ipv4" 2>/dev/null | grep -E "mark=[0-9]+" | head -n 3)
+            if [[ -n "$upload_marks" ]]; then
+                echo "$upload_marks" | while IFS= read -r line; do
+                    local src_ip=$(echo "$line" | awk '{for(i=1;i<=NF;i++) if ($i ~ /^src=/) {sub(/^src=/, "", $i); print $i; exit}}')
+                    local dst_ip=$(echo "$line" | awk '{for(i=1;i<=NF;i++) if ($i ~ /^dst=/) {sub(/^dst=/, "", $i); print $i; exit}}')
+                    local sport=$(echo "$line" | awk '{for(i=1;i<=NF;i++) if ($i ~ /^sport=/) {sub(/^sport=/, "", $i); print $i; exit}}')
+                    local dport=$(echo "$line" | awk '{for(i=1;i<=NF;i++) if ($i ~ /^dport=/) {sub(/^dport=/, "", $i); print $i; exit}}')
+                    local proto=$(echo "$line" | awk '{print $1}')
+                    local dec_mark=$(echo "$line" | grep -o "mark=[0-9]\+" | cut -d= -f2 | head -1)
+                    local mark_hex="0x$(printf '%x' "$dec_mark" 2>/dev/null || echo '0')"
+                    printf "  %-7s %-15s:%-5s → %-15s:%-5s [标记: %s]\n" \
+                        "$proto" "${src_ip:-N/A}" "${sport:-N/A}" "${dst_ip:-N/A}" "${dport:-N/A}" "$mark_hex"
+                done
+            else
+                echo "  未找到带标记的上传方向连接"
+            fi
+        fi
+    fi
+
+    echo -e "\n===== HTB-FQCODEL状态报告结束 ====="
+    return 0
+}
+
+# ========== 主入口 ==========
+main_htb_fqcodel_qos() {
+    local action="$1"
+    case "$action" in
+        "start")
+            if ! init_htb_fqcodel_qos; then
+                qos_log "ERROR" "HTB+FQ_CODEL QoS启动失败"
+                exit 1
+            fi
+            ;;
+        "stop")
+            stop_htb_fqcodel_qos
+            ;;
+        "restart")
+            stop_htb_fqcodel_qos
+            sleep 1
+            if ! init_htb_fqcodel_qos; then
+                qos_log "ERROR" "HTB+FQ_CODEL QoS重启失败"
+                exit 1
+            fi
+            ;;
+        "status")
+            show_htb_fqcodel_status
+            ;;
+        "health_check")
+            health_check
+            ;;
+        "auto_speedtest")
+            if ! auto_speedtest; then
+                qos_log "ERROR" "自动速率测试失败"
+                exit 1
+            fi
+           ;;
+        *)
+            echo "用法: $0 {start|stop|restart|status|health_check}"
+            echo ""
+            echo "命令:"
+            echo "  start        启动HTB+FQ_CODEL QoS"
+            echo "  stop         停止HTB+FQ_CODEL QoS"
+            echo "  restart      重启HTB+FQ_CODEL QoS"
+            echo "  status       显示状态"
+            echo "  health_check 执行健康检查"
+            echo "  auto_speedtest   自动测速（测速或手动输入带宽）"
+            exit 1
+            ;;
+    esac
+}
+
+if [[ "$(basename "$0")" == "htb_fqcodel.sh" ]] || [[ "$(basename "$0")" == "htb-fqcodel.sh" ]]; then
+    main_htb_fqcodel_qos "$1"
+fi

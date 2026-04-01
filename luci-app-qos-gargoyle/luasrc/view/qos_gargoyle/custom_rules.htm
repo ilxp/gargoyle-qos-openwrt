@@ -1,0 +1,41 @@
+<%+header%>
+
+<h2><%:Custom nftables Rules%></h2>
+<p><%:Define custom nftables rules for advanced traffic control. Rules are applied to the appropriate hook based on direction.%></p>
+
+<form method="post" action="<%=REQUEST_URI%>">
+    <div class="cbi-map">
+        <div class="cbi-section">
+            <div class="cbi-section-node">
+                <div class="cbi-value">
+                    <label class="cbi-value-title" for="egress_rules"><%:Egress Custom Rules (upload direction)%></label>
+                    <div class="cbi-value-field">
+                        <textarea name="egress_rules" id="egress_rules" rows="12" cols="80" class="cbi-input-textarea" style="font-family: monospace;"><%=luci.util.pcdata(egress)%></textarea>
+                        <div class="cbi-value-description"><%:These rules are inserted into the nftables chain \"filter_qos_egress\". Do not include \"table\" or \"chain\" definitions.%></div>
+                    </div>
+                </div>
+                <div class="cbi-value">
+                    <label class="cbi-value-title" for="ingress_rules"><%:Ingress Custom Rules (download direction)%></label>
+                    <div class="cbi-value-field">
+                        <textarea name="ingress_rules" id="ingress_rules" rows="12" cols="80" class="cbi-input-textarea" style="font-family: monospace;"><%=luci.util.pcdata(ingress)%></textarea>
+                        <div class="cbi-value-description"><%:These rules are inserted into the nftables chain \"filter_qos_ingress\". Do not include \"table\" or \"chain\" definitions.%></div>
+                    </div>
+                </div>
+                <div class="cbi-value">
+                    <label class="cbi-value-title" for="full_table_rules"><%:Full Table Custom Rules (advanced)%></label>
+                    <div class="cbi-value-field">
+                        <textarea name="full_table_rules" id="full_table_rules" rows="12" cols="80" class="cbi-input-textarea" style="font-family: monospace;"><%=luci.util.pcdata(full_table)%></textarea>
+                        <div class="cbi-value-description"><%:Define a complete nftables table \"inet gargoyle_custom\". The wrapper will be added automatically. Use this for complex multi-chain rules.%></div>
+                    </div>
+                </div>
+            </div>
+        </div>
+        <div class="cbi-page-actions">
+            <input type="submit" name="cbi.save" value="<%:Save%>" class="cbi-button cbi-button-save" />
+            <input type="submit" name="cbi.apply" value="<%:Save & Apply%>" class="cbi-button cbi-button-apply" />
+            <input type="reset" value="<%:Reset%>" class="cbi-button cbi-button-reset" />
+        </div>
+    </div>
+</form>
+
+<%+footer%>

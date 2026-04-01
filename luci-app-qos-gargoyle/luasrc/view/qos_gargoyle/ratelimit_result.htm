@@ -1,0 +1,9 @@
+<%+header%>
+<h2><%:Rate Limits%></h2>
+<% if success then %>
+    <div class="alert-message success"><p><%=message%></p></div>
+<% else %>
+    <div class="alert-message error"><p><%:An error occurred while saving the rules.%></p></div>
+<% end %>
+<p><a href="<%=url('admin/qos/qos_gargoyle/ratelimit')%>"><%:Back to Rate Limits%></a></p>
+<%+footer%>

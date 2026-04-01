@@ -1,0 +1,84 @@
+<%+header%>
+<h2><%:Rate Limits%></h2>
+<p><%:Configure per-device bandwidth limits using nftables meters. Limits are applied based on the source IP of devices, making it easy to control traffic for specific devices or subnets.%></p>
+
+<form method="post" action="<%=REQUEST_URI%>">
+    <div class="cbi-map">
+        <div class="cbi-section">
+            <table class="cbi-section-table" id="ratelimit-table">
+                <thead>
+                    <tr>
+                        <th class="cbi-section-table-cell"><%:Enabled%></th>
+                        <th class="cbi-section-table-cell"><%:Name%></th>
+                        <th class="cbi-section-table-cell"><%:Target Devices%></th>
+                        <th class="cbi-section-table-cell"><%:Download Limit (Kbit/s)%></th>
+                        <th class="cbi-section-table-cell"><%:Upload Limit (Kbit/s)%></th>
+                        <th class="cbi-section-table-cell"><%:Burst Factor%></th>
+                        <th class="cbi-section-table-cell"><%:Delete%></th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <% for i, section in ipairs(sections) do %>
+                    <tr>
+                        <td class="cbi-section-table-cell">
+                            <input type="hidden" name="cbi.sections" value="<%=section.sid%>" />
+                            <input type="checkbox" name="cbi.enabled.<%=section.sid%>" value="1"<% if section.enabled == "1" then %> checked<% end %> />
+                        </td>
+                        <td class="cbi-section-table-cell">
+                            <input type="text" name="cbi.name.<%=section.sid%>" value="<%=luci.util.pcdata(section.name)%>" class="cbi-input-text" />
+                        </td>
+                        <td class="cbi-section-table-cell">
+                            <input type="text" name="cbi.target.<%=section.sid%>" value="<%=luci.util.pcdata(section.target)%>" class="cbi-input-text" style="width: 100%;" />
+                            <div class="cbi-value-description"><%:IP/IPv6/CIDR addresses and subnets only. Exclusions: !=192.168.1.77, IP Sets: @vip_guests%></div>
+                        </td>
+                        <td class="cbi-section-table-cell">
+                            <input type="text" name="cbi.download_limit.<%=section.sid%>" value="<%=luci.util.pcdata(section.download_limit)%>" class="cbi-input-text" />
+                        </td>
+                        <td class="cbi-section-table-cell">
+                            <input type="text" name="cbi.upload_limit.<%=section.sid%>" value="<%=luci.util.pcdata(section.upload_limit)%>" class="cbi-input-text" />
+                        </td>
+                        <td class="cbi-section-table-cell">
+                            <input type="text" name="cbi.burst_factor.<%=section.sid%>" value="<%=luci.util.pcdata(section.burst_factor)%>" class="cbi-input-text" />
+                        </td>
+                        <td class="cbi-section-table-cell">
+                            <input type="checkbox" name="cbi.delete" value="<%=section.sid%>" />
+                        </td>
+                    </tr>
+                    <% end %>
+                    <!-- 添加新行 -->
+                    <tr>
+                        <td class="cbi-section-table-cell">
+                            <input type="hidden" name="cbi.sections" value="new" />
+                            <input type="checkbox" name="cbi.enabled.new" value="1" checked />
+                        </td>
+                        <td class="cbi-section-table-cell">
+                            <input type="text" name="cbi.name.new" placeholder="<%:Name%>" class="cbi-input-text" />
+                        </td>
+                        <td class="cbi-section-table-cell">
+                            <input type="text" name="cbi.target.new" class="cbi-input-text" style="width: 100%;" />
+                        </td>
+                        <td class="cbi-section-table-cell">
+                            <input type="text" name="cbi.download_limit.new" class="cbi-input-text" />
+                        </td>
+                        <td class="cbi-section-table-cell">
+                            <input type="text" name="cbi.upload_limit.new" class="cbi-input-text" />
+                        </td>
+                        <td class="cbi-section-table-cell">
+                            <input type="text" name="cbi.burst_factor.new" class="cbi-input-text" />
+                        </td>
+                        <td class="cbi-section-table-cell">
+                            <!-- 新行无删除按钮 -->
+                        </td>
+                    </tr>
+                </tbody>
+            </table>
+        </div>
+        <div class="cbi-page-actions">
+            <input type="submit" name="cbi.save" value="<%:Save%>" class="cbi-button cbi-button-save" />
+            <input type="submit" name="cbi.apply" value="<%:Save & Apply%>" class="cbi-button cbi-button-apply" />
+            <input type="reset" value="<%:Reset%>" class="cbi-button cbi-button-reset" />
+        </div>
+    </div>
+</form>
+
+<%+footer%>
