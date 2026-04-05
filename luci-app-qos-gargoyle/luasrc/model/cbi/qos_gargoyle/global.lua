@@ -1,7 +1,6 @@
 -- Copyright 2017 Xingwang Liao <kuoruan@gmail.com>
 -- Licensed to the public under the Apache License 2.0.
--- Modified 2026 by ilxp <https://github.com/ilxp/gargoyle-qos-openwrt>
--- 版本: 支持带宽为 0（禁用对应方向），新增 ACK/TCP/UDP 限速开关，动态分类总开关
+-- Modified 2026 by ilxp <https://github.com/ilxp/gargoyle-qos-openwrt>ilxp/gargoyle-qos-openwrt
 
 local sys = require "luci.sys"
 local uci = require "luci.model.uci".cursor()
