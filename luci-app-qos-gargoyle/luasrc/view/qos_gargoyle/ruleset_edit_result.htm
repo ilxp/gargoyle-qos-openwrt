@@ -1,0 +1,18 @@
+<%+header%>
+
+<h2><%:Ruleset Management%></h2>
+
+<% if success then %>
+    <div class="alert-message success">
+        <p><%=message%></p>
+    </div>
+    <p><a href="<%=back_url%>"><%:Continue editing%></a></p>
+    <p><a href="<%=url('admin/qos/qos_gargoyle/global')%>"><%:Go to Global Settings to select and apply the ruleset%></a></p>
+<% else %>
+    <div class="alert-message error">
+        <p><%=message%></p>
+    </div>
+    <p><a href="<%=url('admin/qos/qos_gargoyle/ruleset_edit')%>"><%:Back to Ruleset Management%></a></p>
+<% end %>
+
+<%+footer%>

@@ -1,0 +1,1353 @@
+msgid ""
+msgstr ""
+"Project-Id-Version: Gargoyle QoS\n"
+"Report-Msgid-Bugs-To: \n"
+"POT-Creation-Date: 2026-03-18 16:00+0800\n"
+"PO-Revision-Date: 2026-03-18 16:00+0800\n"
+"Last-Translator: \n"
+"Language-Team: Chinese\n"
+"Language: zh_CN\n"
+"MIME-Version: 1.0\n"
+"Content-Type: text/plain; charset=UTF-8\n"
+"Content-Transfer-Encoding: 8bit\n"
+
+msgid "\"Active Congestion Control\" not enabled"
+msgstr "“主动拥塞控制”未启用"
+
+msgid "ACK Filter"
+msgstr "ACK 过滤器"
+
+msgid "ADSL"
+msgstr "ADSL"
+
+msgid "ATM"
+msgstr "ATM"
+
+msgid "Active Congestion Control"
+msgstr "主动拥塞控制"
+
+msgid "Active Congestion Control dynamically adjusts bandwidth limits based on real-time network latency to maintain low-latency network connections.<br><strong style='color: red;'>Note: Enabling ACC may require reducing total bandwidth.</strong>"
+msgstr "主动拥塞控制基于实时网络延迟动态调整带宽限制，以保持低延迟网络连接。<br><strong style='color: red;'>注意：启用ACC可能需要减少总带宽。</strong>"
+
+msgid "Address Family"
+msgstr "地址族"
+
+msgid "Adjustment Interval (seconds)"
+msgstr "调整间隔（秒）"
+
+msgid "Adopt the DSCP class supplied by a non-WAN client."
+msgstr "采纳非 WAN 客户端提供的 DSCP 类。"
+
+msgid "Advanced Settings"
+msgstr "高级设置"
+
+msgid "Algorithm Selection"
+msgstr "选择算法"
+
+msgid "Algorithm Settings"
+msgstr "算法设置"
+
+msgid "All"
+msgstr "全部"
+
+msgid "Any"
+msgstr "任意"
+
+msgid "Apply"
+msgstr "应用"
+
+msgid "Auto"
+msgstr "自动"
+
+msgid "Auto-detect (gateway)"
+msgstr "自动检测（网关）"
+
+msgid "AutoRate Ingress"
+msgstr "自适应入口带宽"
+
+msgid "Auto Adjust Percentages"
+msgstr "自适应百分比"
+
+msgid "Automatically adjust class percentages and min/max bandwidth based on total bandwidth and linklayer type with priorities ranging from 1 to 4,Only supports 4 class."
+msgstr "根据总带宽和链路层类型按照1-4的优先级自动调整上传和下载类别的百分比以及最小/最大带宽，仅支持4个类别。"
+
+msgid "Automatically adjust ingress bandwidth based on measured throughput"
+msgstr "根据测量的吞吐量自动调整入口带宽"
+
+msgid "Automatically switch between ACTIVE and REALTIME modes based on detected real-time classes."
+msgstr "根据检测到的实时类自动在ACTIVE和REALTIME模式之间切换。"
+
+msgid "Bandwidth Configuration Info"
+msgstr "带宽配置信息"
+
+msgid "Basic Control Parameters"
+msgstr "基本控制参数"
+
+msgid "Basic Settings"
+msgstr "基本设置"
+
+msgid "Both Hosts (hosts)"
+msgstr "双向主机 (hosts)"
+
+msgid "Bulk Client Detection"
+msgstr "大流量客户端检测"
+
+msgid "CAKE Parameters"
+msgstr "CAKE 参数"
+
+msgid "CAKE Parameters (Leaf Queue)"
+msgstr "CAKE 参数（叶子队列）"
+
+msgid "CE Threshold"
+msgstr "CE 阈值"
+
+msgid "Class"
+msgstr "分类"
+
+msgid "Class Name"
+msgstr "分类名称"
+
+msgid "Classification Rules"
+msgstr "分类规则"
+
+msgid "Client Adoption"
+msgstr "客户端采纳"
+
+msgid "Collecting data..."
+msgstr "正在收集数据..."
+
+msgid "Configure global service options and automatic classification features."
+msgstr "配置全局服务选项和自动分类功能。"
+
+msgid "Configuration Persistence"
+msgstr "配置持久化"
+
+msgid "Connection Bytes Reach"
+msgstr "连接字节数达到"
+
+msgid "Control Interval (ms)"
+msgstr "控制间隔（毫秒）"
+
+msgid "Current Algorithm"
+msgstr "当前算法"
+
+msgid "Current Status"
+msgstr "当前状态"
+
+msgid "Custom Ping Limit (ms)"
+msgstr "自定义 Ping 限制（毫秒）"
+
+msgid "Custom ping time limit. If specified, qosacc uses this value as latency threshold; otherwise auto-measured."
+msgstr "自定义 ping 时间限制。如果指定，qosacc 将使用此值作为延迟阈值；否则自动测量。"
+
+msgid "DPI Protocol"
+msgstr "DPI 协议"
+
+msgid "DRR Quantum"
+msgstr "DRR 量子"
+
+msgid "DSCP Class"
+msgstr "DSCP 类"
+
+msgid "DSCP Classify - General Settings"
+msgstr "DSCP 分类 - 常规设置"
+
+msgid "DSCP Classify - IP Sets"
+msgstr "DSCP 分类 - IP 集合"
+
+msgid "DSCP Classify - Rules"
+msgstr "DSCP 分类 - 规则"
+
+msgid "DSCP classes to ignore from client class adoption (e.g., cs6, cs7)."
+msgstr "从客户端类采纳中忽略的 DSCP 类（例如 cs6, cs7）。"
+
+msgid "DSCP class to apply to bulk connections (overrides service default)."
+msgstr "应用于大流量连接的 DSCP 类（覆盖服务默认值）。"
+
+msgid "DSCP class to apply to high-throughput connections (overrides service default)."
+msgstr "应用于高吞吐量连接的 DSCP 类（覆盖服务默认值）。"
+
+msgid "Default Service Class"
+msgstr "默认服务类"
+
+msgid "Define custom classification rules. Rules are processed in order; first match wins."
+msgstr "定义自定义分类规则。规则按顺序处理；首个匹配生效。"
+
+msgid "Delay parameter for minRTT mode (e.g., 1000us, 10ms)"
+msgstr "minRTT 模式的延迟参数（例如 1000us、10ms）"
+
+msgid "Description"
+msgstr "描述"
+
+msgid "Dest IP"
+msgstr "目标 IP"
+
+msgid "Dest Port"
+msgstr "目标端口"
+
+msgid "Destination Host (dsthost)"
+msgstr "目标主机 (dsthost)"
+
+msgid "Destination IP / Set"
+msgstr "目标 IP / 集合"
+
+msgid "Destination MAC"
+msgstr "目标 MAC"
+
+msgid "Destination Port"
+msgstr "目标端口"
+
+msgid "Destination Unreachable"
+msgstr "目标不可达"
+
+msgid "Destination Zone"
+msgstr "目标区域"
+
+msgid "Detect and classify bulk client connections (i.e., P2P)."
+msgstr "检测并分类大流量客户端连接（例如 P2P）。"
+
+msgid "Detect and classify high throughput service connections (e.g., Steam downloads)."
+msgstr "检测并分类高吞吐量服务连接（例如 Steam 下载）。"
+
+msgid "DiffServ Mode"
+msgstr "DiffServ 模式"
+
+msgid "Direction"
+msgstr "方向"
+
+msgid "Disable"
+msgstr "禁用"
+
+msgid "Download Settings"
+msgstr "下载设置"
+
+msgid "Dual Destination Host (dual-dsthost)"
+msgstr "双目标主机 (dual-dsthost)"
+
+msgid "Dual Source Host (dual-srchost)"
+msgstr "双源主机 (dual-srchost)"
+
+msgid "Dynamic"
+msgstr "动态"
+
+msgid "Dynamic Bandwidth Adjustment"
+msgstr "动态带宽调整"
+
+msgid "Dynamically adjust bandwidth limits to keep network latency within acceptable range."
+msgstr "动态调整带宽限制以保持网络延迟在可接受范围内。"
+
+msgid "ECN"
+msgstr "ECN"
+
+msgid "ESP"
+msgstr "ESP"
+
+msgid "Each download service class is specified by five main parameters: priority,percent bandwidth at capacity,minimum bandwidth and maximum bandwidth,MinRTT."
+msgstr "每个下载服务类由五个主要参数指定：优先级、带宽占用百分比、最小带宽、最大带宽和 MinRTT。"
+
+msgid "Each upload service class is specified by four main parameters: priority,percent bandwidth at capacity,minimum bandwidth and maximum bandwidth."
+msgstr "每个上传服务类由四个主要参数指定：优先级、带宽占用百分比、最小带宽和最大带宽。"
+
+msgid "Echo Reply"
+msgstr "回声应答"
+
+msgid "Echo Request"
+msgstr "回声请求"
+
+msgid "Edit Download Classification Rule"
+msgstr "编辑下载分类规则"
+
+msgid "Edit Download Service Class"
+msgstr "编辑下载服务类"
+
+msgid "Edit Upload Classification Rule"
+msgstr "编辑上传分类规则"
+
+msgid "Edit Upload Service Class"
+msgstr "编辑上传服务类"
+
+msgid "Enable"
+msgstr "启用"
+
+msgid "Enable ACTIVE/REALTIME Switching"
+msgstr "启用 ACTIVE/REALTIME 切换"
+
+msgid "Enable Active Congestion Control"
+msgstr "启用主动拥塞控制"
+
+msgid "Enable CAKE-MQ for multi-queue devices"
+msgstr "为多队列设备启用 CAKE-MQ"
+
+msgid "Enable Counter"
+msgstr "启用计数器"
+
+msgid "Enable Multi-Queue"
+msgstr "启用多队列"
+
+msgid "Enable QoS"
+msgstr "启用 QoS"
+
+msgid "Enable detailed logging for debugging."
+msgstr "启用详细日志记录以进行调试。"
+
+msgid "Enable dynamic bandwidth adjustment based on network latency"
+msgstr "根据网络延迟启用动态带宽调整"
+
+msgid "Enable or disable the QoS service"
+msgstr "启用或禁用 QoS 服务"
+
+msgid "Entries"
+msgstr "条目"
+
+msgid "Error collecting show_status information"
+msgstr "收集状态信息时出错"
+
+msgid "Error: qosacc binary not found. Please ensure it is installed correctly."
+msgstr "错误：未找到 qosacc 可执行文件。请确保已正确安装。"
+
+msgid "Ethernet"
+msgstr "以太网"
+
+msgid "Exclude Classes"
+msgstr "排除的类"
+
+msgid "Explicit Congestion Notification"
+msgstr "显式拥塞通知"
+
+msgid "FQ-CoDel Parameters (Leaf Queue)"
+msgstr "FQ-CoDel 参数（叶子队列）"
+
+msgid "Flow Mode"
+msgstr "流模式"
+
+msgid "Flow isolation mode"
+msgstr "流隔离模式"
+
+msgid "Flows (flows)"
+msgstr "流 (flows)"
+
+msgid "GRE"
+msgstr "GRE"
+
+msgid "Gargoyle QoS"
+msgstr "石像鬼 QoS"
+
+msgid "Gateway Detection"
+msgstr "网关检测"
+
+msgid "General"
+msgstr "常规"
+
+msgid "Global Settings"
+msgstr "全局设置"
+
+msgid "HFSC Parameters"
+msgstr "HFSC 参数"
+
+msgid "HFSC: Guarantees low latency, ideal for gaming/voip.HTB: Flexible bandwidth control, good for multi-service management.CAKE: Modern and plug-and-play, simple to use."
+msgstr "HFSC：保证低延迟，适合游戏/VoIP。HTB：灵活带宽控制，适合多业务管理。CAKE：现代高级，即插即用，简单易用。"
+
+msgid "HTB Parameters"
+msgstr "HTB 参数"
+
+msgid "High Throughput Detection"
+msgstr "高吞吐量检测"
+
+msgid "ICMP"
+msgstr "ICMP"
+
+msgid "ICMP Type"
+msgstr "ICMP 类型"
+
+msgid "ICMPv6"
+msgstr "ICMPv6"
+
+msgid "IFB Device"
+msgstr "IFB 设备"
+
+msgid "IP Family"
+msgstr "IP 地址族"
+
+msgid "IP Protocol Version"
+msgstr "IP 协议版本"
+
+msgid "IPv4"
+msgstr "IPv4"
+
+msgid "IPv4 address used for latency monitoring. Leave empty to auto-detect gateway."
+msgstr "用于延迟监控的 IPv4 地址。留空则自动检测网关。"
+
+msgid "IPv4 and IPv6"
+msgstr "IPv4 和 IPv6"
+
+msgid "IPv6"
+msgstr "IPv6"
+
+msgid "IPv6 address used for latency monitoring. Leave empty to auto-detect gateway."
+msgstr "用于延迟监控的 IPv6 地址。留空则自动检测网关。"
+
+msgid "In"
+msgstr "入"
+
+msgid "Indicates to the active congestion controller that you wish to minimize round trip times (RTT) when this class is active. Use this setting for online gaming or VoIP applications that need low round trip times (ping times). Minimizing RTT comes at the expense of efficient WAN throughput so while these class are active your WAN throughput will decline (usually around 20%)."
+msgstr "向主动拥塞控制器表明，当此类活动时，您希望最小化往返时间（RTT）。此设置用于需要低往返时间（ping 时间）的在线游戏或 VoIP 应用。最小化 RTT 会牺牲有效的 WAN 吞吐量，因此当这些类处于活动状态时，您的 WAN 吞吐量将下降（通常约为 20%）。"
+
+msgid "Ingress Mode"
+msgstr "入口模式"
+
+msgid "Ingress queueing method: 0=Use IFB (recommended), 1=Use ingress queue directly"
+msgstr "入口排队方法：0=使用 IFB（推荐），1=直接使用入口队列"
+
+msgid "Initial Link Limit (kbps)"
+msgstr "初始链路限制（kbps）"
+
+msgid "Initial Ping Time (ms)"
+msgstr "初始 Ping 时间（毫秒）"
+
+msgid "Interface Device"
+msgstr "接口设备"
+
+msgid "Internal Parameters"
+msgstr "内部参数"
+
+msgid "Internal Parameters Description:"
+msgstr "内部参数说明："
+
+msgid "Interval (microseconds)"
+msgstr "间隔（微秒）"
+
+msgid "Latency Mode"
+msgstr "延迟模式"
+
+msgid "Leave empty for all protocols"
+msgstr "留空表示所有协议"
+
+msgid "Linklayer Overhead"
+msgstr "链路层开销"
+
+msgid "Linklayer Type"
+msgstr "链路层类型"
+
+msgid "Load"
+msgstr "负载"
+
+msgid "Loading"
+msgstr "正在加载"
+
+msgid "MPU (bytes)"
+msgstr "MPU（字节）"
+
+msgid "Manage named sets of IP addresses/CIDRs. Sets can be referenced in rules using @name."
+msgstr "管理 IP 地址/CIDR 的命名集合。可以在规则中使用 @name 引用集合。"
+
+msgid "Manual Ping Limit"
+msgstr "手动 Ping 限制"
+
+msgid "Mark packets going out of LAN interfaces with DSCP values respective of WMM (RFC-8325)."
+msgstr "使用 WMM（RFC-8325）对应的 DSCP 值标记从 LAN 接口发出的数据包。"
+
+msgid "Match feature code in a packet"
+msgstr "匹配数据包中的特征码"
+
+msgid "Max Packet"
+msgstr "最大数据包"
+
+msgid "Max bandwidth(%)"
+msgstr "最大带宽（%）"
+
+msgid "Maximum Bandwidth Percentage (%)"
+msgstr "最大带宽百分比（%）"
+
+msgid "Maximum Bandwidth Ratio (%)"
+msgstr "最大带宽比例（%）"
+
+msgid "Maximum Target RTT"
+msgstr "最大目标 RTT"
+
+msgid "Maximum acceptable latency. When RTT exceeds this, decrease bandwidth"
+msgstr "最大可接受延迟。当 RTT 超过此值时，减少带宽"
+
+msgid "Maximum bandwidth as percentage of configured bandwidth (100-200%)"
+msgstr "最大带宽占配置带宽的百分比（100-200%）"
+
+msgid "Maximum percentage of bandwidth adjustment to prevent excessive bandwidth usage. Default: 95%"
+msgstr "为防止过度使用带宽，带宽调整的最大百分比。默认值：95%"
+
+msgid "Memory Limit"
+msgstr "内存限制"
+
+msgid "Min Packet"
+msgstr "最小数据包"
+
+msgid "Min bandwidth(%)"
+msgstr "最小带宽（%）"
+
+msgid "Min Bandwidth Change (kbps)"
+msgstr "最小带宽变化（kbps）"
+
+msgid "Minimum Bandwidth Percentage (%)"
+msgstr "最小带宽百分比（%）"
+
+msgid "Minimum Bandwidth Ratio (%)"
+msgstr "最小带宽比例（%）"
+
+msgid "Minimum Bytes"
+msgstr "最小字节数"
+
+msgid "Minimum Connections"
+msgstr "最小连接数"
+
+msgid "Minimum Target RTT"
+msgstr "最小目标 RTT"
+
+msgid "Minimum bandwidth as percentage of configured bandwidth (10-100%)"
+msgstr "最小带宽占配置带宽的百分比（10-100%）"
+
+msgid "Minimum bytes before a client port is classified as bulk."
+msgstr "将客户端端口归类为大流量之前的最小字节数。"
+
+msgid "Minimum bytes before the connection is classified as high-throughput."
+msgstr "将连接归类为高吞吐量之前的最小字节数。"
+
+msgid "Minimum established connections for a client port to be considered as bulk."
+msgstr "将客户端端口视为大流量所需的最小已建立连接数。"
+
+msgid "Minimum established connections for a service to be considered as high-throughput."
+msgstr "将服务视为高吞吐量所需的最小已建立连接数。"
+
+msgid "Minimum percentage of bandwidth adjustment to prevent excessive throttling. Default: 15%"
+msgstr "为防止过度节流，带宽调整的最小百分比。默认值：15%"
+
+msgid "Minimize RTT"
+msgstr "最小化 RTT"
+
+msgid "Modify the QoS algorithm parameters. After completing the modification, you need to save/apply them again in the global settings for them to take effect."
+msgstr "修改 QoS 算法参数。修改完成后，您需要在全局设置中再次保存/应用才能使它们生效。"
+
+msgid "NAT Support"
+msgstr "NAT 支持"
+
+msgid "Name"
+msgstr "名称"
+
+msgid "Network Interface"
+msgstr "网络接口"
+
+msgid "No"
+msgstr "否"
+
+msgid "No data found"
+msgstr "未找到数据"
+
+msgid "None"
+msgstr "无"
+
+msgid "Normal"
+msgstr "正常"
+
+msgid "Not set"
+msgstr "未设置"
+
+msgid "Number of Flows"
+msgstr "流数量"
+
+msgid "Only update TC rules when bandwidth change exceeds this threshold to avoid frequent adjustments. Default: 50kbps"
+msgstr "仅当带宽变化超过此阈值时才更新 TC 规则，以避免频繁调整。默认值：50kbps"
+
+msgid "Optimized Algorithm Description:"
+msgstr "优化算法说明："
+
+msgid "Optional description for this rule."
+msgstr "此规则的可选描述。"
+
+msgid "Optional description for this service class."
+msgstr "此服务类的可选描述。"
+
+msgid "Out"
+msgstr "出"
+
+msgid "Overhead (bytes)"
+msgstr "开销（字节）"
+
+msgid "Optimized Algorithm Description"
+msgstr "优化参数描述"
+
+
+msgid "Packet Feature Code Match"
+msgstr "数据包特征码匹配"
+
+msgid "Packet's destination ip, can optionally have /[mask] after it (see -d option in iptables man page)."
+msgstr "数据包的目标 IP，可在其后添加 /[掩码]（参见 iptables 手册页的 -d 选项）。"
+
+msgid "Packet's destination port, can be a range (eg. 80-90, 443, 6000)."
+msgstr "数据包的目标端口，可以是范围（例如 80-90, 443, 6000）。"
+
+msgid "Packet's maximum size (in bytes)."
+msgstr "数据包的最大大小（字节）。"
+
+msgid "Packet's minimum size (in bytes)."
+msgstr "数据包的最小大小（字节）。"
+
+msgid "Packet's source ip, can optionally have /[mask] after it (see -s option in iptables man page)."
+msgstr "数据包的源 IP，可在其后添加 /[掩码]（参见 iptables 手册页的 -s 选项）。"
+
+msgid "Packet's source port, support multi ports (eg. 80-90, 443, 6000)."
+msgstr "数据包的源端口，支持多端口（例如 80-90, 443, 6000）。"
+
+msgid "Packets are tested against the rules in the order specified -- rules toward the top have priority. As soon as a packet matches a rule it is classified, and the rest of the rules are ignored. The order of the rules can be altered using the arrow controls."
+msgstr "数据包按指定的顺序与规则进行匹配——靠前的规则优先。一旦数据包匹配某条规则，即被分类，其余规则将被忽略。可以使用箭头控件改变规则的顺序。"
+
+msgid "Parameter Problem"
+msgstr "参数问题"
+
+msgid "Percent"
+msgstr "百分比"
+
+msgid "Ping Hosts"
+msgstr "Ping 主机"
+
+msgid "Ping Interval (ms)"
+msgstr "Ping 间隔（毫秒）"
+
+msgid "Ping Target (IPv4)"
+msgstr "Ping 目标（IPv4）"
+
+msgid "Ping Target (IPv6)"
+msgstr "Ping 目标（IPv6）"
+
+msgid "Please set download bandwidth in the download configuration section before enabling ACC."
+msgstr "请在启用 ACC 之前在下载配置部分设置下载带宽。"
+
+msgid "Please set upload bandwidth in the upload configuration section before enabling ACC."
+msgstr "请在启用 ACC 之前在上传配置部分设置上传带宽。"
+
+msgid "Position"
+msgstr "位置"
+
+msgid "Priority"
+msgstr "优先级"
+
+msgid "Priority Mapping Enabled"
+msgstr "启用优先级映射"
+
+msgid "Priority of this class. Lower number means higher priority. Used for sorting and bandwidth allocation."
+msgstr "此类的优先级。数字越小表示优先级越高。用于排序和带宽分配。"
+
+msgid "Protocol"
+msgstr "协议"
+
+msgid "QoS Algorithm"
+msgstr "QoS 算法"
+
+msgid "QoS Algorithm Configuration"
+msgstr "QoS 算法配置"
+
+msgid "QoS Switch"
+msgstr "QoS 开关"
+
+msgid "QoS Gargoyle provides more refined bandwidth control, supporting 4 algorithms including HTP+CAKE,HFSC+CAKE,HTP+FQCODEL,CAKE. It also supports active congestion control, dynamic classification, ACK speed limit, and TCP/UDP optimization. Ensure low latency for gaming and VoIP while efficiently managing high traffic."
+msgstr "QoS Gargoyle 提供更精细的带宽控制，支持HTB+CAKE、HFSC+CAKE、HTB+FQCODEL、CAKE共4种算法，同时支持主动拥塞控制、动态分类、ACK限速以及TCP/UDP优化。确保游戏和VoIP的低延迟，同时高效管理大流量。"
+
+msgid "Quantum (bytes)"
+msgstr "量子（字节）"
+
+msgid "Queue Length Limit"
+msgstr "队列长度限制"
+
+msgid "qosacc startup arguments"
+msgstr "qosacc启动参数"
+
+msgid "Ping Interval"
+msgstr "Ping间隔"
+
+msgid "Ping Target"
+msgstr "Ping目标"
+
+
+msgid "R2Q"
+msgstr "R2Q"
+
+msgid "Rate to quantum ratio (recommended: 10)"
+msgstr "速率与量子比（建议：10）"
+
+msgid "Redirect"
+msgstr "重定向"
+
+msgid "Rule Name"
+msgstr "规则名称"
+
+msgid "Rule Order"
+msgstr "规则顺序"
+
+msgid "Rules"
+msgstr "规则"
+
+msgid "SCTP"
+msgstr "SCTP"
+
+msgid "Save & Apply"
+msgstr "保存并应用"
+
+msgid "Save optimized bandwidth to configuration file (saves every 5 minutes at most)"
+msgstr "将优化后的带宽保存到配置文件（最多每 5 分钟保存一次）"
+
+msgid "Select linkelayer type"
+msgstr "选择链路层类型"
+
+msgid "Select or enter the IFB (Intermediate Functional Block) device used for ingress shaping. Typically ifb0."
+msgstr "选择或输入用于入口整形的 IFB（中间功能块）设备。通常为 ifb0。"
+
+msgid "Select the IP protocol version to use."
+msgstr "选择要使用的 IP 协议版本。"
+
+msgid "Select the network interface"
+msgstr "选择网络接口"
+
+msgid "Service Class"
+msgstr "服务类"
+
+msgid "Service Class Name"
+msgstr "服务类名称"
+
+msgid "Service Classes"
+msgstr "服务类"
+
+msgid "Service Options"
+msgstr "服务选项"
+
+msgid "Set linklayer overhead"
+msgstr "设置链路层开销"
+
+msgid "Sets"
+msgstr "集合"
+
+msgid "Show Status"
+msgstr "运行状态"
+
+msgid "Show_status Data"
+msgstr "状态数据"
+
+msgid "Skip Initial Measurement"
+msgstr "跳过初始测量"
+
+msgid "Skip the 15-second initial link measurement and use specified initial values."
+msgstr "跳过 15 秒的初始链路测量，并使用指定的初始值。"
+
+msgid "Source Host (srchost)"
+msgstr "源主机 (srchost)"
+
+msgid "Source IP"
+msgstr "源 IP"
+
+msgid "Source IP / Set"
+msgstr "源 IP / 集合"
+
+msgid "Source MAC"
+msgstr "源 MAC"
+
+msgid "Source Port"
+msgstr "源端口"
+
+msgid "Source Quench"
+msgstr "源端抑制"
+
+msgid "Source Zone"
+msgstr "源区域"
+
+msgid "Specifies how packets that do not match any rule should be classified."
+msgstr "指定未匹配任何规则的数据包应如何分类。"
+
+msgid "Enter the total upload bandwidth in kbit/s (kilobits per second). It is recommended to set this to about 90% of your actual upload speed. Enter 0 or leave blank to disable upload QoS. Example: 50000 for 50 Mbit/s."
+msgstr "请输入上传总带宽，单位为 kbit/s（千比特每秒）。建议设置为实际上传速度的 90% 左右。输入 0 或留空可禁用上传 QoS。示例：50000 表示 50 Mbit/s。"
+
+msgid "Enter the total download bandwidth in kbit/s (kilobits per second). It is recommended to set this to about 90% of your actual download speed. Enter 0 or leave blank to disable download QoS. Example: 100000 for 100 Mbit/s."
+msgstr "请输入下载总带宽，单位为 kbit/s（千比特每秒）。建议设置为实际下载速度的 90% 左右。输入 0 或留空可禁用下载 QoS。示例：100000 表示 100 Mbit/s。"
+
+msgid "Split GSO"
+msgstr "拆分 GSO"
+
+msgid "Starting ACC service..."
+msgstr "正在启动 ACC 服务..."
+
+msgid "Stopping ACC service..."
+msgstr "正在停止 ACC 服务..."
+
+msgid "Switch Algorithm"
+msgstr "切换算法"
+
+msgid "TCP"
+msgstr "TCP"
+
+msgid "Target Delay (microseconds)"
+msgstr "目标延迟（微秒）"
+
+msgid "Target RTT"
+msgstr "目标 RTT"
+
+msgid "Target hosts for latency measurement, separated by spaces"
+msgstr "用于延迟测量的目标主机，用空格分隔"
+
+msgid "Target minimum latency. When RTT is below this, increase bandwidth"
+msgstr "目标最小延迟。当 RTT 低于此值时，增加带宽"
+
+msgid "The maximum percentage of bandwidth that can be allocated to this service type."
+msgstr "可以分配给此服务类型的最大带宽百分比。"
+
+msgid "The minimum percentage of bandwidth that can be allocated to this service type."
+msgstr "可以分配给此服务类型的最小带宽百分比。"
+
+msgid "The percentage of total bandwidth occupied by this service type."
+msgstr "此服务类型占用的总带宽百分比。"
+
+msgid "The total size of data transmitted since the establishment of the link (in kBytes)."
+msgstr "自连接建立以来，传输的数据总量（单位：kBytes）。"
+
+msgid "Threshold for CE marking (e.g., 1ms)"
+msgstr "CE 标记的阈值（例如 1ms）"
+
+msgid "Time Exceeded"
+msgstr "超时"
+
+msgid "Time between each bandwidth adjustment (5-60 seconds)"
+msgstr "每次带宽调整之间的时间间隔（5-60 秒）"
+
+msgid "Time interval between ping measurements. Lower values respond faster but incur more overhead. Range: 100-2000ms"
+msgstr "Ping 测量之间的时间间隔。较低的值响应更快，但会带来更多开销。范围：100-2000 毫秒"
+
+msgid "Time interval for TC bandwidth updates. Default: 2000ms"
+msgstr "TC 带宽更新的时间间隔。默认值：2000 毫秒"
+
+msgid "Total Download Bandwidth"
+msgstr "总下载带宽"
+
+msgid "Total Upload Bandwidth"
+msgstr "总上传带宽"
+
+msgid "UDP"
+msgstr "UDP"
+
+msgid "UDPLite"
+msgstr "UDPLite"
+
+msgid "Unlimited"
+msgstr "无限制"
+
+msgid "Upload Settings"
+msgstr "上传设置"
+
+msgid "Use IFB (0)"
+msgstr "使用 IFB (0)"
+
+msgid "Use Non-standard Ping Target"
+msgstr "使用自定义 Ping 目标"
+
+msgid "Use ingress queue (1)"
+msgstr "使用入口队列 (1)"
+
+msgid "Use service default"
+msgstr "使用服务默认值"
+
+msgid "Used with -I option to set initial link limit. Default: 90000"
+msgstr "与 -I 选项一起使用以设置初始链路限制。默认值：90000"
+
+msgid "Used with -I option to set initial ping time. Default: 30ms"
+msgstr "与 -I 选项一起使用以设置初始 Ping 时间。默认值：30 毫秒"
+
+msgid "Verbose Logging"
+msgstr "详细日志记录"
+
+msgid "WMM Mark LAN"
+msgstr "WMM 标记 LAN"
+
+msgid "Warning: qosacc binary not found in /usr/sbin/. Please ensure it is installed correctly."
+msgstr "警告：在 /usr/sbin/ 中未找到 qosacc 可执行文件。请确保已正确安装。"
+
+msgid "Wash Traffic"
+msgstr "清洗流量"
+
+msgid "Yes"
+msgstr "是"
+
+msgid "Zero"
+msgstr "零"
+
+msgid "aa:bb:cc:dd:ee:ff"
+msgstr "aa:bb:cc:dd:ee:ff"
+
+msgid "e.g., 53, 80, 1000-2000"
+msgstr "例如 53, 80, 1000-2000"
+
+msgid "e.g., 8.8.8.8 or @doh"
+msgstr "例如 8.8.8.8 或 @doh"
+
+msgid "e.g., 192.168.1.0/24 or @myset"
+msgstr "例如 192.168.1.0/24 或 @myset"
+
+msgid "e.g., 443, 3478-3481"
+msgstr "例如 443, 3478-3481"
+
+msgid "e.g., br-lan"
+msgstr "例如 br-lan"
+
+msgid "minRTT Delay"
+msgstr "minRTT 延迟"
+
+msgid "minRTT Enabled"
+msgstr "启用 minRTT"
+
+msgid "✓ ACC service started (PID: %s)<br>Download: %d Mbps, Upload: %d Mbps"
+msgstr "✓ ACC 服务已启动（PID：%s）<br>下载：%d Mbps，上传：%d Mbps"
+
+msgid "✗ ACC service failed to start"
+msgstr "✗ ACC 服务启动失败"
+
+msgid "⚠ ACC service stop failed, please manually execute: killall -9 qosacc"
+msgstr "⚠ ACC 服务停止失败，请手动执行：killall -9 qosacc"
+
+msgid "✓ ACC service stopped"
+msgstr "✓ ACC 服务已停止"
+
+# custom_rules.htm 相关
+msgid "Custom nftables Rules"
+msgstr "自定义 nftables 规则"
+
+msgid "Define custom nftables rules for advanced traffic control. Rules are applied to the appropriate hook based on direction."
+msgstr "定义用于高级流量控制的自定义 nftables 规则。规则根据方向应用于相应的钩子。"
+
+msgid "Egress Custom Rules (upload direction)"
+msgstr "出口自定义规则（上传方向）"
+
+msgid "These rules are inserted into the nftables chain \"filter_qos_egress\". Do not include \"table\" or \"chain\" definitions."
+msgstr "这些规则被插入到 nftables 链 \"filter_qos_egress\" 中。请勿包含 \"table\" 或 \"chain\" 定义。"
+
+msgid "Ingress Custom Rules (download direction)"
+msgstr "入口自定义规则（下载方向）"
+
+msgid "These rules are inserted into the nftables chain \"filter_qos_ingress\". Do not include \"table\" or \"chain\" definitions."
+msgstr "这些规则被插入到 nftables 链 \"filter_qos_ingress\" 中。请勿包含 \"table\" 或 \"chain\" 定义。"
+
+msgid "Full Table Custom Rules (advanced)"
+msgstr "完整表自定义规则（高级）"
+
+msgid "Define a complete nftables table \"inet gargoyle_custom\". The wrapper will be added automatically. Only supports tables prefixed with \"gargoyle_custom_*\"."
+msgstr "定义一个完整的 nftables 表 \"inet gargoyle_custom\"。系统将自动添加。仅支持以\"gargoyle_custom_*\"开头的表。"
+
+msgid "Back to Custom Rules"
+msgstr "返回自定义规则"
+
+msgid "Custom rules saved. QoS not restarted."
+msgstr "自定义规则已保存。QoS未重新启动。"
+
+
+# ratelimit.htm 相关
+msgid "Rate Limits"
+msgstr "速率限制"
+
+msgid "Configure per-device bandwidth limits using nftables meters. Limits are applied based on the source IP of devices, making it easy to control traffic for specific devices or subnets."
+msgstr "使用 nftables 计量器配置每设备带宽限制。限制基于设备的源 IP 应用，便于控制特定设备或子网的流量。"
+
+msgid "Target Devices"
+msgstr "目标设备"
+
+msgid "Download Limit (Kbit/s)"
+msgstr "下载限制（Kbit/s）"
+
+msgid "Upload Limit (Kbit/s)"
+msgstr "上传限制（Kbit/s）"
+
+msgid "Burst Factor"
+msgstr "突发因子"
+
+msgid "Delete"
+msgstr "删除"
+
+msgid "IP/IPv6/CIDR addresses and subnets only. Exclusions: !=192.168.1.77, IP Sets: @vip_guests"
+msgstr "仅限 IP/IPv6/CIDR 地址和子网。排除：!=192.168.1.77，IP 集合：@vip_guests"
+
+msgid "Back to Rate Limits"
+msgstr "返回速率限制"
+
+# custom_rules_result.htm / ratelimit_result.htm 通用
+msgid "An error occurred while saving the rules."
+msgstr "保存规则时发生错误。"
+
+msgid "Custom Rule"
+msgstr "自定义规则"
+
+msgid "Select a custom rule file to override built-in rules."
+msgstr "选择自定义规则文件以覆盖内置规则。"
+
+msgid "Enable ACK Limit"
+msgstr "ACK 限速"
+
+msgid "Limit ACK packets to prevent bufferbloat. Recommended for asymmetric links."
+msgstr "限制ACK数据包以防止缓冲区膨胀。建议用于非对称链路。"
+
+msgid "Enable TCP Upgrade"
+msgstr "TCP 升级"
+
+msgid "Prioritize slow TCP connections (e.g., web browsing) to improve responsiveness."
+msgstr "优先处理低速TCP连接（例如网页浏览），以提升响应速度。"
+
+msgid "Enable UDP Limit"
+msgstr "UDP 限速"
+
+msgid "Rate limit UDP packets to prevent abuse. Packets exceeding the limit will be dropped or marked as bulk."
+msgstr "限制UDP数据包的速率以防止滥用。超过限制的数据包将被丢弃或标记为批量。"
+
+msgid "Enable Dynamic Classification"
+msgstr "动态分类"
+
+msgid "Automatically detect bulk clients and high-throughput services, and adjust their priority accordingly."
+msgstr "自动检测批量客户端和高通量服务，并相应地调整其优先级。"
+
+msgid "Optimized Algorithm Description:"
+msgstr "优化算法说明："
+
+msgid "Adaptive Control: Adjusts bandwidth based on latency; increases bandwidth when ping is below limit, decreases when above limit."
+msgstr "自适应控制：根据延迟调整带宽；当 ping 低于限制时增加带宽，高于限制时减少带宽。"
+
+msgid "Real-time Class Detection: Automatically detects real-time/MinRTT classes in TC and adjusts strategy accordingly."
+msgstr "实时类检测：自动检测 TC 中的实时/MinRTT 类别，并相应调整策略。"
+
+msgid "State Machine: Includes CHK, INIT, ACTIVE, REALTIME, IDLE states, automatically switching based on network conditions."
+msgstr "状态机：包含 CHK、INIT、ACTIVE、REALTIME、IDLE 状态，根据网络条件自动切换。"
+
+msgid "Filter: Uses exponential smoothing to filter ping times and bandwidth data, avoiding jitter."
+msgstr "滤波：使用指数平滑法对 ping 时间和带宽数据进行滤波，避免抖动。"
+
+msgid "Default parameters are optimized for most networks; no adjustment needed."
+msgstr "默认参数针对大多数网络进行了优化，无需调整。"
+
+msgid "Internal Parameters Description:"
+msgstr "内部参数描述："
+
+msgid "These parameters affect the internal behavior of the algorithm and usually do not need modification."
+msgstr "这些参数影响算法的内部行为，通常无需修改。"
+
+msgid "Modifying internal parameters requires restarting the qosacc service to take effect."
+msgstr "修改内部参数需要重启 qosacc 服务才能生效。"
+
+msgid "It is recommended for experienced users to adjust according to specific network environment."
+msgstr "建议有经验的用户根据具体的网络环境进行调整。"
+
+msgid "AH"
+msgstr "AH"
+
+msgid "All"
+msgstr "全部"
+
+msgid "Comma-separated list: new, established, related, untracked, invalid. Use { } for set."
+msgstr "逗号分隔的列表：new, established, related, untracked, invalid。使用 { } 表示集合。"
+
+msgid "Connection Bytes (KB)"
+msgstr "连接传输字节数 (KB)"
+
+msgid "Connection Bytes Reach"
+msgstr "连接传输字节数阈值"
+
+msgid "Connection State"
+msgstr "连接状态"
+
+msgid "DCCP"
+msgstr "DCCP"
+
+msgid "DPI Protocol"
+msgstr "DPI 协议"
+
+msgid "DSCP Value"
+msgstr "DSCP 值"
+
+msgid "Description"
+msgstr "描述"
+
+msgid "Dest IP"
+msgstr "目标 IP"
+
+msgid "Dest Port"
+msgstr "目标端口"
+
+msgid "Destination Unreachable"
+msgstr "目标不可达"
+
+msgid "ESP"
+msgstr "ESP"
+
+msgid "Echo Reply"
+msgstr "Echo 响应"
+
+msgid "Echo Request"
+msgstr "Echo 请求"
+
+msgid "Edit Download Classification Rule"
+msgstr "编辑下载方向分类规则"
+
+msgid "Edit Upload Classification Rule"
+msgstr "编辑上传方向分类规则"
+
+msgid "GRE"
+msgstr "GRE"
+
+msgid "ICMP"
+msgstr "ICMP"
+
+msgid "ICMP Type"
+msgstr "ICMP 类型"
+
+msgid "ICMP Type (Advanced)"
+msgstr "ICMP 类型 (高级)"
+
+msgid "ICMP/ICMPv6 Type/Code"
+msgstr "ICMP/ICMPv6 类型/代码"
+
+msgid "ICMPv6"
+msgstr "ICMPv6"
+
+msgid "IP Family"
+msgstr "IP 协议族"
+
+msgid "IPv4"
+msgstr "IPv4"
+
+msgid "IPv4 and IPv6"
+msgstr "IPv4 与 IPv6"
+
+msgid "IPv6"
+msgstr "IPv6"
+
+msgid "Input Interface"
+msgstr "入接口"
+
+msgid "Local destination port. Single port, range, or list. Use != for negation."
+msgstr "本地目标端口。支持单个端口、范围或列表。使用 != 表示否定。"
+
+msgid "Match DSCP value (0-63). Use != for negation (e.g., !=46)."
+msgstr "匹配 DSCP 值 (0-63)。可使用 != 表示否定 (例如 !=46)。"
+
+msgid "Match ICMP/ICMPv6 type/code. Format: type/code (e.g., 8/0) or just type. Use != for negation."
+msgstr "匹配 ICMP/ICMPv6 类型/代码。格式：类型/代码 (例如 8/0) 或仅类型。可使用 != 表示否定。"
+
+msgid "Match TCP flags (comma-separated, e.g., syn,ack). Allowed: syn, ack, rst, fin, urg, psh, ecn, cwr"
+msgstr "匹配 TCP 标志 (逗号分隔，例如 syn,ack)。允许的值：syn, ack, rst, fin, urg, psh, ecn, cwr"
+
+msgid "Match TTL (IPv4) or Hop Limit (IPv6). Supports: >64, <128, !=255, etc."
+msgstr "匹配 TTL (IPv4) 或跳数限制 (IPv6)。支持格式：>64, <128, !=255 等。"
+
+msgid "Match UDP packet length (in bytes). Supports comparison and ranges."
+msgstr "匹配 UDP 数据包长度 (字节)。支持比较和范围。"
+
+msgid "Match feature code in a packet"
+msgstr "匹配数据包中的特征码"
+
+msgid "Match input interface name (e.g., eth0, pppoe-wan)."
+msgstr "匹配入接口名称 (例如 eth0, pppoe-wan)。"
+
+msgid "Match output interface name (e.g., eth0, br-lan)."
+msgstr "匹配出接口名称 (例如 eth0, br-lan)。"
+
+msgid "Match packet length (in bytes). Supports: <100, >500, 100-200, !=1500"
+msgstr "匹配数据包长度 (字节)。支持格式：<100, >500, 100-200, !=1500"
+
+msgid "Not used by CAKE/HFSC/HTB backends, only for compatibility."
+msgstr "CAKE/HFSC/HTB 后端不使用，仅用于兼容。"
+
+msgid "Optional description for this rule."
+msgstr "此规则的可选描述。"
+
+msgid "Output Interface"
+msgstr "出接口"
+
+msgid "Packet Feature Code Match"
+msgstr "数据包特征码匹配"
+
+msgid "Packet Length"
+msgstr "数据包长度"
+
+msgid "Packet Length (bytes)"
+msgstr "数据包长度 (字节)"
+
+msgid "Packet's destination ip, can optionally have /[mask] after it (see -d option in iptables man page)."
+msgstr "数据包的目标 IP，可选后跟 /掩码 (参见 iptables 手册中的 -d 选项)。"
+
+msgid "Packet's destination port, can be a range (eg. 80-90, 443, 6000)."
+msgstr "数据包的目标端口，可以是范围 (例如 80-90, 443, 6000)。"
+
+msgid "Packet's maximum size (in bytes). Use 'Packet Length' instead."
+msgstr "数据包的最大大小 (字节)。请改用“数据包长度”。"
+
+msgid "Packet's minimum size (in bytes). Use 'Packet Length' instead."
+msgstr "数据包的最小大小 (字节)。请改用“数据包长度”。"
+
+msgid "Packet's source ip, can optionally have /[mask] after it (see -s option in iptables man page)."
+msgstr "数据包的源 IP，可选后跟 /掩码 (参见 iptables 手册中的 -s 选项)。"
+
+msgid "Packet's source port, support multi ports (eg. 80-90, 443, 6000)."
+msgstr "数据包的源端口，支持多端口 (例如 80-90, 443, 6000)。"
+
+msgid "Parameter Problem"
+msgstr "参数问题"
+
+msgid "Position"
+msgstr "位置"
+
+msgid "Protocol"
+msgstr "协议"
+
+msgid "Redirect"
+msgstr "重定向"
+
+msgid "Remote source port. Single port, range (80-90), or list. Use != for negation."
+msgstr "远程源端口。支持单个端口、范围 (80-90) 或列表。可使用 != 表示否定。"
+
+msgid "Rule Order"
+msgstr "规则顺序"
+
+msgid "SCTP"
+msgstr "SCTP"
+
+msgid "Service Class"
+msgstr "服务类别"
+
+msgid "Source IP"
+msgstr "源 IP"
+
+msgid "Source Port"
+msgstr "源端口"
+
+msgid "Source Quench"
+msgstr "源端抑制"
+
+msgid "TCP"
+msgstr "TCP"
+
+msgid "TCP Flags"
+msgstr "TCP 标志"
+
+msgid "TCP/UDP"
+msgstr "TCP/UDP"
+
+msgid "TTL / Hop Limit"
+msgstr "TTL / 跳数限制"
+
+msgid "The total size of data transmitted since the establishment of the link (in kBytes)."
+msgstr "连接建立以来传输的总数据量 (单位：KB)。"
+
+msgid "Time Exceeded"
+msgstr "超时"
+
+msgid "Total bytes transferred in the connection (KB). Supports: >100, <1024, 100-1000, !=512."
+msgstr "连接中传输的总字节数 (KB)。支持格式：>100, <1024, 100-1000, !=512。"
+
+msgid "UDP"
+msgstr "UDP"
+
+msgid "UDP Length"
+msgstr "UDP 长度"
+
+msgid "UDP Length (bytes)"
+msgstr "UDP 长度 (字节)"
+
+msgid "UDPLite"
+msgstr "UDPLite"
+
+msgid "Source IP address or CIDR (e.g., 8.8.8.8). Use != for negation."
+msgstr "源IP地址或CIDR（例如8.8.8.8）。使用！=表示否定。"
+
+msgid "Destination IP address or CIDR (local). Use != for negation."
+msgstr "目标IP地址或CIDR（本地）。使用！=表示否定。"
+
+msgid "Supports: <100, >500, 100-200, !=1500"
+msgstr "支持: <100, >500, 100-200, !=1500"
+
+msgid "Match DSCP (0-63). Use != for negation."
+msgstr "匹配DSCP（0-63）。使用！=表示否定。"
+
+msgid "Interface where packet arrived (e.g., pppoe-wan, eth0)."
+msgstr "数据包到达的接口（例如pppoe-wan、eth0）。"
+
+msgid "Interface where packet is leaving (e.g., br-lan, eth1)." 
+msgstr "数据包离开的接口（例如，br lan、eth1）。"
+
+msgid "Supports: >64, <128, !=255, =64." 
+msgstr "支持: >64, <128, !=255, =64"
+
+msgid "Comma-separated list of states: new, established, related, untracked, invalid. Use { } for set."
+msgstr "以逗号分隔的状态列表：新建、已建立、相关、未跟踪、无效。使用｛｝进行设置。"
+
+msgid "Source IP address or CIDR (e.g., 192.168.1.0/24). Use != for negation."
+msgstr "源IP地址或CIDR（例如192.168.1.0/24）。使用！=表示否定。"
+
+msgid "Destination IP address or CIDR. Use != for negation."
+msgstr "目标IP地址或CIDR。使用！=表示否定。"
+
+msgid "Match UDP packet length. Supports comparisons and ranges."
+msgstr "匹配UDP数据包长度。支持比较和范围。"
+
+msgid "Single port, range, or list. Use != for negation."
+msgstr "单个端口、范围或列表。使用！=表示否定。"
+
+msgid "Comma-separated flags: syn, ack, rst, fin, urg, psh, ecn, cwr. Use ! for negation."
+msgstr "Sin逗号分隔标志：syn、ack、rst、fin、urg、psh、ecn、cwr。使用！用于否定。单个端口、范围或列表。使用！=表示否定。"
+
+msgid "Ruleset Management"
+msgstr "规则集管理"
+
+msgid "Edit the rule set files (.ru) in /etc/qos_gargoyle/rulesets/. These files contain classification rules (upload_rule/download_rule) as well as parameters for ACK limit, TCP upgrade, UDP limit, and dynamic classification (bulk_detect/htp_detect). After editing, you need to select the rule set in Global Settings and apply QoS to make it effective."
+msgstr "编辑 /etc/qos_gargoyle/rulesets/ 目录下的规则集文件（.ru）。这些文件包含分类规则（upload_rule/download_rule）以及 ACK 限速、TCP 升级、UDP 限速和动态分类（bulk_detect/htp_detect）的参数。编辑后，您需要在“全局设置”页面选择该规则集并应用 QoS 才能生效。"
+
+msgid "Ruleset File"
+msgstr "规则集文件"
+
+msgid "Ruleset Content"
+msgstr "规则集内容"
+
+msgid "New Filename"
+msgstr "新文件名"
+
+msgid "Extension .ru will be added automatically if missing."
+msgstr "若缺少扩展名，将自动添加 .ru"
+
+msgid "Confirm Save As"
+msgstr "确认另存为"
+
+msgid "Save"
+msgstr "保存"
+
+msgid "Save As..."
+msgstr "另存为…"
+
+msgid "Reset"
+msgstr "重置"
+
+msgid "New filename cannot be empty."
+msgstr "新文件名不能为空。"
+
+msgid "Invalid filename. Use only letters, digits, dot, underscore, hyphen."
+msgstr "无效的文件名。请仅使用字母、数字、点、下划线、短横线。"
+
+msgid "Directory is not writable: %s"
+msgstr "目录不可写：%s"
+
+msgid "Failed to create backup: %s"
+msgstr "创建备份失败：%s"
+
+msgid "Failed to write file: %s"
+msgstr "写入文件失败：%s"
+
+msgid "Ruleset saved."
+msgstr "规则集已保存。"
+
+msgid "Ruleset saved as %s"
+msgstr "规则集已另存为 %s"
+
+msgid "Please enter a new filename."
+msgstr "请输入新文件名。"
+
+msgid "Continue editing"
+msgstr "继续编辑"
+
+msgid "Go to Global Settings to select and apply the ruleset"
+msgstr "前往全局设置以选择并应用规则集"
+
+msgid "Back to Ruleset Management"
+msgstr "返回规则集管理"

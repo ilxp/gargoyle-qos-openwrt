@@ -1,0 +1,650 @@
+#!/bin/bash
+# QoS Gargoyle 初始化脚本 - sysvinit 版本
+# 版本: 3.5.15 - 恢复 PID 文件判断运行状态，整合新版优化
+
+START=50
+STOP=89
+
+EXTRA_COMMANDS="show status reload enable disable"
+EXTRA_HELP="        show    显示当前 QoS 配置状态
+        status  显示 QoS 详细状态和统计信息
+        reload  重新加载配置（不重启服务）
+        enable  启用开机自启并立即启动
+        disable 禁用开机自启并停止服务"
+
+# ========== 全局配置和常量 ==========
+CONFIG_FILE="qos_gargoyle"
+UPLOAD_MASK="0xFFFF"
+DOWNLOAD_MASK="0xFFFF0000"
+SERVICE_NAME="qos_gargoyle"
+PID_FILE="/var/run/qos_gargoyle.running"
+
+QOS_MODULES_DIR="/usr/lib/qos_gargoyle"
+CAKE_MODULE="$QOS_MODULES_DIR/cake.sh"
+HFSC_CAKE_MODULE="$QOS_MODULES_DIR/hfsc_cake.sh"
+HTB_CAKE_MODULE="$QOS_MODULES_DIR/htb_cake.sh"
+HTB_MODULE="$QOS_MODULES_DIR/htb_fqcodel.sh"
+RULE_HELPER="$QOS_MODULES_DIR/rule.sh"
+
+# 公共变量
+qos_interface=""
+wan_ip=""
+wan_ip6=""
+local_ip=""
+local_ip6=""
+algorithm=""
+total_upload_bandwidth=""
+total_download_bandwidth=""
+upload_shift=0
+download_shift=8
+upload_class_mark_list=""
+download_class_mark_list=""
+IFB_DEVICE=""
+
+# ========== 辅助函数 ==========
+log_msg() {
+    local msg="$1"
+    echo "$msg"
+    logger -t "qos_gargoyle" "$msg"
+}
+
+# 关键：使用 PID 文件判断运行状态（与旧版一致）
+is_service_running() {
+    [ -f "$PID_FILE" ] && return 0 || return 1
+}
+
+is_config_enabled() {
+    local enabled=$(uci -q get "$CONFIG_FILE.global.enabled" 2>/dev/null)
+    [ "$enabled" = "1" ] && return 0 || return 1
+}
+
+update_config_state() {
+    local state="$1"
+    local config_state=$(uci -q get "$CONFIG_FILE.global.enabled" 2>/dev/null)
+    if [ "$state" = "enable" ] && [ "$config_state" != "1" ]; then
+        uci set "$CONFIG_FILE.global.enabled=1"
+        uci commit "$CONFIG_FILE"
+    elif [ "$state" = "disable" ] && [ "$config_state" != "0" ]; then
+        uci set "$CONFIG_FILE.global.enabled=0"
+        uci commit "$CONFIG_FILE"
+    fi
+}
+
+load_common_libraries() {
+    if [ -f "/lib/functions.sh" ]; then
+        . /lib/functions.sh
+    fi
+    if [ -f "/lib/functions/network.sh" ]; then
+        . /lib/functions/network.sh
+    fi
+    if [ -f "/lib/network" ]; then
+        include /lib/network
+    fi
+    if [ -f "$RULE_HELPER" ]; then
+        . "$RULE_HELPER"
+    else
+        log_msg "错误: 规则辅助模块 $RULE_HELPER 未找到"
+        exit 1
+    fi
+}
+
+load_algorithm_module() {
+    local algo="$1"
+    local module=""
+    case "$algo" in
+        "hfsc_cake") module="$HFSC_CAKE_MODULE" ;;
+        "htb_cake") module="$HTB_CAKE_MODULE" ;;
+        "cake") module="$CAKE_MODULE" ;;
+        "htb_fqcodel") module="$HTB_MODULE" ;;
+        *)
+            log_msg "Unknown algorithm: $algo, using htb_cake as default"
+            module="$HTB_CAKE_MODULE"
+            algo="htb_cake"
+            ;;
+    esac
+    if [ -f "$module" ]; then
+        . "$module"
+        algorithm="$algo"
+        return 0
+    else
+        log_msg "Error: Algorithm module not found: $module"
+        return 1
+    fi
+}
+
+load_qos_config() {
+    log_msg "加载 UCI 配置..."
+    algorithm=$(uci -q get "$CONFIG_FILE.global.algorithm")
+    algorithm="${algorithm:-htb_cake}"
+    total_upload_bandwidth=$(uci -q get "$CONFIG_FILE.upload.total_bandwidth")
+    total_download_bandwidth=$(uci -q get "$CONFIG_FILE.download.total_bandwidth")
+    total_upload_bandwidth="${total_upload_bandwidth:-0}"
+    total_download_bandwidth="${total_download_bandwidth:-0}"
+    qos_interface=$(uci -q get "$CONFIG_FILE.global.wan_interface")
+    IFB_DEVICE=$(uci -q get "$CONFIG_FILE.download.ifb_device")
+    IFB_DEVICE="${IFB_DEVICE:-ifb0}"
+    if [ -z "$qos_interface" ] || [ "$qos_interface" = "auto" ]; then
+        log_msg "wan_interface 未配置或为 auto，尝试自动检测..."
+        if [ -f "/lib/functions/network.sh" ]; then
+            . /lib/functions/network.sh
+            include /lib/network
+        fi
+        network_find_wan qos_interface 2>/dev/null
+        if [ -z "$qos_interface" ]; then
+            qos_interface=$(ip route show default 2>/dev/null | awk '/default/ {print $5}' | head -1)
+            if [ -z "$qos_interface" ]; then
+                log_msg "错误: 自动检测 WAN 接口失败，请手动配置 $CONFIG_FILE.global.wan_interface"
+                return 1
+            fi
+        fi
+    fi
+    log_msg "加载配置完成：算法=$algorithm, 上传带宽=${total_upload_bandwidth}kbit, 下载带宽=${total_download_bandwidth}kbit, 接口=$qos_interface, IFB=$IFB_DEVICE"
+    export algorithm total_upload_bandwidth total_download_bandwidth qos_interface IFB_DEVICE
+    return 0
+}
+
+get_network_info() {
+    log_msg "Defining network interfaces..."
+    if [ -z "$qos_interface" ]; then
+        log_msg "错误: 无法确定 WAN 接口，请检查网络配置。"
+        return 1
+    fi
+    wan_ip=""
+    if ! network_get_ipaddr wan_ip "$qos_interface" 2>/dev/null; then
+        wan_ip=$(ip -4 addr show dev "$qos_interface" 2>/dev/null | awk '/inet / {split($2, a, "/"); print a[1]; exit}')
+    fi
+    wan_ip6=""
+    if ! network_get_ipaddr6 wan_ip6 "$qos_interface" 2>/dev/null; then
+        wan_ip6=$(ip -6 addr show dev "$qos_interface" 2>/dev/null | awk '/inet6 / && !/fe80/ {split($2, a, "/"); print a[1]; exit}')
+    fi
+    local_ip=""
+    for l_iface in lan br-lan eth0.1; do
+        if network_get_ipaddr local_ip "$l_iface" 2>/dev/null; then
+            break
+        fi
+        local_ip=$(ip -4 addr show dev "$l_iface" 2>/dev/null | awk '/inet / {split($2, a, "/"); print a[1]; exit}')
+        [ -n "$local_ip" ] && break
+    done
+    local_ip6=""
+    for l_iface in lan br-lan eth0.1; do
+        if network_get_ipaddr6 local_ip6 "$l_iface" 2>/dev/null; then
+            break
+        fi
+        local_ip6=$(ip -6 addr show dev "$l_iface" 2>/dev/null | awk '/inet6 / && !/fe80/ {split($2, a, "/"); print a[1]; exit}')
+        [ -n "$local_ip6" ] && break
+    done
+    log_msg " 接口: $qos_interface"
+    log_msg " WAN IPv4: $wan_ip"
+    log_msg " WAN IPv6: $wan_ip6"
+    log_msg " LAN IPv4: $local_ip"
+    log_msg " LAN IPv6: $local_ip6"
+}
+
+check_configuration() {
+    local enabled=$(uci -q get "$CONFIG_FILE.global.enabled")
+    if [ "$enabled" != "1" ]; then
+        log_msg "QoS is disabled in configuration"
+        return 1
+    fi
+    if [ -z "$total_upload_bandwidth" ] && [ -z "$total_download_bandwidth" ]; then
+        log_msg "No bandwidth configuration found"
+        return 1
+    fi
+    log_msg "Configuration is valid"
+    return 0
+}
+
+wait_interface() {
+    local iface="$1" timeout="${2:-15}" proto="${3:-ipv4}"
+    local elapsed=0
+    if [ -z "$iface" ]; then
+        log_msg "错误: 未指定接口名称"
+        return 1
+    fi
+    log_msg "等待接口 $iface 就绪 (超时 ${timeout}秒, 协议: $proto)..."
+    while [ $elapsed -lt $timeout ]; do
+        if ip link show dev "$iface" >/dev/null 2>&1; then
+            break
+        fi
+        sleep 1
+        elapsed=$((elapsed + 1))
+    done
+    if ! ip link show dev "$iface" >/dev/null 2>&1; then
+        log_msg "错误: 接口 $iface 在 ${elapsed} 秒后仍未出现"
+        return 1
+    fi
+    local addr_ok=0
+    elapsed=0
+    while [ $elapsed -lt $timeout ]; do
+        case "$proto" in
+            ipv4) ip -4 addr show dev "$iface" | grep -q "inet " && addr_ok=1 ;;
+            ipv6) ip -6 addr show dev "$iface" | grep -q "inet6 " && addr_ok=1 ;;
+            both) ip -4 addr show dev "$iface" | grep -q "inet " || ip -6 addr show dev "$iface" | grep -q "inet6 " && addr_ok=1 ;;
+        esac
+        [ $addr_ok -eq 1 ] && break
+        sleep 1
+        elapsed=$((elapsed + 1))
+    done
+    if [ $addr_ok -eq 1 ]; then
+        log_msg "接口 $iface 已获得 $proto 地址 (耗时 ${elapsed} 秒)"
+        return 0
+    else
+        log_msg "错误: 接口 $iface 在 ${timeout} 秒内未获得 $proto 地址"
+        return 1
+    fi
+}
+
+create_ifb_device() {
+    local ifb="${IFB_DEVICE:-ifb0}"
+    log_msg "Ensuring IFB device $ifb is available..."
+    if ! lsmod | grep -q "^ifb"; then
+        log_msg "Loading IFB kernel module..."
+        modprobe ifb 2>/dev/null || { log_msg "Error: Failed to load IFB kernel module"; return 1; }
+    fi
+    if ip link show dev "$ifb" >/dev/null 2>&1; then
+        ip link set dev "$ifb" up 2>/dev/null
+        log_msg "IFB device $ifb already exists, using it."
+        return 0
+    fi
+    log_msg "Creating IFB device $ifb..."
+    ip link add "$ifb" type ifb 2>/dev/null || { log_msg "Error: Failed to create IFB device $ifb"; return 1; }
+    ip link set dev "$ifb" up 2>/dev/null
+    local wan_iface="$qos_interface"
+    if [ -n "$wan_iface" ] && [ -d "/sys/class/net/$wan_iface" ]; then
+        local wan_mtu=$(cat /sys/class/net/$wan_iface/mtu 2>/dev/null)
+        if [ -n "$wan_mtu" ] && [ "$wan_mtu" -gt 0 ]; then
+            ip link set dev "$ifb" mtu "$wan_mtu" 2>/dev/null
+            log_msg "Set $ifb MTU to $wan_mtu (from $wan_iface)"
+        fi
+    fi
+    local tx_queue_len=$(uci -q get "$CONFIG_FILE.download.tx_queue_len" 2>/dev/null)
+    if [ -z "$tx_queue_len" ]; then
+        if [ -n "$total_download_bandwidth" ] && [ "$total_download_bandwidth" -gt 0 ]; then
+            tx_queue_len=$(( total_download_bandwidth / 100 ))
+            [ "$tx_queue_len" -lt 1000 ] && tx_queue_len=1000
+        else
+            tx_queue_len=1000
+        fi
+    fi
+    echo "$tx_queue_len" > /sys/class/net/$ifb/tx_queue_len 2>/dev/null
+    log_msg "Set $ifb tx_queue_len to $tx_queue_len"
+    log_msg "IFB device $ifb created and configured."
+    return 0
+}
+
+load_bandwidth_config() {
+    log_msg "Loading bandwidth configuration..."
+    log_msg " Upload bandwidth: $total_upload_bandwidth kbit/s"
+    log_msg " Download bandwidth: $total_download_bandwidth kbit/s"
+}
+
+start_qos_acc() {
+    log_msg "Starting QoS acc..."
+    local acc_enabled=$(uci -q get "$CONFIG_FILE.download.acc_monenabled")
+    if [ "$acc_enabled" != "true" ] && [ "$acc_enabled" != "1" ]; then
+        log_msg "QoS acc is disabled in configuration"
+        return 0
+    fi
+    if ! command -v qosacc >/dev/null 2>&1; then
+        log_msg "Warning: qosacc not found, QoS acc cannot start"
+        return 1
+    fi
+    local ptarget_ip=$(uci -q get "$CONFIG_FILE.global.ptarget_ip")
+    if [ -z "$ptarget_ip" ]; then
+        ptarget_ip=$(ip route show default 2>/dev/null | awk '/default/ {print $3}')
+    fi
+    local pinglimit=$(uci -q get "$CONFIG_FILE.download.pinglimit")
+    if [ -z "$pinglimit" ]; then
+        if [ -n "$total_download_bandwidth" ] && [ "$total_download_bandwidth" -gt 0 ] && \
+           [ -n "$total_upload_bandwidth" ] && [ "$total_upload_bandwidth" -gt 0 ]; then
+            pinglimit=$((1500 * 10 * 2 / 3 / total_download_bandwidth + 1500 * 10 / total_upload_bandwidth + 2))
+        fi
+    fi
+    local ret=0
+    if command -v start-stop-daemon >/dev/null 2>&1; then
+        if [ -n "$ptarget_ip" ] && [ -n "$total_download_bandwidth" ] && [ -n "$pinglimit" ]; then
+            start-stop-daemon -S -x /usr/sbin/qosacc -- -a -b 800 "$ptarget_ip" "$total_download_bandwidth" "$pinglimit"
+            ret=$?
+        else
+            start-stop-daemon -S -x /usr/sbin/qosacc
+            ret=$?
+        fi
+    else
+        if [ -n "$ptarget_ip" ] && [ -n "$total_download_bandwidth" ] && [ -n "$pinglimit" ]; then
+            qosacc -a -b 800 "$ptarget_ip" "$total_download_bandwidth" "$pinglimit" &
+            ret=$?
+        else
+            qosacc &
+            ret=$?
+        fi
+    fi
+    if [ $ret -ne 0 ]; then
+        log_msg "Warning: Failed to start QoS acc (exit code $ret)"
+    else
+        log_msg "QoS acc started"
+    fi
+    return $ret
+}
+
+# ========== 通用清理函数 ==========
+generic_cleanup() {
+    log_msg "Stopping QoS system (generic cleanup)..."
+    local wan_if=$(uci -q get "$CONFIG_FILE.global.wan_interface" 2>/dev/null)
+    local ifb_dev=$(uci -q get "$CONFIG_FILE.download.ifb_device" 2>/dev/null)
+    ifb_dev="${ifb_dev:-ifb0}"
+    if [ -n "$wan_if" ] && [ "$wan_if" != "auto" ]; then
+        /sbin/tc qdisc del dev "$wan_if" root 2>/dev/null
+        /sbin/tc qdisc del dev "$wan_if" ingress 2>/dev/null
+    fi
+    /sbin/tc qdisc del dev "$ifb_dev" root 2>/dev/null
+    /sbin/tc qdisc del dev "$ifb_dev" ingress 2>/dev/null
+    /usr/sbin/nft delete table inet gargoyle-qos-priority 2>/dev/null
+    killall qosacc 2>/dev/null
+    rm -f "$PID_FILE"
+    log_msg "Generic cleanup completed"
+}
+
+# ========== 主初始化函数 ==========
+init_qos() {
+    log_msg "init QoS system..."
+    
+    # 1. 确保公共库已加载
+    load_common_libraries
+    
+    # 2. 合并规则集（必须在加载配置之前执行）
+    if ! init_ruleset; then
+        log_msg "规则集合并失败，无法继续启动"
+        return 1
+    fi
+    
+    # 3. 重新加载 QoS 配置（此时主配置文件中已包含完整的类别定义）
+    if ! load_qos_config; then
+        return 1
+    fi
+    
+    # 4. 自动调整分类百分比（如果开启）
+    auto_adjust_class_percentages
+	log_msg "DEBUG: upload_class_list = $upload_class_list"
+	log_msg "DEBUG: download_class_list = $download_class_list"
+    
+    # 5. 等待 WAN 接口就绪
+    if ! wait_interface "$qos_interface" 15 both; then
+        log_msg "WAN 接口未就绪（无 IP 地址），启动中止"
+        return 1
+    fi
+    
+    get_network_info
+    if ! check_configuration; then
+        log_msg "QoS configuration is invalid or disabled"
+        return 1
+    fi
+    
+    generic_cleanup
+    if ! create_ifb_device; then
+        log_msg "IFB 设备创建失败，启动中止"
+        return 1
+    fi
+    
+    load_bandwidth_config
+	
+	# 加载类别列表，确保 default_class 能正确匹配
+	load_upload_class_configurations
+	load_download_class_configurations
+
+    if ! load_algorithm_module "$algorithm"; then
+        log_msg "Failed to load algorithm module: $algorithm"
+        generic_cleanup
+        return 1
+    fi
+    
+    local ALGO_RET=0
+    case "$algorithm" in
+        "cake")
+            export RULES_ALREADY_APPLIED=1
+            if type init_cake_qos >/dev/null 2>&1; then
+                init_cake_qos start
+                ALGO_RET=$?
+            else
+                log_msg "CAKE initialization function not found"
+                generic_cleanup
+                return 1
+            fi
+            ;;
+        "htb_fqcodel")
+            export RULES_ALREADY_APPLIED=1
+            if type init_htb_fqcodel_qos >/dev/null 2>&1; then
+                init_htb_fqcodel_qos start
+                ALGO_RET=$?
+            else
+                log_msg "HTB initialization function not found"
+                generic_cleanup
+                return 1
+            fi
+            ;;
+        "hfsc_cake")
+            export RULES_ALREADY_APPLIED=1
+            if type init_hfsc_cake_qos >/dev/null 2>&1; then
+                init_hfsc_cake_qos start
+                ALGO_RET=$?
+            else
+                log_msg "HFSC+CAKE initialization function not found"
+                generic_cleanup
+                return 1
+            fi
+            ;;
+        "htb_cake")
+            export RULES_ALREADY_APPLIED=1
+            if type init_htb_cake_qos >/dev/null 2>&1; then
+                init_htb_cake_qos start
+                ALGO_RET=$?
+            else
+                log_msg "HTB+CAKE initialization function not found"
+                generic_cleanup
+                return 1
+            fi
+            ;;
+        *)
+            log_msg "Unknown algorithm: $algorithm"
+            generic_cleanup
+            return 1
+            ;;
+    esac
+    
+    if [ $ALGO_RET -ne 0 ]; then
+        log_msg "算法模块初始化失败 (返回值: $ALGO_RET)"
+        generic_cleanup
+        return 1
+    fi
+    
+    start_qos_acc
+    if [ $? -ne 0 ]; then
+        log_msg "Warning: QoS acc failed to start, but QoS core is running."
+    fi
+    
+    if type load_custom_full_table >/dev/null 2>&1; then
+        load_custom_full_table 2>/dev/null
+    fi
+    
+    # 创建 PID 文件标记运行状态
+    echo $$ > "$PID_FILE"
+    log_msg "✅ QoS init successfully (Algorithm: $algorithm)"
+    return 0
+}
+
+# ========== 状态显示辅助 ==========
+display_algorithm_specific_status() {
+    if ! load_algorithm_module "$algorithm"; then
+        log_msg "Failed to load algorithm module: $algorithm"
+        show_basic_status
+        return
+    fi
+    case "$algorithm" in
+        "cake")
+            if type show_cake_status >/dev/null 2>&1; then
+                show_cake_status
+            else
+                log_msg "CAKE status function not found, showing basic status..."
+                show_basic_status
+            fi
+            ;;
+        "htb_fqcodel")
+            if type show_htb_fqcodel_status >/dev/null 2>&1; then
+                show_htb_fqcodel_status
+            else
+                log_msg "HTB status function not found, showing basic status..."
+                show_basic_status
+            fi
+            ;;
+        "hfsc_cake")
+            if type show_hfsc_cake_status >/dev/null 2>&1; then
+                show_hfsc_cake_status
+            else
+                log_msg "HFSC+CAKE status function not found, showing basic status..."
+                show_basic_status
+            fi
+            ;;
+        "htb_cake")
+            if type show_htb_cake_status >/dev/null 2>&1; then
+                show_htb_cake_status
+            else
+                log_msg "HTB+CAKE status function not found, showing basic status..."
+                show_basic_status
+            fi
+            ;;
+        *)
+            log_msg "Unknown algorithm: $algorithm"
+            show_basic_status
+            ;;
+    esac
+}
+
+show_basic_status() {
+    echo "TC Queue Status:"
+    /sbin/tc qdisc show 2>/dev/null || echo "  No TC queues found"
+    echo ""
+    echo "IFB Device Status:"
+    if ip link show dev "$IFB_DEVICE" >/dev/null 2>&1; then
+        ip link show dev "$IFB_DEVICE" 2>/dev/null
+    else
+        echo "  IFB device not found"
+    fi
+    echo ""
+}
+
+# ========== 主流程（sysvinit） ==========
+start() {
+    # 检查是否已有 QoS 在运行（通过 PID 文件）
+    if is_service_running; then
+        log_msg "QoS already appears to be running (PID file exists)."
+        log_msg "If you are sure it's not, please run 'stop' first."
+        return 1
+    fi
+    # 检查 PID 文件残留（如果进程不存在，删除文件）
+    if [ -f "$PID_FILE" ]; then
+        local old_pid=$(cat "$PID_FILE" 2>/dev/null)
+        if ! kill -0 "$old_pid" 2>/dev/null; then
+            rm -f "$PID_FILE"
+            log_msg "Removed stale PID file."
+        fi
+    fi
+    log_msg "Starting QoS Gargoyle service..."
+    if [ -d "$QOS_MODULES_DIR" ]; then
+        for f in "$QOS_MODULES_DIR"/*.sh; do
+            [ -f "$f" ] && sed -i 's/\r$//' "$f"
+        done
+    fi
+    load_common_libraries
+    if ! is_config_enabled; then
+        log_msg "QoS is disabled in configuration. Use 'enable' command first."
+        return 0
+    fi
+    init_qos
+    local ret=$?
+    if [ $ret -eq 0 ]; then
+        log_msg "QoS Gargoyle started successfully"
+    else
+        log_msg "QoS Gargoyle failed to start"
+    fi
+    return $ret
+}
+
+stop() {
+    log_msg "Stopping QoS Gargoyle service..."
+    local algo=$(uci -q get "$CONFIG_FILE.global.algorithm" 2>/dev/null)
+    algo=${algo:-htb_cake}
+    local module="/usr/lib/qos_gargoyle/${algo}.sh"
+    if [ -f "$module" ]; then
+        . "$module" 2>/dev/null
+        if type "stop_${algo}_qos" >/dev/null 2>&1; then
+            log_msg "Calling stop_${algo}_qos from module..."
+            "stop_${algo}_qos" 2>/dev/null || true
+        fi
+    fi
+    generic_cleanup
+    log_msg "QoS Gargoyle stopped"
+    return 0
+}
+
+reload() {
+    log_msg "Reloading QoS Gargoyle configuration..."
+    stop
+    sleep 1
+    start
+}
+
+enable() {
+    log_msg "Enabling QoS Gargoyle..."
+    uci set "$CONFIG_FILE.global.enabled=1"
+    uci commit "$CONFIG_FILE"
+    # 创建开机自启链接
+    ln -sf /etc/init.d/qos_gargoyle /etc/rc.d/S50qos_gargoyle
+    start
+    log_msg "✅ QoS Gargoyle enabled and started"
+}
+
+disable() {
+    log_msg "Disabling QoS Gargoyle..."
+    stop
+    rm -f /etc/rc.d/S50qos_gargoyle
+    uci set "$CONFIG_FILE.global.enabled=0"
+    uci commit "$CONFIG_FILE"
+    log_msg "✅ QoS Gargoyle disabled and stopped"
+}
+
+show() {
+    echo "=== QoS Gargoyle Status Report ==="
+    echo "Time: $(date)"
+    local config_enabled=$(uci -q get "$CONFIG_FILE.global.enabled" 2>/dev/null)
+    local running=$(is_service_running && echo "yes" || echo "no")
+    echo "Service Status:"
+    echo "  Configuration: $( [ "$config_enabled" = "1" ] && echo "enabled" || echo "disabled" )"
+    echo "  Running: $running"
+    echo ""
+    if [ "$running" = "no" ]; then
+        echo "QoS is not currently running."
+        echo "To start, use: /etc/init.d/qos_gargoyle start"
+        return 0
+    fi
+    load_common_libraries
+    load_qos_config
+    display_algorithm_specific_status
+}
+
+status() {
+    show
+}
+
+case "$1" in
+    start)   start ;;
+    stop)    stop ;;
+    restart) stop; sleep 1; start ;;
+    reload)  reload ;;
+    enable)  enable ;;
+    disable) disable ;;
+    show)    show ;;
+    status)  status ;;
+    *)
+        echo "Usage: $0 {start|stop|restart|reload|enable|disable|show|status}"
+        exit 1
+        ;;
+esac

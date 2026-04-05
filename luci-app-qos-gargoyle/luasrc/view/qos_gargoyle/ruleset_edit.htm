@@ -1,0 +1,75 @@
+<%+header%>
+
+<h2><%:Ruleset Management%></h2>
+<p><%:Edit the rule set files (.ru) in /etc/qos_gargoyle/rulesets/. These files contain classification rules (upload_rule/download_rule) as well as parameters for ACK limit, TCP upgrade, UDP limit, and dynamic classification (bulk_detect/htp_detect). After editing, you need to select the rule set in Global Settings and apply QoS to make it effective.%></p>
+
+<form method="post" action="<%=REQUEST_URI%>">
+    <div class="cbi-map">
+        <div class="cbi-section">
+            <div class="cbi-section-node">
+                <div class="cbi-value">
+                    <label class="cbi-value-title" for="file"><%:Ruleset File%></label>
+                    <div class="cbi-value-field">
+                        <select name="file" id="file" onchange="window.location.href='<%=url('admin/qos/qos_gargoyle/ruleset_edit')%>?file='+this.value">
+                            <% for _, f in ipairs(files) do %>
+                                <option value="<%=f%>" <% if f == current_file then %>selected="selected"<% end %>><%=f%></option>
+                            <% end %>
+                        </select>
+                    </div>
+                </div>
+                <div class="cbi-value">
+                    <label class="cbi-value-title" for="ruleset_content"><%:Ruleset Content%></label>
+                    <div class="cbi-value-field">
+                        <textarea name="ruleset_content" id="ruleset_content" rows="30" cols="80" class="cbi-input-textarea" style="font-family: monospace;"><%=luci.util.pcdata(content)%></textarea>
+                    </div>
+                </div>
+                <div class="cbi-value" id="saveas_div" style="display:none;">
+                    <label class="cbi-value-title" for="new_filename"><%:New Filename%></label>
+                    <div class="cbi-value-field">
+                        <input type="text" name="new_filename" id="new_filename" class="cbi-input-text" />
+                        <span class="cbi-value-description"><%:Extension .ru will be added automatically if missing.%></span>
+                        <br />
+                        <input type="button" id="confirm_saveas_btn" value="<%:Confirm Save As%>" class="cbi-button cbi-button-apply" />
+                    </div>
+                </div>
+            </div>
+        </div>
+        <div class="cbi-page-actions">
+            <input type="submit" name="cbi.save" value="<%:Save%>" class="cbi-button cbi-button-save" />
+            <input type="button" name="saveas_btn" value="<%:Save As...%>" class="cbi-button cbi-button-apply" />
+            <input type="reset" value="<%:Reset%>" class="cbi-button cbi-button-reset" />
+        </div>
+    </div>
+</form>
+
+<script type="text/javascript">
+    // 显示另存为输入框
+    document.querySelector('input[name="saveas_btn"]').addEventListener('click', function() {
+        var div = document.getElementById('saveas_div');
+        if (div.style.display === 'none') {
+            div.style.display = 'block';
+            document.getElementById('new_filename').focus();
+        } else {
+            div.style.display = 'none';
+        }
+    });
+
+    // 确认另存为按钮
+    document.getElementById('confirm_saveas_btn').addEventListener('click', function() {
+        var newname = document.getElementById('new_filename').value.trim();
+        if (newname === '') {
+            alert('<%:Please enter a new filename.%>');
+            return;
+        }
+        // 创建隐藏字段模拟 cbi.saveas 提交
+        var input = document.createElement('input');
+        input.type = 'hidden';
+        input.name = 'cbi.saveas';
+        input.value = '1';
+        document.forms[0].appendChild(input);
+        // 提交表单
+        document.forms[0].submit();
+    });
+</script>
+
+<%+footer%>

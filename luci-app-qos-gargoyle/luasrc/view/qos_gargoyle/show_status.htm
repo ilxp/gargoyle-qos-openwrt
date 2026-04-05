@@ -1,0 +1,53 @@
+<%#
+-- Copyright 2017 Xingwang Liao <kuoruan@gmail.com>
+-- Licensed to the public under the Apache License 2.0.
+-- Modified 2026 by ilxp <https://github.com/ilxp/gargoyle-qos-openwrt>
+-%>
+
+<% css = [[
+
+	#show_status_text {
+		padding: 20px;
+		text-align: left;
+	}
+	#show_status_text pre {
+		word-break: break-all;
+		margin: 0;
+	}
+	.description {
+		background-color: #33CCFF;
+	}
+
+]]
+-%>
+
+<%+header%>
+
+<script type="text/javascript" src="<%=resource%>/cbi.js?v=2.0.0"></script>
+<script type="text/javascript">//<![CDATA[
+	XHR.poll(15, '<%=url("admin/qos/qos_gargoyle/show_status/data")%>', null,
+		function(x, data) {
+			var status = document.getElementById('show_status_text');
+			if (data.hasOwnProperty("show")) {
+				status.innerHTML = String.format(
+					'<pre>%s%s%s%s</pre>',
+					'<span class="description">Output of &#34;/etc/init.d/qos_gargoyle show&#34; : </span><br /><br />',
+					data.show,
+					'<br /><br /><span class="description">Output of &#34;cat /tmp/qosacc.status&#34; : </span><br /><br />',
+					data.acc
+				);
+			} else {
+				status.innerHTML = '<strong><%:Error collecting show_status information%></strong>';
+			}
+		}
+	);
+//]]></script>
+
+<div id="show_status">
+	<fieldset class="cbi-section">
+		<legend><%:Show_status Data%></legend>
+		<div id="show_status_text"><img src="<%=resource%>/icons/loading.gif" alt="<%:Loading%>" style="vertical-align:middle" /><%:Collecting data...%></div>
+	</fieldset>
+</div>
+
+<%+footer%>
