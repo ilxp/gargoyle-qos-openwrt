@@ -10,9 +10,8 @@ fi
 _QOS_COMMON_SH_LOADED=1
 
 # ========== 全局常量定义 ==========
-readonly NFT_TABLE="gargoyle-qos-priority"
+readonly NFT_TABLE="qos-gargoyle-priority"
 readonly NFT_FAMILY="inet"
-readonly QOS_VERSION="3.5.11"
 readonly DEFAULT_IFB="ifb0"
 readonly MAX_PRIORITY_INDEX=16
 
@@ -132,6 +131,7 @@ cleanup_temp_files() {
     TEMP_FILES=()
 }
 
+# ========== trap 串联（优化 #18） ==========
 _old_trap=$(trap -p EXIT | awk '{print $3}' | sed "s/^'//;s/'$//")
 if [[ -n "$_old_trap" ]]; then
     trap "cleanup_temp_files; $_old_trap" EXIT
@@ -607,7 +607,7 @@ load_custom_full_table() {
     fi
 
     log_info "加载完整表规则: $custom_table_file"
-    # 可选：仍然保留原始语法检查，但我们现在直接加载预处理文件
+    # 可选：仍然保留原始语法检查，但现在直接加载预处理文件
     if ! validate_full_table_rules "$custom_table_file"; then
         log_error "完整表规则文件 $custom_table_file 语法错误，跳过加载"
         rm -f "$temp_file"

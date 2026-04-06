@@ -1351,3 +1351,6 @@ msgstr "前往全局设置以选择并应用规则集"
 
 msgid "Back to Ruleset Management"
 msgstr "返回规则集管理"
+
+msgid "The maximum bandwidth value (in percentage) that can be allocated to this service type."
+msgstr "可分配给该服务类型的最高带宽值（百分比）。"

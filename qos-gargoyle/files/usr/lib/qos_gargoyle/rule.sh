@@ -69,12 +69,21 @@ format_multivalue() {
             part="$(echo "$part" | xargs)"
             elements="${elements}${elements:+, }$part"
         done
-        echo "${prefix}{ $elements }"
+        # 否定操作符与集合之间也需要空格
+        if [[ -n "$prefix" ]]; then
+            echo "${prefix} { $elements }"
+        else
+            echo "{ $elements }"
+        fi
     else
-        echo "${prefix}${val}"
+        # 单个值：否定操作符与值之间必须有空格
+        if [[ -n "$prefix" ]]; then
+            echo "${prefix} ${val}"
+        else
+            echo "$val"
+        fi
     fi
 }
-
 # ========== TCP 标志位映射 ==========
 declare -A TCP_FLAG_MAP=(
     [syn]=0x02
@@ -343,14 +352,14 @@ build_nft_rule_generic() {
     
     local icmp_v4_cond=""
     local icmp_v6_cond=""
-    if [[ -n "$icmp_type" ]]; then
-        if [[ "$proto_v4" == "icmp" ]]; then
-            icmp_v4_cond=$(build_icmp_cond "$icmp_type")
-        fi
-        if [[ "$proto_v6" == "icmpv6" ]]; then
-            icmp_v6_cond=$(build_icmp_cond "$icmp_type")
-        fi
-    fi
+	if [[ -n "$icmp_type" ]]; then
+		if [[ "$proto_v4" == "icmp" ]]; then
+			icmp_v4_cond="icmp $(build_icmp_cond "$icmp_type")"
+		fi
+		if [[ "$proto_v6" == "icmpv6" ]]; then
+			icmp_v6_cond="icmpv6 $(build_icmp_cond "$icmp_type")"
+		fi
+	fi
     
     if (( has_ipv4 )); then
         local ipv4_full_cond="$common_cond"
@@ -459,12 +468,12 @@ build_icmp_cond() {
     if [[ "$icmp_val" == */* ]]; then
         local type="${icmp_val%/*}" code="${icmp_val#*/}"
         if [[ -n "$neg" ]]; then
-            cond="(icmp type != $type) and (icmp code != $code)"
+            cond="(type != $type) and (code != $code)"
         else
-            cond="icmp type $type icmp code $code"
+            cond="type $type code $code"
         fi
     else
-        cond="icmp type $neg $icmp_val"
+        cond="type $neg $icmp_val"
     fi
     echo "$cond"
 }
@@ -550,7 +559,7 @@ add map inet ${NFT_TABLE} class_mark_upload { type mark : verdict; }
 add map inet ${NFT_TABLE} class_mark_download { type mark : verdict; }
 EOF
 
-    declare -A dscp_chains   # 关联数组记录已创建的 DSCP 链
+    declare -A dscp_chains
 
     # 遍历 class_marks 文件
     while IFS=: read -r dir cls mark_raw; do
@@ -602,24 +611,66 @@ EOF
         fi
     done < "$CLASS_MARKS_FILE"
 
-    # 注意：此处不再添加任何引用规则到主链（如 ct mark vmap ...）
-    # 这些规则将在 apply_all_rules 中最后添加，确保在用户规则之后执行。
-    # 规则如下：
-    #   nft add rule inet ${NFT_TABLE} filter_qos_egress ct mark & 0xFFFF vmap @class_mark_upload
-    #   nft add rule inet ${NFT_TABLE} filter_qos_ingress ct mark >> 16 vmap @class_mark_download
-
     local nft_output
     nft_output=$(nft -f "$tmp_nft_file" 2>&1)
     local nft_ret=$?
     if [[ $nft_ret -eq 0 ]]; then
         qos_log "信息" "class_mark_upload / class_mark_download verdict map 规则加载成功"
         rm -f "$tmp_nft_file"
+
+        # 添加 verdict map 引用规则到链尾
+        qos_log "INFO" "添加 verdict map 规则到 filter_qos_egress/ingress 链尾"
+        nft add rule inet ${NFT_TABLE} filter_qos_egress 'ct mark & 0xFFFF vmap @class_mark_upload' 2>/dev/null || {
+            qos_log "WARN" "添加 filter_qos_egress verdict map 规则失败"
+        }
+        nft add rule inet ${NFT_TABLE} filter_qos_ingress 'ct mark >> 16 vmap @class_mark_download' 2>/dev/null || {
+            qos_log "WARN" "添加 filter_qos_ingress verdict map 规则失败"
+        }
+        qos_log "INFO" "verdict map 规则添加完成"
+
         return 0
     else
         qos_log "错误" "加载 class_mark verdict map 规则失败 (退出码: $nft_ret)"
         while IFS= read -r line; do qos_log "ERROR" "$line"; done <<< "$nft_output"
         while IFS= read -r line; do qos_log "DEBUG" "$line"; done < "$tmp_nft_file"
         rm -f "$tmp_nft_file"
+        return 1
+    fi
+}
+
+# ========== 哈希计算辅助函数（自适应选择工具） ==========
+# 计算字符串哈希
+compute_hash() {
+    local input="$1"
+    if command -v md5sum >/dev/null 2>&1; then
+        echo -n "$input" | md5sum | cut -d' ' -f1
+        return 0
+    elif command -v sha256sum >/dev/null 2>&1; then
+        echo -n "$input" | sha256sum | cut -d' ' -f1
+        return 0
+    elif command -v cksum >/dev/null 2>&1; then
+        echo -n "$input" | cksum | awk '{print $2}'
+        return 0
+    else
+        qos_log "ERROR" "未找到可用的哈希工具 (md5sum/sha256sum/cksum)，无法计算缓存指纹"
+        return 1
+    fi
+}
+
+# 计算文件哈希
+compute_file_hash() {
+    local file="$1"
+    if command -v md5sum >/dev/null 2>&1; then
+        md5sum "$file" 2>/dev/null | cut -d' ' -f1
+        return 0
+    elif command -v sha256sum >/dev/null 2>&1; then
+        sha256sum "$file" 2>/dev/null | cut -d' ' -f1
+        return 0
+    elif command -v cksum >/dev/null 2>&1; then
+        cksum "$file" 2>/dev/null | awk '{print $2}'
+        return 0
+    else
+        qos_log "ERROR" "未找到可用的哈希工具，无法计算文件哈希"
         return 1
     fi
 }
@@ -644,24 +695,33 @@ apply_enhanced_direction_rules() {
         config_fingerprint="${config_fingerprint}$(uci show ${CONFIG_FILE}.${section} 2>/dev/null)"
     done
 
-    # 添加自定义规则文件内容到指纹
+    # 添加自定义规则文件内容到指纹（使用自适应文件哈希）
     local custom_egress="/etc/qos_gargoyle/egress_custom.nft"
     local custom_ingress="/etc/qos_gargoyle/ingress_custom.nft"
     local custom_full="/etc/qos_gargoyle/custom_rules.nft"
     if [[ -f "$custom_egress" ]]; then
-        config_fingerprint="${config_fingerprint}$(md5sum "$custom_egress" 2>/dev/null | cut -d' ' -f1)"
+        local hash_val=$(compute_file_hash "$custom_egress")
+        [[ -n "$hash_val" ]] && config_fingerprint="${config_fingerprint}$hash_val"
     fi
     if [[ -f "$custom_ingress" ]]; then
-        config_fingerprint="${config_fingerprint}$(md5sum "$custom_ingress" 2>/dev/null | cut -d' ' -f1)"
+        local hash_val=$(compute_file_hash "$custom_ingress")
+        [[ -n "$hash_val" ]] && config_fingerprint="${config_fingerprint}$hash_val"
     fi
     if [[ -f "$custom_full" ]]; then
-        config_fingerprint="${config_fingerprint}$(md5sum "$custom_full" 2>/dev/null | cut -d' ' -f1)"
+        local hash_val=$(compute_file_hash "$custom_full")
+        [[ -n "$hash_val" ]] && config_fingerprint="${config_fingerprint}$hash_val"
     fi
 
-    local current_hash=$(echo -n "$config_fingerprint" | md5sum | cut -d' ' -f1)
+    # 计算总指纹哈希（使用自适应字符串哈希）
+    local current_hash=$(compute_hash "$config_fingerprint")
+    if [[ -z "$current_hash" ]]; then
+        qos_log "ERROR" "无法计算配置指纹，将跳过缓存机制"
+        # 清空哈希，后续会重新生成规则（不会使用缓存）
+        current_hash=""
+    fi
 
     # 检查缓存是否可用
-    if [[ -f "$hash_file" ]] && [[ -f "$rule_cache" ]]; then
+    if [[ -f "$hash_file" ]] && [[ -f "$rule_cache" ]] && [[ -n "$current_hash" ]]; then
         local saved_hash=$(cat "$hash_file" 2>/dev/null | tr -d '\n')
         if [[ "$saved_hash" == "$current_hash" ]]; then
             qos_log "INFO" "配置未变化，直接加载缓存的 nft 规则文件: $rule_cache"
@@ -824,10 +884,12 @@ apply_enhanced_direction_rules() {
             local nft_ret=$?
             if [[ $nft_ret -eq 0 ]]; then
                 qos_log "INFO" "✅ 批量规则应用成功"
-                # 保存到缓存
-                cp "$nft_batch_file" "$rule_cache"
-                echo "$current_hash" > "$hash_file"
-                qos_log "INFO" "规则已缓存到 $rule_cache"
+                # 保存到缓存（仅当哈希计算成功时）
+                if [[ -n "$current_hash" ]]; then
+                    cp "$nft_batch_file" "$rule_cache"
+                    echo "$current_hash" > "$hash_file"
+                    qos_log "INFO" "规则已缓存到 $rule_cache"
+                fi
                 if [[ $SAVE_NFT_RULES -eq 1 ]]; then
                     mkdir -p /etc/nftables.d
                     local nft_save_file="/etc/nftables.d/qos_gargoyle_${chain}.nft"
@@ -1142,6 +1204,7 @@ add rule inet ${NFT_TABLE} filter_qos_egress meta l4proto tcp ct state establish
     meta mark set $class_mark ct mark set (ct mark & 0xFFFF0000) | $class_mark counter
 EOF
 }
+
 
 # ========== UDP 限速规则（支持粒度选择，统一使用状态化对象） ==========
 generate_udp_limit_rules() {
@@ -1772,22 +1835,6 @@ apply_all_rules() {
         qos_log "ERROR" "应用 $rule_type 规则失败"
         return 1
     fi
-
-    # ========== 添加 verdict map 规则（位域映射） ==========
-    # 这些规则添加到链尾，在用户规则之后、动态分类规则之前生效
-    if nft list map inet ${NFT_TABLE} class_mark_upload &>/dev/null && \
-       nft list map inet ${NFT_TABLE} class_mark_download &>/dev/null; then
-        qos_log "INFO" "添加 verdict map 规则到 filter_qos_egress/ingress 链尾"
-        nft add rule inet ${NFT_TABLE} filter_qos_egress ct mark & 0xFFFF vmap @class_mark_upload 2>/dev/null || {
-            qos_log "WARN" "添加 filter_qos_egress verdict map 规则失败"
-        }
-        nft add rule inet ${NFT_TABLE} filter_qos_ingress ct mark >> 16 vmap @class_mark_download 2>/dev/null || {
-            qos_log "WARN" "添加 filter_qos_ingress verdict map 规则失败"
-        }
-        qos_log "INFO" "verdict map 规则添加完成"
-    else
-        qos_log "WARN" "class_mark_upload 或 class_mark_download map 不存在，跳过 verdict map 规则"
-    fi
     
     return 0
 }
@@ -2308,10 +2355,14 @@ setup_egress_ctinfo() {
 # ========== IPv6增强支持 ==========
 setup_ipv6_specific_rules() {
     qos_log "INFO" "设置IPv6特定规则（优化版）"
+    
+    # 创建或确保链存在
     nft add chain inet ${NFT_TABLE} filter_prerouting '{ type filter hook prerouting priority 0; policy accept; }' 2>/dev/null || true
 
-    # 删除可能存在的旧复制规则，然后插入新的（无条件复制所有非零 ct mark 到 meta mark）
-    nft delete rule inet ${NFT_TABLE} filter_prerouting 2>/dev/null || true
+    # 清空链中所有现有规则（避免重复累积）
+    nft flush chain inet ${NFT_TABLE} filter_prerouting 2>/dev/null || true
+
+    # 插入核心规则：无条件复制所有非零 ct mark 到 meta mark（插入到链首）
     nft insert rule inet ${NFT_TABLE} filter_prerouting ct mark != 0 meta mark set ct mark
 
     # 添加IPv6特定规则：仅对尚未标记的流量（ct mark == 0）设置高位 ct mark，不设置 meta mark
