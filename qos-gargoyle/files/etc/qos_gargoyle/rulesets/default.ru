@@ -3,10 +3,11 @@
 # ------------------------------
 config bulk_detect 'bulk_detect'
     option prio 'last'                     # 规则优先级: first(链首) / last(链尾)
-    option min_bytes '10000'               # 字节速率阈值（字节/秒），超过则视为批量客户端
-    option min_connections '10'            # 连接建立速率阈值（个/分钟），超过则视为批量客户端
+    option min_bytes '204800'               # 字节速率阈值（字节/秒），超过则视为批量客户端 200 KB/s或者500 KB/s
+    option min_connections '20'            # 连接建立速率阈值（个/分钟），超过则视为批量客户端
     option upload_class 'uclass_4'         # 上传方向标记的类别（bulk）
     option download_class 'dclass_4'       # 下载方向标记的类别（bulk）
+
 # ------------------------------
 # 动态分类：高吞吐服务检测（游戏、视频等）
 # ------------------------------
@@ -37,7 +38,7 @@ config tcp_upgrade 'tcp_upgrade'
     option rate '200'                      # 触发升级的速率阈值（包/秒）
     option burst '200'                     # 突发包数（配合rate使用）
     option granularity 'ip'                # 限速粒度: ip(源IP独立) / conn(连接级) / both(复合)
-    option timeout '30'            		   # 集合条目超时时间（秒）
+    option timeout '30'                    # 集合条目超时时间（秒）
 	option exclude_dscp '8'			       # 排除的 DSCP 值0-63,不排除为256或none
 
 # ------------------------------
@@ -49,8 +50,10 @@ config udp_limit 'udp_limit'
     option upload_mark_class 'uclass_4'    # 上传方向标记的类别（bulk）
     option download_mark_class 'dclass_4'  # 下载方向标记的类别（bulk）
     option timeout '30'                    # 集合条目超时时间（秒）
-
+	
+# ------------------------------	
 # 上传类别定义 - 四大类
+# ------------------------------
 config upload_class 'uclass_1'  # 实时 (游戏/语音/实时视频)
 	option name 'realtime'
 	option priority '1'
@@ -90,8 +93,10 @@ config upload_class 'uclass_4'  # 大文件/后台流量 (P2P, 文件传输)
 	option per_max_bandwidth '100'     # 最大带宽占类别带宽的100% = 7.5Mbps
 	option minRTT 'No'
 	option description 'File/P2P'
-
+	
+# ------------------------------
 # 下载类别定义 - 四大类
+# ------------------------------
 config download_class 'dclass_1'  # 实时 (游戏/语音/实时视频)
 	option name 'realtime'
 	option priority '1'
@@ -183,14 +188,14 @@ config upload_rule 'upload_rule_ntp'  # NTP 时间同步
     option description 'NTP'
 
 # ---------- 大流量/大文件 (bulk) ----------
-config upload_rule 'upload_rule_7'  # HTTP/HTTPS 大文件上传（≥2MB）
+config upload_rule 'upload_rule_7'  # HTTP/HTTPS 大文件上传（≥512KB）
     option enabled '1'
     option class 'uclass_4'
     option order '6'
     option family 'inet'
     option proto 'tcp'
     option dstport '80,443,8080'
-    option connbytes_kb '>=2048'
+    option connbytes_kb '>=512'
     option description 'HTTP/HTTPS大流量上传'
 
 config upload_rule 'upload_rule_6'  # FTP/SSH 大文件上传（≥2MB）
@@ -212,24 +217,24 @@ config upload_rule 'upload_rule_8'  # P2P 专用端口
     option dstport '6881-6999,4662,4672,6346,6347,1214,6699,6882-6900,2710'
     option description 'P2P专用端口'
 
-config upload_rule 'upload_rule_9'  # 非标准端口大流量 TCP (≥10MB)
+config upload_rule 'upload_rule_9'  # 非标准端口大流量 TCP (≥5MB)
     option enabled '1'
     option class 'uclass_4'
     option order '9'
     option family 'inet'
     option proto 'tcp'
     option dstport '1024-65535'
-    option connbytes_kb '>=10240'
+    option connbytes_kb '>=5120'
     option description '大流量TCP上传'
 
-config upload_rule 'upload_rule_10'  # 非标准端口大流量 UDP (≥5MB)
+config upload_rule 'upload_rule_10'  # 非标准端口大流量 UDP (≥2MB)
     option enabled '1'
     option class 'uclass_4'
     option order '10'
     option family 'inet'
     option proto 'udp'
     option dstport '1024-65535'
-    option connbytes_kb '>=5120'
+    option connbytes_kb '>=2048'
     option description '大流量UDP上传'
 
 # ---------- 视频数据流 (video) ----------
@@ -349,13 +354,13 @@ config download_rule 'download_rule_ntp'  # NTP 时间同步
     option description 'NTP'
 
 # ---------- 大流量/大文件 (bulk) ----------
-config download_rule 'download_rule_6'  # HTTP/HTTPS大文件下载（≥2MB）
+config download_rule 'download_rule_6'  # HTTP/HTTPS大文件下载（≥512KB）
     option enabled '1'
     option class 'dclass_4'
     option order '6'
     option family 'inet'
     option srcport '80,443,8080,20,21'
-    option connbytes_kb '>=2048'
+    option connbytes_kb '>=512'
     option proto 'tcp'
 
 config download_rule 'download_rule_7'  # P2P 专用端口
@@ -367,24 +372,24 @@ config download_rule 'download_rule_7'  # P2P 专用端口
     option srcport '6881-6999,4662,4672,6346,6347,1214,6699,6882-6900,2710'
     option description 'P2P专用端口'
 
-config download_rule 'download_rule_8'  # 非标准端口大流量 TCP (≥10MB)
+config download_rule 'download_rule_8'  # 非标准端口大流量 TCP (≥5MB)
     option enabled '1'
     option class 'dclass_4'
     option order '8'
     option family 'inet'
     option proto 'tcp'
     option srcport '1024-65535'
-    option connbytes_kb '>=10240'
+    option connbytes_kb '>=5120'
     option description '大流量TCP下载'
 
-config download_rule 'download_rule_9'  # 非标准端口大流量 UDP (≥5MB)
+config download_rule 'download_rule_9'  # 非标准端口大流量 UDP (≥2MB)
     option enabled '1'
     option class 'dclass_4'
     option order '9'
     option family 'inet'
     option proto 'udp'
     option srcport '1024-65535'
-    option connbytes_kb '>=5120'
+    option connbytes_kb '>=2048'
     option description '大流量UDP下载'
 
 # ---------- 视频数据流 (video) ----------
