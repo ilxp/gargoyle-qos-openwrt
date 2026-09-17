@@ -1,6 +1,7 @@
 <%
 -- Copyright 2017 Xingwang Liao <kuoruan@gmail.com>
 -- Licensed to the public under the Apache License 2.0.
+-- Modified 2026 by ilxp <https://github.com/ilxp/gargoyle-qos-openwrt>
 
 local dsp = require "luci.dispatcher"
 local request = dsp.context.path
@@ -86,9 +87,9 @@ table.cbi-section-table td.cbi-section-table-cell {
         var currentClass = null;
         
         lines.forEach(function(line) {
-            var classMatch = line.match(/class\s+hfsc\s+1:(\d+)/);
+            var classMatch = line.match(/class\s+(hfsc|htb|fq_codel|sfq)\s+1:(\d+)/);
             if (classMatch) {
-                currentClass = classMatch[1];
+                currentClass = classMatch[2];
             }
             
             if (currentClass && line.includes('Sent')) {
