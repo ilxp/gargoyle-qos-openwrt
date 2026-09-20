@@ -1,7 +1,7 @@
 ### 说明：
-- 1、新版石像鬼qos是基于IFB的，不是IMQ的。适用于openwrt21.02以上分支源码。
-- 2、ipt分支只用于防火墙firewall3的iptables，不适用firewall4。
-- 3、有个小bug，就是负载没有显示数据，是个瑕疵，但不影响使用。希望有能力的朋友解决下。
+- 1、新版石像鬼qos是基于IFB的，不是IMQ的。适用于openwrt21.02以上分支源码。只支持hfsc算法。
+- 2、ipt分支只用于iptables防火墙，不适用firewall4。
+- 3、有个小bug，就是负载没有显示数据，是个瑕疵，但不影响使用。【已修复】
 - 4、最新修改来源https://github.com/ErickG233/openwrt-gargoyle-qos 感谢ErickG233辛苦的奉献！保留了负载显示和ndpi。
 
 ### 安装：
